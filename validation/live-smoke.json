@@ -1,0 +1,367 @@
+{
+  "date": "2026-09-19",
+  "scope": "Live smoke test; not a large-refactor benchmark",
+  "models": {
+    "bonsai": "bonsai-27b",
+    "jev": "jev-1.13.0"
+  },
+  "metrics": {
+    "status": "complete",
+    "routes": [
+      "read_files",
+      "write",
+      "bash",
+      "finish"
+    ],
+    "jev_ms": [
+      438.9,
+      159.4,
+      302.7,
+      152.5
+    ],
+    "jev_median_ms": 231.0,
+    "bonsai_ms": [
+      2605.2,
+      5028.9,
+      3157.5,
+      4475.7
+    ],
+    "prompt_tokens": [
+      342,
+      617,
+      649,
+      781
+    ],
+    "completion_tokens": [
+      38,
+      100,
+      30,
+      99
+    ],
+    "cached_tokens": [
+      0,
+      82,
+      80,
+      389
+    ]
+  },
+  "events": [
+    {
+      "at": "2026-09-19T10:08:24.106Z",
+      "type": "jev",
+      "data": {
+        "ms": 438.915153,
+        "model": "jev-1.13.0",
+        "answers": {
+          "route": {
+            "type": "choice",
+            "choice": "read_files",
+            "confidence": 0.98,
+            "probabilities": {
+              "ask_user": 0,
+              "search_codebase": 0.01,
+              "write": 0,
+              "finish": 0,
+              "read_files": 0.99,
+              "bash": 0,
+              "tasks": 0
+            }
+          },
+          "compact": {
+            "type": "noul",
+            "noul": 0.4
+          },
+          "complete": {
+            "type": "noul",
+            "noul": 0.02
+          }
+        },
+        "usage": {
+          "input_tokens": 700,
+          "output_tokens": 104
+        }
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:26.723Z",
+      "type": "bonsai",
+      "data": {
+        "ms": 2605.24684,
+        "prompt": {
+          "tokens": 342,
+          "mode": "llama-tokenizer"
+        },
+        "usage": {
+          "completion_tokens": 38,
+          "prompt_tokens": 342,
+          "total_tokens": 380,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "finishReason": "stop"
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:26.723Z",
+      "type": "action",
+      "data": {
+        "step": 1,
+        "route": "read_files",
+        "args": {
+          "files": [
+            {
+              "path": "math.mjs",
+              "start": 1,
+              "end": 250
+            },
+            {
+              "path": "math.test.mjs",
+              "start": 1,
+              "end": 250
+            }
+          ]
+        }
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:26.725Z",
+      "type": "result",
+      "data": {
+        "step": 1,
+        "ok": true,
+        "artifact": "@artifact/00001.txt"
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:26.885Z",
+      "type": "jev",
+      "data": {
+        "ms": 159.41244300000017,
+        "model": "jev-1.13.0",
+        "answers": {
+          "route": {
+            "type": "choice",
+            "choice": "write",
+            "confidence": 0.99,
+            "probabilities": {
+              "bash": 0,
+              "read_files": 0,
+              "finish": 0,
+              "write": 1,
+              "ask_user": 0,
+              "search_codebase": 0,
+              "tasks": 0
+            }
+          },
+          "compact": {
+            "type": "noul",
+            "noul": 0.77
+          },
+          "complete": {
+            "type": "noul",
+            "noul": 0.03
+          }
+        },
+        "usage": {
+          "input_tokens": 1230,
+          "output_tokens": 103
+        }
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:31.924Z",
+      "type": "bonsai",
+      "data": {
+        "ms": 5028.922469000001,
+        "prompt": {
+          "tokens": 617,
+          "mode": "llama-tokenizer"
+        },
+        "usage": {
+          "completion_tokens": 100,
+          "prompt_tokens": 617,
+          "total_tokens": 717,
+          "prompt_tokens_details": {
+            "cached_tokens": 82
+          }
+        },
+        "finishReason": "stop"
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:31.924Z",
+      "type": "action",
+      "data": {
+        "step": 2,
+        "route": "write",
+        "args": {
+          "path": "math.mjs",
+          "expectedHash": "75cfacb7faac086c50b23ac4b29a709eb8680999e6756f620ca76d42aba07cab",
+          "oldText": "  return a - b;",
+          "newText": "  return a + b;"
+        }
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:31.926Z",
+      "type": "result",
+      "data": {
+        "step": 2,
+        "ok": true,
+        "artifact": "@artifact/00002.txt"
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:32.229Z",
+      "type": "jev",
+      "data": {
+        "ms": 302.6840599999996,
+        "model": "jev-1.13.0",
+        "answers": {
+          "route": {
+            "type": "choice",
+            "choice": "bash",
+            "confidence": 0.98,
+            "probabilities": {
+              "bash": 0.99,
+              "ask_user": 0,
+              "read_files": 0,
+              "search_codebase": 0,
+              "tasks": 0,
+              "write": 0.01
+            }
+          },
+          "compact": {
+            "type": "noul",
+            "noul": 0.52
+          },
+          "complete": {
+            "type": "noul",
+            "noul": 0.06
+          }
+        },
+        "usage": {
+          "input_tokens": 1156,
+          "output_tokens": 96
+        }
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:35.395Z",
+      "type": "bonsai",
+      "data": {
+        "ms": 3157.545915999999,
+        "prompt": {
+          "tokens": 649,
+          "mode": "llama-tokenizer"
+        },
+        "usage": {
+          "completion_tokens": 30,
+          "prompt_tokens": 649,
+          "total_tokens": 679,
+          "prompt_tokens_details": {
+            "cached_tokens": 80
+          }
+        },
+        "finishReason": "stop"
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:35.395Z",
+      "type": "action",
+      "data": {
+        "step": 3,
+        "route": "bash",
+        "args": {
+          "command": "node --test math.test.mjs",
+          "purpose": "Run the focused test suite to verify the minimal fix in math.mjs."
+        }
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:35.475Z",
+      "type": "result",
+      "data": {
+        "step": 3,
+        "ok": true,
+        "artifact": "@artifact/00003.txt"
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:35.628Z",
+      "type": "jev",
+      "data": {
+        "ms": 152.47076899999956,
+        "model": "jev-1.13.0",
+        "answers": {
+          "route": {
+            "type": "choice",
+            "choice": "finish",
+            "confidence": 1,
+            "probabilities": {
+              "search_codebase": 0,
+              "finish": 1,
+              "tasks": 0,
+              "bash": 0,
+              "write": 0,
+              "read_files": 0,
+              "ask_user": 0
+            }
+          },
+          "compact": {
+            "type": "noul",
+            "noul": 0.66
+          },
+          "complete": {
+            "type": "noul",
+            "noul": 0.93
+          }
+        },
+        "usage": {
+          "input_tokens": 1393,
+          "output_tokens": 103
+        }
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:40.113Z",
+      "type": "bonsai",
+      "data": {
+        "ms": 4475.661929,
+        "prompt": {
+          "tokens": 781,
+          "mode": "llama-tokenizer"
+        },
+        "usage": {
+          "completion_tokens": 99,
+          "prompt_tokens": 781,
+          "total_tokens": 880,
+          "prompt_tokens_details": {
+            "cached_tokens": 389
+          }
+        },
+        "finishReason": "stop"
+      }
+    },
+    {
+      "at": "2026-09-19T10:08:40.113Z",
+      "type": "action",
+      "data": {
+        "step": 4,
+        "route": "finish",
+        "args": {
+          "summary": "Fixed math.mjs by changing the add function from `return a - b;` to `return a + b;`. Verified by running `node --test math.test.mjs`, which passed: 1 test, 0 failures. The test 'adds signed numbers' confirmed add(2, 3) === 5 and add(-2, 3) === 1. No limitations; the minimal fix was applied and verified."
+        }
+      }
+    }
+  ],
+  "verification": {
+    "command": "node --test math.test.mjs",
+    "purpose": "Run the focused test suite to verify the minimal fix in math.mjs.",
+    "output": "\u2714 adds signed numbers (0.616854ms)\n\u2139 tests 1\n\u2139 suites 0\n\u2139 pass 1\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 0\n\u2139 todo 0\n\u2139 duration_ms 47.236007\n",
+    "code": 0,
+    "truncated": false,
+    "timedOut": false
+  }
+}

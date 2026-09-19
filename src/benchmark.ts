@@ -50,7 +50,7 @@ export async function evaluateBenchmark(runDir: string, options: { label?: strin
   const completed = options.agentCompleted ?? null;
   const report = {
     version: benchmarkVersion, fixtureHash: manifest.fixtureHash, promptHash: manifest.promptHash,
-    label: options.label ?? manifest.label, evaluation: { completed: completed !== null, wallSeconds: options.wallSeconds ?? null, timedOut: options.timedOut ?? false, metrics, checkpoint, verification },tedAt: new Date().toISOString(),
+    label: options.label ?? manifest.label, evaluatedAt: new Date().toISOString(),
     passed: verification.passed && (completed === null || completed),
     verification, agentCompleted: completed, timedOut: options.timedOut ?? null,
     stopReason: options.timedOut ? 'Benchmark wall-time limit reached' : checkpoint?.stopReason ?? null,

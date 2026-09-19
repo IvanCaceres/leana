@@ -60,11 +60,14 @@ async function main(): Promise<void> {
     if (rest.length !== 1) throw new Error('resume requires a session-directory');
     store = new Store(await realpath(resolve(rest[0]!))); session = await store.load();
     if (session.status === 'complete' && !v.message) throw new Error('Session is complete; provide --message for additional work');
-    if (session.stopReason) session.instructions += `\nRecovery note: ${session.stopReason}`;
-    if (v.message) session.objective += `\nUser update: ${v.message}`;
+    const note = `\nRecovery note: ${session.stopReason}`;
+    if (session.stopReason && !session.instructions.endsWith(note)) session.instructions += note;
+    const update = `\nUser update: ${v.message}`;
+    if (v.message && !session.objective.includes(update)) session.objective += update;
     if (Buffer.byteLength(session.objective) > 6000 || Buffer.byteLength(session.instructions) > 12000) throw new Error('Resumed pinned context exceeds budget');
   } else {
     if (rest.length !== 1) throw new Error('run requires one quoted objective');
+    if (v.message) throw new Error('--message applies to resume; pass the objective for run as the quoted argument');
     const root = await realpath(resolve(v.repo ?? '.'));
     store = new Store(join(root, '.leana', 'runs', `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`));
     session = await newSession(root, rest[0]!);

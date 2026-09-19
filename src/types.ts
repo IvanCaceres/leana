@@ -1,4 +1,6 @@
-export type Route = 'read_files' | 'search_codebase' | 'write' | 'bash' | 'tasks' | 'finish' | 'ask_user';
+export type Route = 'read_files' | 'search_codebase' | 'write' | 'move_lines' | 'bash' | 'tasks' | 'finish' | 'ask_user';
+export const editRoutes: readonly Route[] = ['write', 'move_lines'];
+export interface Coverage { total: number; ranges: [number, number][] }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
   { type: 'choice'; instructions: string; criteria: Record<string, string> };
@@ -12,10 +14,10 @@ export interface Session {
   version: 1; root: string; objective: string; instructions: string; step: number;
   tasks: Task[]; focus: string | null; entries: Entry[]; lastCompact: number;
   phase: Phase; knownFiles: string[]; inspectionCount: number; lastError: string | null;
-  lastRoute: Route | null; lastResultOk: boolean;
+  lastRoute: Route | null; lastResultOk: boolean; lastWriteStale: boolean;
   status: 'running' | 'paused' | 'complete'; stopReason: string;
   writes: string[]; lastWriteStep: number; lastCheckStep: number;
-  repetitions: Record<string, number>;
+  repetitions: Record<string, number>; coverage: Record<string, Coverage>;
 }
 export interface Config {
   baseUrl: string; model: string; contextWindow: number; maxTokens: number;
@@ -31,5 +33,5 @@ export type JsonSchema = {
   items?: JsonSchema; minItems?: number; maxItems?: number; minLength?: number; maxLength?: number;
   minimum?: number; maximum?: number; enum?: string[];
 };
-export interface ToolResult { text: string; ok: boolean; changed?: string; check?: boolean }
+export interface ToolResult { text: string; ok: boolean; changed?: string[]; check?: boolean; stale?: boolean }
 export type Log = (type: string, data: unknown) => Promise<void>;

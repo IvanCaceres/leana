@@ -9,6 +9,8 @@ export const schemas: Record<Route, JsonSchema> = {
     items: obj({ path: str(500), start: integer(1, 1000000), end: integer(1, 1000000) }) } }),
   search_codebase: obj({ query: str(300), path: str(500), mode: { ...str(), enum: ['text', 'files'] } }),
   write: obj({ path: str(500), expectedHash: str(64), oldText: str(16000), newText: str(16000) }),
+  move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),
+    destination: str(500), destinationHash: str(64), replacement: str(4000), prefix: str(4000) }),
   bash: obj({ command: str(2000), purpose: str(500) }),
   tasks: obj({ tasks: { type: 'array', minItems: 1, maxItems: 12,
     items: obj({ id: { ...str(40), minLength: 1 }, description: str(300),

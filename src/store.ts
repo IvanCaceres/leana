@@ -20,7 +20,7 @@ export class Store {
     const s = JSON.parse(await readFile(join(this.path, 'checkpoint.json'), 'utf8')) as Session;
     if (s.version !== 1 || !Array.isArray(s.entries) || !Array.isArray(s.tasks) || typeof s.root !== 'string') throw new Error('Invalid checkpoint');
     s.phase ??= 'inspect'; s.knownFiles ??= []; s.inspectionCount ??= 0; s.lastError ??= null;
-    s.lastRoute ??= null; s.lastResultOk ??= false;
+    s.lastRoute ??= null; s.lastResultOk ??= false; s.lastWriteStale ??= false; s.coverage ??= {};
     return s;
   }
   async artifact(step: number, text: string): Promise<string> {

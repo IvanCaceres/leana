@@ -5,6 +5,9 @@ import { spawn } from 'node:child_process';
 import type { Config, Route, ToolResult } from './types.js';
 import { clip } from './context.js';
 export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex');
+// A write whose target was never read, or was read before it changed. Only this
+// failure class requires a fresh read; other edit failures are argument mistakes.
+export class StaleWriteError extends Error {}
 export async function listRepoFiles(root: string): Promise<string[]> {
   const files: string[] = [];
   async function visit(dir: string, prefix = ''): Promise<void> {
@@ -90,15 +93,28 @@ export class ToolBox {
   async execute(route: Route, a: Record<string, any>): Promise<ToolResult> {
     if (route === 'read_files') {
       const results: string[] = [];
+      // Cut at line boundaries inside the evidence budget. A mid-text clip would
+      // hand Bonsai a truncated excerpt that it then pastes back as oldText.
+      const share = Math.floor(this.config.toolChars / a.files.length);
       for (const f of a.files) {
         if (/[?*\[\]]/.test(f.path)) throw new Error(`read_files requires exact regular file paths; glob rejected: ${f.path}`);
-        if (f.end < f.start || f.end - f.start >= 250) throw new Error('Read ranges must contain 1..250 lines');
+        if (f.end < f.start || f.end - f.start >= 250) throw new Error(`Read ranges must contain 1..250 lines: end must be between start and start+249 (got ${f.start}..${f.end})`);
         const artifact = f.path.startsWith('@artifact/');
         const path = artifact ? await safePath(this.artifacts, f.path.slice(10)) : await safePath(this.root, f.path);
         const text = await boundedRead(path, artifact ? 8 * 1024 * 1024 : 1024 * 1024);
         const lines = text.split('\n');
-        results.push(`${f.path} sha256=${hash(text)} totalLines=${lines.length}\n` +
-          clip(lines.slice(f.start - 1, f.end).map((line, i) => `${f.start + i}: ${line}`).join('\n'), 20000));
+        const end = Math.min(f.end, lines.length);
+        // Reserve room for the header line and the continuation marker.
+        const budget = Math.max(400, share - f.path.length - 240);
+        const body: string[] = []; let size = 0; let shown = f.start - 1;
+        for (let n = f.start; n <= end; n++) {
+          const line = `${n}: ${lines[n - 1]}`;
+          if (body.length && size + line.length + 1 > budget) break;
+          body.push(clip(line, budget)); size += line.length + 1; shown = n;
+          if (line.length > budget) break;
+        }
+        const cut = shown < end ? `\n[…truncated at the read budget after line ${shown}; request lines ${shown + 1}..${end} in a later read_files call or narrow the range…]` : '';
+        results.push(`${f.path} sha256=${hash(text)} totalLines=${lines.length} shown=${f.start}..${shown}\n${body.join('\n') || '(no lines in range)'}${cut}`);
       }
       return { ok: true, text: results.join('\n\n') };
     }
@@ -128,20 +144,56 @@ export class ToolBox {
         const handle = await open(path, 'wx', 0o644);
         try { await handle.writeFile(a.newText); } finally { await handle.close(); }
       } else {
-        if (a.expectedHash === 'new') throw new Error('expectedHash=new is only valid for a new file; read the existing file and use its sha256');
-        if (hash(original) !== a.expectedHash) throw new Error('Stale file hash: read the file again before editing');
-        if (!a.oldText || original.split(a.oldText).length !== 2) throw new Error('oldText must match exactly once');
+        if (a.expectedHash === 'new') throw new StaleWriteError(`expectedHash=new is only valid for a new file; ${a.path} exists: read it with read_files and use the returned sha256`);
+        if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.path}: read the file again and use the sha256 from that result`);
+        const matches = a.oldText ? original.split(a.oldText).length - 1 : 0;
+        if (matches === 0) throw new Error('oldText must match exactly once: it was not found in the current file. Copy a small anchor exactly from the latest read_files result of this path; never paste a truncated excerpt');
+        if (matches > 1) throw new Error(`oldText must match exactly once: it matches ${matches} times. Include more surrounding lines so the anchor is unique`);
         const updated = original.replace(a.oldText, () => a.newText);
-        if (updated === original) throw new Error('Write produced no change; choose a different exact replacement');
+        if (updated === original) throw new Error('Write produced no change: newText equals oldText. oldText is the exact existing anchor; newText must be the modified text that replaces it');
         const temp = `${path}.leana-${randomUUID()}.tmp`;
         try {
           const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
           try { await h.writeFile(updated); } finally { await h.close(); }
-          if (hash(await boundedRead(path)) !== a.expectedHash) throw new Error('File changed while preparing edit');
+          if (hash(await boundedRead(path)) !== a.expectedHash) throw new StaleWriteError('File changed while preparing edit; read it again');
           await rename(temp, path);
         } finally { await unlink(temp).catch(() => {}); }
       }
-      return { ok: true, changed: a.path, text: `Updated ${a.path}; sha256=${hash(await boundedRead(path))}. Run focused validation.` };
+      return { ok: true, changed: [a.path], text: `Updated ${a.path}; sha256=${hash(await boundedRead(path))}. Run focused validation.` };
+    }
+    if (route === 'move_lines') {
+      if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
+      if (a.source === a.destination) throw new Error('source and destination must differ');
+      if (a.end < a.start || a.end - a.start >= 2000) throw new Error('move_lines ranges must contain 1..2000 lines');
+      const sourcePath = await safePath(this.root, a.source);
+      const destinationPath = await safePath(this.root, a.destination, true);
+      if (/[\\/]$/.test(a.destination)) throw new Error('destination must be a regular file path');
+      const original = await boundedRead(sourcePath);
+      if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.source}: read the file again and use the sha256 from that result`);
+      const lines = original.split('\n');
+      if (a.end > lines.length) throw new Error(`Range ${a.start}..${a.end} exceeds ${a.source} (${lines.length} lines)`);
+      let existing: string | null = null;
+      try { existing = await boundedRead(destinationPath); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+      if (existing === null && a.destinationHash !== 'new') throw new StaleWriteError(`${a.destination} does not exist; use destinationHash=new to create it`);
+      if (existing !== null && a.destinationHash === 'new') throw new StaleWriteError(`${a.destination} exists: read it and use its sha256 as destinationHash`);
+      if (existing !== null && hash(existing) !== a.destinationHash) throw new StaleWriteError(`Stale file hash for ${a.destination}: read it again`);
+      const moved = lines.slice(a.start - 1, a.end).join('\n');
+      const remaining = [...lines.slice(0, a.start - 1), ...(a.replacement ? a.replacement.split('\n') : []), ...lines.slice(a.end)].join('\n');
+      const output = existing === null ? `${a.prefix ? a.prefix.replace(/\n?$/, '\n') : ''}${moved}\n`
+        : `${existing.replace(/\n?$/, '\n')}\n${moved}\n`;
+      await mkdir(dirname(destinationPath), { recursive: true });
+      const temp = `${sourcePath}.leana-${randomUUID()}.tmp`;
+      try {
+        const h = await open(temp, 'wx', (await stat(sourcePath)).mode & 0o777);
+        try { await h.writeFile(remaining); } finally { await h.close(); }
+        const d = await open(destinationPath, existing === null ? 'wx' : 'w', 0o644);
+        try { await d.writeFile(output); } finally { await d.close(); }
+        if (hash(await boundedRead(sourcePath)) !== a.expectedHash) throw new StaleWriteError('File changed while preparing edit; read it again');
+        await rename(temp, sourcePath);
+      } finally { await unlink(temp).catch(() => {}); }
+      return { ok: true, changed: [a.source, a.destination], text: `Moved lines ${a.start}..${a.end} (${a.end - a.start + 1} lines) from ${a.source} to ${a.destination}. ` +
+        `${a.source} sha256=${hash(remaining)} totalLines=${remaining.split('\n').length}; ${a.destination} sha256=${hash(output)} totalLines=${output.split('\n').length}. ` +
+        'The moved code keeps its original imports only if prefix supplied them; add the import to the source with write, then run focused validation.' };
     }
     if (route === 'bash') {
       if (!this.config.allowBash) throw new Error('Shell disabled; restart with --allow-bash');

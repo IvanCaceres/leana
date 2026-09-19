@@ -6,11 +6,11 @@ import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { defaults, loadConfig } from '../src/config.js';
 import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
-import { compact, confidentChoice, decisionState, messages, routeQuestions } from '../src/context.js';
+import { compact, confidentChoice, decisionState, mergeCoverage, messages, relevantFiles, repoOverview, routeQuestions } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
-import { hash, runCommand, safePath, ToolBox } from '../src/tools.js';
+import { hash, runCommand, safePath, StaleWriteError, ToolBox } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -22,7 +22,7 @@ async function fixture(t: any) {
 }
 function answersFor(q: Questions, route = 'read_files', complete = .99): Answers {
   return Object.fromEntries(Object.entries(q).map(([id, question]) => [id, question.type === 'noul'
-    ? { type: 'noul', noul: id === 'complete' ? complete : .1 }
+    ? { type: 'noul', noul: id === 'complete' || id === 'supported' ? complete : .1 }
     : { type: 'choice', choice: route, confidence: 1,
       probabilities: Object.fromEntries(Object.keys(question.criteria).map(k => [k, k === route ? 1 : 0])) }])) as Answers;
 }
@@ -106,35 +106,44 @@ test('Routing is phase-scoped and exposes deterministic exact files', async t =>
   assert(route.type === 'choice');
   assert(!('write' in route.criteria)); assert(!('bash' in route.criteria)); assert(!('finish' in route.criteria));
   const state = decisionState(s) as any;
-  assert.deepEqual(state.knownFiles, s.knownFiles); assert.equal(state.phase, 'inspect');
+  assert.deepEqual(state.files, ['test/behavior.test.mjs']); assert.equal(state.fileCount, 3); assert.equal(state.phase, 'inspect');
   s.phase = 'implement'; s.inspectionCount = 3;
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
-  assert(route.type === 'choice'); assert('write' in route.criteria); assert(!('bash' in route.criteria)); assert(!('read_files' in route.criteria)); assert(!('search_codebase' in route.criteria));
+  assert(route.type === 'choice'); assert('write' in route.criteria); assert(!('bash' in route.criteria));
+  assert.match(route.criteria.read_files!, /has not been read; 3 inspections/); assert.match(route.criteria.search_codebase!, /3 inspections/);
   s.writes = ['src/domain/price-order.mjs'];
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
   assert(route.type === 'choice'); assert('write' in route.criteria); assert('bash' in route.criteria); assert(!('finish' in route.criteria));
   s.step = 5; s.lastRoute = 'bash'; s.lastResultOk = true; s.lastCheckStep = 4; s.lastWriteStep = 3;
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
-  assert(route.type === 'choice'); assert('write' in route.criteria); assert(!('bash' in route.criteria)); assert(!('read_files' in route.criteria)); assert('finish' in route.criteria);
-  s.lastRoute = 'write'; s.lastResultOk = false;
+  assert(route.type === 'choice'); assert('write' in route.criteria); assert(!('bash' in route.criteria)); assert.match(route.criteria.read_files!, /not yet in the evidence/); assert('finish' in route.criteria);
+  s.lastRoute = 'write'; s.lastResultOk = false; s.lastWriteStale = true;
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
   assert(route.type === 'choice'); assert(!('write' in route.criteria)); assert('bash' in route.criteria); assert('read_files' in route.criteria); assert('search_codebase' in route.criteria);
-  s.writes = [];
+  s.lastWriteStale = false;
+  route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
+  assert(route.type === 'choice'); assert('write' in route.criteria); assert(!('tasks' in route.criteria)); assert('read_files' in route.criteria);
+  s.writes = []; s.lastWriteStale = true;
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
   assert(route.type === 'choice'); assert(!('write' in route.criteria)); assert(!('bash' in route.criteria)); assert('read_files' in route.criteria); assert('search_codebase' in route.criteria);
   s.writes = ['src/domain/price-order.mjs'];
-  s.lastResultOk = true;
+  s.lastResultOk = true; s.lastWriteStale = false;
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
   assert(route.type === 'choice'); assert('bash' in route.criteria); assert('write' in route.criteria); assert('read_files' in route.criteria); assert('search_codebase' in route.criteria);
   s.step = 9; s.lastRoute = 'bash'; s.lastResultOk = true; s.lastCheckStep = 8; s.lastWriteStep = 7;
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
-  assert(route.type === 'choice'); assert(!('bash' in route.criteria)); assert('write' in route.criteria); assert(!('read_files' in route.criteria)); assert('finish' in route.criteria);
+  assert(route.type === 'choice'); assert(!('bash' in route.criteria)); assert('write' in route.criteria); assert('read_files' in route.criteria); assert('finish' in route.criteria);
   s.lastRoute = 'tasks'; s.lastResultOk = true; s.phase = 'implement'; s.writes = [];
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
   assert(route.type === 'choice'); assert(!('tasks' in route.criteria)); assert('read_files' in route.criteria); assert('search_codebase' in route.criteria);
   s.phase = 'verify'; s.lastCheckStep = 4; s.lastWriteStep = 3;
   route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
-  assert(route.type === 'choice'); assert('finish' in route.criteria); assert(!('read_files' in route.criteria)); assert(!('search_codebase' in route.criteria));
+  assert(route.type === 'choice'); assert('finish' in route.criteria); assert('write' in route.criteria); assert('read_files' in route.criteria); assert(!('search_codebase' in route.criteria)); assert(!('tasks' in route.criteria));
+  route = routeQuestions(s, { ...defaults, allowBash: true }).route!;
+  assert(route.type === 'choice'); assert(!('write' in route.criteria)); assert('read_files' in route.criteria);
+  s.lastCheckStep = 2;
+  route = routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route!;
+  assert(route.type === 'choice'); assert(!('finish' in route.criteria)); assert(!('write' in route.criteria)); assert(!('read_files' in route.criteria)); assert('bash' in route.criteria);
 });
 test('Schemas reject unknown arguments and unbounded reads/tasks', () => {
   assert.throws(() => validate(schemas.bash, { command: 'pwd', purpose: 'check', unsafe: true }));
@@ -267,4 +276,211 @@ test('Malformed generated arguments are rejected by Bonsai before effects', asyn
   await new Promise<void>(resolve => server.once('listening', resolve)); t.after(() => server.close());
   const bonsai = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1` }, 'local', noop);
   await assert.rejects(bonsai.generate([{ role: 'user', content: 'test' }], schemas.bash), /missing purpose/);
+});
+
+test('Reads are cut at line boundaries within the evidence budget and report the last line shown', async t => {
+  const { root, store } = await fixture(t);
+  const lines = Array.from({ length: 200 }, (_, i) => `line ${i + 1} ${'y'.repeat(60)}`);
+  await writeFile(join(root, 'big.ts'), lines.join('\n'));
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, toolChars: 2000 });
+  const one = await tools.execute('read_files', { files: [{ path: 'big.ts', start: 1, end: 200 }] });
+  assert(one.text.length <= 2000);
+  const shown = Number(one.text.match(/shown=1\.\.(\d+)/)?.[1]);
+  assert(shown > 10 && shown < 200);
+  assert(one.text.includes(`\n${shown}: line ${shown} `)); assert(!one.text.includes(`\n${shown + 1}: `));
+  assert.match(one.text, new RegExp(`request lines ${shown + 1}\\.\\.200`));
+  const tail = one.text.split('\n').at(-2)!;
+  assert.match(tail, /y{60}$/);
+  const three = await tools.execute('read_files', { files: [{ path: 'big.ts', start: 1, end: 100 }, { path: 'big.ts', start: 101, end: 150 }, { path: 'big.ts', start: 151, end: 200 }] });
+  assert(three.text.length <= 2000); assert.equal(three.text.match(/sha256=/g)?.length, 3);
+  const fits = await tools.execute('read_files', { files: [{ path: 'big.ts', start: 5, end: 6 }] });
+  assert(fits.text.includes('shown=5..6')); assert(!fits.text.includes('truncated'));
+  const beyond = await tools.execute('read_files', { files: [{ path: 'big.ts', start: 500, end: 501 }] });
+  assert(beyond.text.includes('(no lines in range)'));
+});
+test('Write failures distinguish stale or unread targets from replacement mistakes', async t => {
+  const { root, store } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'alpha\nbeta\nbeta\n');
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
+  const h = hash('alpha\nbeta\nbeta\n');
+  await assert.rejects(tools.execute('write', { path: 'a.ts', expectedHash: 'new', oldText: '', newText: 'x' }), (e: any) => e instanceof StaleWriteError);
+  await assert.rejects(tools.execute('write', { path: 'a.ts', expectedHash: hash('other'), oldText: 'alpha', newText: 'x' }), (e: any) => e instanceof StaleWriteError);
+  await assert.rejects(tools.execute('write', { path: 'a.ts', expectedHash: h, oldText: 'gamma', newText: 'x' }), (e: any) => !(e instanceof StaleWriteError) && /not found/.test(e.message));
+  await assert.rejects(tools.execute('write', { path: 'a.ts', expectedHash: h, oldText: 'beta', newText: 'x' }), (e: any) => !(e instanceof StaleWriteError) && /matches 2 times/.test(e.message));
+  await assert.rejects(tools.execute('write', { path: 'a.ts', expectedHash: h, oldText: 'alpha', newText: 'alpha' }), (e: any) => !(e instanceof StaleWriteError) && /newText equals oldText/.test(e.message));
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'alpha\nbeta\nbeta\n');
+});
+test('A successful write marks earlier reads of that file as superseded without dropping other evidence', async t => {
+  const { root, store, session: s } = await fixture(t);
+  const runner = new Runner({ ...defaults, allowWrite: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
+  s.step = 1; await runner.evidence(s, 'read_files', { ok: true, text: 'src/a.ts sha256=abc totalLines=1 shown=1..1\n1: one' });
+  s.step = 2; await runner.evidence(s, 'read_files', { ok: true, text: 'src/b.ts sha256=def totalLines=1 shown=1..1\n1: two\n\nsrc/a.ts sha256=abc totalLines=1 shown=1..1\n1: one' });
+  s.step = 3; await runner.evidence(s, 'read_files', { ok: true, text: 'src/c.ts sha256=ghi totalLines=1 shown=1..1\n1: three' });
+  s.step = 4; await runner.evidence(s, 'write', { ok: true, changed: ['src/a.ts'], text: 'Updated src/a.ts; sha256=new' });
+  assert.match(s.entries[0]!.text, /^\[superseded by the edit at step 4; re-read src\/a\.ts/); assert.equal(s.entries[0]!.relevance, .2);
+  assert.match(s.entries[1]!.text, /^\[superseded/);
+  assert.match(s.entries[2]!.text, /^src\/c\.ts/); assert.equal(s.entries[2]!.relevance, .5);
+  assert.equal(s.entries.length, 4);
+});
+test('A passing check in verify lets Jev return to implementation instead of repeating the check', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'one\n');
+  session.phase = 'verify'; session.writes = ['a.ts']; session.lastWriteStep = 1; session.lastCheckStep = 2; session.step = 2; session.inspectionCount = 3;
+  const offered: string[][] = [];
+  const jev = { decide: async (_s: unknown, q: Questions) => { offered.push(Object.keys((q.route as any).criteria)); return answersFor(q, 'write', .1); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }),
+    generate: async () => ({ path: 'a.ts', expectedHash: hash('one\n'), oldText: 'one', newText: 'two' }) };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(offered[0]!.sort(), ['ask_user', 'bash', 'finish', 'move_lines', 'read_files', 'write']);
+  assert.equal(result.phase, 'implement'); assert.equal(result.lastResultOk, true); assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'two\n');
+  assert.equal(result.lastWriteStep, 3); assert.equal(result.lastCheckStep, 2);
+});
+test('Stale write failures force a read while replacement mistakes keep write available', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'one\n');
+  session.phase = 'implement'; session.inspectionCount = 3;
+  const offered: string[][] = [];
+  let attempt = 0;
+  const jev = { decide: async (_s: unknown, q: Questions) => { offered.push(Object.keys((q.route as any).criteria)); return answersFor(q, 'write', .1); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ++attempt === 1
+    ? { path: 'a.ts', expectedHash: hash('one\n'), oldText: 'one', newText: 'one' }
+    : { path: 'a.ts', expectedHash: 'new', oldText: '', newText: 'x' } };
+  const result = await new Runner({ ...defaults, allowWrite: true, maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /route is uncertain/);
+  assert(offered[1]!.includes('write')); assert(!offered[1]!.includes('tasks'));
+  assert.equal(offered.length, 3); assert(!offered[2]!.includes('write')); assert(offered[2]!.includes('read_files'));
+  assert.equal(result.lastWriteStale, true);
+});
+test('The second identical action and result warns both models before the third pauses', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'same.txt'), 'unchanged');
+  const seen: (string | null)[] = []; const prompts: string[] = [];
+  const bonsai = { count: async () => ({ tokens: 100, mode: 'test' }),
+    generate: async (m: any) => { prompts.push(JSON.stringify(m)); return { files: [{ path: 'same.txt', start: 1, end: 1 }] }; } };
+  const jev = { decide: async (state: any, q: Questions) => { seen.push(state.lastError); return answersFor(q, 'read_files'); } };
+  const result = await new Runner(defaults, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.status, 'paused'); assert.equal(result.step, 3);
+  assert.deepEqual(seen.map(e => e === null ? null : /repeated an identical read_files action/.test(e)), [null, null, true]);
+  assert.match(prompts[2]!, /A third identical repetition pauses the session/);
+});
+test('Finish with insufficient completion evidence re-routes without finish instead of pausing', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'README.md'), 'Hello');
+  session.phase = 'verify'; session.lastCheckStep = 1; session.lastWriteStep = -1; session.step = 1;
+  const calls: { phase: string; criteria: string[]; state: any }[] = [];
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    calls.push({ phase: ctx!.phase, criteria: Object.keys((q.route as any).criteria), state });
+    return answersFor(q, ctx!.phase === 'routing-without-finish' ? 'read_files' : 'finish', .4);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'README.md', start: 1, end: 1 }] }) };
+  const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(calls.length, 2); assert(calls[0]!.criteria.includes('finish')); assert(!calls[1]!.criteria.includes('finish'));
+  assert.equal(calls[1]!.phase, 'routing-without-finish'); assert.match(calls[1]!.state.finishWithheld, /0\.4 is below 0\.9/);
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /step limit/); assert.equal(result.entries.length, 1);
+  assert.equal(result.entries[0]!.kind, 'read_files'); assert.equal(result.phase, 'implement');
+});
+
+test('A completion summary unsupported by tool evidence is rejected and the loop continues; a second rejection pauses', async t => {
+  const { root, store, session } = await fixture(t);
+  session.phase = 'verify'; session.lastCheckStep = 1; session.lastWriteStep = -1; session.step = 1; session.writes = ['deps.ts'];
+  const checks: any[] = [];
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'completion-check') { checks.push({ state, q }); return { supported: { type: 'noul', noul: .2 } } as Answers; }
+    return answersFor(q, 'finish', .99);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Imported deps from cli.ts and verified.' }) };
+  const result = await new Runner({ ...defaults, maxSteps: 5 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(checks.length, 2);
+  assert.equal(checks[0].state.proposedSummary, 'Imported deps from cli.ts and verified.'); assert.match(checks[0].state.tasks, /worker claims/);
+  assert.deepEqual(checks[0].state.changedFiles, ['deps.ts']); assert.equal(typeof checks[0].q.supported.instructions, 'string');
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /not supported by tool evidence twice/);
+  assert.equal(result.entries.length, 1); assert.equal(result.entries[0]!.kind, 'finish_rejected');
+  assert.match(result.lastError!, /Completion rejected.*P\(supported\)=0\.2/);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(events.some(e => e.type === 'action' && e.data.rejected === true && e.data.route === 'finish'));
+});
+test('A supported completion summary still finishes', async t => {
+  const { root, store, session } = await fixture(t);
+  session.phase = 'verify'; session.lastCheckStep = 1; session.lastWriteStep = -1; session.step = 1;
+  const phases: string[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); return answersFor(q, 'finish', .95); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Done.' }) };
+  const result = await new Runner(defaults, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.status, 'complete'); assert.deepEqual(phases, ['routing-and-context', 'completion-check']);
+});
+
+test('move_lines cuts a range into a new or existing file with hash checks and no retyping', async t => {
+  const { root, store } = await fixture(t);
+  const source = ['import a from "a";', 'const keep = 1;', 'interface Deps {', '  x: number;', '}', 'const DEFAULTS: Deps = {', '  x: 1,', '};', 'export { keep };', ''].join('\n');
+  await writeFile(join(root, 'cli.ts'), source);
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
+  const base = { source: 'cli.ts', expectedHash: hash(source), start: 3, end: 8, destination: 'cli/deps.ts', destinationHash: 'new', replacement: 'import { DEFAULTS, type Deps } from "./cli/deps.js";', prefix: 'import type { X } from "../x.js";' };
+  await assert.rejects(tools.execute('move_lines', { ...base, expectedHash: hash('other') }), (e: any) => e instanceof StaleWriteError);
+  await assert.rejects(tools.execute('move_lines', { ...base, end: 40 }), /exceeds cli.ts/);
+  await assert.rejects(tools.execute('move_lines', { ...base, destination: 'cli.ts' }), /must differ/);
+  await assert.rejects(tools.execute('move_lines', { ...base, destinationHash: hash('x') }), (e: any) => e instanceof StaleWriteError && /destinationHash=new/.test(e.message));
+  const moved = await tools.execute('move_lines', base);
+  assert.deepEqual(moved.changed, ['cli.ts', 'cli/deps.ts']);
+  const remaining = await readFile(join(root, 'cli.ts'), 'utf8');
+  assert.equal(remaining, ['import a from "a";', 'const keep = 1;', 'import { DEFAULTS, type Deps } from "./cli/deps.js";', 'export { keep };', ''].join('\n'));
+  const created = await readFile(join(root, 'cli/deps.ts'), 'utf8');
+  assert.equal(created, ['import type { X } from "../x.js";', 'interface Deps {', '  x: number;', '}', 'const DEFAULTS: Deps = {', '  x: 1,', '};', ''].join('\n'));
+  assert(moved.text.includes(`cli.ts sha256=${hash(remaining)} totalLines=5`)); assert(moved.text.includes(`cli/deps.ts sha256=${hash(created)}`));
+  await assert.rejects(tools.execute('move_lines', { ...base, expectedHash: hash(remaining), start: 2, end: 2 }), (e: any) => e instanceof StaleWriteError && /exists/.test(e.message));
+  const appended = await tools.execute('move_lines', { ...base, expectedHash: hash(remaining), destinationHash: hash(created), start: 2, end: 2, replacement: '', prefix: 'ignored for existing files' });
+  assert.equal(await readFile(join(root, 'cli.ts'), 'utf8'), ['import a from "a";', 'import { DEFAULTS, type Deps } from "./cli/deps.js";', 'export { keep };', ''].join('\n'));
+  assert.equal(await readFile(join(root, 'cli/deps.ts'), 'utf8'), `${created}\nconst keep = 1;\n`);
+  assert(appended.ok);
+  await assert.rejects(new ToolBox(root, store.artifacts, defaults).execute('move_lines', base), /Writes disabled/);
+});
+test('move_lines is offered exactly where write is offered', async t => {
+  const { session: s } = await fixture(t);
+  const c = { ...defaults, allowWrite: true, allowBash: true };
+  let route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert(!('move_lines' in route.criteria));
+  s.phase = 'implement'; s.inspectionCount = 3;
+  route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert('move_lines' in route.criteria); assert('write' in route.criteria);
+  route = routeQuestions(s, defaults).route!;
+  assert(route.type === 'choice'); assert(!('move_lines' in route.criteria));
+  s.lastRoute = 'move_lines'; s.lastResultOk = false; s.lastWriteStale = true;
+  route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert(!('move_lines' in route.criteria)); assert(!('write' in route.criteria)); assert('read_files' in route.criteria);
+  s.phase = 'verify'; s.writes = ['a.ts']; s.lastWriteStep = 3; s.lastCheckStep = 4; s.lastRoute = 'bash'; s.lastResultOk = true;
+  route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert.match(route.criteria.move_lines!, /return to implementation/);
+  assert(schemas.move_lines.required!.includes('destinationHash'));
+});
+test('Both models receive a relevance-ranked file subset, a directory overview and read coverage instead of the raw listing', async t => {
+  const { session: s } = await fixture(t);
+  s.objective = 'Read docs/plan.md then extract DEFAULT_DEPENDENCIES from sdk/typescript/src/cli.ts into sdk/typescript/src/cli/deps.ts';
+  s.knownFiles = [...Array.from({ length: 400 }, (_, i) => `.github/workflows/w${i}.yml`), 'docs/plan.md', 'docs/other.md',
+    'sdk/typescript/src/cli.ts', 'sdk/typescript/src/api.ts', 'sdk/python/setup.py', 'README.md'].sort();
+  const files = relevantFiles(s);
+  assert.deepEqual(files.slice(0, 2), ['sdk/typescript/src/cli.ts', 'docs/plan.md']);
+  assert(files.includes('sdk/typescript/src/api.ts')); assert(!files.some(f => f.startsWith('.github')));
+  assert(files.length < 20);
+  const overview = repoOverview(s);
+  assert.equal(overview['.github/workflows/'], 400); assert.equal(overview['sdk/typescript/'], 2); assert.equal(overview['.'], 1);
+  s.coverage = { 'sdk/typescript/src/cli.ts': mergeCoverage(mergeCoverage(undefined, 9464, 1, 195), 9464, 196, 373) };
+  assert.deepEqual(s.coverage['sdk/typescript/src/cli.ts'], { total: 9464, ranges: [[1, 373]] });
+  assert.deepEqual(mergeCoverage({ total: 9464, ranges: [[1, 373]] }, 9464, 1100, 1180), { total: 9464, ranges: [[1, 373], [1100, 1180]] });
+  assert.deepEqual(mergeCoverage({ total: 9464, ranges: [[1, 373]] }, 9000, 1, 10), { total: 9000, ranges: [[1, 10]] });
+  const state = decisionState(s) as any;
+  assert.deepEqual(state.readCoverage, { 'sdk/typescript/src/cli.ts': 'read 1-373 of 9464 lines' });
+  assert.equal(state.fileCount, s.knownFiles.length); assert(!('knownFiles' in state));
+  const prompt = JSON.parse(messages(s, 'read_files')[1]!.content);
+  assert.deepEqual(prompt.readCoverage, state.readCoverage); assert.equal(prompt.files.length, files.length); assert(!('knownFiles' in prompt));
+  assert(Buffer.byteLength(messages(s, 'read_files')[1]!.content) < 6000);
+});
+test('Read results update coverage and an edit resets it for the changed file', async t => {
+  const { root, store, session: s } = await fixture(t);
+  const runner = new Runner({ ...defaults, allowWrite: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
+  s.step = 1; await runner.evidence(s, 'read_files', { ok: true, text: 'a.ts sha256=x totalLines=500 shown=1..180\n1: a\n\nb.ts sha256=y totalLines=10 shown=1..10\n1: b' });
+  s.step = 2; await runner.evidence(s, 'read_files', { ok: true, text: 'a.ts sha256=x totalLines=500 shown=181..300\n181: a' });
+  s.step = 3; await runner.evidence(s, 'read_files', { ok: true, text: 'a.ts sha256=x totalLines=500 shown=600..599\n(no lines in range)' });
+  assert.deepEqual(s.coverage, { 'a.ts': { total: 500, ranges: [[1, 300]] }, 'b.ts': { total: 10, ranges: [[1, 10]] } });
+  s.step = 4; await runner.evidence(s, 'move_lines', { ok: true, changed: ['a.ts', 'c.ts'], text: 'Moved' });
+  assert.deepEqual(Object.keys(s.coverage), ['b.ts']); assert.deepEqual(s.writes, ['a.ts', 'c.ts']);
+  assert.match(s.entries[0]!.text, /^\[superseded by the edit at step 4/);
 });

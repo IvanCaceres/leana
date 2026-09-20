@@ -13,6 +13,7 @@ export type ProgressEvent =
   | { kind: 'generation_error'; step: number; message: string }
   | { kind: 'result'; step: number; route: string; ok: boolean; ms: number; chars: number; text: string }
   | { kind: 'undo'; step: number; files: string[] }
+  | { kind: 'warning'; step: number; text: string }
   | { kind: 'stop'; step: number; status: string; reason: string };
 
 const k = (n: number | null | undefined) => n == null ? '-' : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(Math.round(n));
@@ -37,6 +38,7 @@ export function describe(e: ProgressEvent, verbose: boolean): string | null {
     case 'generation_error': return verbose ? `${p} generation failed: ${e.message}` : null;
     case 'result': return verbose ? `${p} result ${e.ok ? 'ok' : 'FAILED'} | ${e.ms.toFixed(0)}ms | ${e.chars} chars | ${clip(e.text.replace(/\s+/g, ' '), 200)}` : null;
     case 'undo': return `[${e.step}] undo | reverting ${e.files.join(', ')}`;
+    case 'warning': return `warning | ${e.text}`;
     default: return null;
   }
 }

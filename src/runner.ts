@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
 import { checkDelta, clip, compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
-import { completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
 import { editRoutes } from './types.js';
@@ -190,8 +190,11 @@ export class Runner {
     const own = s.missingNames.filter(n => s.writes.some(w => w === n.inFile || w.endsWith(`/${n.inFile}`) || n.inFile.endsWith(`/${w}`)));
     const fixes = compactNames(s, 60, own);
     // One file per step, so the check runs between files and each fix is judged alone.
-    for (const file of new Set([...Object.keys(fixes.addImports), ...Object.keys(fixes.addExportAtLines)])) {
-      const key = hash(JSON.stringify({ i: fixes.addImports[file] ?? [], e: fixes.addExportAtLines[file] ?? [] }));
+    for (const file of new Set([...Object.keys(fixes.addImports), ...Object.keys(fixes.addExportAtLines), ...Object.keys(fixes.removeImports)])) {
+      // Export fixes land in the declaring file, which may be one the session never
+      // touched; those stay listed for the worker but are not applied unasked.
+      if (!s.writes.some(w => w === file || w.endsWith(`/${file}`) || file.endsWith(`/${w}`))) continue;
+      const key = hash(JSON.stringify({ i: fixes.addImports[file] ?? [], e: fixes.addExportAtLines[file] ?? [], r: fixes.removeImports[file] ?? [] }));
       if (s.autoFixKeys[file] === key) continue;
       s.autoFixKeys[file] = key;
       let text: string;
@@ -209,7 +212,11 @@ export class Runner {
         const start = await importInsertLine(file, text);
         edits.push({ start, end: start - 1, newText: wanted.join('\n'), prepend: '' });
       }
+      if (fixes.removeImports[file]?.length) edits.push(...await removeImportBindings(file, text, fixes.removeImports[file]!));
       if (!edits.length) continue;
+      // An identical fix already rolled back is not tried again.
+      const identity = hash(JSON.stringify({ route: 'replace_lines', args: { path: file, edits, expectedHash: undefined, destinationHash: undefined } }));
+      if (s.rejectedEdits.some(r => r.identity === identity)) continue;
       await this.forced(s, 'replace_lines', { path: file, expectedHash: hash(text), edits }, 'auto-fix');
       return true;
     }
@@ -271,7 +278,11 @@ export class Runner {
   async run(s: Session): Promise<Session> {
     s.status = 'running'; s.stopReason = '';
     // A declared check is the verification: baseline it before any edit.
-    if (this.config.checkCommand) { s.lastCheckCommand = this.config.checkCommand; if (!s.lastCheck) s.pendingCheck = true; }
+    if (this.config.checkCommand) {
+      s.lastCheckCommand = this.config.checkCommand; if (!s.lastCheck) s.pendingCheck = true;
+      const advice = await checkAdvice(this.tools.root, this.config.checkCommand);
+      if (advice) { this.observe({ kind: 'warning', step: s.step, text: advice }); await this.store.log('warning', { step: s.step, text: advice }); }
+    }
     const endStep = s.step + this.config.maxSteps;
     let generationFailures = 0;
     try {
@@ -465,7 +476,19 @@ export class Runner {
           const stopCondition = s.editEvidence.length > 0 && s.lastCheck?.ok && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && staleFor(s).length === 0 && check.stop_condition?.type === 'noul'
             ? check.stop_condition.noul : 0;
           const complete = Math.max(coverage, stopCondition);
-          if (supported < this.config.completeProbability || complete < this.config.completeProbability) {
+          // A claim Jev cannot confirm from source facts is not the same as one it
+          // judges false. "No behavior changes were introduced" is unverifiable by
+          // construction; it is dropped from the record and named as unverified,
+          // while a contradicted claim or missing deliverable coverage rejects.
+          const floor = this.config.completeProbability / 2;
+          const contradicted = claimScores.filter(c => c.probability < floor);
+          const unverified = claimScores.filter(c => c.probability >= floor && c.probability < this.config.completeProbability);
+          if (!contradicted.length && complete >= this.config.completeProbability && unverified.length) {
+            const kept = claimScores.filter(c => c.probability >= this.config.completeProbability).map(c => c.claim).join(' ');
+            await this.store.log('completion-unverified', { step: s.step, unverified });
+            args = { ...args, summary: `${kept}${kept ? ' ' : ''}Unverified: ${unverified.map(c => c.claim).join(' ')}` };
+          }
+          if (contradicted.length || complete < this.config.completeProbability) {
             const unsupported = claimScores.filter(c => c.probability < this.config.completeProbability);
             await this.store.log('action', { step: s.step, route, args, rejected: true, supported, complete, coverage, stopCondition, unsupported });
             const feedback = `Completion rejected (lowest claim support=${supported}, deliverable coverage=${complete}). ${complete < this.config.completeProbability ? 'The objective is still unfinished or unverified. Compare the requested deliverables with current source, locate the missing declarations or references, and continue implementation. A passing check alone does not establish completion. ' : ''}${unsupported.length ? `Unsupported claims: ${JSON.stringify(unsupported)}. Correct the summary or obtain the missing evidence; do not redo successful edits merely to repair a historical procedural deviation.` : 'Obtain evidence for the missing deliverables before trying finish again.'}`;

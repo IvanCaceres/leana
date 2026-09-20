@@ -8,7 +8,7 @@ export const schemas: Record<Route, JsonSchema> = {
   read_files: obj({ files: { type: 'array', minItems: 1, maxItems: 3,
     items: obj({ path: str(500), start: integer(1, 1000000), end: integer(1, 1000000) }) } }),
   search_codebase: obj({ query: str(300), path: str(500), mode: { ...str(), enum: ['text', 'files'] } }),
-  write: obj({ path: str(500), expectedHash: str(64), oldText: str(16000), newText: str(16000) }),
+  write: obj({ path: str(500), expectedHash: str(64), oldText: str(4000), newText: str(6000) }),
   replace_lines: obj({ path: str(500), expectedHash: str(64), edits: { type: 'array', minItems: 1, maxItems: 40,
     items: obj({ start: integer(1, 1000000), end: integer(1, 1000000), newText: str(16000), prepend: str(200) }) } }),
   move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),

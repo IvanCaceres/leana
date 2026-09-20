@@ -22,15 +22,22 @@ export function regression(before: CheckSummary | null, after: CheckSummary, sco
   const matches = (f: string) => files.some(p => f === p || f.endsWith(`/${p}`) || p.endsWith(`/${f}`));
   const attributed = files.length > 0 && [before, after].some(s => Object.keys(s.byFile).some(k => k !== '(other)' && matches(k)));
   const inScope = (s: CheckSummary) => {
-    if (!attributed) return { errors: s.errors, syntax: s.syntax };
-    let errors = 0; let syntax = 0;
-    for (const [f, v] of Object.entries(s.byFile)) if (f === '(other)' || matches(f)) { errors += v.count; syntax += v.syntax; }
-    return { errors, syntax };
+    if (!attributed) return { errors: s.errors, syntax: s.syntax, resolution: s.resolution ?? 0 };
+    let errors = 0; let syntax = 0; let resolution = 0;
+    for (const [f, v] of Object.entries(s.byFile)) if (f === '(other)' || matches(f)) { errors += v.count; syntax += v.syntax; resolution += v.resolution ?? 0; }
+    return { errors, syntax, resolution };
   };
   const b = inScope(before); const a = inScope(after);
   // New syntax errors with no net progress are a regression. New syntax errors
   // alongside a net decrease are progress with one known line to fix: keep them.
   if (a.syntax > b.syntax && a.errors >= b.errors) return 'worse';
+  // Unresolved names and modules come first: an edit that adds one is never
+  // progress, and one that removes one is progress even when the types it
+  // brings in surface further errors (an any-typed import hides them).
+  // (Net progress with one new unresolved name, such as an import line removed
+  // that also carried a used binding, is kept: the resolver repairs that name.)
+  if (!scope.structural && a.resolution > b.resolution && a.errors >= b.errors) return 'worse';
+  if (a.resolution < b.resolution) return 'fine';
   // A structural move legitimately raises the count until its follow-ups land.
   if (!scope.structural && a.errors > b.errors) return 'worse';
   return 'fine';
@@ -55,6 +62,146 @@ export function assertNoBulkDuplication(before: string, inserted: string[], labe
     const w = ins.slice(i, i + 5);
     if (substantive(w) && windows.has(w.join('\n'))) throw new Error(`Edit refused: it would insert a block that ${label} already contains (starting ${JSON.stringify(w[0]!.slice(0, 60))}). The file already has these lines; add only what is missing.`);
   }
+}
+// What an extraction needs beyond cutting and pasting, computed from the
+// TypeScript AST: export on the moved top-level declarations, the source's
+// import lines that the block uses (re-based to the destination), the import the
+// source needs for names it still references, and the source's own top-level
+// declarations the block depends on (which need an export or a move).
+export async function movePlan(source: string, text: string, start: number, end: number, destination: string, replacementText = ''): Promise<{
+  moved: string; exported: string[]; prefix: string[]; replacement: string[]; stillUsed: string[]; localDeps: { name: string; line: number }[];
+} | null> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule) return null;
+  const ts = tsModule;
+  const lines = text.split('\n');
+  const block = lines.slice(start - 1, end).join('\n');
+  const bf = ts.createSourceFile(source, block, ts.ScriptTarget.Latest, true);
+  const declName = (st: any): string | null => {
+    if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st) || ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st) || ts.isEnumDeclaration(st)) && st.name) return st.name.text;
+    if (ts.isVariableStatement(st)) { const d = st.declarationList.declarations[0]; return d && ts.isIdentifier(d.name) ? d.name.text : null; }
+    return null;
+  };
+  const hasExport = (st: any) => (ts.canHaveModifiers(st) ? ts.getModifiers(st) ?? [] : []).some((m: any) => m.kind === ts.SyntaxKind.ExportKeyword);
+  const typeOnly = (st: any) => ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st);
+  const declared: { name: string; typeOnly: boolean }[] = []; const exported: string[] = []; const inserts: number[] = [];
+  for (const st of bf.statements) {
+    const name = declName(st); if (!name) continue;
+    declared.push({ name, typeOnly: typeOnly(st) });
+    if (!hasExport(st)) { exported.push(name); inserts.push(st.getStart(bf)); }
+  }
+  let moved = block;
+  for (const pos of inserts.sort((x, y) => y - x)) moved = `${moved.slice(0, pos)}export ${moved.slice(pos)}`;
+  // Identifiers the block uses (excluding property names and its own declarations).
+  const used = new Set<string>();
+  const walk = (n: any) => {
+    if (ts.isIdentifier(n)) {
+      const p = n.parent;
+      const isProperty = (p && ((ts.isPropertyAccessExpression(p) && p.name === n) || (ts.isPropertyAssignment(p) && p.name === n) || (ts.isQualifiedName(p) && p.right === n)
+        || ((ts.isPropertySignature(p) || ts.isMethodSignature(p) || ts.isPropertyDeclaration(p) || ts.isMethodDeclaration(p) || ts.isEnumMember(p)) && p.name === n)));
+      if (!isProperty) used.add(n.text);
+    }
+    ts.forEachChild(n, walk);
+  };
+  walk(bf);
+  for (const d of declared) used.delete(d.name);
+  // The source's imports and top-level declarations, outside the block.
+  const sf = ts.createSourceFile(source, text, ts.ScriptTarget.Latest, true);
+  const rebase = (spec: string) => { if (!spec.startsWith('.')) return spec; const r = relative(dirname(destination), resolve(dirname(source), spec)).replace(/\\/g, '/'); return r.startsWith('.') ? r : `./${r}`; };
+  const prefix: string[] = []; const covered = new Set<string>();
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+    const c = st.importClause; const spec = st.moduleSpecifier.text; const mod = rebase(spec);
+    const named = (c.namedBindings && ts.isNamedImports(c.namedBindings) ? c.namedBindings.elements : []).filter((b: any) => used.has(b.name.text));
+    const def = c.name && used.has(c.name.text) ? c.name.text : null;
+    const ns = c.namedBindings && ts.isNamespaceImport(c.namedBindings) && used.has(c.namedBindings.name.text) ? c.namedBindings.name.text : null;
+    if (def) { prefix.push(`import ${c.isTypeOnly ? 'type ' : ''}${def} from "${mod}";`); covered.add(def); }
+    if (ns) { prefix.push(`import ${c.isTypeOnly ? 'type ' : ''}* as ${ns} from "${mod}";`); covered.add(ns); }
+    if (named.length) {
+      const parts = named.map((b: any) => `${b.isTypeOnly && !c.isTypeOnly ? 'type ' : ''}${b.propertyName ? `${b.propertyName.text} as ` : ''}${b.name.text}`);
+      prefix.push(`import ${c.isTypeOnly ? 'type ' : ''}{ ${parts.join(', ')} } from "${mod}";`);
+      for (const b of named) covered.add(b.name.text);
+    }
+  }
+  const blockStart = lines.slice(0, start - 1).join('\n').length + (start > 1 ? 1 : 0); const blockEnd = blockStart + block.length;
+  const localDeps: { name: string; line: number }[] = [];
+  for (const st of sf.statements) {
+    if (st.getStart(sf) >= blockStart && st.getEnd() <= blockEnd) continue;
+    const name = declName(st);
+    if (name && used.has(name) && !covered.has(name) && !hasExport(st)) localDeps.push({ name, line: sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1 });
+  }
+  // Names the source still references after the cut need an import from the destination.
+  const restRaw = `${lines.slice(0, start - 1).join('\n')}\n${replacementText}\n${lines.slice(end).join('\n')}`;
+  const rest = stripLiterals(restRaw);
+  const toDest = (() => { const r = relative(dirname(source), destination).replace(/\\/g, '/').replace(/\.[cm]?ts$/, '.js'); return r.startsWith('.') ? r : `./${r}`; })();
+  // Names the source (or the worker's own replacement) already imports from the destination.
+  const imported = new Set<string>();
+  for (const m of restRaw.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+["']([^"']+)["']/g)) if (m[2] === toDest) for (const part of m[1]!.split(',')) { const local = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/).pop()!.trim(); if (local) imported.add(local); }
+  const stillUsed = declared.filter(d => !imported.has(d.name) && new RegExp(`\\b${d.name.replace(/[$]/g, '\\$&')}\\b`).test(rest));
+  const replacement: string[] = [];
+  const types = stillUsed.filter(d => d.typeOnly).map(d => d.name); const values = stillUsed.filter(d => !d.typeOnly).map(d => d.name);
+  if (types.length) replacement.push(`import type { ${types.join(', ')} } from "${toDest}";`);
+  if (values.length) replacement.push(`import { ${values.join(', ')} } from "${toDest}";`);
+  return { moved, exported, prefix, replacement, stillUsed: stillUsed.map(d => d.name), localDeps };
+}
+// Is the TS6133 at this line an import binding (not a local declaration)?
+export async function importBindingAt(path: string, text: string, line: number, name: string): Promise<boolean> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return false;
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+    const from = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1; const to = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
+    if (line < from || line > to) continue;
+    const c = st.importClause;
+    if (c.name?.text === name) return true;
+    if (c.namedBindings && ts.isNamespaceImport(c.namedBindings) && c.namedBindings.name.text === name) return true;
+    if (c.namedBindings && ts.isNamedImports(c.namedBindings) && c.namedBindings.elements.some((b: any) => b.name.text === name)) return true;
+  }
+  return false;
+}
+// Line edits that drop the named bindings from a file's import declarations: a
+// declaration left empty is deleted, one still carrying other bindings is
+// rewritten on one line with the rest intact.
+export async function removeImportBindings(path: string, text: string, names: string[]): Promise<{ start: number; end: number; newText: string; prepend: string }[]> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return [];
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  const drop = new Set(names); const edits: { start: number; end: number; newText: string; prepend: string }[] = [];
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+    const c = st.importClause;
+    const def = c.name && !drop.has(c.name.text) ? c.name.text : null; const defDropped = Boolean(c.name && drop.has(c.name.text));
+    const ns = c.namedBindings && ts.isNamespaceImport(c.namedBindings) ? c.namedBindings.name.text : null;
+    const nsDropped = Boolean(ns && drop.has(ns));
+    const named = c.namedBindings && ts.isNamedImports(c.namedBindings) ? c.namedBindings.elements : [];
+    const kept = named.filter((b: any) => !drop.has(b.name.text));
+    if (!defDropped && !nsDropped && kept.length === named.length) continue;
+    const start = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1; const end = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
+    const parts: string[] = [];
+    if (def) parts.push(def);
+    if (ns && !nsDropped) parts.push(`* as ${ns}`);
+    if (kept.length) parts.push(`{ ${kept.map((b: any) => `${b.isTypeOnly ? 'type ' : ''}${b.propertyName ? `${b.propertyName.text} as ` : ''}${b.name.text}`).join(', ')} }`);
+    const spec = st.moduleSpecifier.getText(sf);
+    edits.push({ start, end, newText: parts.length ? `import ${c.isTypeOnly ? 'type ' : ''}${parts.join(', ')} from ${spec};` : '', prepend: '' });
+  }
+  return edits;
+}
+// A check whose output depends on a cache is not a verification: incremental
+// tsc reuses a file's cached diagnostics until that file itself changes, so a
+// new module that stops declaring globals leaves stale results elsewhere.
+export async function checkAdvice(root: string, command: string): Promise<string | null> {
+  if (!command || /--incremental\s+false|--force\b/.test(command)) return null;
+  const dir = command.match(/(?:--dir|-C|--prefix|cd)\s+(\S+)/)?.[1] ?? '.';
+  const tsc = /\btsc\b/.test(command) || /\b(lint|typecheck|check|build)\b/.test(command);
+  if (!tsc) return null;
+  for (const name of ['tsconfig.json', 'tsconfig.build.json']) {
+    try {
+      const text = await readFile(resolve(root, dir, name), 'utf8');
+      if (/"incremental"\s*:\s*true/.test(text) || /"composite"\s*:\s*true/.test(text)) return `${command} runs tsc with incremental mode (${dir}/${name}); its error list depends on the previous run's cache, so rollbacks would be judged on stale results. Use a non-incremental check, for example: pnpm --dir ${dir === '.' ? '.' : dir} exec tsc --noEmit --incremental false`;
+    } catch { /* absent */ }
+  }
+  return null;
 }
 // The 1-based line at which a new import belongs: after the last import
 // declaration according to the TypeScript parser (never an import-shaped line
@@ -143,7 +290,7 @@ export async function sourceHashes(root: string, paths: string[]): Promise<Recor
 export function summarizeCheck(text: string): CheckSummary {
   let output = text;
   try { const parsed = JSON.parse(text); if (typeof parsed?.output === 'string') output = parsed.output; } catch { /* plain text */ }
-  const byFile: CheckSummary['byFile'] = {}; let errors = 0; let syntax = 0;
+  const byFile: CheckSummary['byFile'] = {}; let errors = 0; let syntax = 0; let resolution = 0;
   for (const raw of output.split('\n')) {
     const line = raw.trim();
     // Test runners report failures without the word error: TAP 'not ok', Jest 'FAIL',
@@ -152,14 +299,18 @@ export function summarizeCheck(text: string): CheckSummary {
     errors++;
     const isSyntax = /\bTS1\d{3}\b|SyntaxError|Unexpected token|[a-z')\]}] expected\.$/.test(line);
     if (isSyntax) syntax++;
+    // A name or module the checker cannot resolve: the class of error an
+    // extraction leaves behind, and the one a correct fix removes first.
+    const isResolution = !isSyntax && /\bTS(?:2304|2305|2306|2307|2459|2503|2552|2613|2614|2694|2724|7016)\b|Cannot find (?:name|module)|has no exported member|is not exported|Could not find a declaration file/.test(line);
+    if (isResolution) resolution++;
     const m = line.match(/^([\w@./\\-]+\.\w+)(?:\((\d+)|:(\d+))?/);
     const file = m?.[1] ?? '(other)'; const at = Number(m?.[2] ?? m?.[3] ?? 0);
-    const f = byFile[file] ??= { count: 0, syntax: 0, lines: [], samples: [] };
-    f.count++; if (isSyntax) f.syntax++;
+    const f = byFile[file] ??= { count: 0, syntax: 0, resolution: 0, lines: [], samples: [] };
+    f.count++; if (isSyntax) f.syntax++; if (isResolution) f.resolution = (f.resolution ?? 0) + 1;
     if (at && f.lines.length < 12 && !f.lines.includes(at)) f.lines.push(at);
     if (f.samples.length < 3) f.samples.push(clip(line, 140));
   }
-  return { errors, syntax, byFile: Object.fromEntries(Object.entries(byFile).sort((a, b) => b[1].count - a[1].count)) };
+  return { errors, syntax, resolution, byFile: Object.fromEntries(Object.entries(byFile).sort((a, b) => b[1].count - a[1].count)) };
 }
 // Bracket balance of code, ignoring string literals and comments so an ANSI
 // escape such as "\u001B[?25l" or a "{" in a comment does not skew the count.
@@ -302,18 +453,32 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS2459: Module '"([^"]+)"' declares '([^']+)' locally, but it is not exported/gm)) add(m[1]!, m[3]!, 'not-exported', m[2]!);
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS(?:2305|2724): (?:Module )?'"([^"]+)"' has no exported member(?: named)? '([^']+)'/gm)) add(m[1]!, m[3]!, 'wrong-module', m[2]!);
   const results: NameOrigin[] = [];
+  // An unused import binding is mechanical to remove, and removing the whole
+  // line is the classic mistake when it also carries a used binding.
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS6133: '([^']+)' is declared but its value is never read/gm)) {
+    const reported = m[1]!; const line = Number(m[2]); const name = m[3]!;
+    const inFile = editedFiles.find(f => f.endsWith(reported) || reported.endsWith(f)); if (!inFile) continue;
+    let text: string; try { text = await boundedRead(await safePath(root, inFile)); } catch { continue; }
+    if (await importBindingAt(inFile, text, line, name)) results.push({ name, inFile, kind: 'unused', line, note: 'unused import binding; the harness removes it' });
+  }
   const headers = new Map<string, string>();
   const header = async (rel: string): Promise<string> => {
     if (!headers.has(rel)) { try { headers.set(rel, (await boundedRead(await safePath(root, rel))).split('\n').slice(0, 400).join('\n')); } catch { headers.set(rel, ''); } }
     return headers.get(rel)!;
   };
   const relPath = (from: string, to: string) => { const r = relative(resolve(root, dirname(from)), resolve(root, to)).replace(/\\/g, '/'); return r.startsWith('.') ? r : `./${r}`; };
+  const ambiguous = new Map<string, string[]>();
   const declare = async (name: string, only?: string): Promise<{ file: string; line: string; exported: boolean; typeLike: boolean } | null> => {
     const r = await runCommand('rg', ['-n', '-H', '--no-heading', '--color', 'never', '--max-count', '3', '-g', '!node_modules/**', '-g', '!.leana/**', '-g', '!dist/**', '-e', `^(export )?(declare )?(type|interface|const|let|function|async function|class|enum) ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, '--', only ?? '.'], root, 10000).catch(() => null);
-    const hits = (r?.output.split('\n') ?? []).map(line => line.match(/^(.*?):(\d+):(.*)$/)).filter((m): m is RegExpMatchArray => Boolean(m));
-    // A repository-wide first match can be an unrelated test helper. Only a
-    // unique declaration is usable without a known source module.
-    const m = new Set(hits.map(m => m[1])).size === 1 ? hits[0] : undefined;
+    const all = (r?.output.split('\n') ?? []).map(line => line.match(/^(.*?):(\d+):(.*)$/)).filter((m): m is RegExpMatchArray => Boolean(m));
+    // A repository-wide first match can be an unrelated test helper. Test and
+    // fixture files never stand in for source; among source files only a unique
+    // declaration is usable without a known module, and ambiguity is reported.
+    const isTest = (f: string) => /(^|\/)(tests?|__tests__|spec|fixtures?|test-fixtures)\/|\.(test|spec)\.[cm]?[jt]sx?$|(^|\/)test_[^/]*$/.test(f);
+    const hits = all.filter(m => !isTest(m[1]!)).length ? all.filter(m => !isTest(m[1]!)) : all;
+    const files = [...new Set(hits.map(m => m[1]!.replace(/^\.\//, '')))].sort(); // ripgrep searches in parallel; the order must not depend on it
+    if (files.length > 1) { ambiguous.set(name, files.slice(0, 5)); return null; }
+    const m = hits[0];
     return m ? { file: m[1]!.replace(/^\.\//, ''), line: m[2]!, exported: /^export /.test(m[3]!), typeLike: /^(export )?(declare )?(type|interface)\b/.test(m[3]!) } : null;
   };
   const locate = async (name: string, inFile: string) => {
@@ -353,7 +518,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
           if (!ts.isImportDeclaration(st) || !st.importClause) continue;
           const c = st.importClause;
           const spec = st.moduleSpecifier.text;
-          const module = spec.startsWith('.') ? relPath(inFile, resolve(dirname(other), spec)) : spec;
+          const module = spec.startsWith('.') ? relPath(inFile, resolve(root, dirname(other), spec)) : spec;
           const binding = c.namedBindings?.elements?.find((b: any) => b.name.text === name);
           const localDefault = c.name?.text === name;
           const localNamespace = c.namedBindings && ts.isNamespaceImport(c.namedBindings) && c.namedBindings.name.text === name;
@@ -373,7 +538,9 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
           if (!d.exported) origin.note = `not exported yet: add export to the declaration at ${origin.declaredIn}: replace_lines edit { start: ${d.line}, end: ${d.line}, newText: "", prepend: "export " } on ${d.file}`;
         }
       }
-      if (!origin.importLine) origin.note = 'no import or declaration found in the repository; the name may be a builtin or a typo';
+      if (!origin.importLine) origin.note = ambiguous.has(name)
+        ? `declared in several files (${ambiguous.get(name)!.join(', ')}); none is the obvious source, so import it from the intended one or declare it in ${inFile}`
+        : 'no import or declaration found in the repository; the name may be a builtin or a typo';
       results.push(origin);
       if (results.length >= limit) return results;
     }
@@ -563,14 +730,35 @@ export class ToolBox {
         else { for (let from = a.start - 1; from >= Math.max(1, a.start - 3000); from--) if (balanced(from, a.end)) { hint = `The block ending at line ${a.end} opens at line ${from}: retry with start=${from}`; break; } }
         throw new Error(`Range ${a.start}..${a.end} of ${a.source} is not a complete block: ${detail}. ${hint}.`);
       }
-      const remaining = [...lines.slice(0, a.start - 1), ...(a.replacement ? a.replacement.split('\n') : []), ...lines.slice(a.end)].join('\n');
-      const output = existing === null ? `${a.prefix ? a.prefix.replace(/\n?$/, '\n') : ''}${moved}\n`
-        : `${existing.replace(/\n?$/, '\n')}\n${moved}\n`;
+      // The mechanical part of an extraction is the harness's: the moved
+      // declarations are exported, the imports they use are copied from the
+      // source with re-based paths, and the source imports what it still uses.
+      const plan = parseable.test(a.source) ? await movePlan(a.source, original, a.start, a.end, a.destination, a.replacement ?? '') : null;
+      const movedOut = plan?.moved ?? moved;
+      let remaining = [...lines.slice(0, a.start - 1), ...(a.replacement ? a.replacement.split('\n') : []), ...lines.slice(a.end)].join('\n');
+      if (plan?.replacement.length) {
+        const norm = (l: string) => l.trim().replace(/'/g, '"').replace(/;$/, '').replace(/\s+/g, ' ');
+        const have = new Set(remaining.split('\n').map(norm));
+        const missing = plan.replacement.filter(l => !have.has(norm(l)));
+        if (missing.length) { const rl = remaining.split('\n'); const at = await importInsertLine(a.source, remaining); rl.splice(at - 1, 0, ...missing); remaining = rl.join('\n'); }
+      }
+      // The worker's prefix opens a new file; an existing file takes only the derived imports.
+      const prefixLines = [...(a.prefix && existing === null ? a.prefix.replace(/\n?$/, '').split('\n') : []), ...(plan?.prefix ?? [])];
+      const norm2 = (l: string) => l.trim().replace(/'/g, '"').replace(/;$/, '').replace(/\s+/g, ' ');
+      const seen = new Set((existing ?? '').split('\n').map(norm2));
+      const prefix = prefixLines.filter(l => { const k = norm2(l); if (!k || seen.has(k)) return false; seen.add(k); return true; });
+      let output: string;
+      if (existing === null) output = `${prefix.length ? `${prefix.join('\n')}\n${plan ? '\n' : ''}` : ''}${movedOut}\n`;
+      else {
+        const el = existing.replace(/\n?$/, '\n').split('\n');
+        if (prefix.length) el.splice(await importInsertLine(a.destination, existing) - 1, 0, ...prefix);
+        output = `${el.join('\n').replace(/\n?$/, '\n')}\n${movedOut}\n`;
+      }
       assertBalancePreserved(original, remaining, a.source);
       assertBalancePreserved(existing ?? '', output, a.destination);
       await assertParses(a.source, original, remaining);
       await assertParses(a.destination, existing ?? '', output);
-      if (existing !== null) assertNoBulkDuplication(existing, `${a.prefix ?? ''}\n${moved}`.split('\n'), a.destination, false);
+      if (existing !== null) assertNoBulkDuplication(existing, [...prefix, ...movedOut.split('\n')], a.destination, false);
       await mkdir(dirname(destinationPath), { recursive: true });
       const temp = `${sourcePath}.leana-${randomUUID()}.tmp`;
       try {
@@ -584,7 +772,10 @@ export class ToolBox {
       return { ok: true, changed: [a.source, a.destination], hashes: { [a.source]: hash(remaining), [a.destination]: hash(output) }, snapshots,
         text: `Moved lines ${a.start}..${a.end} (${a.end - a.start + 1} lines) from ${a.source} to ${a.destination}. ` +
         `${a.source} sha256=${hash(remaining)} totalLines=${remaining.split('\n').length}; ${a.destination} sha256=${hash(output)} totalLines=${output.split('\n').length}. ` +
-        (a.replacement ? 'Run the focused check next; its errors list any imports the moved code still needs in the destination.'
+        (plan ? `Exported ${plan.exported.length ? plan.exported.join(', ') : 'nothing new'}; copied ${plan.prefix.length} import line(s) into the destination; ${plan.replacement.length ? `${a.source} now imports ${plan.stillUsed.join(', ')} from the destination` : `${a.source} no longer referenced the moved names`}.` +
+          (plan.localDeps.length ? ` The moved code also uses ${plan.localDeps.map(d => `${d.name} (declared at ${a.source}:${d.line}, not exported)`).join(', ')}: export those in ${a.source} and import them in ${a.destination}, or move them too; the check reports them next.` : '') +
+          ' The check runs next.'
+          : a.replacement ? 'Run the focused check next; its errors list any imports the moved code still needs in the destination.'
           : 'The source no longer imports the moved names; add that import with write, then run the focused check.') };
     }
     if (route === 'bash') {

@@ -14,7 +14,7 @@ import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -475,12 +475,16 @@ test('move_lines cuts a range into a new or existing file with hash checks and n
   const remaining = await readFile(join(root, 'cli.ts'), 'utf8');
   assert.equal(remaining, ['import a from "a";', 'const keep = 1;', 'import { DEFAULTS, type Deps } from "./cli/deps.js";', 'export { keep };', ''].join('\n'));
   const created = await readFile(join(root, 'cli/deps.ts'), 'utf8');
-  assert.equal(created, ['import type { X } from "../x.js";', 'interface Deps {', '  x: number;', '}', 'const DEFAULTS: Deps = {', '  x: 1,', '};', ''].join('\n'));
+  // The extraction is completed by the harness: moved declarations are exported.
+  assert.equal(created, ['import type { X } from "../x.js";', '', 'export interface Deps {', '  x: number;', '}', 'export const DEFAULTS: Deps = {', '  x: 1,', '};', ''].join('\n'));
+  assert.match(moved.text, /Exported Deps, DEFAULTS/);
   assert(moved.text.includes(`cli.ts sha256=${hash(remaining)} totalLines=5`)); assert(moved.text.includes(`cli/deps.ts sha256=${hash(created)}`));
   await assert.rejects(tools.execute('move_lines', { ...base, expectedHash: hash(remaining), start: 2, end: 2 }), (e: any) => e instanceof StaleWriteError && /exists/.test(e.message));
   const appended = await tools.execute('move_lines', { ...base, expectedHash: hash(remaining), destinationHash: hash(created), start: 2, end: 2, replacement: '', prefix: 'ignored for existing files' });
-  assert.equal(await readFile(join(root, 'cli.ts'), 'utf8'), ['import a from "a";', 'import { DEFAULTS, type Deps } from "./cli/deps.js";', 'export { keep };', ''].join('\n'));
-  assert.equal(await readFile(join(root, 'cli/deps.ts'), 'utf8'), `${created}\nconst keep = 1;\n`);
+  // keep is still re-exported by cli.ts, so the harness imports it from the destination; the prefix is ignored for an existing file.
+  assert.equal(await readFile(join(root, 'cli.ts'), 'utf8'), ['import a from "a";', 'import { DEFAULTS, type Deps } from "./cli/deps.js";', 'import { keep } from "./cli/deps.js";', 'export { keep };', ''].join('\n'));
+  assert.equal(await readFile(join(root, 'cli/deps.ts'), 'utf8'), `${created}\nexport const keep = 1;\n`);
+  assert.match(appended.text, /cli\.ts now imports keep from the destination/);
   assert(appended.ok);
   await assert.rejects(new ToolBox(root, store.artifacts, defaults).execute('move_lines', base), /Writes disabled/);
 });
@@ -895,7 +899,7 @@ test('Check summaries count errors per file, single out syntax errors, and keep 
   const s = summarizeCheck(JSON.stringify({ command: 'lint', output, code: 1 }));
   assert.equal(s.errors, 5); assert.equal(s.syntax, 2);
   assert.deepEqual(Object.keys(s.byFile), ['src/cli.ts', 'src/cli/deps.ts', 'tests-ts/a.test.ts']);
-  assert.deepEqual(s.byFile['src/cli.ts'], { count: 2, syntax: 2, lines: [3832, 3839], samples: ["src/cli.ts(3832,1): error TS1005: ':' expected.", 'src/cli.ts(3839,17): error TS1109: Expression expected.'] });
+  assert.deepEqual(s.byFile['src/cli.ts'], { count: 2, syntax: 2, resolution: 0, lines: [3832, 3839], samples: ["src/cli.ts(3832,1): error TS1005: ':' expected.", 'src/cli.ts(3839,17): error TS1109: Expression expected.'] });
   assert.equal(s.byFile['src/cli/deps.ts']!.syntax, 0);
   assert.equal(summarizeCheck('all good').errors, 0);
 });
@@ -1033,7 +1037,7 @@ test('Names a check cannot find are resolved to import lines from the other edit
     'src/cli/deps.ts(4,1): error TS2304: Cannot find name \'SignalName\'.', 'src/cli/deps.ts(5,1): error TS2304: Cannot find name \'exportEnvironment\'.', 'src/cli/deps.ts(6,1): error TS2304: Cannot find name \'Nowhere\'.', 'src/cli/deps.ts(7,1): error TS2304: Cannot find name \'Writable\'.', 'src/cli.ts(1,1): error TS6133: \'a\' is declared but its value is never read.'].join('\n');
   const names = await resolveMissingNames(root, output, ['sdk/src/cli.ts', 'sdk/src/cli/deps.ts']);
   const by = Object.fromEntries(names.map(n => [n.name, n]));
-  assert.deepEqual(Object.keys(by), ['Finding', 'Long', 'cwd', 'SignalName', 'exportEnvironment', 'Nowhere', 'Writable']);
+  assert.deepEqual(Object.keys(by), ['a', 'Finding', 'Long', 'cwd', 'SignalName', 'exportEnvironment', 'Nowhere', 'Writable']);
   assert.equal(by.Writable!.importLine, 'import type { Writable } from "../cli.js";'); assert.match(by.Writable!.note!, /not exported yet.*cli\.ts:7/);
   assert.equal(by.Finding!.importLine, 'import type { Finding } from "../models.js";'); assert.equal(by.Finding!.importedBy, 'sdk/src/cli.ts'); assert.equal(by.Finding!.inFile, 'sdk/src/cli/deps.ts');
   assert.equal(by.Long!.importLine, 'import type { Long } from "../long.js";');
@@ -1049,7 +1053,7 @@ test('missingNames are pinned after a failing check and cleared by a passing one
   const runner = new Runner({ ...defaults, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
   s.step = 2; await runner.evidence(s, 'bash', { ok: false, verification: true, text: JSON.stringify({ output: "b.ts(1,1): error TS2304: Cannot find name 'z'." }) });
   assert.deepEqual(s.missingNames, [{ name: 'z', inFile: 'b.ts', importedBy: 'a.ts', importLine: 'import { z } from "./z.js";' }]);
-  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, unresolved: [], total: 1 };
+  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, unresolved: [], total: 1 };
   assert.deepEqual((decisionState(s) as any).missingNames, grouped); assert.deepEqual(promptFields(messages(s, 'replace_lines')).missingNames, grouped);
   s.step = 3; await runner.evidence(s, 'bash', { ok: true, verification: true, check: true, text: 'passed' });
   assert.deepEqual(s.missingNames, []);
@@ -1195,7 +1199,7 @@ test('The decision state shrinks optional lists and the evidence tail before pau
   s.searches = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`text:q${i} in .`, 'z'.repeat(300)]));
   const state = decisionState(s) as any;
   assert(Buffer.byteLength(JSON.stringify(state)) <= 22000);
-  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'unresolved', 'total']);
+  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'unresolved', 'total']);
   assert.equal(state.evidenceCount, 20); assert(state.evidence.length <= 8); assert(state.objective.includes('Fix'));
 });
 test('Panel lines are flattened to one ASCII row each', () => {
@@ -1764,4 +1768,96 @@ test('Completion source evidence stays bounded and reports omitted facts', async
   const facts = await completionSource(root, paths, names.join(' '));
   assert(Buffer.byteLength(JSON.stringify(facts)) < 7000);
   assert(facts.every(f => f.omitted! > 0));
+});
+
+test('Unresolved names decide before the plain count: removing one is progress even when types surface further errors', () => {
+  // Step 88 of the 31-minute run: replacing an any-typed import from a test file with the real module
+  // removed a TS7016 and revealed a TS18047; the count rose 1 -> 2 and the correct fix was rolled back.
+  const before = summarizeCheck("src/cli/deps.ts(44,26): error TS7016: Could not find a declaration file for module '../../x.mjs'.");
+  const after = summarizeCheck("src/cli/deps.ts(200,47): error TS18047: 'stdout' is possibly 'null'.\nsrc/cli/deps.ts(210,3): error TS2322: Type 'x' is not assignable.");
+  assert.equal(before.resolution, 1); assert.equal(after.resolution, 0);
+  assert.equal(regression(before, after, { files: ['sdk/typescript/src/cli/deps.ts'] }), 'fine');
+  // Deleting an import that is still used adds an unresolved name: worse when the total does not fall.
+  const flat = summarizeCheck("src/cli.ts(505,5): error TS2304: Cannot find name 'stripVTControlCharacters'.\nsrc/cli.ts(9,1): error TS6133: 'x' is declared but its value is never read.");
+  assert.equal(regression(after, flat, { files: ['sdk/typescript/src/cli.ts', 'sdk/typescript/src/cli/deps.ts'] }), 'worse');
+  // Removing fourteen unused imports and breaking one used binding is progress the resolver completes (15 -> 2 in the paused run).
+  const fifteen = summarizeCheck(Array.from({ length: 15 }, (_, i) => `src/cli.ts(${i + 1},1): error TS6133: 'n${i}' is declared but its value is never read.`).join('\n'));
+  const two = summarizeCheck("src/cli.ts(3836,17): error TS2304: Cannot find name 'componentPlanSchema'.\nsrc/cli/deps.ts(3,1): error TS6133: 'resolve' is declared but its value is never read.");
+  assert.equal(regression(fifteen, two, { files: ['sdk/typescript/src/cli.ts', 'sdk/typescript/src/cli/deps.ts'] }), 'fine');
+  // A structural move legitimately leaves unresolved names behind.
+  const many = summarizeCheck(Array.from({ length: 30 }, (_, i) => `src/cli.ts(${i + 1},1): error TS2304: Cannot find name 'CliDependencies'.`).join('\n'));
+  assert.equal(regression(summarizeCheck('ok'), many, { files: ['sdk/typescript/src/cli.ts'], structural: true }), 'fine');
+  assert.equal(regression(summarizeCheck('ok'), many, { files: ['sdk/typescript/src/cli.ts'] }), 'worse');
+});
+test('The check advice names incremental tsc and the non-incremental command to use', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'sdk', 'typescript'), { recursive: true });
+  await writeFile(join(root, 'sdk', 'typescript', 'tsconfig.json'), '{ "compilerOptions": { "incremental": true, "noEmit": true } }\n');
+  const advice = await checkAdvice(root, 'pnpm --dir sdk/typescript lint');
+  assert.match(advice ?? '', /incremental mode/); assert.match(advice ?? '', /pnpm --dir sdk\/typescript exec tsc --noEmit --incremental false/);
+  assert.equal(await checkAdvice(root, 'pnpm --dir sdk/typescript exec tsc --noEmit --incremental false'), null);
+  assert.equal(await checkAdvice(root, 'npm test'), null);
+  await writeFile(join(root, 'sdk', 'typescript', 'tsconfig.json'), '{ "compilerOptions": { "noEmit": true } }\n');
+  assert.equal(await checkAdvice(root, 'pnpm --dir sdk/typescript lint'), null);
+});
+test('A name declared in several files, or only in test files, is reported as ambiguous rather than guessed', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true }); await mkdir(join(root, 'plugins', 'tests'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'import { execFile as execFileCallback } from "node:child_process";\nconst other = 1;\n');
+  await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'const x = execFile();\n');
+  await writeFile(join(root, 'src', 'github.ts'), 'const execFile = promisify(execFileCallback);\n');
+  await writeFile(join(root, 'src', 'targets.ts'), 'const execFile = promisify(execFileCallback);\n');
+  await writeFile(join(root, 'plugins', 'tests', 'test_inventory.mjs'), 'const execFile = promisify(nodeExecFile);\nconst onlyHere = 1;\n');
+  const names = await resolveMissingNames(root, "src/cli/deps.ts(1,11): error TS2304: Cannot find name 'execFile'.\nsrc/cli/deps.ts(2,1): error TS2304: Cannot find name 'onlyHere'.", ['src/cli.ts', 'src/cli/deps.ts']);
+  assert.equal(names[0]!.importLine, undefined); assert.match(names[0]!.note ?? '', /declared in several files \(src\/github\.ts, src\/targets\.ts\)/);
+  assert.match(names[1]!.importLine ?? '', /plugins\/tests\/test_inventory\.mjs/, 'a test file is used only when nothing else declares the name');
+  // Declared once in the source of the move: that declaration wins, with the export it needs.
+  await writeFile(join(root, 'src', 'cli.ts'), 'import { execFile as execFileCallback } from "node:child_process";\nconst execFile = promisify(execFileCallback);\n');
+  const own = await resolveMissingNames(root, "src/cli/deps.ts(1,11): error TS2304: Cannot find name 'execFile'.", ['src/cli.ts', 'src/cli/deps.ts']);
+  assert.equal(own[0]!.importLine, 'import { execFile } from "../cli.js";'); assert.equal(own[0]!.declaredIn, 'src/cli.ts:2'); assert.equal(own[0]!.exported, false);
+});
+test('Auto-fix never edits a file the session did not touch and never re-applies a rolled-back fix', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'import { x } from "./third.js";\nconst a = x;\n'); await writeFile(join(root, 'third.ts'), 'const x = 1;\n');
+  // The check blames a.ts for an import whose declaration in third.ts lacks export.
+  await writeFile(join(root, 'check.mjs'), "console.error(`a.ts(1,10): error TS2459: Module '\"./third.js\"' declares 'x' locally, but it is not exported.`); process.exit(1);\n");
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['a.ts'];
+  const jev = { decide: async (_s: unknown, q: Questions) => answersFor(q, 'read_files', .1) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'a.ts', start: 1, end: 2 }] }) };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(await readFile(join(root, 'third.ts'), 'utf8'), 'const x = 1;\n', 'third.ts is not the session\'s to edit');
+  assert(!result.entries.some(e => e.kind === 'replace_lines'));
+  assert.equal(result.missingNames.length, 1, 'the fix stays listed for the worker');
+  // A fix identical to one that was rolled back is skipped.
+  const { root: r2, store: s2, session: sess } = await fixture(t);
+  await writeFile(join(r2, 'b.ts'), 'const b = y;\n'); await writeFile(join(r2, 'lib.ts'), 'export const y = 1;\n');
+  await writeFile(join(r2, 'check.mjs'), "console.error(`b.ts(1,11): error TS2304: Cannot find name 'y'.`); process.exit(1);\n");
+  sess.phase = 'implement'; sess.inspectionCount = 3; sess.writes = ['b.ts'];
+  const edits = [{ start: 1, end: 0, newText: 'import { y } from "./lib.js";', prepend: '' }];
+  sess.rejectedEdits = [{ key: 'k', identity: hash(JSON.stringify({ route: 'replace_lines', args: { path: 'b.ts', edits, expectedHash: undefined, destinationHash: undefined } })), step: 1, route: 'replace_lines', summary: '', undoneAt: 2, reason: 'worse' }];
+  const r = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 3 }, s2, jev, { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'b.ts', start: 1, end: 1 }] }) }, r2, () => {}).run(sess);
+  assert.equal(await readFile(join(r2, 'b.ts'), 'utf8'), 'const b = y;\n'); assert(!r.entries.some(e => e.kind === 'replace_lines'));
+});
+
+test('Unused import bindings are removed by the harness without dropping a binding still in use', async t => {
+  const { root, store, session } = await fixture(t);
+  const text = 'import { existsSync, writeSync } from "node:fs";\nimport {\n  componentPlanSchema,\n  planComponents,\n} from "./component-plan.js";\nimport type { Only } from "./only.js";\nimport def from "./def.js";\nconst unusedLocal = 1;\nexport const a = existsSync("x") && componentPlanSchema && def;\n';
+  await writeFile(join(root, 'a.ts'), text);
+  const check = "a.ts(1,22): error TS6133: 'writeSync' is declared but its value is never read.\na.ts(4,3): error TS6133: 'planComponents' is declared but its value is never read.\na.ts(6,15): error TS6133: 'Only' is declared but its value is never read.\na.ts(8,7): error TS6133: 'unusedLocal' is declared but its value is never read.";
+  const names = await resolveMissingNames(root, check, ['a.ts']);
+  assert.deepEqual(names.map(n => [n.name, n.kind, n.line]), [['writeSync', 'unused', 1], ['planComponents', 'unused', 4], ['Only', 'unused', 6]], 'a local const is not an import');
+  const edits = await removeImportBindings('a.ts', text, ['writeSync', 'planComponents', 'Only']);
+  assert.deepEqual(edits, [
+    { start: 1, end: 1, newText: 'import { existsSync } from "node:fs";', prepend: '' },
+    { start: 2, end: 5, newText: 'import { componentPlanSchema } from "./component-plan.js";', prepend: '' },
+    { start: 6, end: 6, newText: '', prepend: '' },
+  ]);
+  // End to end: the check names the unused bindings, the harness removes them, the check passes, no worker edit.
+  await writeFile(join(root, 'check.mjs'), "import { readFileSync } from 'node:fs'; const t = readFileSync('a.ts', 'utf8'); const errs = []; if (t.includes('writeSync')) errs.push(`a.ts(1,22): error TS6133: 'writeSync' is declared but its value is never read.`); if (t.includes('planComponents')) errs.push(`a.ts(4,3): error TS6133: 'planComponents' is declared but its value is never read.`); if (errs.length) { console.error(errs.join('\\n')); process.exit(1); }\n");
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['a.ts'];
+  const jev = { decide: async (_s: unknown, q: Questions) => answersFor(q, 'read_files', .1) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'a.ts', start: 1, end: 2 }] }) };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'import { existsSync } from "node:fs";\nimport { componentPlanSchema } from "./component-plan.js";\nimport type { Only } from "./only.js";\nimport def from "./def.js";\nconst unusedLocal = 1;\nexport const a = existsSync("x") && componentPlanSchema && def;\n');
+  assert.deepEqual(result.entries.map(e => e.kind).slice(0, 3), ['bash', 'replace_lines', 'bash']); assert.equal(result.lastCheck?.ok, true);
 });

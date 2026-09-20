@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { readFile, realpath, open, unlink } from 'node:fs/promises';
+import { readFile, readdir, realpath, open, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from './config.js';
-import { Bonsai, Jev } from './clients.js';
+import { Bonsai, Jev, postJson } from './clients.js';
 import { newSession, Runner } from './runner.js';
 import { Store } from './store.js';
 import { runCommand } from './tools.js';
+import { renderReport } from './report.js';
+import { Display } from './display.js';
+import { basename } from 'node:path';
 
 export async function readKey(path: string): Promise<string> {
   const value = (await readFile(path.replace(/^~(?=\/)/, homedir()), 'utf8')).trim();
@@ -17,27 +20,59 @@ export async function readKey(path: string): Promise<string> {
   if (!key || /\s/.test(key)) throw new Error('Key file must contain one key or a TYPESAFE_API_KEY assignment');
   return key;
 }
+// A new run over files an earlier session changed re-does or fights that work.
+export async function dirtySessionConflict(root: string): Promise<string | null> {
+  const git = await runCommand('git', ['status', '--porcelain', '--untracked-files=all'], root, 10000).catch(() => null);
+  if (!git || git.code !== 0) return null;
+  const dirty = git.output.split('\n').filter(Boolean).map(l => l.slice(3).trim());
+  if (!dirty.length) return null;
+  const runs = join(root, '.leana', 'runs');
+  const names = (await readdir(runs).catch(() => [] as string[])).sort().reverse();
+  for (const name of names) {
+    const path = join(runs, name);
+    let s: any;
+    try { s = JSON.parse(await readFile(join(path, 'checkpoint.json'), 'utf8')); } catch { continue; }
+    const touched = (s.writes as string[] ?? []).filter(w => dirty.includes(w));
+    if (touched.length) return `Repository has uncommitted changes to ${touched.join(', ')} made by session ${path} (${s.status} at step ${s.step}). Resume that session, revert the files, or pass --allow-dirty to start over on top of them.`;
+  }
+  return null;
+}
 async function main(): Promise<void> {
   const { values: v, positionals } = parseArgs({ allowPositionals: true, options: {
     repo: { type: 'string' }, config: { type: 'string' }, 'key-file': { type: 'string' },
     'env-file': { type: 'string' }, 'allow-write': { type: 'boolean' }, 'allow-bash': { type: 'boolean' },
-    'max-steps': { type: 'string' }, message: { type: 'string' }, help: { type: 'boolean', short: 'h' },
+    'max-steps': { type: 'string' }, message: { type: 'string' }, help: { type: 'boolean', short: 'h' }, 'allow-dirty': { type: 'boolean' },
+    verbose: { type: 'boolean', short: 'v' }, follow: { type: 'boolean' }, check: { type: 'string' },
   } });
   const [command, ...rest] = positionals;
   if (v.help || !command) {
-    console.log(`Leana — Jev-directed local coding agent\n\n  leana doctor [--config file] [--key-file file]\n  leana run "objective" --repo path [--allow-write] [--allow-bash]\n  leana resume session-directory [--message "new guidance"]\n\nOptions: --key-file PATH, --env-file PATH, --config PATH, --max-steps N\nDefault: read-only tools; shell is disabled. --allow-bash permits unsandboxed\ncommands with your user privileges, including file changes outside the repository.\nJev receives the objective, task ledger and bounded excerpts of repository evidence.\nSessions and action logs are stored under REPO/.leana/runs/.`);
+    console.log(`Leana — Jev-directed local coding agent\n\n  leana doctor [--config file] [--key-file file]\n  leana run "objective" --repo path [--allow-write] [--allow-bash]\n  leana resume session-directory [--message "new guidance"]\n  leana report session-directory [--follow]   write report.html with prompts, Jev decisions, latency, tokens and context use\n\nOptions: --key-file PATH, --env-file PATH, --config PATH, --max-steps N, --allow-dirty, --verbose,\n         --check "command" (the verification; run as a baseline first and after every edit)\nDefault: read-only tools; shell is disabled. --allow-bash permits unsandboxed\ncommands with your user privileges, including file changes outside the repository.\nJev receives the objective, task ledger and bounded excerpts of repository evidence.\nSessions and action logs are stored under REPO/.leana/runs/.`);
     return;
   }
-  if (!['run', 'resume', 'doctor'].includes(command)) throw new Error(`Unknown command: ${command}`);
+  if (!['run', 'resume', 'doctor', 'report'].includes(command)) throw new Error(`Unknown command: ${command}`);
+  if (command === 'report') {
+    if (rest.length !== 1) throw new Error('report requires a session-directory');
+    const dir = await realpath(resolve(rest[0]!));
+    const write = async () => { await renderReport(dir); return join(dir, 'report.html'); };
+    console.log(await write());
+    if (v.follow) {
+      const { stat } = await import('node:fs/promises');
+      let last = (await stat(join(dir, 'events.jsonl'))).size;
+      setInterval(async () => { const size = (await stat(join(dir, 'events.jsonl')).catch(() => ({ size: last }))).size; if (size !== last) { last = size; await write(); } }, 3000);
+      console.error('Following the session; press Ctrl-C to stop.');
+    }
+    return;
+  }
   if (v['env-file']) process.loadEnvFile(resolve(v['env-file']));
   const config = await loadConfig(v.config, {
     ...(v['allow-write'] ? { allowWrite: true } : {}), ...(v['allow-bash'] ? { allowBash: true } : {}),
-    ...(v['max-steps'] ? { maxSteps: Number(v['max-steps']) } : {}),
+    ...(v['max-steps'] ? { maxSteps: Number(v['max-steps']) } : {}), ...(v.verbose ? { verbose: true } : {}), ...(v.check ? { checkCommand: v.check } : {}),
   });
   const key = v['key-file'] ? await readKey(v['key-file']) : process.env.TYPESAFE_API_KEY ?? '';
   const localKey = process.env.LOCAL_API_KEY ?? 'local';
   if (command === 'doctor') {
-    const log = async (type: string, data: unknown) => console.log(JSON.stringify({ type, data }));
+    // Raw events only when asked; the summary lines are the point of doctor.
+    const log = async (type: string, data: unknown) => { if (config.verbose) console.log(JSON.stringify({ type, data })); };
     const rg = await runCommand('rg', ['--version'], process.cwd(), 5000);
     if (rg.code !== 0) throw new Error('ripgrep is required');
     const bonsai = new Bonsai(config, localKey, log);
@@ -46,6 +81,28 @@ async function main(): Promise<void> {
     });
     if (result.ok !== true) throw new Error('Local model smoke check failed');
     console.log('Bonsai JSON generation: OK');
+    // Prefix-cache probe: a long prompt, then the same prompt changed in the
+    // middle. A server that can resume from a checkpoint reuses the shared
+    // prefix; one that cannot reprocesses everything on every step.
+    // A fresh nonce per run: the server keeps earlier prompt states in host memory
+    // and would otherwise restore a previous doctor run's prompt instead of proving
+    // it can resume from a checkpoint inside this one.
+    // The harness sends its prompt as several user messages, because llama.cpp
+    // checkpoints hybrid and sliding-window models only at user-message starts.
+    // Probe that exact shape: eight messages, then the same with the sixth changed.
+    const nonce = randomUUID();
+    const block = (i: number, mark = '') => ({ role: 'user', content: `Block ${i} (${nonce}${mark}): ` + Array.from({ length: 40 }, (_, j) => `the harness records evidence ${i}.${j} about the repository`).join('; ') });
+    const probe = async (blocks: unknown[]) => {
+      const r = await postJson(`${config.baseUrl.replace(/\/$/, '')}/chat/completions`, { model: config.model, messages: [{ role: 'system', content: 'Reply with one word.' }, ...blocks],
+        max_tokens: 1, temperature: 0, stream: false, cache_prompt: true, chat_template_kwargs: { enable_thinking: false } }, localKey, 180000, 0);
+      return { total: r.usage?.prompt_tokens ?? 0, cached: r.usage?.prompt_tokens_details?.cached_tokens ?? r.timings?.cache_n ?? 0, ms: r.timings?.prompt_ms ?? 0 };
+    };
+    const blocks = Array.from({ length: 8 }, (_, i) => block(i));
+    const first = await probe(blocks);
+    const changed = await probe(blocks.map((b, i) => i === 5 ? block(i, ' changed') : b));
+    const share = first.total ? Math.round(100 * changed.cached / first.total) : 0;
+    console.log(`Bonsai prefix cache: ${changed.cached} of ${changed.total} prompt tokens reused after changing message 6 of 8 (${share}%, ideal about 62%); prompt processing ${changed.ms.toFixed(0)} ms after the change, ${first.ms.toFixed(0)} ms for the full prompt`);
+    if (share < 40) console.log('  The server is not resuming from the message boundary before the change. Start llama-server with --checkpoint-min-step 0 --ctx-checkpoints 128 so a checkpoint is created at the start of every user message (the default spacing of 8192 tokens skips them); keep cache_prompt enabled.');
     const jev = new Jev(config, key, log);
     const a = await jev.decide({ test: 'The build exited with code zero. No changes are needed.' }, {
       successful: { type: 'noul', instructions: 'Did the build succeed?' },
@@ -69,6 +126,8 @@ async function main(): Promise<void> {
     if (rest.length !== 1) throw new Error('run requires one quoted objective');
     if (v.message) throw new Error('--message applies to resume; pass the objective for run as the quoted argument');
     const root = await realpath(resolve(v.repo ?? '.'));
+    const conflict = v['allow-dirty'] ? null : await dirtySessionConflict(root);
+    if (conflict) throw new Error(conflict);
     store = new Store(join(root, '.leana', 'runs', `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`));
     session = await newSession(root, rest[0]!);
   }
@@ -85,8 +144,13 @@ async function main(): Promise<void> {
     await store.log('start', { config, root: session.root });
     console.error(`Session: ${store.path}`);
     console.error(`Jev questions and answers: ${join(store.path, 'jev-decisions.md')}`);
+    console.error(`Report: node dist/src/cli.js report ${store.path} --follow`);
     if (config.allowBash) console.error('Shell enabled: commands run unsandboxed with your user privileges.');
-    const result = await new Runner(config, store, jev, bonsai, session.root).run(session);
+    // A live panel on a terminal; plain lines otherwise (logs, CI, pipes).
+    const display = new Display(process.stderr, { objective: session.objective, session: basename(store.path), verbose: config.verbose });
+    let result;
+    try { result = await new Runner(config, store, jev, bonsai, session.root, line => display.log(line), e => display.update(e)).run(session); }
+    finally { display.close(); }
     console.log(`\n${result.status.toUpperCase()}: ${result.stopReason}\nSession: ${store.path}`);
     if (result.status !== 'complete') process.exitCode = 2;
   } finally { await lock.close(); await unlink(lockPath); }

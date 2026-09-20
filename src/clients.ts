@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
-import type { Answers, Config, JsonSchema, Log, Message, Questions } from './types.js';
+import type { Answers, Config, GenerationMeta, JsonSchema, Log, Message, Questions } from './types.js';
 import { samplingSchema, validate } from './schema.js';
 
 export async function postJson(url: string, body: unknown, key: string, timeoutMs = 30000, retries = 2): Promise<any> {
@@ -38,8 +38,10 @@ export function validateAnswers(questions: Questions, raw: unknown): Answers {
         throw new Error(`Jev: invalid distribution ${id}`);
       if (Math.abs(Object.values(a.probabilities).reduce((s, p) => s + p, 0) - 1) > .02)
         throw new Error(`Jev: distribution does not sum to one: ${id}`);
-      if (Object.values(a.probabilities).some(p => p > a.probabilities[a.choice]! + 1e-6))
-        throw new Error(`Jev: choice is not highest probability: ${id}`);
+      // Routing acts on the distribution; a choice field that disagrees with it
+      // is reconciled to the argmax rather than failing the whole step.
+      const top = Object.entries(a.probabilities).sort((x, y) => y[1] - x[1])[0]![0];
+      if (a.probabilities[top]! > a.probabilities[a.choice]! + 1e-6) a.choice = top;
     }
   }
   return answers;
@@ -58,7 +60,9 @@ export class Jev {
     const start = performance.now();
     try {
       const result = await postJson(this.config.jevUrl, body, this.key, 15000);
-      const answers = validateAnswers(questions, result.answers);
+      let answers: Answers;
+      try { answers = validateAnswers(questions, result.answers); }
+      catch (e) { await this.log('jev-invalid', { requestId, ...context, answers: result.answers }); throw e; }
       await this.log('jev', { requestId, ...context, ms: performance.now() - start, model: result.model, answers, usage: result.usage });
       return answers;
     } catch (e) {
@@ -68,6 +72,8 @@ export class Jev {
   }
 }
 export class Bonsai {
+  // Timing and usage of the latest generation, for live progress and reports.
+  lastMeta: GenerationMeta | null = null;
   constructor(readonly config: Config, private key: string, private log: Log) {}
   async count(messages: Message[]): Promise<{ tokens: number; mode: string }> {
     const root = this.config.baseUrl.replace(/\/v1\/?$/, '').replace(/\/$/, '');
@@ -84,21 +90,22 @@ export class Bonsai {
       return { tokens: Buffer.byteLength(JSON.stringify(messages)), mode: 'utf8-byte-upper-bound' };
     }
   }
-  async generate(messages: Message[], schema: JsonSchema): Promise<Record<string, any>> {
+  async generate(messages: Message[], schema: JsonSchema, temperature = .2, context?: { step: number; route: string }): Promise<Record<string, any>> {
     const count = await this.count(messages);
     if (count.tokens > this.config.workingTokens || count.tokens + this.config.maxTokens + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
     const requestId = randomUUID();
-    await this.log('bonsai-request', { requestId, prompt: count });
+    await this.log('bonsai-request', { requestId, ...context, prompt: count, temperature });
     const start = performance.now();
     try {
     const result = await postJson(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-      model: this.config.model, messages, temperature: .2, max_tokens: this.config.maxTokens,
+      model: this.config.model, messages, temperature, max_tokens: this.config.maxTokens,
       stream: false, chat_template_kwargs: { enable_thinking: false },
       response_format: { type: 'json_schema', json_schema: { name: 'arguments', strict: true, schema: samplingSchema(schema) } },
     }, this.key, 180000, 0);
     const choice = result.choices?.[0];
-    await this.log('bonsai', { requestId, model: result.model, ms: performance.now() - start, prompt: count, usage: result.usage, finishReason: choice?.finish_reason });
+    this.lastMeta = { ms: performance.now() - start, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason, promptTokens: count.tokens };
+    await this.log('bonsai', { requestId, ...context, model: result.model, ms: this.lastMeta.ms, prompt: count, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason });
     if (choice?.finish_reason !== 'stop' || typeof choice.message?.content !== 'string')
       throw new Error(`Bonsai did not finish a JSON argument object (${choice?.finish_reason ?? 'missing choice'})`);
     let args: unknown;
@@ -106,7 +113,7 @@ export class Bonsai {
     validate(schema, args);
     return args as Record<string, any>;
     } catch (e) {
-      await this.log('bonsai-error', { requestId, ms: performance.now() - start, error: (e as Error).message });
+      await this.log('bonsai-error', { requestId, ...context, ms: performance.now() - start, error: (e as Error).message });
       throw e;
     }
   }

@@ -9,8 +9,10 @@ export const schemas: Record<Route, JsonSchema> = {
     items: obj({ path: str(500), start: integer(1, 1000000), end: integer(1, 1000000) }) } }),
   search_codebase: obj({ query: str(300), path: str(500), mode: { ...str(), enum: ['text', 'files'] } }),
   write: obj({ path: str(500), expectedHash: str(64), oldText: str(16000), newText: str(16000) }),
+  replace_lines: obj({ path: str(500), expectedHash: str(64), edits: { type: 'array', minItems: 1, maxItems: 40,
+    items: obj({ start: integer(1, 1000000), end: integer(1, 1000000), newText: str(16000), prepend: str(200) }) } }),
   move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),
-    destination: str(500), destinationHash: str(64), replacement: str(4000), prefix: str(4000) }),
+    destination: str(500), destinationHash: str(64), replacement: str(16000), prefix: str(16000) }),
   bash: obj({ command: str(2000), purpose: str(500) }),
   tasks: obj({ tasks: { type: 'array', minItems: 1, maxItems: 12,
     items: obj({ id: { ...str(40), minLength: 1 }, description: str(300),
@@ -47,7 +49,8 @@ export function validate(schema: JsonSchema, value: unknown, path = 'args'): voi
       (value as unknown[]).forEach((v, i) => validate(schema.items!, v, `${path}[${i}]`)); break;
     case 'string':
       if (typeof value !== 'string') fail('expected string');
-      if ((value as string).length < (schema.minLength ?? 0) || (value as string).length > (schema.maxLength ?? Infinity)) fail('string length');
+      if ((value as string).length < (schema.minLength ?? 0)) fail(`string length ${(value as string).length} is below the minimum ${schema.minLength}`);
+      if ((value as string).length > (schema.maxLength ?? Infinity)) fail(`string length ${(value as string).length} exceeds the maximum ${schema.maxLength}; shorten this field`);
       if (schema.enum && !schema.enum.includes(value as string)) fail('unknown choice'); break;
     case 'integer':
       if (!Number.isSafeInteger(value) || (value as number) < (schema.minimum ?? -Infinity) || (value as number) > (schema.maximum ?? Infinity)) fail('integer out of range'); break;

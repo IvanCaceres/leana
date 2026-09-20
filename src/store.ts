@@ -7,6 +7,7 @@ import { decisionLog } from './decision-log.js';
 import { clip, rememberEdit, retireEvidence } from './context.js';
 import { editRoutes } from './types.js';
 import { summarizeCheck } from './tools.js';
+import { rememberReferences } from './references.js';
 export class Store {
   readonly artifacts: string;
   constructor(readonly path: string) { this.artifacts = join(path, 'artifacts'); }
@@ -36,6 +37,13 @@ export class Store {
     if (!s.editEvidence) {
       s.editEvidence = [];
       await this.recoverEditEvidence(s);
+    }
+    s.referenceEvidence ??= [];
+    for (const e of s.entries) if (e.kind === 'read_files' && !e.stale) rememberReferences(s, e.text);
+    s.completionFeedback ??= null;
+    if (!s.completionFeedback && s.stopReason.startsWith('Completion was not established by tool evidence')) {
+      s.completionFeedback = { step: s.step, text: 'The previous completion attempt was rejected. Inspect the referenced requirements and current source, then continue the missing work before trying finish again.', awaitingEvidence: true };
+      s.phase = 'implement'; s.inspectionsSinceAction = 0;
     }
     retireEvidence(s);
     // Old runs did not bind verification to file versions. Re-check once on

@@ -96,21 +96,22 @@ export async function completionSource(root: string, paths: string[], objective:
         const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
         for (const st of sf.statements) {
           const line = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1;
+          const endLine = sf.getLineAndCharacterOfPosition(st.getEnd() - 1).line + 1;
           const exported = Boolean(st.modifiers?.some((m: any) => m.kind === ts.SyntaxKind.ExportKeyword));
           if (ts.isImportDeclaration(st)) {
             const c = st.importClause;
             const bindings = [...(c?.name ? [{ name: c.name, propertyName: { text: 'default' } }] : []), ...(c?.namedBindings?.elements ?? []),
               ...(c?.namedBindings?.name ? [{ name: c.namedBindings.name, propertyName: { text: '*' } }] : [])];
             for (const b of bindings) if (wanted.has(b.name.text) || wanted.has(b.propertyName?.text))
-              evidence.facts.push({ line, kind: 'import', name: b.name.text, imported: b.propertyName?.text ?? b.name.text, from: st.moduleSpecifier.text, typeOnly: Boolean(c.isTypeOnly || b.isTypeOnly) });
+              evidence.facts.push({ line, endLine, kind: 'import', name: b.name.text, imported: b.propertyName?.text ?? b.name.text, from: st.moduleSpecifier.text, typeOnly: Boolean(c.isTypeOnly || b.isTypeOnly) });
           } else if (ts.isExportDeclaration(st)) {
             for (const b of st.exportClause?.elements ?? []) if (wanted.has(b.name.text) || wanted.has(b.propertyName?.text))
-              evidence.facts.push({ line, kind: 'export', name: b.name.text, local: b.propertyName?.text ?? b.name.text, from: st.moduleSpecifier?.text });
+              evidence.facts.push({ line, endLine, kind: 'export', name: b.name.text, local: b.propertyName?.text ?? b.name.text, from: st.moduleSpecifier?.text });
           } else if (ts.isVariableStatement(st)) {
             for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name) && wanted.has(d.name.text))
-              evidence.facts.push({ line, kind: 'variable', name: d.name.text, exported });
+              evidence.facts.push({ line, endLine, kind: 'variable', name: d.name.text, exported });
           } else if (st.name && ts.isIdentifier(st.name) && wanted.has(st.name.text)) {
-            evidence.facts.push({ line, kind: ts.SyntaxKind[st.kind], name: st.name.text, exported });
+            evidence.facts.push({ line, endLine, kind: ts.SyntaxKind[st.kind], name: st.name.text, exported });
           }
         }
       }
@@ -306,11 +307,20 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     if (!headers.has(rel)) { try { headers.set(rel, (await boundedRead(await safePath(root, rel))).split('\n').slice(0, 400).join('\n')); } catch { headers.set(rel, ''); } }
     return headers.get(rel)!;
   };
-  const relPath = (from: string, to: string) => { const r = relative(dirname(from), to).replace(/\\/g, '/'); return r.startsWith('.') ? r : `./${r}`; };
+  const relPath = (from: string, to: string) => { const r = relative(resolve(root, dirname(from)), resolve(root, to)).replace(/\\/g, '/'); return r.startsWith('.') ? r : `./${r}`; };
   const declare = async (name: string, only?: string): Promise<{ file: string; line: string; exported: boolean; typeLike: boolean } | null> => {
     const r = await runCommand('rg', ['-n', '-H', '--no-heading', '--color', 'never', '--max-count', '3', '-g', '!node_modules/**', '-g', '!.leana/**', '-g', '!dist/**', '-e', `^(export )?(declare )?(type|interface|const|let|function|async function|class|enum) ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, '--', only ?? '.'], root, 10000).catch(() => null);
-    const hit = r?.output.split('\n').find(Boolean); const m = hit?.match(/^(.*?):(\d+):(.*)$/);
+    const hits = (r?.output.split('\n') ?? []).map(line => line.match(/^(.*?):(\d+):(.*)$/)).filter((m): m is RegExpMatchArray => Boolean(m));
+    // A repository-wide first match can be an unrelated test helper. Only a
+    // unique declaration is usable without a known source module.
+    const m = new Set(hits.map(m => m[1])).size === 1 ? hits[0] : undefined;
     return m ? { file: m[1]!.replace(/^\.\//, ''), line: m[2]!, exported: /^export /.test(m[3]!), typeLike: /^(export )?(declare )?(type|interface)\b/.test(m[3]!) } : null;
+  };
+  const locate = async (name: string, inFile: string) => {
+    for (const source of editedFiles.filter(f => f !== inFile)) {
+      const found = await declare(name, source); if (found) return found;
+    }
+    return declare(name);
   };
   for (const [reported, names] of wanted) {
     // The check prints paths relative to the package it ran in; match them to repository paths.
@@ -326,7 +336,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
         results.push(origin); continue;
       }
       if (want.kind === 'wrong-module') {
-        const d = await declare(name);
+        const d = await locate(name, inFile);
         if (d) {
           origin.declaredIn = `${d.file}:${d.line}`; origin.exported = d.exported;
           origin.importLine = `import ${d.typeLike ? 'type ' : ''}{ ${name} } from "${relPath(inFile, d.file).replace(/\.ts$/, '.js')}";`;
@@ -336,16 +346,27 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
       }
       for (const other of editedFiles.filter(f => f !== inFile)) {
         const text = await header(other);
-        const imp = text.match(new RegExp(`import\\s+(type\\s+)?\\{[^}]*?\\b(type\\s+)?${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b(?!\\s+as\\b)[^}]*\\}\\s*from\\s+["']([^"']+)["']`, 's'));
-        if (imp) {
-          const spec = imp[3]!; const typeOnly = Boolean(imp[1] || imp[2]);
-          const module = spec.startsWith('.') ? relPath(inFile, resolve(dirname(other), spec).replace(`${resolve(root)}/`, '')) : spec;
-          origin.importedBy = other; origin.importLine = `import ${typeOnly ? 'type ' : ''}{ ${name} } from "${module}";`;
+        if (tsModule === undefined) { const m: any = await import('typescript'); tsModule = m.default ?? m; }
+        const ts = tsModule;
+        const sf = ts.createSourceFile(other, text, ts.ScriptTarget.Latest, true);
+        for (const st of sf.statements) {
+          if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+          const c = st.importClause;
+          const spec = st.moduleSpecifier.text;
+          const module = spec.startsWith('.') ? relPath(inFile, resolve(dirname(other), spec)) : spec;
+          const binding = c.namedBindings?.elements?.find((b: any) => b.name.text === name);
+          const localDefault = c.name?.text === name;
+          const localNamespace = c.namedBindings && ts.isNamespaceImport(c.namedBindings) && c.namedBindings.name.text === name;
+          if (!binding && !localDefault && !localNamespace) continue;
+          const imported = binding ? `{ ${binding.propertyName ? `${binding.propertyName.text} as ` : ''}${name} }` : localDefault ? name : `* as ${name}`;
+          origin.importedBy = other;
+          origin.importLine = `import ${c.isTypeOnly || binding?.isTypeOnly ? 'type ' : ''}${imported} from "${module}";`;
           break;
         }
+        if (origin.importLine) break;
       }
       if (!origin.importLine) {
-        const d = await declare(name);
+        const d = await locate(name, inFile);
         if (d) {
           origin.declaredIn = `${d.file}:${d.line}`; origin.exported = d.exported;
           origin.importLine = `import ${d.typeLike ? 'type ' : ''}{ ${name} } from "${relPath(inFile, d.file).replace(/\.ts$/, '.js')}";`;

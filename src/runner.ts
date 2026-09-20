@@ -5,6 +5,7 @@ import { checkDelta, clip, compactNames, completionClaims, completionQuestions, 
 import { schemas } from './schema.js';
 import { completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
 import { Store } from './store.js';
+import { referenceContext, rememberReferences } from './references.js';
 import { editRoutes } from './types.js';
 import type { Config, GenerationMeta, Message, Phase, Route, Session, Task, ToolResult } from './types.js';
 import { lineObserver, type ProgressEvent } from './display.js';
@@ -16,7 +17,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [],
+    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null,
     lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
@@ -69,6 +70,7 @@ export class Runner {
       for (const old of Object.keys(s.searches).slice(0, -20)) delete s.searches[old];
     }
     if (kind === 'read_files' && result.ok) {
+      rememberReferences(s, result.text);
       // Line numbers for edits must come from a read of the current version.
       for (const [path, h] of Object.entries(result.hashes ?? {})) s.readHashes[path] = h;
       // Remember which ranges were seen even after the text itself is evicted.
@@ -272,7 +274,6 @@ export class Runner {
     if (this.config.checkCommand) { s.lastCheckCommand = this.config.checkCommand; if (!s.lastCheck) s.pendingCheck = true; }
     const endStep = s.step + this.config.maxSteps;
     let generationFailures = 0;
-    let rejectedFinishes = 0;
     try {
       for (; s.step < endStep;) {
         s.step++; this.current = s.step;
@@ -358,7 +359,9 @@ export class Runner {
           s.phase = 'verify';
         // Further edits after a passing check mean the implementation is not done.
         if (phase === 'verify' && (editRoutes.includes(route) || route === 'read_files')) s.phase = 'implement';
-        const currentSource = route === 'finish' ? await completionSource(s.root, s.writes, s.objective) : undefined;
+        const currentSource = route === 'finish' ? await completionSource(s.root,
+          [...new Set([...s.writes, ...Object.keys(s.readHashes).filter(p => /\.[cm]?[jt]sx?$/.test(p))])],
+          [s.objective, ...referenceContext(s).map(e => e.text)].join('\n')) : undefined;
         if (currentSource) await this.store.log('completion-source', { step: s.step, files: currentSource });
         let prompt = messages(s, route, undefined, currentSource);
         let counted = await this.bonsai.count(prompt);
@@ -465,8 +468,11 @@ export class Runner {
           if (supported < this.config.completeProbability || complete < this.config.completeProbability) {
             const unsupported = claimScores.filter(c => c.probability < this.config.completeProbability);
             await this.store.log('action', { step: s.step, route, args, rejected: true, supported, complete, coverage, stopCondition, unsupported });
-            if (++rejectedFinishes >= 2) throw new Error('Completion was not established by tool evidence twice; paused for review');
-            await this.evidence(s, 'finish_rejected', { ok: false, text: `Completion rejected (lowest claim support=${supported}, deliverable coverage=${complete}). ${unsupported.length ? `Unsupported claims: ${JSON.stringify(unsupported)}. Correct the summary or obtain the missing evidence; do not redo successful edits merely to repair a historical procedural deviation.` : 'The summary omits requested deliverables; finish the missing work or report the actual evidence for them.'}` });
+            const feedback = `Completion rejected (lowest claim support=${supported}, deliverable coverage=${complete}). ${complete < this.config.completeProbability ? 'The objective is still unfinished or unverified. Compare the requested deliverables with current source, locate the missing declarations or references, and continue implementation. A passing check alone does not establish completion. ' : ''}${unsupported.length ? `Unsupported claims: ${JSON.stringify(unsupported)}. Correct the summary or obtain the missing evidence; do not redo successful edits merely to repair a historical procedural deviation.` : 'Obtain evidence for the missing deliverables before trying finish again.'}`;
+            await this.evidence(s, 'finish_rejected', { ok: false, text: feedback });
+            s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true };
+            s.phase = 'implement'; s.inspectionsSinceAction = 0;
+            s.lastRoute = 'finish'; s.lastResultOk = false;
             await this.store.save(s);
             continue;
           }
@@ -502,6 +508,8 @@ export class Runner {
         // A blocked route stays off the table until some other action succeeds.
         if (result.ok && route !== s.blockedRoute) s.blockedRoute = null;
         await this.evidence(s, route, result, args);
+        if (s.completionFeedback && result.ok && (result.changed?.length || route === 'read_files' || route === 'search_codebase'))
+          s.completionFeedback.awaitingEvidence = false;
         this.observe({ kind: 'result', step: s.step, route, ok: result.ok, ms: performance.now() - toolStarted, chars: result.text.length, text: clip(result.text, 200) });
         // Recorded after the action so a read's key carries the hash it produced. A
         // stale-target rejection is not recorded: it is meant to be retried with the

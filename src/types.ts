@@ -30,6 +30,9 @@ export interface Session {
   editSnapshots: Record<string, string>;
   // Tool-confirmed edits survive ordinary evidence eviction; undo removes them.
   editEvidence: EditEvidence[];
+  // Tool-observed excerpts of documents explicitly referenced by the objective.
+  referenceEvidence: { path: string; hash: string; text: string; scope?: string }[];
+  completionFeedback: { step: number; text: string; awaitingEvidence: boolean } | null;
   // Coverage per content hash, so a rollback to known content restores read state.
   coverageByHash: Record<string, Coverage>; repetitionSteps: Record<string, number>;
   // Harness-fetched context and harness-applied fixes, once per failing check.

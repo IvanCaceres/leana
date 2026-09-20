@@ -8,6 +8,7 @@ import { defaults, loadConfig } from '../src/config.js';
 import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
 import { completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
+import { referenceContext, rememberReferences } from '../src/references.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
@@ -391,22 +392,35 @@ test('A finish vote goes to a concrete completion audit instead of being redirec
   assert.equal(result.status, 'complete'); assert.equal(result.entries.length, 0);
 });
 
-test('A completion summary unsupported by tool evidence is rejected and the loop continues; a second rejection pauses', async t => {
+test('Repeated completion rejections return to inspection and allow later supported completion', async t => {
   const { root, store, session } = await fixture(t);
   session.phase = 'verify'; session.lastCheckStep = 1; session.lastWriteStep = -1; session.step = 1; session.writes = ['deps.ts'];
+  await writeFile(join(root, 'deps.ts'), 'export const deps = 1;\n');
   const checks: any[] = [];
+  let selected = 'finish';
   const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
-    if (ctx!.phase === 'completion-check') { checks.push({ state, q }); return answersFor(q, 'finish', .2); }
-    return answersFor(q, 'finish', .99);
+    if (ctx!.phase === 'completion-check') { checks.push({ state, q }); return answersFor(q, 'finish', checks.length < 3 ? .2 : .99); }
+    selected = session.step === 3 ? 'read_files' : session.step === 5 ? 'search_codebase' : 'finish';
+    if (selected !== 'finish') {
+      assert.equal(state.phase, 'implement');
+      assert.equal(state.completionFeedback.awaitingEvidence, true);
+      assert(q.route?.type === 'choice');
+      assert(!('finish' in q.route.criteria));
+      assert('read_files' in q.route.criteria && 'search_codebase' in q.route.criteria);
+    }
+    return answersFor(q, selected, .99);
   } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Imported deps from cli.ts and verified.' }) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => selected === 'read_files'
+    ? { files: [{ path: 'deps.ts', start: 1, end: 10 }] }
+    : selected === 'search_codebase' ? { query: 'deps', path: '.', mode: 'text' }
+    : { summary: 'Imported deps from cli.ts and verified.' } };
   const result = await new Runner({ ...defaults, maxSteps: 5 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.equal(checks.length, 2);
+  assert.equal(checks.length, 3);
   assert.equal(checks[0].state.proposedSummary, 'Imported deps from cli.ts and verified.'); assert.match(checks[0].state.tasks, /worker claims/);
   assert.deepEqual(checks[0].state.changedFiles, ['deps.ts']); assert.equal(typeof checks[0].q.supported_1.instructions, 'string');
-  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /not established by tool evidence twice/);
-  assert.equal(result.entries.length, 1); assert.equal(result.entries[0]!.kind, 'finish_rejected');
-  assert.match(result.lastError!, /Completion rejected.*lowest claim support=0\.2/);
+  assert.equal(result.status, 'complete');
+  assert.equal(result.entries.filter(e => e.kind === 'finish_rejected').length, 2);
+  assert.match(result.completionFeedback!.text, /Completion rejected.*lowest claim support=0\.2/);
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.some(e => e.type === 'action' && e.data.rejected === true && e.data.route === 'finish'));
 });
@@ -418,6 +432,32 @@ test('A supported completion summary still finishes', async t => {
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Done.' }) };
   const result = await new Runner(defaults, store, jev, bonsai, root, () => {}).run(session);
   assert.equal(result.status, 'complete'); assert.deepEqual(phases, ['routing-and-context', 'completion-check']);
+});
+
+test('An incomplete but passing implementation continues through an edit and verification to completion', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'value.mjs'), 'export const value = 1;\n');
+  s.objective = 'Change value to 2 and verify syntax.';
+  s.phase = 'implement'; s.step = 1; s.lastCheckStep = 1;
+  s.lastCheck = { step: 1, ok: true, text: 'syntax passed', summary: summarizeCheck('') };
+  let selected = 'finish'; let audits = 0;
+  const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx?.phase === 'completion-check') {
+      audits++;
+      const done = (await readFile(join(root, 'value.mjs'), 'utf8')).includes('value = 2');
+      return answersFor(q, 'finish', done ? .99 : .2);
+    }
+    selected = s.step === 3 ? 'read_files' : s.step === 4 ? 'write' : 'finish';
+    return answersFor(q, selected);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => selected === 'read_files'
+    ? { files: [{ path: 'value.mjs', start: 1, end: 10 }] }
+    : selected === 'write' ? { path: 'value.mjs', expectedHash: s.hashes['value.mjs'], oldText: 'value = 1', newText: 'value = 2' }
+    : { summary: s.step === 2 ? 'The syntax check passes but value is still 1.' : 'Changed value to 2 and verified syntax.' } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node --check value.mjs', maxSteps: 5 }, store, jev, bonsai, root, () => {}).run(s);
+  assert.equal(result.status, 'complete', result.stopReason);
+  assert.equal(audits, 2); assert.equal(result.lastWriteStep, 4); assert.equal(result.lastCheckStep, 5);
+  assert.equal(await readFile(join(root, 'value.mjs'), 'utf8'), 'export const value = 2;\n');
 });
 
 test('move_lines cuts a range into a new or existing file with hash checks and no retyping', async t => {
@@ -478,7 +518,8 @@ test('Both models receive a relevance-ranked file subset, a directory overview a
   assert.deepEqual(mergeCoverage({ total: 9464, ranges: [[1, 373]] }, 9464, 1100, 1180), { total: 9464, ranges: [[1, 373], [1100, 1180]] });
   assert.deepEqual(mergeCoverage({ total: 9464, ranges: [[1, 373]] }, 9000, 1, 10), { total: 9000, ranges: [[1, 10]] });
   const state = decisionState(s) as any;
-  assert(!('readCoverage' in state) && !('files' in state) && !('knownFiles' in state), 'the worker prompt carries listings and coverage, Jev does not');
+  assert.deepEqual(state.readCoverage, { 'sdk/typescript/src/cli.ts': 'read 1-373 of 9464 lines' });
+  assert(!('files' in state) && !('knownFiles' in state), 'the full repository listing stays out of routing');
   const prompt = promptFields(messages(s, 'read_files'));
   assert.deepEqual(prompt.readCoverage, { 'sdk/typescript/src/cli.ts': 'read 1-373 of 9464 lines' }); assert.equal(prompt.files.length, files.length); assert(!('knownFiles' in prompt));
   assert(Buffer.byteLength(JSON.stringify(messages(s, 'read_files'))) < 8000);
@@ -690,7 +731,7 @@ test('Searches are pinned as a digest in both prompts after their entries are go
     'text:x in .': 'a:1:x | a:2:x | a:3:x | +2 more',
     'text:absent in .': '(no matches)',
   });
-  assert(!('searched' in (decisionState(s) as any)), 'the search digest is the worker\'s concern');
+  assert.deepEqual((decisionState(s) as any).searched, s.searches);
   assert.deepEqual(promptFields(messages(s, 'search_codebase')).searched, s.searches);
 });
 test('Four consecutive generation failures pause; two only block the route once', async t => {
@@ -1297,12 +1338,12 @@ test('An improving check is committed, an in-scope increase is rolled back, and 
   assert.deepEqual((s.autoUndo as any)?.files, { 'a.ts': '@artifact/00008-a.ts' });
 });
 
-test('After four inspections without an edit or check, reads and searches are withheld', async t => {
+test('Four inspections do not force an edit before the needed source has been located', async t => {
   const { session: s } = await fixture(t);
   const c = { ...defaults, allowWrite: true, allowBash: true };
   s.phase = 'implement'; s.inspectionCount = 6; s.inspectionsSinceAction = 4; s.writes = ['a.ts'];
   let route = routeQuestions(s, c).route!;
-  assert(route.type === 'choice'); assert(!('read_files' in route.criteria)); assert(!('search_codebase' in route.criteria)); assert('replace_lines' in route.criteria);
+  assert(route.type === 'choice'); assert('read_files' in route.criteria); assert('search_codebase' in route.criteria); assert('replace_lines' in route.criteria);
   s.inspectionsSinceAction = 3;
   route = routeQuestions(s, c).route!;
   assert(route.type === 'choice'); assert('read_files' in route.criteria);
@@ -1528,9 +1569,72 @@ test('A truthful partial summary cannot complete an unfinished objective', async
     ? { supported_1: { type: 'noul', noul: .99 }, complete: { type: 'noul', noul: .47 } } as Answers
     : answersFor(q, 'finish') };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Only the first part was done.' }) };
-  const result = await new Runner({ ...defaults, maxSteps: 2 }, store, jev, bonsai, root, () => {}).run(s);
-  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /not established by tool evidence twice/);
+  const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(s);
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /step limit/);
+  assert.equal(result.completionFeedback?.awaitingEvidence, true);
   assert.match(result.entries[0]!.text, /deliverable coverage=0.47/);
+  await store.save(result);
+  const resumed = await store.load();
+  resumed.entries = []; // recovery feedback must survive eviction and restart
+  const routes = routeQuestions(resumed, defaults).route!;
+  assert(routes.type === 'choice'); assert(!('finish' in routes.criteria));
+  assert('search_codebase' in routes.criteria);
+  assert.match(promptFields(messages(resumed, 'search_codebase')).completionFeedback.text, /still unfinished/);
+});
+
+test('Referenced plan requirements survive eviction and restart, and guide source facts for a short objective', async t => {
+  const { root, store, session: s } = await fixture(t);
+  s.objective = 'Read plan.md. Perform only Step 1 substep 1';
+  const preamble = Array.from({ length: 90 }, (_, i) => `Background paragraph ${i}.`).join('\n');
+  const plan = `${preamble}\n**Step 0 — Baseline**\n1. Run all tests.\n**Step 1 — Extract leaves**\n1. Extract CliDependencies and DEFAULT_DEPENDENCIES into deps.ts.\n   Update main to use deps.DEFAULT_DEPENDENCIES.\n2. Extract OtherTask into other.ts.\n**Step 10 — Later work**\n1. Do not include this task.\n`;
+  await writeFile(join(root, 'plan.md'), plan);
+  await writeFile(join(root, 'cli.ts'), `${'// unrelated\n'.repeat(300)}type CliDependencies = {};\nconst DEFAULT_DEPENDENCIES = {};\n`);
+  const runner = new Runner(defaults, store, {} as any, {} as any, root, () => {});
+  const args = { files: [{ path: 'plan.md', start: 78, end: 110 }] };
+  await runner.evidence(s, 'read_files', await runner.tools.execute('read_files', args), args);
+  const refs = referenceContext(s);
+  assert.match(JSON.stringify(refs), /CliDependencies/);
+  assert(!JSON.stringify(refs).includes('OtherTask'));
+  assert(!JSON.stringify(refs).includes('Step 0'));
+  s.entries = [];
+  await store.save(s);
+  const resumed = await store.load();
+  assert.deepEqual(referenceContext(resumed), refs);
+  assert.match(JSON.stringify(decisionState(resumed)), /CliDependencies/);
+  assert.match(JSON.stringify(promptFields(messages(resumed, 'search_codebase')).referenceEvidence), /DEFAULT_DEPENDENCIES/);
+  const facts = await completionSource(root, ['cli.ts'], [resumed.objective, ...referenceContext(resumed).map(e => e.text)].join('\n'));
+  assert(facts[0]!.facts.some(f => f.name === 'CliDependencies' && f.line === 301));
+  resumed.hashes['plan.md'] = 'changed';
+  assert.deepEqual(referenceContext(resumed), [], 'changed requirements need a fresh read');
+});
+
+test('Only observed referenced documents are pinned and reference budgets also bound multibyte text', async t => {
+  const { session: s } = await fixture(t);
+  s.objective = 'Read plan.md and implement the requested feature';
+  rememberReferences(s, 'other.md sha256=123 totalLines=1 shown=1..1\n1: unrelated');
+  assert.deepEqual(s.referenceEvidence, []);
+  for (let start = 1; start < 1000; start += 24)
+    rememberReferences(s, `plan.md sha256=123 totalLines=1000 shown=${start}..${start + 23}\n` + Array.from({ length: 24 }, (_, i) => `${start + i}: ${'🪴'.repeat(200)}`).join('\n'));
+  assert(Buffer.byteLength(JSON.stringify(s.referenceEvidence)) < 12500);
+  assert(Buffer.byteLength(JSON.stringify(referenceContext(s))) < 6100);
+  assert(Buffer.byteLength(JSON.stringify(decisionState(s))) <= 22000);
+});
+
+test('Legacy completion pauses resume implementation with the observed plan requirements', async t => {
+  const { store, session: s } = await fixture(t);
+  s.objective = 'Read plan.md. Perform only Step 1 substep 1';
+  s.status = 'paused'; s.phase = 'verify'; s.inspectionsSinceAction = 4;
+  s.stopReason = 'Completion was not established by tool evidence twice; paused for review';
+  s.entries = [{ id: 'e1', step: 1, kind: 'read_files', artifact: '', relevance: .5,
+    text: 'plan.md sha256=123 totalLines=4 shown=1..4\n1: **Step 1 — Extract leaves**\n2: 1. Extract Dependencies.\n3: 2. Later work.\n4: end' }];
+  delete (s as any).referenceEvidence; delete (s as any).completionFeedback;
+  await store.save(s);
+  const loaded = await store.load();
+  assert.equal(loaded.phase, 'implement'); assert.equal(loaded.completionFeedback?.awaitingEvidence, true);
+  assert.match(JSON.stringify(decisionState(loaded)), /Extract Dependencies/);
+  const q = routeQuestions(loaded, { ...defaults, allowWrite: true, allowBash: true }).route!;
+  assert(q.type === 'choice'); assert('read_files' in q.criteria && 'search_codebase' in q.criteria);
+  assert(!('finish' in q.criteria));
 });
 
 test('A later failing check or pending verification withholds finish despite an earlier pass', async t => {

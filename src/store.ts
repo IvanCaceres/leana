@@ -1,8 +1,11 @@
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import type { Session } from './types.js';
 import { decisionLog } from './decision-log.js';
-import { clip } from './context.js';
+import { clip, rememberEdit, retireEvidence } from './context.js';
+import { editRoutes } from './types.js';
 import { summarizeCheck } from './tools.js';
 export class Store {
   readonly artifacts: string;
@@ -30,8 +33,40 @@ export class Store {
     for (const e of s.entries) if (e.text.startsWith('[superseded') && e.text.split('\n').length > 2) { const l = e.text.split('\n'); e.text = `${l[0]}\n${l.find(x => x.includes(' sha256=')) ?? ''}`; e.relevance = Math.min(e.relevance, .1); }
     if (!s.lastCheckCommand && s.lastCheck) { const m = s.lastCheck.text.match(/^\{"command":"((?:[^"\\]|\\.)*)"/); if (m) { try { s.lastCheckCommand = JSON.parse(`"${m[1]}"`); } catch { /* leave null */ } } }
     for (const c of [s.lastCheck, s.previousCheck]) if (c && !c.summary) c.summary = summarizeCheck(c.text);
+    if (!s.editEvidence) {
+      s.editEvidence = [];
+      await this.recoverEditEvidence(s);
+    }
+    retireEvidence(s);
     if (s.lastError) s.lastError = clip(s.lastError, 1500);
     return s;
+  }
+  // Legacy checkpoints lost successful edits when failures crowded out the
+  // working context. Rebuild only from logged successful results and artifacts,
+  // never from a worker's task ledger or unexecuted action arguments.
+  private async recoverEditEvidence(s: Session): Promise<void> {
+    let action: any;
+    const input = createReadStream(join(this.path, 'events.jsonl'), { encoding: 'utf8' });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        let event: any; try { event = JSON.parse(line); } catch { continue; }
+        const d = event.data;
+        if (!d || d.step > s.step) continue;
+        if (event.type === 'action') action = d;
+        if (event.type === 'undo') {
+          s.editEvidence = s.editEvidence.filter(e => !(d.rejected ?? []).some((r: any) => r.step === e.step));
+        }
+        if (event.type !== 'result' || !d.ok || action?.step !== d.step || !editRoutes.includes(action.route) || action.rejected) continue;
+        const paths = action.route === 'move_lines' ? [action.args.source, action.args.destination] : [action.args.path];
+        // Only accept the standard result artifact for this step, not arbitrary log paths.
+        const name = `${String(d.step).padStart(5, '0')}.txt`;
+        if (d.artifact !== `@artifact/${name}` || !paths.every(p => typeof p === 'string')) continue;
+        try { rememberEdit(s, d.step, action.route, paths, d.artifact, await readFile(join(this.artifacts, name), 'utf8'), action.args); }
+        catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+      }
+    } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+    finally { lines.close(); input.destroy(); }
   }
   // Previous content of a file about to be edited, so a bad edit can be undone.
   async snapshot(step: number, path: string, text: string): Promise<string> {

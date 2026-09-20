@@ -12,7 +12,8 @@ export type Answer = { type: 'noul'; noul: number } |
 export type Questions = Record<string, Question>;
 export type Answers = Record<string, Answer>;
 export interface Task { id: string; description: string; status: 'pending' | 'done'; evidence: string }
-export interface Entry { id: string; step: number; kind: string; text: string; artifact: string; relevance: number; stale?: string }
+export interface Entry { id: string; step: number; kind: string; text: string; artifact: string; relevance: number; stale?: string; verification?: boolean }
+export interface EditEvidence { step: number; route: string; paths: string[]; artifact: string; text: string; applied?: string }
 export interface Session {
   version: 1; root: string; objective: string; instructions: string; step: number;
   tasks: Task[]; focus: string | null; entries: Entry[]; lastCompact: number;
@@ -26,6 +27,8 @@ export interface Session {
   // Pre-edit snapshots of files edited since the previous check, and the set
   // offered for rollback once the next check has judged those edits.
   editSnapshots: Record<string, string>;
+  // Tool-confirmed edits survive ordinary evidence eviction; undo removes them.
+  editEvidence: EditEvidence[];
   // Coverage per content hash, so a rollback to known content restores read state.
   coverageByHash: Record<string, Coverage>; repetitionSteps: Record<string, number>;
   // Harness-fetched context and harness-applied fixes, once per failing check.

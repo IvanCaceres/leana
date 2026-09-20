@@ -1,7 +1,7 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
-import { checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, routeQuestions } from './context.js';
+import { checkDelta, clip, compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
 import { hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
 import { Store } from './store.js';
@@ -16,7 +16,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null,
+    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [],
     lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
@@ -52,7 +52,9 @@ export class Runner {
       for (const f of args.files as { path: string; start: number }[])
         for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
-    s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, text: clip(result.text, limit), relevance: result.ok ? .5 : .9 });
+    s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
+    if (result.ok && result.changed?.length && editRoutes.includes(kind as Route))
+      rememberEdit(s, s.step, kind, result.changed, artifact, result.text, args);
     if (kind === 'read_files' || kind === 'search_codebase') if (result.ok) s.inspectionCount++;
     if (kind === 'search_codebase' && result.ok && args) {
       // What each search found stays visible after its entry is evicted, so the
@@ -132,6 +134,7 @@ export class Runner {
     // is context, not a reason to start editing before the code has been read.
     if (!result.ok && s.phase === 'verify' && (kind === 'bash' || editRoutes.includes(kind as Route))) s.phase = 'implement';
     // Unbounded history lives in artifacts; the decision surface is strictly bounded.
+    retireEvidence(s);
     let evicted = 0;
     while (s.entries.length > 12) { evictOne(s); evicted++; }
     if (evicted) await this.store.log('compact', { step: s.step, removed: evicted, reason: 'entry-cap', retained: s.entries.length });
@@ -243,6 +246,7 @@ export class Runner {
     const what = [restored.length ? `reverted ${restored.join(', ')} to the content before the edits` : '', removed.length ? `removed ${removed.join(', ')}, which those edits created` : ''].filter(Boolean).join(' and ');
     // The edits just reverted are now known-bad: the same edit content will not be accepted again.
     const rejected = s.transaction.filter(t => t.paths.some(p => p in files) || !t.paths.length).map(t => ({ ...t, undoneAt: s.step, reason }));
+    s.editEvidence = s.editEvidence.filter(e => !rejected.some(r => r.step === e.step));
     s.rejectedEdits = [...s.rejectedEdits, ...rejected].slice(-20);
     s.transaction = [];
     await this.evidence(s, 'undo', { ok: true, changed: [...restored, ...removed], hashes, text: `Rolled back: ${what} made after the check at step ${s.previousCheck?.step ?? 'start'}, because the check at step ${s.lastCheck?.step} was worse (${reason}). Those exact edits are now rejected and will not run again; make a different, smaller change.` });
@@ -317,17 +321,10 @@ export class Runner {
           route: answers.route?.type === 'choice' ? Object.entries(answers.route.probabilities).sort((a, b) => b[1] - a[1]) : [],
           nouls: Object.fromEntries(Object.entries(answers).filter(([, a]) => a.type === 'noul').map(([k, a]) => [k, (a as { noul: number }).noul])) });
         const criteria = (questions.route as { criteria: Record<string, string> }).criteria;
-        let routeAnswer = answers.route;
+        const routeAnswer = answers.route;
         let route = confidentChoice(routeAnswer, this.config) as Route | null;
-        const completeOk = answers.complete?.type === 'noul' && answers.complete.noul >= this.config.completeProbability;
-        if (route === 'finish' && !completeOk) {
-          // Jev's completion estimate contradicts its route. Withdraw finish and
-          // let it pick the next action instead of pausing the whole session.
-          delete criteria.finish;
-          const finishWithheld = `Completion probability ${answers.complete?.type === 'noul' ? answers.complete.noul : 0} is below ${this.config.completeProbability}. Choose the action that produces the evidence still missing for the objective.`;
-          const again = await this.jev.decide(decisionState(s, { finishWithheld }), { route: questions.route! }, { step: s.step, phase: 'routing-without-finish' });
-          routeAnswer = again.route; route = confidentChoice(routeAnswer, this.config) as Route | null;
-        }
+        // finish proposes a summary, not completion. Audit that concrete proposal
+        // below instead of redirecting a finish vote into unrelated inspections.
         if ((!route || !Object.hasOwn(criteria, route)) && routeAnswer?.type === 'choice') {
           // Probability spread thinly over many options is not the same as not
           // knowing. Re-ask among the leading candidates before pausing.
@@ -435,14 +432,27 @@ export class Runner {
           // The summary is a worker claim. Only tool evidence and the harness's
           // own changed-file record may support it; the task ledger is excluded
           // because Bonsai writes both and can mark work done that never happened.
-          const check = await this.jev.decide(decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', proposedSummary: args.summary }), {
-            supported: { type: 'noul', instructions: 'Is every claim in proposedSummary established by the supplied tool evidence and changedFiles? Answer no if any claimed file change, import, extraction, or verification has no matching tool result, or if changedFiles lacks a file the objective requires to change.' },
-          }, { step: s.step, phase: 'completion-check' });
-          const supported = check.supported?.type === 'noul' ? check.supported.noul : 0;
-          if (supported < this.config.completeProbability) {
-            await this.store.log('action', { step: s.step, route, args, rejected: true, supported });
-            if (++rejectedFinishes >= 2) throw new Error('Completion summary was not supported by tool evidence twice; paused for review');
-            await this.evidence(s, 'finish_rejected', { ok: false, text: `Completion rejected: the summary claims work the tool evidence does not establish (P(supported)=${supported}). Produce the missing change or verification before finishing. Summary: ${args.summary}` });
+          const claims = completionClaims(args.summary);
+          const check = await this.jev.decide(decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', proposedSummary: args.summary }),
+            completionQuestions(claims), { step: s.step, phase: 'completion-check' });
+          const claimScores = claims.map((claim, i) => {
+            const answer = check[`supported_${i + 1}`];
+            return { claim, probability: answer?.type === 'noul' ? answer.noul : 0 };
+          });
+          const supported = Math.min(...claimScores.map(c => c.probability));
+          const coverage = check.complete?.type === 'noul' ? check.complete.noul : 0;
+          // An explicit user stopping condition takes precedence over a broader
+          // scope estimate, but never over claim support or a missing/stale check.
+          // Require actual edit evidence so an untouched passing baseline cannot
+          // short-circuit an implementation objective.
+          const stopCondition = s.editEvidence.length > 0 && s.lastCheck?.ok && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && staleFor(s).length === 0 && check.stop_condition?.type === 'noul'
+            ? check.stop_condition.noul : 0;
+          const complete = Math.max(coverage, stopCondition);
+          if (supported < this.config.completeProbability || complete < this.config.completeProbability) {
+            const unsupported = claimScores.filter(c => c.probability < this.config.completeProbability);
+            await this.store.log('action', { step: s.step, route, args, rejected: true, supported, complete, coverage, stopCondition, unsupported });
+            if (++rejectedFinishes >= 2) throw new Error('Completion was not established by tool evidence twice; paused for review');
+            await this.evidence(s, 'finish_rejected', { ok: false, text: `Completion rejected (lowest claim support=${supported}, deliverable coverage=${complete}). ${unsupported.length ? `Unsupported claims: ${JSON.stringify(unsupported)}. Correct the summary or obtain the missing evidence; do not redo successful edits merely to repair a historical procedural deviation.` : 'The summary omits requested deliverables; finish the missing work or report the actual evidence for them.'}` });
             await this.store.save(s);
             continue;
           }

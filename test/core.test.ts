@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { defaults, loadConfig } from '../src/config.js';
 import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
-import { confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
+import { completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { samplingSchema, schemas, validate } from '../src/schema.js';
@@ -25,7 +25,7 @@ async function fixture(t: any) {
 }
 function answersFor(q: Questions, route = 'read_files', complete = .99): Answers {
   return Object.fromEntries(Object.entries(q).map(([id, question]) => [id, question.type === 'noul'
-    ? { type: 'noul', noul: id === 'complete' || id === 'supported' ? complete : .1 }
+    ? { type: 'noul', noul: id === 'complete' || id.startsWith('supported_') ? complete : .1 }
     : { type: 'choice', choice: route, confidence: 1,
       probabilities: Object.fromEntries(Object.keys(question.criteria).map(k => [k, k === route ? 1 : 0])) }])) as Answers;
 }
@@ -372,21 +372,23 @@ test('The second identical action and result warns both models before the third 
   assert.match(prompts[2]!, /Choose a different action or arguments/); assert.match(seen[3]!, /withheld until another action succeeds/);
   assert.equal(result.blockedRoute, 'read_files');
 });
-test('Finish with insufficient completion evidence re-routes without finish instead of pausing', async t => {
+test('A finish vote goes to a concrete completion audit instead of being redirected into reads', async t => {
   const { root, store, session } = await fixture(t);
-  await writeFile(join(root, 'README.md'), 'Hello');
   session.phase = 'verify'; session.lastCheckStep = 1; session.lastWriteStep = -1; session.step = 1;
-  const calls: { phase: string; criteria: string[]; state: any }[] = [];
+  const calls: { phase: string; state: any }[] = [];
   const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
-    calls.push({ phase: ctx!.phase, criteria: Object.keys((q.route as any).criteria), state });
-    return answersFor(q, ctx!.phase === 'routing-without-finish' ? 'read_files' : 'finish', .4);
+    calls.push({ phase: ctx!.phase, state });
+    if (ctx!.phase === 'routing-and-context') assert(!q.complete, 'completion is evaluated with the concrete summary');
+    else { assert(q.complete); assert(q.supported_1); }
+    return answersFor(q, 'finish');
   } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'README.md', start: 1, end: 1 }] }) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => {
+    assert.equal(schema, schemas.finish); return { summary: 'Verified the requested work.' };
+  } };
   const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.equal(calls.length, 2); assert(calls[0]!.criteria.includes('finish')); assert(!calls[1]!.criteria.includes('finish'));
-  assert.equal(calls[1]!.phase, 'routing-without-finish'); assert.match(calls[1]!.state.finishWithheld, /0\.4 is below 0\.9/);
-  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /step limit/); assert.equal(result.entries.length, 1);
-  assert.equal(result.entries[0]!.kind, 'read_files'); assert.equal(result.phase, 'implement');
+  assert.deepEqual(calls.map(c => c.phase), ['routing-and-context', 'completion-check']);
+  assert.equal(calls[1]!.state.proposedSummary, 'Verified the requested work.');
+  assert.equal(result.status, 'complete'); assert.equal(result.entries.length, 0);
 });
 
 test('A completion summary unsupported by tool evidence is rejected and the loop continues; a second rejection pauses', async t => {
@@ -394,17 +396,17 @@ test('A completion summary unsupported by tool evidence is rejected and the loop
   session.phase = 'verify'; session.lastCheckStep = 1; session.lastWriteStep = -1; session.step = 1; session.writes = ['deps.ts'];
   const checks: any[] = [];
   const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
-    if (ctx!.phase === 'completion-check') { checks.push({ state, q }); return { supported: { type: 'noul', noul: .2 } } as Answers; }
+    if (ctx!.phase === 'completion-check') { checks.push({ state, q }); return answersFor(q, 'finish', .2); }
     return answersFor(q, 'finish', .99);
   } };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Imported deps from cli.ts and verified.' }) };
   const result = await new Runner({ ...defaults, maxSteps: 5 }, store, jev, bonsai, root, () => {}).run(session);
   assert.equal(checks.length, 2);
   assert.equal(checks[0].state.proposedSummary, 'Imported deps from cli.ts and verified.'); assert.match(checks[0].state.tasks, /worker claims/);
-  assert.deepEqual(checks[0].state.changedFiles, ['deps.ts']); assert.equal(typeof checks[0].q.supported.instructions, 'string');
-  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /not supported by tool evidence twice/);
+  assert.deepEqual(checks[0].state.changedFiles, ['deps.ts']); assert.equal(typeof checks[0].q.supported_1.instructions, 'string');
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /not established by tool evidence twice/);
   assert.equal(result.entries.length, 1); assert.equal(result.entries[0]!.kind, 'finish_rejected');
-  assert.match(result.lastError!, /Completion rejected.*P\(supported\)=0\.2/);
+  assert.match(result.lastError!, /Completion rejected.*lowest claim support=0\.2/);
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.some(e => e.type === 'action' && e.data.rejected === true && e.data.route === 'finish'));
 });
@@ -1385,7 +1387,9 @@ test('Rolling back a transaction that created a file removes the file and forget
   const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
   s.step = 2; s.writes = ['src/cli/deps.ts']; s.hashes['src/cli/deps.ts'] = 'h'; s.readHashes['src/cli/deps.ts'] = 'h'; s.coverage['src/cli/deps.ts'] = { total: 1, ranges: [[1, 1]] } as any; s.writeSteps['src/cli/deps.ts'] = 2;
   s.transaction = [{ key: 'k', identity: 'i', step: 2, route: 'write', paths: ['src/cli/deps.ts'], summary: 'created' }];
+  s.editEvidence = [{ step: 2, route: 'write', paths: ['src/cli/deps.ts'], artifact: '', text: 'created deps.ts' }];
   await runner.undo(s, { 'src/cli/deps.ts': '@new' }, 'worse');
+  assert.deepEqual(s.editEvidence, [], 'rolled-back changes cannot support completion');
   await assert.rejects(readFile(join(root, 'src/cli/deps.ts'), 'utf8'), /ENOENT/);
   assert(!('src/cli/deps.ts' in s.hashes) && !('src/cli/deps.ts' in s.readHashes) && !('src/cli/deps.ts' in s.coverage) && !s.writes.includes('src/cli/deps.ts'));
   assert.match(s.entries.at(-1)!.text, /removed src\/cli\/deps\.ts, which those edits created/); assert.equal(s.rejectedEdits.length, 1);
@@ -1454,4 +1458,130 @@ test('Auto-fix touches only files this session edited, and a failing baseline du
   assert.equal(await readFile(join(root, 'other.ts'), 'utf8'), 'const o = helper();\n');
   assert.equal(result.phase, 'inspect', 'a failing baseline is context, not a reason to start editing before reading');
   assert.equal(result.missingNames.length, 1, 'the resolved fix stays visible to the models');
+});
+
+test('Superseded failures cannot evict every success and recreate the repeated-read loop', async t => {
+  const { root, store, session: s } = await fixture(t);
+  const runner = new Runner(defaults, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}) }, root, () => {});
+  // Reproduce the paused run's mixture of high-priority checks and generation errors.
+  for (let step = 1; step <= 15; step++) {
+    s.step = step;
+    if (step % 3 === 0) await runner.evidence(s, 'generation_error', { ok: false, text: 'Repeated edit; not executed' });
+    else await runner.evidence(s, 'bash', { ok: false, verification: true, text: JSON.stringify({ command: 'lint', output: 'a.ts(1,1): error TS2304: Cannot find name x.', code: 1 }) }, { command: 'lint' });
+  }
+  s.step = 16;
+  await runner.evidence(s, 'move_lines', { ok: true, changed: ['a.ts', 'deps.ts'], text: 'Moved Dependencies from a.ts to deps.ts' });
+  s.step = 17;
+  await runner.evidence(s, 'bash', { ok: true, verification: true, check: true, text: 'lint passed' }, { command: 'lint' });
+  for (let step = 18; step <= 20; step++) {
+    s.step = step;
+    await runner.evidence(s, 'read_files', { ok: true, text: `a.ts sha256=abc totalLines=250 shown=${step}..${step}\n${step}: code` }, { files: [{ path: 'a.ts', start: step, end: step }] });
+  }
+  assert(s.entries.some(e => e.step === 17), 'the passing check survives new reads');
+  assert(s.entries.some(e => e.step === 18), 'a fresh read survives the next read so duplicate detection can find it');
+  const state = decisionState(s) as any;
+  assert(state.evidence.every((e: any) => !e.excerpt.includes('Cannot find name') && e.kind !== 'generation_error'));
+  const finalPrompt = promptFields(messages(s, 'finish'));
+  assert(finalPrompt.evidence.every((e: any) => !e.text.includes('Cannot find name') && e.kind !== 'generation_error'), 'the final summary does not see superseded failures as current evidence');
+  s.entries = [];
+  assert.match((decisionState(s) as any).editEvidence[0].text, /Moved Dependencies/);
+  assert.match(promptFields(messages(s, 'finish')).editEvidence[0].text, /Moved Dependencies/);
+});
+
+test('Legacy resume recovers only confirmed edits, excludes rollbacks, and retires obsolete checks', async t => {
+  const { store, session: s } = await fixture(t);
+  s.step = 9; s.lastWriteStep = 7; s.lastCheckStep = 8; s.lastCheckCommand = 'lint';
+  s.lastCheck = { step: 8, ok: true, text: 'passed', summary: summarizeCheck('passed') };
+  s.entries = [
+    { id: 'e1', step: 1, kind: 'bash', text: '{"command":"lint","output":"failed"}', artifact: '', relevance: .9 },
+    { id: 'e2', step: 2, kind: 'bash', text: '{"command":"diagnostic","output":"failed"}', artifact: '', relevance: .9 },
+    { id: 'e3', step: 3, kind: 'generation_error', text: 'old attempt', artifact: '', relevance: .9 },
+  ];
+  for (const step of [4, 5, 6, 7]) {
+    await store.log('action', { step, route: 'write', args: { path: 'a.ts' } });
+    const artifact = await store.artifact(step, `Applied edit ${step}`);
+    if (step !== 6) await store.log('result', { step, ok: step !== 5, artifact });
+  }
+  await store.log('undo', { step: 8, rejected: [{ step: 7 }] });
+  delete (s as any).editEvidence;
+  await store.save(s);
+  const recovered = await store.load();
+  assert.deepEqual(recovered.editEvidence.map(e => e.step), [4]);
+  assert.equal(recovered.editEvidence[0]!.text, 'Applied edit 4');
+  assert(recovered.entries[0]!.stale); assert(!recovered.entries[1]!.stale, 'unrelated diagnostics are not superseded by lint');
+  assert(recovered.entries[2]!.stale);
+  await store.save(recovered);
+  assert.deepEqual((await store.load()).editEvidence, recovered.editEvidence, 'reload must not duplicate evidence');
+});
+
+test('Legacy checkpoints without an event log still resume without inventing edit evidence', async t => {
+  const { store, session } = await fixture(t);
+  delete (session as any).editEvidence;
+  await store.save(session);
+  assert.deepEqual((await store.load()).editEvidence, []);
+});
+
+test('A truthful partial summary cannot complete an unfinished objective', async t => {
+  const { root, store, session: s } = await fixture(t);
+  s.phase = 'implement'; s.lastCheckStep = 1; s.step = 1;
+  const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => ctx?.phase === 'completion-check'
+    ? { supported_1: { type: 'noul', noul: .99 }, complete: { type: 'noul', noul: .47 } } as Answers
+    : answersFor(q, 'finish') };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Only the first part was done.' }) };
+  const result = await new Runner({ ...defaults, maxSteps: 2 }, store, jev, bonsai, root, () => {}).run(s);
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /not established by tool evidence twice/);
+  assert.match(result.entries[0]!.text, /deliverable coverage=0.47/);
+});
+
+test('A later failing check or pending verification withholds finish despite an earlier pass', async t => {
+  const { session: s } = await fixture(t);
+  s.phase = 'implement'; s.step = 4; s.lastCheckStep = 1;
+  s.lastCheck = { step: 3, ok: false, text: 'failed', summary: summarizeCheck('failed') };
+  const hasFinish = () => 'finish' in (routeQuestions(s, defaults).route as { criteria: Record<string, string> }).criteria;
+  assert(!hasFinish());
+  s.lastCheck.ok = true; assert(hasFinish());
+  s.pendingCheck = true; assert(!hasFinish());
+});
+
+test('Completion audits all claims, bounds questions without dropping the tail, and rejects any unsupported claim', async t => {
+  const long = Array.from({ length: 20 }, (_, i) => `Claim ${i}.`).join(' ');
+  const claims = completionClaims(long);
+  assert.equal(claims.length, 8); assert.equal(claims.join(' '), long);
+  assert.equal(Object.keys(completionQuestions(claims)).length, 10);
+  const { root, store, session: s } = await fixture(t);
+  s.phase = 'implement'; s.lastCheckStep = 1; s.step = 1;
+  const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => {
+    const answers = answersFor(q, 'finish');
+    if (ctx?.phase === 'completion-check') answers.supported_2 = { type: 'noul', noul: .2 };
+    return answers;
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Lint passed. All tests passed.' }) };
+  const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(s);
+  assert.equal(result.status, 'paused');
+  assert.match(result.entries[0]!.text, /Unsupported claims:.*All tests passed/);
+  assert(!result.entries[0]!.text.includes('"claim":"Lint passed."'), 'feedback names only the unsupported claim');
+});
+
+test('An explicit passing-check stopping condition still requires edits and supported claims', async t => {
+  for (const scenario of ['verified edits', 'untouched baseline', 'unsupported summary']) await t.test(scenario, async t => {
+    const { root, store, session: s } = await fixture(t);
+    s.objective = 'Extract the dependencies. Finish when lint passes.';
+    s.phase = 'implement'; s.step = 3; s.lastCheckStep = 3;
+    s.lastCheck = { step: 3, ok: true, text: 'lint passed', summary: summarizeCheck('passed') };
+    if (scenario !== 'untouched baseline') {
+      s.writes = ['deps.ts']; s.lastWriteStep = 2;
+      s.editEvidence = [{ step: 2, route: 'move_lines', paths: ['cli.ts', 'deps.ts'], artifact: '', text: 'Moved dependencies' }];
+    }
+    const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => {
+      const answers = answersFor(q, 'finish', scenario === 'unsupported summary' ? .2 : .99);
+      if (ctx?.phase === 'completion-check') {
+        answers.complete = { type: 'noul', noul: .47 };
+        answers.stop_condition = { type: 'noul', noul: .99 };
+      }
+      return answers;
+    } };
+    const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Extracted dependencies and lint passed.' }) };
+    const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(s);
+    assert.equal(result.status, scenario === 'verified edits' ? 'complete' : 'paused');
+  });
 });

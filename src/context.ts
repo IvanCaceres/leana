@@ -1,4 +1,4 @@
-import type { Answers, Config, Coverage, Entry, Message, NameOrigin, Questions, Route, Session } from './types.js';
+import type { Answers, Config, Coverage, Entry, Message, NameOrigin, Questions, Route, Session, SourceEvidence } from './types.js';
 import { editRoutes } from './types.js';
 import { schemas } from './schema.js';
 export function clip(text: string, limit: number): string {
@@ -239,7 +239,7 @@ export function completionQuestions(claims: string[]): Questions {
   return {
     ...Object.fromEntries(claims.map((claim, i) => [`supported_${i + 1}`, {
       type: 'noul' as const,
-      instructions: `Is this specific claim supported by tool-confirmed editEvidence and the current lastCheck? Judge this claim individually, not compliance with every earlier process instruction. Do not assume a requested procedure was followed merely because the objective requested it. Claim: ${claim}`,
+      instructions: `Is this specific claim supported by currentSource (fresh filesystem facts), editEvidence, and the current lastCheck? Current source establishes the final code structure even when old edit history is missing or was rolled back. It does not establish historical procedure; missing history proves neither compliance nor noncompliance. Judge this claim individually. Do not assume a requested procedure was followed merely because the objective requested it. Claim: ${claim}`,
     }])),
     complete: { type: 'noul', instructions: 'Does proposedSummary address all requested final deliverables within the user objective\'s scope, including the verification, rather than omit unfinished deliverables or merely state generic success? A truthful summary of partial work is insufficient. Evaluate only the requested substep, not later steps of a referenced plan. Past procedural deviations are separate from deliverable coverage; the supported questions check the truth of the individual claims.' },
     stop_condition: { type: 'noul', instructions: 'Does the user objective explicitly instruct the agent to finish when the verification command recorded in lastCheck passes? Judge only whether that explicit stopping instruction exists; do not infer it just from a request to run tests or lint.' },
@@ -294,7 +294,7 @@ const details: Record<Route, string> = {
   write: 'expectedHash must be the current sha256 of the path from fileHashes (the same value the latest read_files or edit result reported). oldText is a small unique anchor (a few consecutive lines) copied exactly from that read; never paste a truncated excerpt or an entire file. newText replaces the anchor and must differ from it. For a NEW file only, expectedHash="new" and oldText="". Never overwrite an unread file.',
   bash: 'command runs with bash in the repository root (the harness already sets cwd; use repository-relative paths and do not cd into a subdirectory or to /workspace). Explain its purpose. Use it for diagnostics; the harness runs the verification command itself after every edit. Do not start background processes or servers.',
   tasks: 'Return the full task ledger, max 12 tasks. Preserve existing IDs and all unfinished work. Mark done only with concrete evidence from supplied tool results. Break complex work into bounded changes and verification.',
-  finish: 'Report the final changes, verification actually run, and limitations concisely, using tool-confirmed editEvidence and current lastCheck. Do not turn procedural requirements from the objective into claims that they were followed. If the record shows a requested procedure was not followed, acknowledge that deviation explicitly; do not claim full procedural compliance or propose redoing successful effects. Superseded failures are history. Report only what the evidence establishes.',
+  finish: 'Report the final code structure from currentSource, verification from lastCheck, and limitations concisely. currentSource contains fresh filesystem facts; missing historical edit records do not mean that those declarations or imports are absent now. Use editEvidence for historical actions only. Missing history proves neither that a requested procedure was followed nor that it was skipped. Do not infer a procedural violation from absent records. Report only what the evidence establishes.',
   ask_user: 'Ask one concise question that explains the missing information.',
 };
 // The prompt is a sequence of user messages, not one blob, because llama.cpp
@@ -302,12 +302,13 @@ const details: Record<Route, string> = {
 // end of the prompt). With one message per pinned block and per evidence entry,
 // a change late in the prompt reprocesses only what follows the last unchanged
 // boundary; with one giant message, any change reprocessed everything.
-export function messages(s: Session, route: Route, harnessNote?: string): Message[] {
+export function messages(s: Session, route: Route, harnessNote?: string, currentSource?: SourceEvidence[]): Message[] {
   // The pinned block never changes within a session, so the prefix stays cached.
   const pinned = { objective: s.objective, repositoryInstructions: s.instructions,
     directories: repoOverview(s, 30), fileCount: s.knownFiles.length, files: relevantFiles(s, 40) };
   const staleEvidence = Object.fromEntries(s.entries.filter(e => e.stale).map(e => [e.id, e.stale]));
   const request = { phase: s.phase, tasks: s.tasks, activeTask: s.focus, changedFiles: s.writes, staleEvidence,
+    ...(currentSource ? { currentSource } : {}),
     editEvidence: s.editEvidence,
     readCoverage: coverageSummary(s, 12), searched: compactSearched(s, 10), fileHashes: Object.fromEntries(Object.entries(s.hashes).slice(-12)),
     lastCheck: s.lastCheck && { step: s.lastCheck.step, ok: s.lastCheck.ok, text: clip(s.lastCheck.text, 900), staleFor: staleFor(s), errors: s.lastCheck.summary.errors, syntaxErrors: s.lastCheck.summary.syntax },

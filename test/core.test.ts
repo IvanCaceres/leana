@@ -13,7 +13,7 @@ import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { assertBalancePreserved, hash, importInsertLine, runCommand, safePath, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -1584,4 +1584,80 @@ test('An explicit passing-check stopping condition still requires edits and supp
     const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(s);
     assert.equal(result.status, scenario === 'verified edits' ? 'complete' : 'paused');
   });
+});
+
+test('Completion reads real current declarations and imports, not lookalikes inside comments or strings', async t => {
+  const { root } = await fixture(t);
+  await writeFile(join(root, 'cli.ts'), `import type { Dependencies as Deps } from './deps.js';\nconst template = "export interface Fake {}";\n// export const GHOST = 1;\n`);
+  await writeFile(join(root, 'deps.ts'), 'export interface Dependencies {}\nexport const DEFAULTS = {};\nconst PRIVATE = 1;\n');
+  const facts = await completionSource(root, ['cli.ts', 'deps.ts'], 'Extract Dependencies as Deps with DEFAULTS PRIVATE Fake GHOST.');
+  assert.deepEqual(facts[0]!.facts, [{ line: 1, kind: 'import', name: 'Deps', imported: 'Dependencies', from: './deps.js', typeOnly: true }]);
+  assert.deepEqual(facts[1]!.facts.map(f => [f.name, f.exported]), [['Dependencies', true], ['DEFAULTS', true], ['PRIVATE', false]]);
+  assert.equal(facts[1]!.hash, hash(await readFile(join(root, 'deps.ts'))));
+  const missing = await completionSource(root, ['missing.ts', '../outside.ts'], 'Missing');
+  assert(missing.every(f => f.error && !f.hash && !f.facts.length));
+});
+
+test('Fresh source facts establish completion even when rollback history lost the original extraction', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'cli.mjs'), "import { Dependency, DEFAULTS } from './deps.mjs';\n");
+  await writeFile(join(root, 'deps.mjs'), 'export class Dependency {}\nexport const DEFAULTS = {};\n');
+  s.objective = 'Extract Dependency and DEFAULTS into deps.mjs, import both in cli.mjs, and verify.';
+  s.phase = 'implement'; s.step = 3; s.lastWriteStep = 2; s.writes = ['cli.mjs', 'deps.mjs'];
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    if (ctx?.phase === 'completion-check') {
+      assert.deepEqual(state.editEvidence, [], 'the history does not prove the extraction');
+      assert(state.currentSource[0].facts.some((f: any) => f.kind === 'import' && f.name === 'Dependency'));
+      assert(state.currentSource[1].facts.some((f: any) => f.exported && f.name === 'DEFAULTS'));
+    }
+    return answersFor(q, 'finish');
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (prompt: any) => {
+    assert.equal(promptFields(prompt).currentSource.length, 2);
+    return { summary: 'cli.mjs imports Dependency and DEFAULTS from deps.mjs. Verification passed.' };
+  } };
+  const runner = new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {});
+  await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'node --check passed' }, { command: 'node --check deps.mjs' });
+  assert.deepEqual(s.lastCheck!.fileHashes, await sourceHashes(root, s.writes));
+  assert.equal((await runner.run(s)).status, 'complete');
+});
+
+test('Files changed during final-summary generation must be reverified before completion', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'deps.mjs'), 'export const DEFAULTS = {};\n');
+  s.objective = 'Export DEFAULTS and verify.'; s.phase = 'implement'; s.step = 3; s.lastWriteStep = 2; s.writes = ['deps.mjs'];
+  let generated = 0; let audited = 0;
+  const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx?.phase === 'completion-check') { audited++; assert.equal(s.lastCheck!.step, 5); }
+    return answersFor(q, 'finish');
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => {
+    if (++generated === 1) await writeFile(join(root, 'deps.mjs'), 'export const DEFAULTS = {};\n// external edit\n');
+    return { summary: 'DEFAULTS is exported and verification passed.' };
+  } };
+  const runner = new Runner({ ...defaults, allowBash: true, maxSteps: 3 }, store, jev, bonsai, root, () => {});
+  await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'passed' }, { command: 'node --check deps.mjs' });
+  const result = await runner.run(s);
+  assert.equal(result.status, 'complete'); assert.equal(generated, 2); assert.equal(audited, 1);
+  assert.match(await readFile(join(store.path, 'events.jsonl'), 'utf8'), /completion-stale/);
+});
+
+test('Legacy passing checks without file versions are re-run once on resume', async t => {
+  const { store, session: s } = await fixture(t);
+  s.status = 'paused'; s.writes = ['deps.ts']; s.lastWriteStep = 1; s.lastCheckStep = 2;
+  s.lastCheckCommand = 'lint'; s.lastCheck = { step: 2, ok: true, text: 'passed', summary: summarizeCheck('passed') };
+  await store.save(s);
+  assert.equal((await store.load()).pendingCheck, true);
+  s.lastCheck.fileHashes = { 'deps.ts': 'abc' }; await store.save(s);
+  assert.equal((await store.load()).pendingCheck, false);
+});
+
+test('Completion source evidence stays bounded and reports omitted facts', async t => {
+  const { root } = await fixture(t);
+  const names = Array.from({ length: 100 }, (_, i) => `Name${i}`);
+  const paths = Array.from({ length: 12 }, (_, i) => `file${i}.ts`);
+  for (const path of paths) await writeFile(join(root, path), names.map(n => `export const ${n} = 1;`).join('\n'));
+  const facts = await completionSource(root, paths, names.join(' '));
+  assert(Buffer.byteLength(JSON.stringify(facts)) < 7000);
+  assert(facts.every(f => f.omitted! > 0));
 });

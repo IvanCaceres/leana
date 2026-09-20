@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
 import { checkDelta, clip, compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
-import { hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
 import { Store } from './store.js';
 import { editRoutes } from './types.js';
 import type { Config, GenerationMeta, Message, Phase, Route, Session, Task, ToolResult } from './types.js';
@@ -114,7 +114,7 @@ export class Runner {
     // until the next check replaces it, whatever compaction does to the entry.
     if (result.verification) {
       s.previousCheck = s.lastCheck;
-      s.lastCheck = { step: s.step, ok: result.ok, text: clip(result.text, 1500), summary: summarizeCheck(result.text) };
+      s.lastCheck = { step: s.step, ok: result.ok, text: clip(result.text, 1500), summary: summarizeCheck(result.text), fileHashes: await sourceHashes(s.root, s.writes) };
       s.pendingCheck = false;
       // The edits since the previous check are now judged by this one. An
       // objective regression is rolled back deterministically; a small increase
@@ -358,13 +358,15 @@ export class Runner {
           s.phase = 'verify';
         // Further edits after a passing check mean the implementation is not done.
         if (phase === 'verify' && (editRoutes.includes(route) || route === 'read_files')) s.phase = 'implement';
-        let prompt = messages(s, route);
+        const currentSource = route === 'finish' ? await completionSource(s.root, s.writes, s.objective) : undefined;
+        if (currentSource) await this.store.log('completion-source', { step: s.step, files: currentSource });
+        let prompt = messages(s, route, undefined, currentSource);
         let counted = await this.bonsai.count(prompt);
         let forced = 0;
         while (counted.tokens > this.config.workingTokens) {
           if (!evictOne(s)) throw new Error('Pinned objective, instructions and ledger exceed working context; reduce them or increase workingTokens');
           forced++;
-          prompt = messages(s, route); counted = await this.bonsai.count(prompt);
+          prompt = messages(s, route, undefined, currentSource); counted = await this.bonsai.count(prompt);
         }
         if (forced) { s.lastCompact = s.step; await this.store.log('compact', { step: s.step, removed: forced, reason: 'hard-budget' }); }
         s.lastPromptTokens = counted.tokens;
@@ -429,11 +431,23 @@ export class Runner {
           continue;
         }
         if (route === 'finish') {
+          // The worker may take seconds to summarize. Never accept a passing
+          // check for files that changed while it was generating that summary.
+          const now = await sourceHashes(s.root, s.writes);
+          const changed = Object.keys(s.lastCheck?.fileHashes ?? {}).filter(path => now[path] !== s.lastCheck!.fileHashes![path]);
+          if (changed.length) {
+            s.lastCheckStep = -1;
+            s.pendingCheck = Boolean(s.lastCheckCommand);
+            await this.store.log('completion-stale', { step: s.step, files: changed });
+            if (!s.pendingCheck || !this.config.allowBash) throw new Error(`Files changed since verification: ${changed.join(', ')}; run the check again before completion`);
+            await this.store.save(s);
+            continue;
+          }
           // The summary is a worker claim. Only tool evidence and the harness's
           // own changed-file record may support it; the task ledger is excluded
           // because Bonsai writes both and can mark work done that never happened.
           const claims = completionClaims(args.summary);
-          const check = await this.jev.decide(decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', proposedSummary: args.summary }),
+          const check = await this.jev.decide(decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', currentSource, proposedSummary: args.summary }),
             completionQuestions(claims), { step: s.step, phase: 'completion-check' });
           const claimScores = claims.map((claim, i) => {
             const answer = check[`supported_${i + 1}`];

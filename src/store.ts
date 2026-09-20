@@ -38,6 +38,9 @@ export class Store {
       await this.recoverEditEvidence(s);
     }
     retireEvidence(s);
+    // Old runs did not bind verification to file versions. Re-check once on
+    // resume rather than assuming edits made by another run were verified.
+    if (s.status !== 'complete' && s.lastCheck?.ok && !s.lastCheck.fileHashes && s.writes.length && s.lastCheckCommand) s.pendingCheck = true;
     if (s.lastError) s.lastError = clip(s.lastError, 1500);
     return s;
   }

@@ -2,7 +2,8 @@ export type Route = 'read_files' | 'search_codebase' | 'write' | 'replace_lines'
 export const editRoutes: readonly Route[] = ['write', 'replace_lines', 'move_lines'];
 export interface Coverage { total: number; ranges: [number, number][] }
 export interface CheckSummary { errors: number; syntax: number; byFile: Record<string, { count: number; syntax: number; lines: number[]; samples: string[] }> }
-export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary }
+export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string> }
+export interface SourceEvidence { path: string; hash?: string; facts: Record<string, unknown>[]; excerpt?: string; error?: string; omitted?: number }
 export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |

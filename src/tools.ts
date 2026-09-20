@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { open, readFile, realpath, rename, stat, unlink, mkdir, readdir } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
-import type { CheckSummary, Config, NameOrigin, Route, ToolResult } from './types.js';
+import type { CheckSummary, Config, NameOrigin, Route, SourceEvidence, ToolResult } from './types.js';
 import { clip } from './context.js';
 export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex');
 // A write whose target was never read, or was read before it changed. Only this
@@ -76,6 +76,64 @@ export async function importInsertLine(path: string, text: string): Promise<numb
   let last = -1;
   for (let i = 0; i < lines.length; i++) if (/^import\b.*\bfrom\s+["'][^"']+["'];?\s*$/.test(lines[i]!) || /^import\s+["'][^"']+["'];?\s*$/.test(lines[i]!) || /^\}\s*from\s+["'][^"']+["'];?\s*$/.test(lines[i]!)) last = i;
   return last >= 0 ? last + 2 : lines[0]?.startsWith('#!') ? 2 : 1;
+}
+// Fresh, parser-backed facts for completion. Historical edits can be evicted or
+// conservatively rejected by an old rollback; current imports and declarations
+// still establish the final structure. Names are selected from the objective,
+// never inferred from a worker's claim. Comments and strings are not declarations.
+export async function completionSource(root: string, paths: string[], objective: string): Promise<SourceEvidence[]> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  const wanted = new Set(objective.match(/[A-Za-z_$][\w$]*/g) ?? []);
+  const out: SourceEvidence[] = [];
+  let remaining = 6500;
+  for (const path of [...new Set(paths)].slice(0, 12)) {
+    const evidence: SourceEvidence = { path, facts: [] };
+    try {
+      const text = await boundedRead(await safePath(root, path));
+      evidence.hash = hash(text);
+      if (tsModule && parseable.test(path)) {
+        const ts = tsModule;
+        const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+        for (const st of sf.statements) {
+          const line = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1;
+          const exported = Boolean(st.modifiers?.some((m: any) => m.kind === ts.SyntaxKind.ExportKeyword));
+          if (ts.isImportDeclaration(st)) {
+            const c = st.importClause;
+            const bindings = [...(c?.name ? [{ name: c.name, propertyName: { text: 'default' } }] : []), ...(c?.namedBindings?.elements ?? []),
+              ...(c?.namedBindings?.name ? [{ name: c.namedBindings.name, propertyName: { text: '*' } }] : [])];
+            for (const b of bindings) if (wanted.has(b.name.text) || wanted.has(b.propertyName?.text))
+              evidence.facts.push({ line, kind: 'import', name: b.name.text, imported: b.propertyName?.text ?? b.name.text, from: st.moduleSpecifier.text, typeOnly: Boolean(c.isTypeOnly || b.isTypeOnly) });
+          } else if (ts.isExportDeclaration(st)) {
+            for (const b of st.exportClause?.elements ?? []) if (wanted.has(b.name.text) || wanted.has(b.propertyName?.text))
+              evidence.facts.push({ line, kind: 'export', name: b.name.text, local: b.propertyName?.text ?? b.name.text, from: st.moduleSpecifier?.text });
+          } else if (ts.isVariableStatement(st)) {
+            for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name) && wanted.has(d.name.text))
+              evidence.facts.push({ line, kind: 'variable', name: d.name.text, exported });
+          } else if (st.name && ts.isIdentifier(st.name) && wanted.has(st.name.text)) {
+            evidence.facts.push({ line, kind: ts.SyntaxKind[st.kind], name: st.name.text, exported });
+          }
+        }
+      }
+      const all = evidence.facts.length;
+      evidence.facts = evidence.facts.slice(0, 16);
+      if (!all) evidence.excerpt = clip(text.split('\n').slice(0, 20).join('\n'), 600);
+      while (Buffer.byteLength(JSON.stringify(evidence)) > remaining && evidence.facts.length) evidence.facts.pop();
+      if (evidence.facts.length < all) evidence.omitted = all - evidence.facts.length;
+      if (Buffer.byteLength(JSON.stringify(evidence)) > remaining) evidence.excerpt = undefined;
+    } catch (e) { evidence.error = clip((e as Error).message, 160); }
+    remaining -= Buffer.byteLength(JSON.stringify(evidence));
+    out.push(evidence);
+    if (remaining < 500) break;
+  }
+  return out;
+}
+export async function sourceHashes(root: string, paths: string[]): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const path of new Set(paths)) {
+    try { out[path] = hash(await boundedRead(await safePath(root, path))); }
+    catch { out[path] = 'unavailable'; }
+  }
+  return out;
 }
 // A compact, comparable view of a check's output: error counts overall and per
 // file, with the lines they name. Syntax errors are singled out because a file

@@ -40,7 +40,7 @@ export class Store {
     }
     s.referenceEvidence ??= [];
     for (const e of s.entries) if (e.kind === 'read_files' && !e.stale) rememberReferences(s, e.text);
-    s.completionFeedback ??= null;
+    s.completionFeedback ??= null; s.finishTriedAtCheck ??= -1;
     if (!s.completionFeedback && s.stopReason.startsWith('Completion was not established by tool evidence')) {
       s.completionFeedback = { step: s.step, text: 'The previous completion attempt was rejected. Inspect the referenced requirements and current source, then continue the missing work before trying finish again.', awaitingEvidence: true };
       s.phase = 'implement'; s.inspectionsSinceAction = 0;

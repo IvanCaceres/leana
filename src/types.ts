@@ -32,7 +32,9 @@ export interface Session {
   editEvidence: EditEvidence[];
   // Tool-observed excerpts of documents explicitly referenced by the objective.
   referenceEvidence: { path: string; hash: string; text: string; scope?: string }[];
-  completionFeedback: { step: number; text: string; awaitingEvidence: boolean } | null;
+  completionFeedback: { step: number; text: string; awaitingEvidence: boolean; addressed?: boolean } | null;
+  // The passing check for which the harness already proposed a finish; one attempt per check.
+  finishTriedAtCheck: number;
   // Coverage per content hash, so a rollback to known content restores read state.
   coverageByHash: Record<string, Coverage>; repetitionSteps: Record<string, number>;
   // Harness-fetched context and harness-applied fixes, once per failing check.

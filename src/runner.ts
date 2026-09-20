@@ -17,7 +17,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null,
+    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1,
     lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
@@ -88,6 +88,10 @@ export class Runner {
     for (const [path, h] of Object.entries(result.hashes ?? {})) { delete s.hashes[path]; s.hashes[path] = h; }
     for (const stale of Object.keys(s.hashes).slice(0, -20)) delete s.hashes[stale];
     if (result.verification) { s.editsSinceCheck = 0; if (kind === 'bash' && args?.command) s.lastCheckCommand = args.command; }
+    // Edits followed by a passing check answer a completion rejection; the pinned
+    // text must stop telling Jev the objective is unfinished.
+    if (s.completionFeedback && !s.completionFeedback.addressed && result.verification && result.ok && s.lastWriteStep > s.completionFeedback.step)
+      s.completionFeedback = { step: s.completionFeedback.step, addressed: true, awaitingEvidence: false, text: `The completion proposed at step ${s.completionFeedback.step} was rejected (${clip(s.completionFeedback.text.replace(/^Completion rejected /, ''), 300)}); edits at step ${s.lastWriteStep} and the passing check at step ${s.step} followed. Propose finish again with claims that match currentSource.` };
     if (result.changed?.length) { s.editsSinceCheck++; s.pendingCheck = Boolean(s.lastCheckCommand); }
     if ((kind === 'read_files' || kind === 'search_codebase') && result.ok) s.inspectionsSinceAction++;
     if (result.changed?.length || result.verification || kind === 'undo') s.inspectionsSinceAction = 0;
@@ -326,9 +330,16 @@ export class Runner {
           }
         }
         const questions = routeQuestions(s, this.config);
+        // A passing check after edits, with nothing pending, is the moment to propose
+        // completion: the audit judges the proposal, so the harness makes it once per
+        // check rather than leaving the worker to read until it feels ready.
+        const readyToFinish = Boolean(s.lastCheck?.ok && s.editEvidence.length && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && !s.autoUndo
+          && staleFor(s).length === 0 && !s.missingNames.length && s.finishTriedAtCheck !== s.lastCheck.step && 'finish' in (questions.route as { criteria: Record<string, string> }).criteria);
+        if (readyToFinish) s.finishTriedAtCheck = s.lastCheck!.step;
         const jevStarted = performance.now();
         const state = decisionState(s);
         const answers = await this.jev.decide(state, questions, { step: s.step, phase: 'routing-and-context' });
+        if (readyToFinish) { answers.route = { type: 'choice', choice: 'finish', confidence: 1, probabilities: { finish: 1 } }; await this.store.log('auto-finish', { step: s.step, check: s.lastCheck!.step }); }
         this.observe({ kind: 'jev', step: s.step, ms: performance.now() - jevStarted, questions: Object.keys(questions).length, stateBytes: Buffer.byteLength(JSON.stringify(state)),
           route: answers.route?.type === 'choice' ? Object.entries(answers.route.probabilities).sort((a, b) => b[1] - a[1]) : [],
           nouls: Object.fromEntries(Object.entries(answers).filter(([, a]) => a.type === 'noul').map(([k, a]) => [k, (a as { noul: number }).noul])) });
@@ -460,6 +471,7 @@ export class Runner {
           // The summary is a worker claim. Only tool evidence and the harness's
           // own changed-file record may support it; the task ledger is excluded
           // because Bonsai writes both and can mark work done that never happened.
+          if (typeof args.summary !== 'string' || !args.summary.trim()) throw new Error('finish requires a summary of the final code structure and verification');
           const claims = completionClaims(args.summary);
           const check = await this.jev.decide(decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', currentSource, proposedSummary: args.summary }),
             completionQuestions(claims), { step: s.step, phase: 'completion-check' });
@@ -497,6 +509,7 @@ export class Runner {
             const feedback = `Completion rejected (lowest claim support=${supported}, deliverable coverage=${complete}). ${complete < this.config.completeProbability ? 'The objective is still unfinished or unverified. Compare the requested deliverables with current source, locate the missing declarations or references, and continue implementation. A passing check alone does not establish completion. ' : ''}${unsupported.length ? `Unsupported claims: ${JSON.stringify(unsupported)}. Correct the summary or obtain the missing evidence; do not redo successful edits merely to repair a historical procedural deviation.` : 'Obtain evidence for the missing deliverables before trying finish again.'}${digest ? ` Current source: ${clip(digest, 700)}` : ''}`;
             await this.evidence(s, 'finish_rejected', { ok: false, text: feedback });
             s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true };
+            if (s.lastCheck) s.finishTriedAtCheck = s.lastCheck.step;
             s.phase = 'implement'; s.inspectionsSinceAction = 0;
             s.lastRoute = 'finish'; s.lastResultOk = false;
             await this.store.save(s);
@@ -536,6 +549,7 @@ export class Runner {
         await this.evidence(s, route, result, args);
         if (s.completionFeedback && result.ok && (result.changed?.length || route === 'read_files' || route === 'search_codebase'))
           s.completionFeedback.awaitingEvidence = false;
+
         this.observe({ kind: 'result', step: s.step, route, ok: result.ok, ms: performance.now() - toolStarted, chars: result.text.length, text: clip(result.text, 200) });
         // Recorded after the action so a read's key carries the hash it produced. A
         // stale-target rejection is not recorded: it is meant to be retried with the

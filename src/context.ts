@@ -105,7 +105,14 @@ export function routeQuestions(s: Session, c: Config): Questions {
   // Counts cannot establish that the needed source was found. Large plans may
   // consume several reads before source inspection even starts. Actual duplicate
   // actions/results have their own loop guards; keep novel inspection available.
-  if (s.inspectionsSinceAction >= 4) {
+  // Once every edited file is readable at its current version, the source for
+  // the next edit is in hand: after four inspections without an action the worker
+  // edits, checks or finishes. Before that, novel inspection stays available.
+  const located = s.writes.length > 0 && s.writes.every(p => s.readHashes[p] !== undefined && s.readHashes[p] === s.hashes[p]);
+  const actionable = editRoutes.some(r => r in criteria) || 'bash' in criteria || 'finish' in criteria;
+  if (s.inspectionsSinceAction >= 4 && s.phase !== 'inspect' && located && actionable && !(editFailed && s.lastWriteStale)) {
+    delete (criteria as Partial<typeof criteria>).read_files; delete (criteria as Partial<typeof criteria>).search_codebase;
+  } else if (s.inspectionsSinceAction >= 4) {
     if (criteria.read_files) criteria.read_files += ' Several inspections have run; read a specific missing range rather than repeating known evidence.';
     if (criteria.search_codebase) criteria.search_codebase += ' Locate the exact declaration or reference still needed for the next edit.';
   }

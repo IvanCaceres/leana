@@ -1861,3 +1861,34 @@ test('Unused import bindings are removed by the harness without dropping a bindi
   assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'import { existsSync } from "node:fs";\nimport { componentPlanSchema } from "./component-plan.js";\nimport type { Only } from "./only.js";\nimport def from "./def.js";\nconst unusedLocal = 1;\nexport const a = existsSync("x") && componentPlanSchema && def;\n');
   assert.deepEqual(result.entries.map(e => e.kind).slice(0, 3), ['bash', 'replace_lines', 'bash']); assert.equal(result.lastCheck?.ok, true);
 });
+
+test('After four inspections with every edited file read at its current version, reads leave the menu', async t => {
+  const { session: s } = await fixture(t);
+  const c = { ...defaults, allowWrite: true, allowBash: true };
+  s.phase = 'implement'; s.inspectionCount = 6; s.inspectionsSinceAction = 4; s.writes = ['a.ts']; s.hashes['a.ts'] = 'h1';
+  let route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert('read_files' in route.criteria, 'a.ts not yet read at its current version');
+  s.readHashes['a.ts'] = 'h1';
+  route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert(!('read_files' in route.criteria)); assert(!('search_codebase' in route.criteria)); assert('replace_lines' in route.criteria);
+  s.readHashes['a.ts'] = 'stale';
+  route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert('read_files' in route.criteria, 'edited since the last read: the read is needed again');
+});
+test('A passing check after edits proposes finish once without asking Jev to route, and a rejection is retired by later edits', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'export const a = 1;\n'); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['a.ts']; session.step = 4; session.lastWriteStep = 3;
+  session.editEvidence = [{ step: 3, route: 'write', path: 'a.ts', summary: 'edited' } as any];
+  session.completionFeedback = { step: 2, text: 'Completion rejected (lowest claim support=0.3, deliverable coverage=0.4). The objective is still unfinished.', awaitingEvidence: false };
+  const phases: string[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); const a = answersFor(q, 'read_files', .9) as any; if (q.stop_condition) a.stop_condition = { type: 'noul', noul: .05 }; return a; } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'a.ts exports a. The check passed.' } : { files: [{ path: 'a.ts', start: 1, end: 1 }] } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
+  // step 4: baseline check passes (after the edit at 3) -> step 5: harness proposes finish, audited, accepted
+  assert.equal(result.status, 'complete'); assert.equal(result.stopReason, 'a.ts exports a. The check passed.');
+  assert.deepEqual(phases, ['routing-and-context', 'completion-check'], 'Jev routed once, the harness overrode it with finish, then the audit ran');
+  assert.match(result.completionFeedback?.text ?? '', /^The completion proposed at step 2 was rejected/); assert.equal(result.completionFeedback?.addressed, true);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(events.some(e => e.type === 'auto-finish'));
+});

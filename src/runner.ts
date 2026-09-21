@@ -1,9 +1,11 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
-import { checkDelta, clip, compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
+import { checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
-import { topLevelDeclarations, extractionTargets, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { anchorPath, candidatesFrom, completionQuestions, diffChunks, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from './ledger.js';
+const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
 import { editRoutes } from './types.js';
@@ -17,7 +19,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [],
+    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], ledgerAttempts: 0, ledgerBuilt: false, ledgerComplete: 0, baselineArtifacts: {},
     lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
@@ -54,8 +56,11 @@ export class Runner {
         for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
     s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
-    if (result.ok && result.changed?.length && editRoutes.includes(kind as Route))
+    if (result.ok && result.changed?.length && editRoutes.includes(kind as Route)) {
       rememberEdit(s, s.step, kind, result.changed, artifact, result.text, args);
+      // An edit, the harness's included, means implementation has begun: finish and edits are on the menu.
+      if (s.phase === 'inspect') s.phase = 'implement';
+    }
     if (kind === 'read_files' || kind === 'search_codebase') if (result.ok) s.inspectionCount++;
     if (kind === 'search_codebase' && result.ok && args) {
       // What each search found stays visible after its entry is evicted, so the
@@ -136,9 +141,11 @@ export class Runner {
       let output = result.text; try { output = JSON.parse(result.text).output ?? result.text; } catch { /* plain text */ }
       const deliverables = namedIdentifiers([s.objective, ...referenceContext(s).map(e => e.text)].join('\n'));
       s.missingNames = result.ok ? [] : await resolveMissingNames(this.tools.root, output, s.writes, 40, deliverables, s.moveDirection).catch(() => []);
+      await refreshLedger(this.tools.root, s).catch(() => {});
       s.pendingMoves = await this.pendingMoves(s).catch(() => []);
     }
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.editSnapshots)) s.editSnapshots[path] = artifact;
+    for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.baselineArtifacts)) s.baselineArtifacts[path] = artifact;
     // A failing check ends verification; a failing baseline during inspection
     // is context, not a reason to start editing before the code has been read.
     if (!result.ok && s.phase === 'verify' && (kind === 'bash' || editRoutes.includes(kind as Route))) s.phase = 'implement';
@@ -194,16 +201,69 @@ export class Runner {
   // Once the extraction has a direction, the plan's remaining targets are known
   // without a check error naming them: still declared in the source, absent
   // from the destination, and small enough that a misread cannot move main().
+  // Ledger items of kind move whose source still declares them are the harness's
+  // to perform: never against the session's direction, never a declaration so
+  // large that a misclassified item could move main().
   private async pendingMoves(s: Session): Promise<Session['pendingMoves']> {
-    const dir = s.moveDirection; if (!dir) return [];
-    const targets = extractionTargets([s.objective, ...referenceContext(s).map(e => e.text)].join('\n'))
-      .filter(t => !t.destination || dir.destination === t.destination || dir.destination.endsWith(`/${t.destination}`) || t.destination.endsWith(`/${dir.destination}`));
-    if (!targets.length) return [];
-    let source: string; let destination = '';
-    try { source = await readFile(await safePath(this.tools.root, dir.source), 'utf8'); } catch { return []; }
-    try { destination = await readFile(await safePath(this.tools.root, dir.destination), 'utf8'); } catch { /* not created yet */ }
-    const declared = await topLevelDeclarations(dir.source, source); const done = await topLevelDeclarations(dir.destination, destination);
-    return targets.flatMap(t => { const d = declared.get(t.name); return d && !done.has(t.name) && d.end - d.start < 600 ? [{ name: t.name, source: dir.source, start: d.start, end: d.end, destination: dir.destination }] : []; });
+    const out: Session['pendingMoves'] = [];
+    for (const d of s.ledger) {
+      if (d.kind !== 'move' || d.status !== 'pending' || !d.name || !d.from || !d.to) continue;
+      const source = ledgerFile(s, d.from)!; const destination = await anchorPath(this.tools.root, source, ledgerFile(s, d.to)!);
+      if (s.moveDirection && !(same(source, s.moveDirection.source) && same(destination, s.moveDirection.destination))) continue;
+      let text: string; try { text = await readFile(await safePath(this.tools.root, source), 'utf8'); } catch { continue; }
+      const decl = (await topLevelDeclarations(source, text)).get(d.name);
+      if (decl && decl.end - decl.start < 600) out.push({ name: d.name, source, start: decl.start, end: decl.end, destination });
+    }
+    return out;
+  }
+  // The onset: read the documents the objective names, have the worker list the
+  // deliverables under a schema, and let Jev classify each against the request.
+  // Returns true when a step was consumed (a forced read or the build itself).
+  private async buildLedger(s: Session): Promise<boolean> {
+    const docs = [...new Set((s.objective.match(/\S+\.(?:md|txt|rst)\b/gi) ?? []).map(d => d.replace(/[`'",.;:)]+$/, '')))].filter(d => s.knownFiles.includes(d));
+    for (const doc of docs) {
+      const read = s.coverage[doc]; const total = read?.total ?? 0;
+      const covered = read ? read.ranges.reduce((n, [a, b]) => n + (b - a + 1), 0) : 0;
+      if (read && (covered >= total || covered >= 750)) continue;
+      const start = read ? Math.max(...read.ranges.map(([, b]) => b)) + 1 : 1;
+      await this.forced(s, 'read_files', { files: [{ path: doc, start, end: start + 249 }] }, 'auto-read');
+      return true;
+    }
+    if (s.ledgerAttempts >= 2) { s.ledgerBuilt = true; return false; }
+    s.ledgerAttempts++;
+    const note = s.ledger.length ? `These deliverables are already listed: ${s.ledger.map(d => `${d.kind} ${d.name ?? ''} ${d.to ?? ''}`).join('; ')}. Jev judged the list incomplete: add only the missing ones.` : undefined;
+    let raw: Record<string, any>;
+    try { raw = await this.bonsai.generate(ledgerPrompt(s, note), ledgerSchema, .1, { step: s.step, route: 'ledger' }); }
+    catch (e) { await this.store.log('ledger', { step: s.step, error: (e as Error).message }); s.ledgerBuilt = s.ledgerAttempts >= 2; return false; }
+    const fresh = candidatesFrom(raw).filter(c => !s.ledger.some(d => d.kind === c.kind && d.name === c.name && d.to === c.to && d.from === c.from));
+    const candidates = fresh.map((c, i) => ({ ...c, id: `d${s.ledger.length + i + 1}` }));
+    if (!candidates.length) { s.ledgerBuilt = true; await this.store.log('ledger', { step: s.step, candidates: [], kept: s.ledger }); return false; }
+    const answers = await this.jev.decide(decisionState(s, { candidateDeliverables: candidates.map(c => ({ id: c.id, kind: c.kind, name: c.name, from: c.from, to: c.to, detail: c.detail })) }), ledgerQuestions(candidates), { step: s.step, phase: 'ledger' });
+    const kept = candidates.filter(c => { const a = answers[`required_${c.id}`]; const p = a?.type === 'noul' ? a.noul : 0; c.required = p; return p >= this.config.completeProbability; });
+    s.ledger = [...s.ledger, ...kept];
+    const complete = answers.complete?.type === 'noul' ? answers.complete.noul : 0;
+    s.ledgerComplete = Math.max(s.ledgerComplete, complete);
+    s.ledgerBuilt = complete >= this.config.completeProbability || s.ledgerAttempts >= 2;
+    await refreshLedger(this.tools.root, s).catch(() => {});
+    s.pendingMoves = await this.pendingMoves(s).catch(() => []);
+    await this.store.log('ledger', { step: s.step, candidates, kept: s.ledger, complete });
+    this.observe({ kind: 'warning', step: s.step, text: `ledger: ${s.ledger.length} deliverable(s) (${s.ledger.map(d => `${d.kind} ${d.name ?? ''}`).join(', ')}); completeness ${complete.toFixed(2)}` });
+    await this.evidence(s, 'ledger', { ok: true, text: `Deliverables (classified by Jev): ${s.ledger.map(d => `${d.id} ${d.kind} ${d.name ?? ''}${d.from ? ` from ${d.from}` : ''}${d.to ? ` to ${d.to}` : ''}: ${d.status}`).join('; ') || 'none identified'}` });
+    return true;
+  }
+  // A worker move that sweeps ledger declarations along with ones the ledger
+  // never asked for is the wrong range: hand back the exact ranges instead.
+  private async moveOutsideLedger(s: Session, args: Record<string, any>): Promise<string | null> {
+    const source = ledgerFile(s, args.source) ?? args.source;
+    const wanted = s.ledger.filter(d => d.kind === 'move' && d.name && d.from && same(ledgerFile(s, d.from)!, source)).map(d => d.name!);
+    if (!wanted.length) return null;
+    let text: string; try { text = await readFile(await safePath(this.tools.root, source), 'utf8'); } catch { return null; }
+    const decls = await topLevelDeclarations(source, text);
+    const inRange = [...decls].filter(([, d]) => d.start >= args.start && d.end <= args.end).map(([n]) => n);
+    const inside = inRange.filter(n => wanted.includes(n)); const outside = inRange.filter(n => !wanted.includes(n));
+    if (!inside.length || !outside.length) return null;
+    const ranges = wanted.flatMap(n => { const d = decls.get(n); return d ? [`${n} lines ${d.start}-${d.end}`] : []; });
+    return `The range ${args.start}..${args.end} of ${source} also declares ${outside.slice(0, 6).join(', ')}${outside.length > 6 ? ` and ${outside.length - 6} more` : ''}, which the deliverables do not ask to move. Move only the deliverables' declarations: ${ranges.join('; ')}.`;
   }
   private async forcedMove(s: Session, mv: { name: string; source: string; start: number; end: number; destination: string }): Promise<boolean> {
     const key = hash(JSON.stringify({ m: mv }));
@@ -250,7 +310,7 @@ export class Runner {
         const start = await importInsertLine(file, text);
         edits.push({ start, end: start - 1, newText: wanted.join('\n'), prepend: '' });
       }
-      if (fixes.removeImports[file]?.length) edits.push(...await removeImportBindings(file, text, fixes.removeImports[file]!));
+      if (fixes.removeImports[file]?.length) edits.push(...await removeImportBindings(file, text, fixes.removeImports[file]!, fixes.removeImportLines[file] ?? {}));
       if (!edits.length) continue;
       // An identical fix already rolled back is not tried again.
       const identity = hash(JSON.stringify({ route: 'replace_lines', args: { path: file, edits, expectedHash: undefined, destinationHash: undefined } }));
@@ -364,12 +424,13 @@ export class Runner {
             if (!s.focus) throw new Error('Jev is uncertain which task to work on; clarify task dependencies');
           }
         }
+        if (this.config.ledger && !s.ledgerBuilt && await this.buildLedger(s)) { await this.store.save(s); continue; }
         const questions = routeQuestions(s, this.config);
         // A passing check after edits, with nothing pending, is the moment to propose
         // completion: the audit judges the proposal, so the harness makes it once per
         // check rather than leaving the worker to read until it feels ready.
         const readyToFinish = Boolean(s.lastCheck?.ok && s.editEvidence.length && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && !s.autoUndo
-          && staleFor(s).length === 0 && !s.missingNames.length && !s.pendingMoves.length && s.finishTriedAtCheck !== s.lastCheck.step && 'finish' in (questions.route as { criteria: Record<string, string> }).criteria);
+          && staleFor(s).length === 0 && !s.missingNames.length && !s.pendingMoves.length && !s.ledger.some(d => d.status === 'pending' && d.kind === 'move') && s.finishTriedAtCheck !== s.lastCheck.step && 'finish' in (questions.route as { criteria: Record<string, string> }).criteria);
         if (readyToFinish) s.finishTriedAtCheck = s.lastCheck!.step;
         const jevStarted = performance.now();
         const state = decisionState(s);
@@ -489,6 +550,11 @@ export class Runner {
             throw new Error(`Bonsai repeated the ${route} action from step ${earlier} (${known}); not executed. Choose different arguments or another action`);
           }
           }
+          if (route === 'move_lines' && s.ledger.length) { const why = await this.moveOutsideLedger(s, args); if (why) throw new Error(why); }
+          if (route === 'move_lines' && typeof args.destination === 'string' && args.destinationHash === 'new') {
+            const anchored = await anchorPath(this.tools.root, ledgerFile(s, args.source) ?? args.source, args.destination);
+            if (anchored !== args.destination) { await this.store.log('anchored-path', { step: s.step, from: args.destination, to: anchored }); args = { ...args, destination: anchored }; }
+          }
           generationFailures = 0;
         } catch (e) {
           // Two failures in a row on one route: keep the session going by taking
@@ -514,45 +580,38 @@ export class Runner {
             await this.store.save(s);
             continue;
           }
-          // The summary is a worker claim. Only tool evidence and the harness's
-          // own changed-file record may support it; the task ledger is excluded
-          // because Bonsai writes both and can mark work done that never happened.
           if (typeof args.summary !== 'string' || !args.summary.trim()) throw new Error('finish requires a summary of the final code structure and verification');
-          const claims = completionClaims(args.summary);
-          const check = await this.jev.decide(decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', currentSource, proposedSummary: args.summary }),
-            completionQuestions(claims), { step: s.step, phase: 'completion-check' });
-          const claimScores = claims.map((claim, i) => {
-            const answer = check[`supported_${i + 1}`];
-            return { claim, probability: answer?.type === 'noul' ? answer.noul : 0 };
-          });
-          const supported = Math.min(...claimScores.map(c => c.probability));
-          const coverage = check.complete?.type === 'noul' ? check.complete.noul : 0;
-          // An explicit user stopping condition takes precedence over a broader
-          // scope estimate, but never over claim support or a missing/stale check.
-          // Require actual edit evidence so an untouched passing baseline cannot
-          // short-circuit an implementation objective.
-          const stopCondition = s.editEvidence.length > 0 && s.lastCheck?.ok && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && staleFor(s).length === 0 && check.stop_condition?.type === 'noul'
-            ? check.stop_condition.noul : 0;
-          const complete = Math.max(coverage, stopCondition);
-          // A claim Jev cannot confirm from source facts is not the same as one it
-          // judges false. "No behavior changes were introduced" is unverifiable by
-          // construction; it is dropped from the record and named as unverified,
-          // while a contradicted claim or missing deliverable coverage rejects.
-          const floor = this.config.completeProbability / 2;
-          const contradicted = claimScores.filter(c => c.probability < floor);
-          const unverified = claimScores.filter(c => c.probability >= floor && c.probability < this.config.completeProbability);
-          if (!contradicted.length && complete >= this.config.completeProbability && unverified.length) {
-            const kept = claimScores.filter(c => c.probability >= this.config.completeProbability).map(c => c.claim).join(' ');
-            await this.store.log('completion-unverified', { step: s.step, unverified });
-            args = { ...args, summary: `${kept}${kept ? ' ' : ''}Unverified: ${unverified.map(c => c.claim).join(' ')}` };
+          // Completion is judged on the repository's structural diff against the
+          // ledger, never on the summary: Jev classifies, per deliverable, whether
+          // the change implements it, and whether the diff strays out of scope.
+          await refreshLedger(this.tools.root, s).catch(() => {});
+          const diff = await structuralDiff(this.tools.root, s, this.store.artifacts);
+          await this.store.log('completion-diff', { step: s.step, files: diff.files.map(f => ({ ...f, hunks: f.hunks ? clip(f.hunks, 2000) : undefined })), moved: diff.moved });
+          // The diff supersedes edit evidence and recent excerpts: the audit's base
+          // state omits them, and the diff chunks are sized from the bytes left.
+          const base = (extra: Record<string, unknown>) => decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', editEvidence: [], evidence: [], currentSource, lastCheck: s.lastCheck && { step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors }, ...extra });
+          const baseBytes = Buffer.byteLength(JSON.stringify(base({})));
+          const chunks = diffChunks(diff, s.ledger, Math.max(2500, 21000 - baseBytes));
+          const implemented: Record<string, number> = {}; let outOfScope = 0; let objectiveMet = 0;
+          for (const [i, chunk] of chunks.entries()) {
+            const state = base({ diff: { files: chunk.files, moved: chunk.moved }, ...(chunks.length > 1 ? { chunk: `${i + 1} of ${chunks.length} (by file)` } : {}) });
+            const answers = await this.jev.decide(state, completionQuestions(chunk.items, i === 0), { step: s.step, phase: 'completion-check' });
+            for (const it of chunk.items) { const a = answers[`implemented_${it.id}`]; const p = a?.type === 'noul' ? a.noul : 0; implemented[it.id] = Math.max(implemented[it.id] ?? 0, p); }
+            if (answers.out_of_scope?.type === 'noul') outOfScope = Math.max(outOfScope, answers.out_of_scope.noul);
+            if (answers.objective_met?.type === 'noul') objectiveMet = answers.objective_met.noul;
           }
-          if (contradicted.length || complete < this.config.completeProbability) {
-            const unsupported = claimScores.filter(c => c.probability < this.config.completeProbability);
-            await this.store.log('action', { step: s.step, route, args, rejected: true, supported, complete, coverage, stopCondition, unsupported });
-            // The facts that failed the claims are the ones the worker needs next:
-            // what each changed file declares and imports right now, with lines.
-            const digest = (currentSource ?? []).filter(f => f.facts.length).map(f => `${f.path}: ${f.facts.slice(0, 8).map((x: any) => x.kind === 'import' ? `imports ${x.name} from ${x.from}` : `${x.name} (${x.kind}${x.exported ? ', exported' : ''}, lines ${x.line}-${x.endLine ?? x.line})`).join('; ')}`).join(' | ');
-            const feedback = `Completion rejected (lowest claim support=${supported}, deliverable coverage=${complete}). ${complete < this.config.completeProbability ? 'The objective is still unfinished or unverified. Compare the requested deliverables with current source, locate the missing declarations or references, and continue implementation. A passing check alone does not establish completion. ' : ''}${unsupported.length ? `Unsupported claims: ${JSON.stringify(unsupported)}. Correct the summary or obtain the missing evidence; do not redo successful edits merely to repair a historical procedural deviation.` : 'Obtain evidence for the missing deliverables before trying finish again.'}${digest ? ` Current source: ${clip(digest, 700)}` : ''}`;
+          const threshold = this.config.completeProbability;
+          const unmet = s.ledger.filter(d => !d.unresolvable && d.status !== 'done' && (implemented[d.id] ?? 0) < threshold);
+          // Out-of-scope rejects only with confidence: mechanical consequences of a
+          // move (imports copied, exports added) read as noise to a classifier.
+          // With a ledger Jev classified as complete, every resolvable item done or
+          // implemented is the objective; the whole-diff question is then advisory.
+          const resolvable = s.ledger.filter(d => !d.unresolvable);
+          const objectiveGate = objectiveMet >= threshold || (s.ledgerComplete >= threshold && resolvable.length > 0 && !unmet.length);
+          const accepted = !unmet.length && objectiveGate && outOfScope < threshold;
+          await this.store.log('action', { step: s.step, route, args, rejected: !accepted, implemented, objectiveMet, outOfScope, unmet: unmet.map(d => d.id) });
+          if (!accepted) {
+            const feedback = `Completion rejected (objective met=${objectiveMet.toFixed(2)}, out-of-scope changes=${outOfScope.toFixed(2)}). ${unmet.length ? `Deliverables not implemented: ${unmet.map(d => `${d.id} ${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} [${d.status}${d.note ? `: ${d.note}` : ''}]`).join('; ')}. ` : ''}${outOfScope >= threshold ? 'The diff contains changes the objective did not ask for; revert them. ' : ''}${!unmet.length && objectiveMet < threshold ? 'The diff does not accomplish the objective as requested; compare the deliverables with current source and continue. ' : ''}Continue the implementation; the harness re-proposes completion after the next passing check.`;
             await this.evidence(s, 'finish_rejected', { ok: false, text: feedback });
             s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true };
             if (s.lastCheck) s.finishTriedAtCheck = s.lastCheck.step;
@@ -561,6 +620,7 @@ export class Runner {
             await this.store.save(s);
             continue;
           }
+          if (s.ledger.length) args = { ...args, summary: `${args.summary} Deliverables: ${s.ledger.map(d => `${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} (${d.status === 'done' ? 'done' : `implemented ${(implemented[d.id] ?? 0).toFixed(2)}`})`).join('; ')}.` };
         }
         await this.store.log('action', { step: s.step, route, args });
         // Save an intent marker before effects; recovery never blindly replays an action.

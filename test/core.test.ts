@@ -4,17 +4,20 @@ import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
-import { defaults, loadConfig } from '../src/config.js';
+import { defaults as baseDefaults, loadConfig } from '../src/config.js';
+// The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
+const defaults = { ...baseDefaults, ledger: false };
 import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
-import { compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
+import { compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { referenceContext, rememberReferences, scopes } from '../src/references.js';
+import { anchorPath, candidatesFrom, completionQuestions, diffChunks, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from '../src/ledger.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { extractionTargets, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -26,7 +29,7 @@ async function fixture(t: any) {
 }
 function answersFor(q: Questions, route = 'read_files', complete = .99): Answers {
   return Object.fromEntries(Object.entries(q).map(([id, question]) => [id, question.type === 'noul'
-    ? { type: 'noul', noul: id === 'complete' || id.startsWith('supported_') ? complete : .1 }
+    ? { type: 'noul', noul: id === 'complete' || id === 'objective_met' || id.startsWith('supported_') || id.startsWith('implemented_') || id.startsWith('required_') ? complete : .1 }
     : { type: 'choice', choice: route, confidence: 1,
       probabilities: Object.fromEntries(Object.keys(question.criteria).map(k => [k, k === route ? 1 : 0])) }])) as Answers;
 }
@@ -260,7 +263,7 @@ test('Hard prompt limit evicts evidence and never compacts the pinned objective'
   const bonsai = { count: async (m: any) => ({ tokens: JSON.stringify(m).length, mode: 'test' }),
     generate: async (m: any) => { assert(JSON.stringify(m).includes(session.objective)); return { summary: 'done' }; } };
   const result = await new Runner(c, store, { decide: async (_s, q) => answersFor(q, 'finish') }, bonsai, root, () => {}).run(session);
-  assert.equal(result.status, 'complete'); assert.equal(result.entries.length, 0);
+  assert.equal(result.status, 'complete', result.stopReason); assert.equal(result.entries.length, 0);
 });
 test('Uncertain routing and API failure pause before generation or tools', async t => {
   const { root, store, session } = await fixture(t);
@@ -379,8 +382,8 @@ test('A finish vote goes to a concrete completion audit instead of being redirec
   const calls: { phase: string; state: any }[] = [];
   const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
     calls.push({ phase: ctx!.phase, state });
-    if (ctx!.phase === 'routing-and-context') assert(!q.complete, 'completion is evaluated with the concrete summary');
-    else { assert(q.complete); assert(q.supported_1); }
+    if (ctx!.phase === 'routing-and-context') assert(!q.objective_met, 'completion is evaluated on the diff, not during routing');
+    else { assert(q.objective_met); assert(q.out_of_scope); }
     return answersFor(q, 'finish');
   } };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => {
@@ -388,7 +391,7 @@ test('A finish vote goes to a concrete completion audit instead of being redirec
   } };
   const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
   assert.deepEqual(calls.map(c => c.phase), ['routing-and-context', 'completion-check']);
-  assert.equal(calls[1]!.state.proposedSummary, 'Verified the requested work.');
+  assert(calls[1]!.state.diff, 'the audit sees the structural diff');
   assert.equal(result.status, 'complete'); assert.equal(result.entries.length, 0);
 });
 
@@ -416,11 +419,11 @@ test('Repeated completion rejections return to inspection and allow later suppor
     : { summary: 'Imported deps from cli.ts and verified.' } };
   const result = await new Runner({ ...defaults, maxSteps: 5 }, store, jev, bonsai, root, () => {}).run(session);
   assert.equal(checks.length, 3);
-  assert.equal(checks[0].state.proposedSummary, 'Imported deps from cli.ts and verified.'); assert.match(checks[0].state.tasks, /worker claims/);
-  assert.deepEqual(checks[0].state.changedFiles, ['deps.ts']); assert.equal(typeof checks[0].q.supported_1.instructions, 'string');
+  assert.match(checks[0].state.tasks, /worker claims/);
+  assert.deepEqual(checks[0].state.changedFiles, ['deps.ts']); assert.equal(typeof checks[0].q.objective_met.instructions, 'string');
   assert.equal(result.status, 'complete');
   assert.equal(result.entries.filter(e => e.kind === 'finish_rejected').length, 2);
-  assert.match(result.completionFeedback!.text, /Completion rejected.*lowest claim support=0\.2/);
+  assert.match(result.completionFeedback!.text, /Completion rejected \(objective met=0\.20/);
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.some(e => e.type === 'action' && e.data.rejected === true && e.data.route === 'finish'));
 });
@@ -1053,8 +1056,9 @@ test('missingNames are pinned after a failing check and cleared by a passing one
   const runner = new Runner({ ...defaults, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
   s.step = 2; await runner.evidence(s, 'bash', { ok: false, verification: true, text: JSON.stringify({ output: "b.ts(1,1): error TS2304: Cannot find name 'z'." }) });
   assert.deepEqual(s.missingNames, [{ name: 'z', inFile: 'b.ts', importedBy: 'a.ts', importLine: 'import { z } from "./z.js";' }]);
-  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, moveDeclarations: [], unresolved: [], total: 1 };
-  assert.deepEqual((decisionState(s) as any).missingNames, grouped); assert.deepEqual(promptFields(messages(s, 'replace_lines')).missingNames, grouped);
+  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, moveDeclarations: [], unresolved: [], total: 1 };
+  const pinned = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, total: 1 };
+  assert.deepEqual((decisionState(s) as any).missingNames, grouped); assert.deepEqual(promptFields(messages(s, 'replace_lines')).missingNames, pinned);
   s.step = 3; await runner.evidence(s, 'bash', { ok: true, verification: true, check: true, text: 'passed' });
   assert.deepEqual(s.missingNames, []);
 });
@@ -1199,7 +1203,7 @@ test('The decision state shrinks optional lists and the evidence tail before pau
   s.searches = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`text:q${i} in .`, 'z'.repeat(300)]));
   const state = decisionState(s) as any;
   assert(Buffer.byteLength(JSON.stringify(state)) <= 22000);
-  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'moveDeclarations', 'unresolved', 'total']);
+  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'removeImportLines', 'moveDeclarations', 'unresolved', 'total']);
   assert.equal(state.evidenceCount, 20); assert(state.evidence.length <= 8); assert(state.objective.includes('Fix'));
 });
 test('Panel lines are flattened to one ASCII row each', () => {
@@ -1566,25 +1570,6 @@ test('Legacy checkpoints without an event log still resume without inventing edi
   assert.deepEqual((await store.load()).editEvidence, []);
 });
 
-test('A truthful partial summary cannot complete an unfinished objective', async t => {
-  const { root, store, session: s } = await fixture(t);
-  s.phase = 'implement'; s.lastCheckStep = 1; s.step = 1;
-  const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => ctx?.phase === 'completion-check'
-    ? { supported_1: { type: 'noul', noul: .99 }, complete: { type: 'noul', noul: .47 } } as Answers
-    : answersFor(q, 'finish') };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Only the first part was done.' }) };
-  const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(s);
-  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /step limit/);
-  assert.equal(result.completionFeedback?.awaitingEvidence, true);
-  assert.match(result.entries[0]!.text, /deliverable coverage=0.47/);
-  await store.save(result);
-  const resumed = await store.load();
-  resumed.entries = []; // recovery feedback must survive eviction and restart
-  const routes = routeQuestions(resumed, defaults).route!;
-  assert(routes.type === 'choice'); assert(!('finish' in routes.criteria));
-  assert('search_codebase' in routes.criteria);
-  assert.match(promptFields(messages(resumed, 'search_codebase')).completionFeedback.text, /still unfinished/);
-});
 
 test('Referenced plan requirements survive eviction and restart, and guide source facts for a short objective', async t => {
   const { root, store, session: s } = await fixture(t);
@@ -1651,48 +1636,7 @@ test('A later failing check or pending verification withholds finish despite an 
   s.pendingCheck = true; assert(!hasFinish());
 });
 
-test('Completion audits all claims, bounds questions without dropping the tail, and rejects any unsupported claim', async t => {
-  const long = Array.from({ length: 20 }, (_, i) => `Claim ${i}.`).join(' ');
-  const claims = completionClaims(long);
-  assert.equal(claims.length, 8); assert.equal(claims.join(' '), long);
-  assert.equal(Object.keys(completionQuestions(claims)).length, 10);
-  const { root, store, session: s } = await fixture(t);
-  s.phase = 'implement'; s.lastCheckStep = 1; s.step = 1;
-  const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => {
-    const answers = answersFor(q, 'finish');
-    if (ctx?.phase === 'completion-check') answers.supported_2 = { type: 'noul', noul: .2 };
-    return answers;
-  } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Lint passed. All tests passed.' }) };
-  const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(s);
-  assert.equal(result.status, 'paused');
-  assert.match(result.entries[0]!.text, /Unsupported claims:.*All tests passed/);
-  assert(!result.entries[0]!.text.includes('"claim":"Lint passed."'), 'feedback names only the unsupported claim');
-});
 
-test('An explicit passing-check stopping condition still requires edits and supported claims', async t => {
-  for (const scenario of ['verified edits', 'untouched baseline', 'unsupported summary']) await t.test(scenario, async t => {
-    const { root, store, session: s } = await fixture(t);
-    s.objective = 'Extract the dependencies. Finish when lint passes.';
-    s.phase = 'implement'; s.step = 3; s.lastCheckStep = 3;
-    s.lastCheck = { step: 3, ok: true, text: 'lint passed', summary: summarizeCheck('passed') };
-    if (scenario !== 'untouched baseline') {
-      s.writes = ['deps.ts']; s.lastWriteStep = 2;
-      s.editEvidence = [{ step: 2, route: 'move_lines', paths: ['cli.ts', 'deps.ts'], artifact: '', text: 'Moved dependencies' }];
-    }
-    const jev = { decide: async (_state: unknown, q: Questions, ctx?: { phase: string }) => {
-      const answers = answersFor(q, 'finish', scenario === 'unsupported summary' ? .2 : .99);
-      if (ctx?.phase === 'completion-check') {
-        answers.complete = { type: 'noul', noul: .47 };
-        answers.stop_condition = { type: 'noul', noul: .99 };
-      }
-      return answers;
-    } };
-    const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'Extracted dependencies and lint passed.' }) };
-    const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(s);
-    assert.equal(result.status, scenario === 'verified edits' ? 'complete' : 'paused');
-  });
-});
 
 test('Completion reads real current declarations and imports, not lookalikes inside comments or strings', async t => {
   const { root } = await fixture(t);
@@ -2079,32 +2023,226 @@ test('A stale destination hash does not refuse a move whose source is current, a
   assert(route.type === 'choice'); assert(!('read_files' in route.criteria), 'a.ts is fresh; d.ts was changed by the harness and need not be re-read');
 });
 
-test('A plan\'s extraction targets are the names before the arrow in an extract sentence, never names it merely mentions', () => {
-  const plan = ['94: **Step 1 — Lift pure leaves out of `main()`** (no behavior changes)', '95: 1. Extract `CliDependencies` type + `DEFAULT_DEPENDENCIES` factory →', '96:    `src/cli/deps.ts`. Update `main()`\'s default arg to `deps.DEFAULT_DEPENDENCIES`.', '97: 2. Extract `Writable`, `SignalName`, terminal constants (`PROGRESS_REFRESH_MILLISECONDS`,', '98:    `HIDE_CURSOR`, `SHOW_CURSOR`, `DUPLICATE_SIGNAL_WINDOW_MS`), `invokedAsMain()`,', '99:    `isJsonObject()` → `src/cli/deps.ts`.'].join('\n');
-  const targets = extractionTargets(plan);
-  assert.deepEqual(targets.map(t => t.name), ['CliDependencies', 'DEFAULT_DEPENDENCIES', 'Writable', 'SignalName', 'PROGRESS_REFRESH_MILLISECONDS', 'HIDE_CURSOR', 'SHOW_CURSOR', 'DUPLICATE_SIGNAL_WINDOW_MS', 'invokedAsMain', 'isJsonObject']);
-  assert(targets.every(t => t.destination === 'src/cli/deps.ts')); assert(!targets.some(t => t.name === 'main' || t.name === 'deps'));
-});
-test('After the first move fixes the direction, the harness moves the plan\'s remaining targets itself and withholds finish until none remain', async t => {
+
+test('The onset ledger: the referenced document is read by the harness, the worker lists typed deliverables, Jev keeps the required ones, and the harness performs the moves', async t => {
   const { root, store, session } = await fixture(t);
   await mkdir(join(root, 'src', 'cli'), { recursive: true }); await mkdir(join(root, 'docs'), { recursive: true });
+  await writeFile(join(root, 'docs', 'plan.md'), '# Plan\n\nPart A: Move the terminal constants HIDE_CURSOR and SHOW_CURSOR from src/cli.ts into src/cli/deps.ts. Relocate isJsonObject as well; leave main() where it is.\n\nPart B: later work, out of scope.\n');
   await writeFile(join(root, 'src', 'cli.ts'), 'const HIDE_CURSOR = "h";\nconst SHOW_CURSOR = "s";\nfunction isJsonObject(v: unknown): boolean { return typeof v === "object"; }\nexport function main() { return [HIDE_CURSOR, SHOW_CURSOR, isJsonObject(1)]; }\n');
   await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export const DEFAULT_DEPENDENCIES = {};\n');
-  await writeFile(join(root, 'check.mjs'), "import { readFileSync } from 'node:fs'; const c = readFileSync('src/cli.ts', 'utf8'); const d = readFileSync('src/cli/deps.ts', 'utf8'); for (const n of ['HIDE_CURSOR', 'SHOW_CURSOR', 'isJsonObject']) if (c.includes(n) && !c.includes(`{ ${n} }`) && !c.includes(`${n},`) && !c.includes(`, ${n}`) && !d.includes(`export`)) {} process.exit(0);\n");
-  session.objective = 'Read docs/plan.md. Perform only Step 1 substep 2';
-  session.referenceEvidence = [{ path: 'docs/plan.md', hash: 'p', scope: 'step 1 substep 2', text: '94: **Step 1 — Lift pure leaves**\n97: 2. Extract terminal constants (`HIDE_CURSOR`, `SHOW_CURSOR`), `isJsonObject()` → `src/cli/deps.ts`.' }];
-  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src/cli.ts', 'src/cli/deps.ts']; session.moveDirection = { source: 'src/cli.ts', destination: 'src/cli/deps.ts' };
-  session.editEvidence = [{ step: 1, route: 'move_lines', path: 'src/cli/deps.ts', summary: 'moved' } as any]; session.lastWriteStep = 1; session.step = 2;
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  session.objective = 'Read docs/plan.md. Do only Part A of the plan.'; session.knownFiles.push('docs/plan.md');
   const phases: string[] = [];
-  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); const a = answersFor(q, 'read_files', .95) as any; if (q.stop_condition) a.stop_condition = { type: 'noul', noul: .05 }; return a; } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'deps.ts now declares HIDE_CURSOR, SHOW_CURSOR and isJsonObject; the check passed.' } : { files: [{ path: 'src/cli.ts', start: 1, end: 2 }] } };
-  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 12 }, store, jev, bonsai, root, () => {}).run(session);
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    phases.push(ctx!.phase);
+    if (ctx!.phase === 'ledger') {
+      assert.equal(state.candidateDeliverables.length, 4);
+      const a: Answers = { complete: { type: 'noul', noul: .9 } };
+      for (const c of state.candidateDeliverables) a[`required_${c.id}`] = { type: 'noul', noul: c.name === 'main' ? .1 : .92 };
+      return a;
+    }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
+    if (schema === ledgerSchema) {
+      assert.match(JSON.stringify(m), /Part A: Move the terminal constants/, 'the plan excerpt reaches the worker');
+      return { deliverables: [
+        { kind: 'move', name: 'HIDE_CURSOR', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'Move the terminal constant HIDE_CURSOR' },
+        { kind: 'move', name: 'SHOW_CURSOR', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'Move the terminal constant SHOW_CURSOR' },
+        { kind: 'move', name: 'isJsonObject', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'Relocate isJsonObject' },
+        { kind: 'modify', name: 'main', from: 'src/cli.ts', to: '', detail: 'leave main() where it is' } ] };
+    }
+    if (schema === schemas.finish) return { summary: 'Part A is done and the check passed.' };
+    return { files: [{ path: 'src/cli.ts', start: 1, end: 4 }] };
+  } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 16 }, store, jev, bonsai, root, () => {}).run(session);
   const kinds = result.entries.map(e => e.kind);
-  assert.equal(kinds.filter(k => k === 'move_lines').length, 3, `three harness moves, got ${kinds.join(',')}`);
+  assert.equal(result.status, 'complete', `${result.stopReason} | steps: ${kinds.join(',')} | ledger: ${JSON.stringify(result.ledger.map(d => [d.name, d.status]))} | pending: ${JSON.stringify(result.pendingMoves)}`);
+  assert.equal(kinds[0], 'bash'); assert.equal(kinds[1], 'read_files', 'the harness read the referenced document itself'); assert.equal(kinds[2], 'ledger');
+  assert.deepEqual(result.ledger.map(d => [d.kind, d.name, d.status]), [['move', 'HIDE_CURSOR', 'done'], ['move', 'SHOW_CURSOR', 'done'], ['move', 'isJsonObject', 'done']], 'the main() item was classified as not required');
+  assert.equal(kinds.filter(k => k === 'move_lines').length, 3);
   const deps = await readFile(join(root, 'src', 'cli', 'deps.ts'), 'utf8'); const cli = await readFile(join(root, 'src', 'cli.ts'), 'utf8');
-  assert.match(deps, /export const HIDE_CURSOR/); assert.match(deps, /export const SHOW_CURSOR/); assert.match(deps, /export function isJsonObject/);
-  assert(!/const HIDE_CURSOR =/.test(cli)); assert.match(cli, /import \{ [^}]*isJsonObject[^}]* \} from ".\/cli\/deps.js";/);
-  assert.equal(result.status, 'complete', result.stopReason); assert.deepEqual(result.pendingMoves, []);
-  const finishIdx = kinds.indexOf('finish'); const lastMove = kinds.lastIndexOf('move_lines');
-  assert(finishIdx === -1 || finishIdx > lastMove, 'no finish proposed while targets remained');
+  assert.match(deps, /export function isJsonObject/); assert(!/const HIDE_CURSOR =/.test(cli)); assert.match(cli, /from ".\/cli\/deps.js";/);
+  assert.equal(result.status, 'complete', result.stopReason); assert.match(result.stopReason, /Deliverables: move HIDE_CURSOR to src\/cli\/deps.ts \(done\)/);
+  assert(phases.includes('ledger') && phases.includes('completion-check'));
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(events.find(e => e.type === 'ledger')?.data.kept.length, 3); assert(events.some(e => e.type === 'completion-diff'));
+});
+test('Ledger statuses come from source facts for every kind', async t => {
+  const { root, session: s } = await fixture(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'a.ts'), 'import { z } from "./z.js";\nconst keep = 1;\nexport const shown = 2;\nfunction gone() {}\n');
+  await writeFile(join(root, 'src', 'b.ts'), 'export const moved = 3;\n');
+  s.ledger = candidatesFrom({ deliverables: [
+    { kind: 'move', name: 'moved', from: 'src/a.ts', to: 'src/b.ts', detail: 'moved already' },
+    { kind: 'move', name: 'keep', from: 'src/a.ts', to: 'src/b.ts', detail: 'still to move' },
+    { kind: 'move', name: 'ghost', from: 'src/a.ts', to: 'src/b.ts', detail: 'nowhere' },
+    { kind: 'create', name: 'src/c.ts', from: '', to: 'src/c.ts', detail: 'new file' },
+    { kind: 'export', name: 'keep', from: 'src/a.ts', to: '', detail: 'export keep' },
+    { kind: 'export', name: 'shown', from: 'src/a.ts', to: '', detail: 'export shown' },
+    { kind: 'import', name: 'z', from: './z.js', to: 'src/a.ts', detail: 'import z' },
+    { kind: 'delete', name: 'gone', from: 'src/a.ts', to: '', detail: 'delete gone' },
+    { kind: 'verify', name: 'node check.mjs', from: '', to: '', detail: 'check passes' },
+    { kind: 'modify', name: 'main', from: 'src/a.ts', to: '', detail: 'change behaviour' } ] });
+  s.lastCheck = { step: 4, ok: true, text: 'ok', summary: summarizeCheck('') }; s.lastWriteStep = 3;
+  await refreshLedger(root, s);
+  assert.deepEqual(s.ledger.map(d => `${d.name}:${d.status}`), ['moved:done', 'keep:pending', 'ghost:unknown', 'src/c.ts:pending', 'keep:pending', 'shown:done', 'z:done', 'gone:pending', 'node check.mjs:done', 'main:unknown']);
+  assert.match(s.ledger[1]!.note ?? '', /still declared in src\/a\.ts lines 2-2/);
+});
+test('The structural diff reports declarations moved between files and chunks by file for the audit', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  const before = 'import { x } from "./x.js";\nconst A = 1;\nexport function f() { return A; }\n';
+  const artifact = await store.snapshot(1, 'src/a.ts', before);
+  await writeFile(join(root, 'src', 'a.ts'), 'import { x } from "./x.js";\nimport { A } from "./b.js";\nexport function f() { return A; }\n');
+  await writeFile(join(root, 'src', 'b.ts'), 'export const A = 1;\n');
+  s.writes = ['src/a.ts', 'src/b.ts']; s.baselineArtifacts = { 'src/a.ts': artifact, 'src/b.ts': '@new' };
+  const diff = await structuralDiff(root, s, store.artifacts);
+  assert.deepEqual(diff.moved, [{ name: 'A', from: 'src/a.ts', to: 'src/b.ts' }]);
+  assert.deepEqual(diff.files[0]!.declarationsRemoved, ['A']); assert.deepEqual(diff.files[0]!.importsAdded, ['A from ./b.js']); assert.match(diff.files[0]!.hunks ?? '', /^--- src\/a\.ts \(before\)/m);
+  assert.equal(diff.files[1]!.created, true); assert.match(diff.files[1]!.declarationsAdded[0]!, /^A \(VariableStatement, exported, lines 1-1\)/);
+  const items = candidatesFrom({ deliverables: [{ kind: 'move', name: 'A', from: 'src/a.ts', to: 'src/b.ts', detail: 'move A' }, { kind: 'verify', name: 'check', from: '', to: '', detail: 'passes' }] });
+  const chunks = diffChunks(diff, items, 400);
+  assert(chunks.length >= 2, 'a small budget splits the files'); assert.deepEqual(chunks[0]!.items.map(i => i.name), ['A', 'check'], 'the move rides with its files, the file-less item with the first chunk');
+  assert(chunks.every(c => Buffer.byteLength(JSON.stringify(c.files)) <= 400 || c.files.length === 1));
+  assert.deepEqual(Object.keys(completionQuestions(items, true)), ['implemented_d1', 'implemented_d2', 'objective_met', 'out_of_scope']);
+  assert.deepEqual(Object.keys(completionQuestions(items, false)), ['implemented_d1', 'implemented_d2', 'out_of_scope']);
+});
+test('A finish is rejected on the diff when a deliverable is unmet, and the feedback names it with its source status', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'a.ts'), 'const K = 1;\nexport const done = 2;\n'); await writeFile(join(root, 'src', 'b.ts'), 'export const other = 0;\n');
+  s.objective = 'Move K from src/a.ts to src/b.ts.'; s.phase = 'implement'; s.step = 3; s.lastWriteStep = 2; s.writes = ['src/a.ts', 'src/b.ts']; s.inspectionCount = 3;
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'K', from: 'src/a.ts', to: 'src/b.ts', detail: 'move K' }] });
+  s.moveDirection = { source: 'src/b.ts', destination: 'src/a.ts' }; // a direction that forbids the harness move, so the audit is exercised
+  const jev = { decide: async (_st: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx?.phase === 'completion-check') { const a = answersFor(q, 'finish', .9) as Answers; a.implemented_d1 = { type: 'noul', noul: .2 }; return a; }
+    return answersFor(q, 'finish', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'K was moved.' }) };
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {});
+  await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'passed' }, { command: 'node --check src/a.ts' });
+  const result = await runner.run(s);
+  assert.equal(result.status, 'paused');
+  assert.match(result.entries.at(-1)!.text, /Completion rejected \(objective met=0\.90, out-of-scope changes=0\.10\)\. Deliverables not implemented: d1 move K to src\/b\.ts \[pending: still declared in src\/a\.ts lines 1-1\]/);
+  assert.equal(result.completionFeedback?.awaitingEvidence, true);
+});
+
+test('Ledger items with worker-invented paths or parenthesised names are repaired from the session\'s files, and junk items do not block the harness finish', async t => {
+  const { root, session: s } = await fixture(t);
+  await mkdir(join(root, 'sdk', 'src', 'cli'), { recursive: true });
+  await writeFile(join(root, 'sdk', 'src', 'cli.ts'), 'const DEFAULTS = 1;\nfunction invokedAsMain() { return true; }\n');
+  await writeFile(join(root, 'sdk', 'src', 'cli', 'deps.ts'), 'export const X = 0;\n');
+  s.writes = ['sdk/src/cli.ts', 'sdk/src/cli/deps.ts'];
+  s.ledger = candidatesFrom({ deliverables: [
+    { kind: 'move', name: 'invokedAsMain()', from: 'src/cli/main.ts', to: 'src/cli/deps.ts', detail: 'move' },
+    { kind: 'move', name: 'DEFAULTS', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'move' },
+    { kind: 'create', name: 'src/cli/deps.ts', from: '', to: '', detail: 'create the module' },
+    { kind: 'import', name: 'deps', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'nonsense' } ] });
+  assert.equal(s.ledger[0]!.name, 'invokedAsMain');
+  await refreshLedger(root, s);
+  assert.deepEqual(s.ledger.map(d => [d.name, d.from, d.to, d.status]), [
+    ['invokedAsMain', 'sdk/src/cli.ts', 'sdk/src/cli/deps.ts', 'pending'], ['DEFAULTS', 'sdk/src/cli.ts', 'sdk/src/cli/deps.ts', 'pending'],
+    ['src/cli/deps.ts', undefined, 'sdk/src/cli/deps.ts', 'done'], ['deps', 'sdk/src/cli.ts', 'sdk/src/cli/deps.ts', 'unknown']]);
+});
+
+test('Duplicate and conflicting import bindings are removed at the reported line, keeping the first import', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  const text = 'import { type JsonObject, type JsonValue } from "../config.js";\nimport type { CliDependencies } from "../cli.js";\nimport type { JsonObject } from "../config.js";\nexport interface CliDependencies { a: JsonObject; b: JsonValue }\n';
+  await writeFile(join(root, 'src', 'cli', 'deps.ts'), text);
+  const check = "src/cli/deps.ts(1,15): error TS2300: Duplicate identifier 'JsonObject'.\nsrc/cli/deps.ts(2,15): error TS2440: Import declaration conflicts with local declaration of 'CliDependencies'.\nsrc/cli/deps.ts(3,15): error TS2300: Duplicate identifier 'JsonObject'.";
+  const names = await resolveMissingNames(root, check, ['src/cli/deps.ts']);
+  assert.deepEqual(names.map(n => [n.name, n.kind, n.line]), [['JsonObject', 'unused', 3], ['CliDependencies', 'unused', 2]]);
+  const fixes = compactNames({ missingNames: names } as any, 40);
+  const edits = await removeImportBindings('src/cli/deps.ts', text, fixes.removeImports['src/cli/deps.ts']!, fixes.removeImportLines['src/cli/deps.ts']);
+  assert.deepEqual(edits, [{ start: 2, end: 2, newText: '', prepend: '' }, { start: 3, end: 3, newText: '', prepend: '' }], 'line 1 keeps JsonObject');
+});
+test('A move into an existing destination never duplicates a binding it already imports and drops an import the move supersedes', async t => {
+  const { root, store } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  const source = 'import { type JsonObject, type JsonValue } from "./config.js";\nexport interface CliDependencies { a: JsonObject; b: JsonValue }\nexport const rest = 1;\n';
+  const existing = 'import type { JsonObject } from "../config.js";\nimport type { CliDependencies } from "../cli.js";\nexport const DEFAULTS: CliDependencies = {} as CliDependencies;\n';
+  await writeFile(join(root, 'src', 'cli.ts'), source); await writeFile(join(root, 'src', 'cli', 'deps.ts'), existing);
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
+  const r = await tools.execute('move_lines', { source: 'src/cli.ts', expectedHash: hash(source), start: 2, end: 2, destination: 'src/cli/deps.ts', destinationHash: hash(existing), replacement: '', prefix: '' });
+  assert(r.ok, r.text);
+  const deps = await readFile(join(root, 'src', 'cli', 'deps.ts'), 'utf8');
+  assert.equal(deps, 'import type { JsonObject } from "../config.js";\nimport { type JsonValue } from "../config.js";\nexport const DEFAULTS: CliDependencies = {} as CliDependencies;\n\nexport interface CliDependencies { a: JsonObject; b: JsonValue }\n');
+});
+
+test('A worker move that sweeps up declarations the ledger never asked for is refused with the exact ranges', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'interface CliDependencies {\n  a: number;\n}\nconst DEFAULT_DEPENDENCIES: CliDependencies = { a: 1 };\nexport const OPTION = 2;\nexport function runCodexSkillCommand() { return DEFAULT_DEPENDENCIES; }\n');
+  await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export const X = 0;\n');
+  session.phase = 'implement'; session.inspectionCount = 3; session.hashes['src/cli.ts'] = hash(await readFile(join(root, 'src', 'cli.ts'), 'utf8')); session.readHashes['src/cli.ts'] = session.hashes['src/cli.ts']!;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'CliDependencies', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'm' }, { kind: 'move', name: 'DEFAULT_DEPENDENCIES', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'm' }] });
+  session.moveDirection = { source: 'src/cli/deps.ts', destination: 'src/cli.ts' }; // keeps the harness from moving them itself in this test
+  const jev = { decide: async (_s: unknown, q: Questions) => answersFor(q, 'move_lines', .1) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ source: 'src/cli.ts', expectedHash: session.hashes['src/cli.ts'], start: 1, end: 6, destination: 'src/cli/deps.ts', destinationHash: hash('export const X = 0;\n'), replacement: '', prefix: '' }) };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.entries[0]!.kind, 'generation_error');
+  assert.match(result.entries[0]!.text, /also declares OPTION, runCodexSkillCommand, which the deliverables do not ask to move\. Move only the deliverables' declarations: CliDependencies lines 1-3; DEFAULT_DEPENDENCIES lines 4-4\./);
+  assert.match(await readFile(join(root, 'src', 'cli.ts'), 'utf8'), /^interface CliDependencies/, 'nothing moved');
+});
+test('An invented ledger source path is repaired from the repository when the declaration is unique there', async t => {
+  const { root, session: s } = await fixture(t);
+  await mkdir(join(root, 'sdk', 'src', 'cli'), { recursive: true }); await mkdir(join(root, 'sdk', 'tests-ts'), { recursive: true });
+  await writeFile(join(root, 'sdk', 'src', 'cli.ts'), 'interface CliDependencies { a: number }\n'); await writeFile(join(root, 'sdk', 'src', 'cli', 'deps.ts'), 'export const X = 0;\n');
+  await writeFile(join(root, 'sdk', 'tests-ts', 'cli.test.ts'), 'interface CliDependencies { fake: true }\n');
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'CliDependencies', from: 'src/cli/main.ts', to: 'sdk/src/cli/deps.ts', detail: 'm' }] });
+  await refreshLedger(root, s);
+  assert.equal(s.ledger[0]!.from, 'sdk/src/cli.ts'); assert.equal(s.ledger[0]!.status, 'pending'); assert(!s.ledger[0]!.unresolvable);
+  // A name declared in two modules: the file the plan names wins, then the sibling items' file.
+  await writeFile(join(root, 'sdk', 'src', 'api.ts'), 'const DEFAULTS = 1;\n'); await writeFile(join(root, 'sdk', 'src', 'cli.ts'), 'interface CliDependencies { a: number }\nconst DEFAULTS = 2;\n');
+  s.knownFiles.push('sdk/src/api.ts');
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'CliDependencies', from: 'src/cli/main.ts', to: 'sdk/src/cli/deps.ts', detail: 'm' }, { kind: 'move', name: 'DEFAULTS', from: 'src/cli/main.ts', to: 'sdk/src/cli/deps.ts', detail: 'm' }] });
+  await refreshLedger(root, s);
+  assert.equal(s.ledger[1]!.from, 'sdk/src/cli.ts', 'sibling resolution'); assert.equal(s.ledger[1]!.status, 'pending');
+  s.objective = 'Extract DEFAULTS from src/api.ts into src/cli/deps.ts';
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'DEFAULTS', from: 'lib/nowhere.ts', to: 'sdk/src/cli/deps.ts', detail: 'm' }] });
+  await refreshLedger(root, s);
+  assert.equal(s.ledger[0]!.from, 'sdk/src/api.ts', 'the file the objective names wins');
+});
+test('An untouched importer that lost a name to a move gets it back through a re-export the harness adds to the edited module', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'sdk', 'src', 'cli'), { recursive: true }); await mkdir(join(root, 'sdk', 'tests-ts'), { recursive: true });
+  await writeFile(join(root, 'sdk', 'src', 'cli.ts'), 'import { DEFAULT_DEPENDENCIES } from "./cli/deps.js";\nexport const main = DEFAULT_DEPENDENCIES;\n');
+  await writeFile(join(root, 'sdk', 'src', 'cli', 'deps.ts'), 'export const DEFAULT_DEPENDENCIES = {};\nexport function runCodexSkillCommand() {}\n');
+  await writeFile(join(root, 'sdk', 'tests-ts', 'cli.test.ts'), 'import { runCodexSkillCommand } from "../src/cli.js";\n');
+  const check = `tests-ts/cli.test.ts(1,10): error TS2305: Module '"../src/cli.js"' has no exported member 'runCodexSkillCommand'.`;
+  const names = await resolveMissingNames(root, check, ['sdk/src/cli.ts', 'sdk/src/cli/deps.ts']);
+  assert.equal(names[0]!.kind, 'reexport'); assert.equal(names[0]!.inFile, 'sdk/src/cli.ts'); assert.equal(names[0]!.importLine, 'export { runCodexSkillCommand } from "./cli/deps.js";');
+  const fixes = compactNames({ missingNames: names } as any, 40);
+  assert.deepEqual(fixes.addImports, { 'sdk/src/cli.ts': ['export { runCodexSkillCommand } from "./cli/deps.js";'] });
+});
+
+test('A destination that matches no file is anchored to the source\'s package, for the ledger and for worker moves', async t => {
+  const { root, session: s } = await fixture(t);
+  await mkdir(join(root, 'sdk', 'typescript', 'src'), { recursive: true });
+  await writeFile(join(root, 'sdk', 'typescript', 'src', 'cli.ts'), 'const A = 1;\n');
+  assert.equal(await anchorPath(root, 'sdk/typescript/src/cli.ts', 'src/cli/deps.ts'), 'sdk/typescript/src/cli/deps.ts');
+  assert.equal(await anchorPath(root, 'sdk/typescript/src/cli.ts', 'sdk/typescript/src/cli.ts'), 'sdk/typescript/src/cli.ts', 'an existing path is left alone');
+  assert.equal(await anchorPath(root, 'a.ts', 'lib/x.ts'), 'lib/x.ts', 'a root-level source anchors at the root');
+  s.knownFiles.push('sdk/typescript/src/cli.ts');
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'A', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'm' }] });
+  await refreshLedger(root, s);
+  assert.equal(s.ledger[0]!.to, 'sdk/typescript/src/cli/deps.ts'); assert.equal(s.ledger[0]!.status, 'pending');
+});
+test('The completion audit state stays under the Jev budget with a large diff and long edit history', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  const big = Array.from({ length: 400 }, (_, i) => `export const v${i} = ${i};`).join('\n') + '\n';
+  const artifact = await store.snapshot(1, 'src/a.ts', 'export const a = 1;\n');
+  await writeFile(join(root, 'src', 'a.ts'), big); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  s.objective = 'Add many constants to src/a.ts.'; s.phase = 'implement'; s.step = 3; s.lastWriteStep = 2; s.writes = ['src/a.ts']; s.baselineArtifacts = { 'src/a.ts': artifact }; s.inspectionCount = 3;
+  s.editEvidence = Array.from({ length: 20 }, (_, i) => ({ step: i, route: 'write', paths: ['src/a.ts'], artifact: '', text: 'x'.repeat(400), applied: 'y'.repeat(600) } as any));
+  const sizes: number[] = [];
+  const jev = { decide: async (state: unknown, q: Questions, ctx?: { phase: string }) => { sizes.push(Buffer.byteLength(JSON.stringify(state))); if (Buffer.byteLength(JSON.stringify(state)) > 22000) throw new Error('Jev decision state exceeds its configured byte budget'); return answersFor(q, 'finish', .9); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'done' }) };
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {});
+  await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'passed' }, { command: 'node check.mjs' });
+  const result = await runner.run(s);
+  assert.equal(result.status, 'complete', result.stopReason); assert(sizes.every(n => n <= 22000), `state sizes ${sizes.join(',')}`);
 });

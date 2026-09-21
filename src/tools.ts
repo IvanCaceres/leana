@@ -69,7 +69,7 @@ export function assertNoBulkDuplication(before: string, inserted: string[], labe
 // source needs for names it still references, and the source's own top-level
 // declarations the block depends on (which need an export or a move).
 export async function movePlan(source: string, text: string, start: number, end: number, destination: string, replacementText = ''): Promise<{
-  moved: string; exported: string[]; prefix: string[]; replacement: string[]; stillUsed: string[]; localDeps: { name: string; line: number }[];
+  moved: string; declared: string[]; exported: string[]; prefix: string[]; replacement: string[]; stillUsed: string[]; localDeps: { name: string; line: number }[];
 } | null> {
   if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
   if (!tsModule) return null;
@@ -147,7 +147,7 @@ export async function movePlan(source: string, text: string, start: number, end:
   const types = stillUsed.filter(d => d.typeOnly).map(d => d.name); const values = stillUsed.filter(d => !d.typeOnly).map(d => d.name);
   if (types.length) replacement.push(`import type { ${types.join(', ')} } from "${toDest}";`);
   if (values.length) replacement.push(`import { ${values.join(', ')} } from "${toDest}";`);
-  return { moved, exported, prefix, replacement, stillUsed: stillUsed.map(d => d.name), localDeps };
+  return { moved, declared: declared.map(d => d.name), exported, prefix, replacement, stillUsed: stillUsed.map(d => d.name), localDeps };
 }
 // Is the TS6133 at this line an import binding (not a local declaration)?
 export async function importBindingAt(path: string, text: string, line: number, name: string): Promise<boolean> {
@@ -168,14 +168,17 @@ export async function importBindingAt(path: string, text: string, line: number, 
 // Line edits that drop the named bindings from a file's import declarations: a
 // declaration left empty is deleted, one still carrying other bindings is
 // rewritten on one line with the rest intact.
-export async function removeImportBindings(path: string, text: string, names: string[]): Promise<{ start: number; end: number; newText: string; prepend: string }[]> {
+export async function removeImportBindings(path: string, text: string, names: string[], atLine: Record<string, number> = {}): Promise<{ start: number; end: number; newText: string; prepend: string }[]> {
   if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
   if (!tsModule || !parseable.test(path)) return [];
   const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-  const drop = new Set(names); const edits: { start: number; end: number; newText: string; prepend: string }[] = [];
+  const edits: { start: number; end: number; newText: string; prepend: string }[] = [];
   for (const st of sf.statements) {
     if (!ts.isImportDeclaration(st) || !st.importClause) continue;
     const c = st.importClause;
+    const stStart = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1; const stEnd = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
+    // A name restricted to a line is dropped only from the declaration spanning it.
+    const drop = new Set(names.filter(n => atLine[n] === undefined || (atLine[n]! >= stStart && atLine[n]! <= stEnd)));
     const def = c.name && !drop.has(c.name.text) ? c.name.text : null; const defDropped = Boolean(c.name && drop.has(c.name.text));
     const ns = c.namedBindings && ts.isNamespaceImport(c.namedBindings) ? c.namedBindings.name.text : null;
     const nsDropped = Boolean(ns && drop.has(ns));
@@ -191,6 +194,12 @@ export async function removeImportBindings(path: string, text: string, names: st
     edits.push({ start, end, newText: parts.length ? `import ${c.isTypeOnly ? 'type ' : ''}${parts.join(', ')} from ${spec};` : '', prepend: '' });
   }
   return edits;
+}
+// Files declaring a name at top level, test and fixture files excluded.
+export async function declarationFiles(root: string, name: string): Promise<string[]> {
+  const r = await runCommand('rg', ['-l', '--color', 'never', '-g', '!node_modules/**', '-g', '!.leana/**', '-g', '!dist/**', '-g', '*.{ts,tsx,mts,cts,js,mjs,cjs}', '-e', `^(export )?(declare )?(type|interface|const|let|function|async function|class|enum) ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, '--', '.'], root, 10000).catch(() => null);
+  const isTest = (f: string) => /(^|\/)(tests?|__tests__|spec|fixtures?|test-fixtures|tests-ts)\/|\.(test|spec)\.[cm]?[jt]sx?$/.test(f);
+  return (r?.output.split('\n') ?? []).map(l => l.trim().replace(/^\.\//, '')).filter(f => f && !isTest(f));
 }
 // The last line of the top-level statement that starts at (or spans) a line.
 export async function declarationEnd(root: string, file: string, line: number): Promise<number | null> {
@@ -212,25 +221,9 @@ export function nearRetype(oldLines: string[], newLines: string[], start: number
   if (differing.length === 0 || differing.length > Math.max(2, Math.floor(oldLines.length * .2))) return null;
   return `this rewrites ${oldLines.length} lines of which only ${differing.length} change (line${differing.length > 1 ? 's' : ''} ${differing.join(', ')}); edit only those lines, in ranges of their own`;
 }
-// What a plan says to extract: the backticked names before the arrow in a
-// sentence that extracts, moves or lifts, and the destination path after it.
-// "Update `main()`'s default arg" mentions main without extracting it.
-export function extractionTargets(text: string): { name: string; destination?: string }[] {
-  const out: { name: string; destination?: string }[] = [];
-  const sentences = text.replace(/^\d+:\s?/gm, '').split(/(?<=[.;])\s+(?=[A-Z`])|\n(?=\s*\d+[.)]\s)/);
-  for (const sentence of sentences) {
-    if (!/\b(extract|move|lift|relocate)\b/i.test(sentence)) continue;
-    const parts = sentence.split(/\s*(?:→|->|=>|\binto\b)\s*/);
-    if (parts.length < 2) continue; // a heading such as "Lift pure leaves out of `main()`" names no destination
-    const left = parts[0]!; const right = parts.slice(1).join(' ');
-    const destination = right.match(/`?([\w./-]+\.(?:[cm]?[jt]sx?))`?/)?.[1];
-    for (const m of left.matchAll(/`([A-Za-z_$][\w$]*)(?:\(\))?`/g)) if (!out.some(o => o.name === m[1])) out.push(destination ? { name: m[1]!, destination } : { name: m[1]! });
-  }
-  return out;
-}
 // Top-level declarations of a file by name, with their line ranges.
-export async function topLevelDeclarations(path: string, text: string): Promise<Map<string, { start: number; end: number; kind: string }>> {
-  const out = new Map<string, { start: number; end: number; kind: string }>();
+export async function topLevelDeclarations(path: string, text: string): Promise<Map<string, { start: number; end: number; kind: string; exported: boolean }>> {
+  const out = new Map<string, { start: number; end: number; kind: string; exported: boolean }>();
   if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
   if (!tsModule || !parseable.test(path)) return out;
   const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
@@ -240,7 +233,24 @@ export async function topLevelDeclarations(path: string, text: string): Promise<
     if (ts.isVariableStatement(st)) for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name)) names.push(d.name.text);
     if (!names.length) continue;
     const start = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1; const end = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
-    for (const n of names) out.set(n, { start, end, kind: ts.SyntaxKind[st.kind] });
+    const exported = (ts.canHaveModifiers(st) ? ts.getModifiers(st) ?? [] : []).some((m: any) => m.kind === ts.SyntaxKind.ExportKeyword);
+    const kind = ts.isVariableStatement(st) ? 'VariableStatement' : ts.SyntaxKind[st.kind]; // SyntaxKind[] yields the enum alias FirstStatement
+    for (const n of names) out.set(n, { start, end, kind, exported });
+  }
+  return out;
+}
+// The import bindings of a file: local name and module.
+export async function importBindings(path: string, text: string): Promise<{ name: string; from: string; typeOnly: boolean }[]> {
+  const out: { name: string; from: string; typeOnly: boolean }[] = [];
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return out;
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+    const c = st.importClause; const from = st.moduleSpecifier.text;
+    if (c.name) out.push({ name: c.name.text, from, typeOnly: Boolean(c.isTypeOnly) });
+    if (c.namedBindings && ts.isNamespaceImport(c.namedBindings)) out.push({ name: c.namedBindings.name.text, from, typeOnly: Boolean(c.isTypeOnly) });
+    if (c.namedBindings && ts.isNamedImports(c.namedBindings)) for (const b of c.namedBindings.elements) out.push({ name: b.name.text, from, typeOnly: Boolean(c.isTypeOnly || b.isTypeOnly) });
   }
   return out;
 }
@@ -478,7 +488,7 @@ export async function runCommand(command: string, args: string[], cwd: string, t
     });
   });
 }
-async function boundedRead(path: string, limit = 1024 * 1024): Promise<string> {
+export async function boundedRead(path: string, limit = 1024 * 1024): Promise<string> {
   const handle = await open(path, 'r');
   try {
     if (!(await handle.stat()).isFile()) throw new Error('Only regular files may be read');
@@ -525,6 +535,23 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     const inFile = editedFiles.find(f => f.endsWith(reported) || reported.endsWith(f)); if (!inFile) continue;
     let text: string; try { text = await boundedRead(await safePath(root, inFile)); } catch { continue; }
     if (await importBindingAt(inFile, text, line, name)) results.push({ name, inFile, kind: 'unused', line, note: 'unused import binding; the harness removes it' });
+  }
+  // A binding imported twice (TS2300 on import lines) keeps its first import; an
+  // import that conflicts with a local declaration (TS2440) goes.
+  const dup = new Map<string, { inFile: string; name: string; lines: number[] }>();
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2300: Duplicate identifier '([^']+)'/gm)) {
+    const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (!inFile) continue;
+    const key = `${inFile}:${m[3]}`; const d = dup.get(key) ?? { inFile, name: m[3]!, lines: [] }; d.lines.push(Number(m[2])); dup.set(key, d);
+  }
+  for (const d of dup.values()) {
+    let text: string; try { text = await boundedRead(await safePath(root, d.inFile)); } catch { continue; }
+    const importLines: number[] = []; for (const l of d.lines) if (await importBindingAt(d.inFile, text, l, d.name)) importLines.push(l);
+    if (importLines.length >= 2) for (const l of importLines.sort((a, b) => a - b).slice(1)) results.push({ name: d.name, inFile: d.inFile, kind: 'unused', line: l, note: 'imported twice; the harness removes the later binding' });
+  }
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2440: Import declaration conflicts with local declaration of '([^']+)'/gm)) {
+    const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (!inFile) continue;
+    let text: string; try { text = await boundedRead(await safePath(root, inFile)); } catch { continue; }
+    if (await importBindingAt(inFile, text, Number(m[2]), m[3]!)) results.push({ name: m[3]!, inFile, kind: 'unused', line: Number(m[2]), note: 'imported and declared locally; the harness removes the import' });
   }
   const headers = new Map<string, string>();
   const header = async (rel: string): Promise<string> => {
@@ -583,6 +610,18 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
       }
       if (want.kind === 'wrong-module') {
         const d = await locate(name, inFile);
+        // An importer the session never touched lost a name to a move: the edited
+        // module it imports from re-exports the name from where it now lives.
+        const importerEdited = editedFiles.some(f => f === inFile || f.endsWith(`/${inFile}`) || inFile.endsWith(`/${f}`));
+        if (!importerEdited && want.module && d?.exported) {
+          const moduleTs = relative(root, resolve(root, dirname(inFile), want.module)).replace(/\\/g, '/').replace(/\.js$/, '.ts');
+          const target = editedFiles.find(f => f === moduleTs || f.endsWith(`/${moduleTs}`) || moduleTs.endsWith(`/${f}`));
+          if (target && target !== d.file && !d.file.endsWith(`/${target}`)) {
+            if (results.some(r => r.kind === 'reexport' && r.name === name && r.inFile === target)) continue;
+            results.push({ name, inFile: target, kind: 'reexport', declaredIn: `${d.file}:${d.line}`, exported: true, importLine: `export { ${name} } from "${relPath(target, d.file).replace(/\.ts$/, '.js')}";`, note: `${inFile} imports ${name} from ${target}, which no longer declares it; the harness re-exports it from ${d.file}` });
+            if (results.length >= limit) return results; continue;
+          }
+        }
         const mv = toMove(name, d, inFile); if (mv) { results.push(mv); if (results.length >= limit) return results; continue; }
         if (d) {
           origin.declaredIn = `${d.file}:${d.line}`; origin.exported = d.exported;
@@ -846,12 +885,25 @@ export class ToolBox {
       const prefixLines = [...(a.prefix && existing === null ? a.prefix.replace(/\n?$/, '').split('\n') : []), ...(plan?.prefix ?? [])];
       const norm2 = (l: string) => l.trim().replace(/'/g, '"').replace(/;$/, '').replace(/\s+/g, ' ');
       const seen = new Set((existing ?? '').split('\n').map(norm2));
-      const prefix = prefixLines.filter(l => { const k = norm2(l); if (!k || seen.has(k)) return false; seen.add(k); return true; });
+      // Dedupe at the binding level: a name the destination already imports, under
+      // whatever line text, is not imported again; a line left empty is dropped.
+      const already = new Set((existing !== null ? await importBindings(a.destination, existing) : []).map(b => b.name));
+      const declaredNow = plan ? new Set(plan.declared) : new Set<string>();
+      const trimImport = (l: string): string | null => {
+        const m = l.match(/^(\s*import\s+)(type\s+)?\{([^}]*)\}(\s+from\s+.*)$/); if (!m) return l;
+        const kept = m[3]!.split(',').map(x => x.trim()).filter(Boolean).filter(x => { const local = x.replace(/^type\s+/, '').split(/\s+as\s+/).pop()!.trim(); if (already.has(local) || declaredNow.has(local)) return false; already.add(local); return true; });
+        return kept.length ? `${m[1]}${m[2] ?? ''}{ ${kept.join(', ')} }${m[4]}` : null;
+      };
+      const prefix = prefixLines.map(trimImport).filter((l): l is string => l !== null).filter(l => { const k = norm2(l); if (!k || seen.has(k)) return false; seen.add(k); return true; });
       let output: string;
       if (existing === null) output = `${prefix.length ? `${prefix.join('\n')}\n${plan ? '\n' : ''}` : ''}${movedOut}\n`;
       else {
-        const el = existing.replace(/\n?$/, '\n').split('\n');
-        if (prefix.length) el.splice(await importInsertLine(a.destination, existing) - 1, 0, ...prefix);
+        // An import in the destination of a name the move now declares there would conflict: drop it first.
+        let base = existing;
+        const conflicting = plan ? plan.declared.filter(n => already.has(n)) : [];
+        if (conflicting.length) { const bl = base.split('\n'); for (const e of (await removeImportBindings(a.destination, base, conflicting)).sort((x, y) => y.start - x.start)) bl.splice(e.start - 1, e.end - e.start + 1, ...(e.newText ? [e.newText] : [])); base = bl.join('\n'); }
+        const el = base.replace(/\n?$/, '\n').split('\n');
+        if (prefix.length) el.splice(await importInsertLine(a.destination, base) - 1, 0, ...prefix);
         output = `${el.join('\n').replace(/\n?$/, '\n')}\n${movedOut}\n`;
       }
       assertBalancePreserved(original, remaining, a.source);

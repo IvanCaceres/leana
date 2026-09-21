@@ -4,7 +4,9 @@ export interface Coverage { total: number; ranges: [number, number][] }
 export interface CheckSummary { errors: number; syntax: number; resolution?: number; byFile: Record<string, { count: number; syntax: number; resolution?: number; lines: number[]; samples: string[] }> }
 export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string> }
 export interface SourceEvidence { path: string; hash?: string; facts: Record<string, unknown>[]; excerpt?: string; error?: string; omitted?: number }
-export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move'; line?: number; move?: { source: string; start: number; end: number } }
+export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export' | 'import' | 'verify' | 'other';
+export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean }
+export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move' | 'reexport'; line?: number; move?: { source: string; start: number; end: number } }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
   { type: 'choice'; instructions: string; criteria: Record<string, string> };
@@ -54,8 +56,12 @@ export interface Session {
   lastToolError: { route: Route; message: string; step: number } | null;
   // The first successful move fixes the direction of the extraction; deliverables never travel back.
   moveDirection: { source: string; destination: string } | null;
-  // Deliverables the plan says to extract that the source still declares and the destination lacks.
+  // Deliverables of kind move still declared in the source: performed by the harness.
   pendingMoves: { name: string; source: string; start: number; end: number; destination: string }[];
+  // The harness's own deliverable list, classified by Jev; statuses come from source facts.
+  ledger: Deliverable[]; ledgerAttempts: number; ledgerBuilt: boolean; ledgerComplete: number;
+  // The first pre-edit snapshot of each changed file, for the completion diff ('@new' for created files).
+  baselineArtifacts: Record<string, string>;
   readHashes: Record<string, string>; writeSteps: Record<string, number>;
   editsSinceCheck: number;
 }
@@ -64,7 +70,7 @@ export interface Config {
   workingTokens: number; safetyTokens: number; jevUrl: string; jevModel: string;
   routeProbability: number; routeMargin: number; compactProbability: number;
   completeProbability: number; compactCooldown: number; maxSteps: number;
-  toolChars: number; commandTimeoutMs: number; allowWrite: boolean; allowBash: boolean; verbose: boolean;
+  toolChars: number; commandTimeoutMs: number; allowWrite: boolean; allowBash: boolean; verbose: boolean; ledger: boolean;
   // The verification command. When set, it is run as a baseline before any edit and
   // after every edit; only this command counts as verification.
   checkCommand: string;

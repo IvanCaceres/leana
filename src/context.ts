@@ -110,7 +110,9 @@ export function routeQuestions(s: Session, c: Config): Questions {
   // edits, checks or finishes. Before that, novel inspection stays available.
   // Before the first edit, a source file read at its current version is the located source.
   const target = s.writes.length ? s.writes : Object.keys(s.readHashes).filter(p => /\.[cm]?[jt]sx?$/.test(p));
-  const located = target.length > 0 && target.every(p => s.readHashes[p] !== undefined && s.readHashes[p] === s.hashes[p]);
+  // Any one of them read at its current version will do: the harness's own forced
+  // edits are what keep the others stale, and the worker need not re-read those.
+  const located = target.some(p => s.readHashes[p] !== undefined && s.readHashes[p] === s.hashes[p]);
   const actionable = editRoutes.some(r => r in criteria) || 'bash' in criteria || 'finish' in criteria;
   if (s.inspectionsSinceAction >= 4 && s.phase !== 'inspect' && located && actionable && !(editFailed && s.lastWriteStale)) {
     delete (criteria as Partial<typeof criteria>).read_files; delete (criteria as Partial<typeof criteria>).search_codebase;
@@ -196,17 +198,22 @@ export function focus(s: Session, files = 5): Record<string, { lines: number[]; 
 // Grouped by the edit that fixes them: import lines to add per file, line
 // numbers to export per file (one replace_lines call with prepend "export "
 // per line), and names nothing resolved. Far smaller than one row per name.
-export interface NameFixes { addImports: Record<string, string[]>; addExportAtLines: Record<string, number[]>; removeImports: Record<string, string[]>; unresolved: string[]; total: number }
+export interface NameFixes { addImports: Record<string, string[]>; addExportAtLines: Record<string, number[]>; removeImports: Record<string, string[]>; moveDeclarations: { name: string; source: string; start: number; end: number; into: string }[]; unresolved: string[]; total: number }
 export function compactNames(s: Session, limit: number, names: NameOrigin[] = s.missingNames): NameFixes {
-  const out: NameFixes = { addImports: {}, addExportAtLines: {}, removeImports: {}, unresolved: [], total: names.length };
+  const out: NameFixes = { addImports: {}, addExportAtLines: {}, removeImports: {}, moveDeclarations: [], unresolved: [], total: names.length };
   for (const n of names.slice(0, limit)) {
+    if (n.kind === 'move') {
+      if (n.move && !out.moveDeclarations.some(m => m.source === n.move!.source && m.start === n.move!.start)) out.moveDeclarations.push({ name: n.name, source: n.move.source, start: n.move.start, end: n.move.end, into: n.inFile });
+      else if (!n.move) out.unresolved.push(`${n.name}: ${clip(n.note ?? 'unresolved', 240)}`);
+      continue;
+    }
     if (n.kind === 'unused') { (out.removeImports[n.inFile] ??= []).push(n.name); continue; }
     if (n.importLine) (out.addImports[n.inFile] ??= []).push(n.importLine);
     if (n.declaredIn && n.exported === false) {
       const [file, line] = n.declaredIn.split(':');
       if (file && line) (out.addExportAtLines[file] ??= []).push(Number(line));
-      else out.unresolved.push(`${n.name}: ${clip(n.note ?? 'declaration line unknown', 100)}`);
-    } else if (!n.importLine) out.unresolved.push(`${n.name}: ${clip(n.note ?? 'unresolved', 100)}`);
+      else out.unresolved.push(`${n.name}: ${clip(n.note ?? 'declaration line unknown', 240)}`);
+    } else if (!n.importLine) out.unresolved.push(`${n.name}: ${clip(n.note ?? 'unresolved', 240)}`);
   }
   for (const k of Object.keys(out.addExportAtLines)) out.addExportAtLines[k] = [...new Set(out.addExportAtLines[k])].sort((a, b) => a - b);
   // Names nothing resolved are the least actionable; never let them dominate the prompt.
@@ -275,6 +282,7 @@ export function decisionState(s: Session, extra: Record<string, unknown> = {}): 
       lastCheck: s.lastCheck && { step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors, syntaxErrors: s.lastCheck.summary.syntax, staleFor: staleFor(s), text: clip(s.lastCheck.text, preview * 2) },
       checkAfterLastWrite: s.lastCheckStep > s.lastWriteStep, checkPending: s.pendingCheck,
       focus: focus(s, cap.files), missingNames: compactNames(s, cap.names * 3), checkDelta: checkDelta(s) && clip(checkDelta(s)!, 400),
+      ...(s.pendingMoves.length ? { remainingDeliverables: s.pendingMoves.slice(0, 12).map(m => `${m.name}: still declared in ${m.source} lines ${m.start}-${m.end}; the harness moves it into ${m.destination} next`) } : {}),
       rejectedEdits: compactRejected(s, cap.rejected),
       evidence: entries.map(e => ({ id: e.id, kind: e.kind, ...(e.stale ? { stale: e.stale } : {}), excerpt: clip(e.text, preview) })),
       evidenceCount: s.entries.length,

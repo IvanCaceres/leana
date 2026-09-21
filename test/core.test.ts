@@ -8,13 +8,13 @@ import { defaults, loadConfig } from '../src/config.js';
 import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
 import { compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
-import { referenceContext, rememberReferences } from '../src/references.js';
+import { referenceContext, rememberReferences, scopes } from '../src/references.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { extractionTargets, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -469,7 +469,7 @@ test('move_lines cuts a range into a new or existing file with hash checks and n
   await assert.rejects(tools.execute('move_lines', { ...base, expectedHash: hash('other') }), (e: any) => e instanceof StaleWriteError);
   await assert.rejects(tools.execute('move_lines', { ...base, end: 40 }), /exceeds cli.ts/);
   await assert.rejects(tools.execute('move_lines', { ...base, destination: 'cli.ts' }), /must differ/);
-  await assert.rejects(tools.execute('move_lines', { ...base, destinationHash: hash('x') }), (e: any) => e instanceof StaleWriteError && /destinationHash=new/.test(e.message));
+  await assert.rejects(tools.execute('move_lines', { ...base, destinationHash: hash('x') }), (e: any) => e instanceof StaleWriteError && /destinationHash=new/.test(e.message), 'a missing destination still needs destinationHash=new');
   const moved = await tools.execute('move_lines', base);
   assert.deepEqual(moved.changed, ['cli.ts', 'cli/deps.ts']);
   const remaining = await readFile(join(root, 'cli.ts'), 'utf8');
@@ -1053,7 +1053,7 @@ test('missingNames are pinned after a failing check and cleared by a passing one
   const runner = new Runner({ ...defaults, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
   s.step = 2; await runner.evidence(s, 'bash', { ok: false, verification: true, text: JSON.stringify({ output: "b.ts(1,1): error TS2304: Cannot find name 'z'." }) });
   assert.deepEqual(s.missingNames, [{ name: 'z', inFile: 'b.ts', importedBy: 'a.ts', importLine: 'import { z } from "./z.js";' }]);
-  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, unresolved: [], total: 1 };
+  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, moveDeclarations: [], unresolved: [], total: 1 };
   assert.deepEqual((decisionState(s) as any).missingNames, grouped); assert.deepEqual(promptFields(messages(s, 'replace_lines')).missingNames, grouped);
   s.step = 3; await runner.evidence(s, 'bash', { ok: true, verification: true, check: true, text: 'passed' });
   assert.deepEqual(s.missingNames, []);
@@ -1199,7 +1199,7 @@ test('The decision state shrinks optional lists and the evidence tail before pau
   s.searches = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`text:q${i} in .`, 'z'.repeat(300)]));
   const state = decisionState(s) as any;
   assert(Buffer.byteLength(JSON.stringify(state)) <= 22000);
-  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'unresolved', 'total']);
+  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'moveDeclarations', 'unresolved', 'total']);
   assert.equal(state.evidenceCount, 20); assert(state.evidence.length <= 8); assert(state.objective.includes('Fix'));
 });
 test('Panel lines are flattened to one ASCII row each', () => {
@@ -1903,11 +1903,11 @@ test('A deliverable still declared in the move source is reported as something t
   assert(names.has('Writable') && names.has('HIDE_CURSOR') && names.has('invokedAsMain') && names.has('SignalName') && !names.has('Extract'));
   const check = "src/cli/deps.ts(2,22): error TS2304: Cannot find name 'Writable'.\nsrc/cli/deps.ts(2,35): error TS2304: Cannot find name 'Other'.";
   const out = await resolveMissingNames(root, check, ['src/cli.ts', 'src/cli/deps.ts'], 40, names);
-  assert.equal(out[0]!.importLine, undefined); assert.equal(out[0]!.declaredIn, 'src/cli.ts:1'); assert.match(out[0]!.note ?? '', /move that declaration into src\/cli\/deps\.ts/);
+  assert.equal(out[0]!.importLine, undefined); assert.equal(out[0]!.declaredIn, 'src/cli.ts:1'); assert.equal(out[0]!.kind, 'move'); assert.deepEqual(out[0]!.move, { source: 'src/cli.ts', start: 1, end: 1 }); assert.match(out[0]!.note ?? '', /the harness moves it into src\/cli\/deps\.ts/);
   assert.equal(out[1]!.importLine, 'import type { Other } from "../cli.js";', 'a helper that is not a deliverable is imported as before');
   const fixes = compactNames({ missingNames: out } as any, 40);
   assert.deepEqual(fixes.addImports, { 'src/cli/deps.ts': ['import type { Other } from "../cli.js";'] }); assert.deepEqual(fixes.addExportAtLines, { 'src/cli.ts': [2] }, 'the export fix belongs to the imported helper only, at its own line');
-  assert.match(fixes.unresolved[0] ?? '', /^Writable: named by the objective/);
+  assert.deepEqual(fixes.moveDeclarations, [{ name: 'Writable', source: 'src/cli.ts', start: 1, end: 1, into: 'src/cli/deps.ts' }]); assert.deepEqual(fixes.unresolved, []);
 });
 
 test('Before any edit, a source file read at its current version counts as located for the inspection cap', async t => {
@@ -1950,4 +1950,161 @@ test('A write anchor longer than six lines is refused with the line number for r
   assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), text);
   const ok = await tools.execute('write', { path: 'a.ts', expectedHash: hash(text), oldText: 'const v4 = 4;', newText: 'export const v4 = 4;' });
   assert(ok.ok);
+});
+
+test('Retyping a block in place with a change is a rewrite, not a paste, and a redundant prepend keyword is refused up front', async t => {
+  const { root, store } = await fixture(t);
+  const block = ['type Writable = Pick<NodeJS.WriteStream, "write"> & {', '  on?(event: "error", listener: (error: Error) => void): unknown;', '  off?(event: "error", listener: (error: Error) => void): unknown;', '  once?(event: "close", listener: () => void): unknown;', '  isTTY?: boolean;', '  columns?: number;', '};'];
+  const text = ['const a = 1;', ...block, 'const b = 2;', ''].join('\n');
+  await writeFile(join(root, 'a.ts'), text);
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
+  const retyped = [`export ${block[0]}`, ...block.slice(1)].join('\n');
+  const r = await tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(text), edits: [{ start: 2, end: 8, newText: retyped, prepend: '' }] });
+  assert(r.ok); assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), ['const a = 1;', ...retyped.split('\n'), 'const b = 2;', ''].join('\n'));
+  // Pasting the same block elsewhere is still refused.
+  const now = await readFile(join(root, 'a.ts'), 'utf8');
+  await assert.rejects(tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(now), edits: [{ start: 10, end: 9, newText: block.join('\n'), prepend: '' }] }), /already contains/);
+  // prepend "export const " on a const line: refused with the right prefix named.
+  await assert.rejects(tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(now), edits: [{ start: 1, end: 1, newText: '', prepend: 'export const ' }] }), /already starts with "const".*use prepend "export "/);
+  // write keeps the same rule: a short anchor rewritten with export is fine.
+  const w = await tools.execute('write', { path: 'a.ts', expectedHash: hash(now), oldText: 'const b = 2;', newText: 'export const b = 2;' });
+  assert(w.ok);
+});
+
+test('An objective naming several substeps pins every one of them, so the plan text for each is in scope', async t => {
+  const { session: s } = await fixture(t);
+  const plan = ['# Plan', '', '**Step 1 — Lift pure leaves out of `main()`** (no behavior changes)', '1. Extract `CliDependencies` type + `DEFAULT_DEPENDENCIES` factory →', '   `src/cli/deps.ts`. Update `main()`\'s default arg to `deps.DEFAULT_DEPENDENCIES`.', '2. Extract `Writable`, `SignalName`, terminal constants (`PROGRESS_REFRESH_MILLISECONDS`,', '   `HIDE_CURSOR`, `SHOW_CURSOR`, `DUPLICATE_SIGNAL_WINDOW_MS`), `invokedAsMain()`,', '   `isJsonObject()` → `src/cli/deps.ts`.', '3. Extract all `z` option schemas → `src/cli/options.ts`.', '', '**Step 2 — Later**', '1. Something else.'];
+  const read = `docs/plan.md sha256=abc totalLines=${plan.length} shown=1..${plan.length}\n${plan.map((l, i) => `${i + 1}: ${l}`).join('\n')}`;
+  assert.deepEqual(scopes('Read docs/plan.md. Perform only Step 1 substep 1 and substep 2').map(r => r.key), ['step 1 substep 1', 'step 1 substep 2']);
+  assert.deepEqual(scopes('Do step 1 substeps 1-3').map(r => r.item), ['1', '2', '3']);
+  assert.deepEqual(scopes('Do step 1 substep 2 and 3, then step 2 item 1').map(r => r.key), ['step 1 substep 2', 'step 1 substep 3', 'step 2 substep 1']);
+  s.objective = 'Read docs/plan.md. Perform only Step 1 substep 1 and substep 2';
+  rememberReferences(s, read);
+  const scoped = s.referenceEvidence.filter(e => e.scope);
+  assert.deepEqual(scoped.map(e => e.scope), ['step 1 substep 1', 'step 1 substep 2']);
+  assert.match(scoped[1]!.text, /invokedAsMain\(\)/); assert.match(scoped[1]!.text, /isJsonObject\(\)/); assert(!/option schemas/.test(scoped[1]!.text), 'the excerpt ends before substep 3');
+  const served = referenceContext(s);
+  assert.deepEqual(served.map(e => e.scope), ['step 1 substep 1', 'step 1 substep 2'], 'both requested substeps are served, nothing unscoped');
+  s.objective = 'Read docs/plan.md. Perform only Step 1 substep 2';
+  assert.deepEqual(referenceContext(s).map(e => e.scope), ['step 1 substep 2']);
+});
+
+test('The same edit refusal twice in a row takes that route off the menu until another action succeeds', async t => {
+  const { root, store, session } = await fixture(t);
+  const text = 'export function main() {}\nconst a = 1;\n';
+  await writeFile(join(root, 'a.ts'), text);
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['a.ts']; session.hashes['a.ts'] = hash(text); session.readHashes['a.ts'] = hash(text);
+  const offered: string[][] = [];
+  const jev = { decide: async (_s: unknown, q: Questions) => { const keys = Object.keys(q.route!.type === 'choice' ? q.route!.criteria : {}); offered.push(keys); return answersFor(q, keys.includes('replace_lines') ? 'replace_lines' : 'read_files', .1); } };
+  let n = 0;
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.replace_lines
+    ? { path: 'a.ts', expectedHash: hash(text), edits: [{ start: 1, end: 1, newText: '', prepend: 'export ' }, { start: 2, end: 2, newText: `// attempt ${++n}`, prepend: '' }] }
+    : { files: [{ path: 'a.ts', start: 1, end: 2 }] } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(result.entries.map(e => e.kind), ['replace_lines', 'replace_lines', 'read_files']);
+  assert(offered[0]!.includes('replace_lines') && offered[1]!.includes('replace_lines') && !offered[2]!.includes('replace_lines'), 'blocked after the second identical refusal');
+  assert.equal(result.blockedRoute, null, 'the successful read at step 3 lifts the block');
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(events.find(e => e.type === 'blocked-route')?.data.step, 2);
+});
+
+test('A deliverable the destination needs is moved by the harness, in every resolver branch, with its full range', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  const iface = ['interface CliDependencies {', '  create(config: string): number;', '  other?: boolean;', '}'].join('\n');
+  await writeFile(join(root, 'src', 'cli.ts'), `import { x } from "./x.js";\n${iface}\nexport const keep = 1;\nexport function main(deps: CliDependencies) { return deps; }\n`);
+  await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export const DEFAULT_DEPENDENCIES: CliDependencies = { create: () => 1 };\n');
+  await writeFile(join(root, 'docs', 'plan.md').replace('/docs/', '/'), '');
+  session.objective = 'Extract `CliDependencies` and `DEFAULT_DEPENDENCIES` into src/cli/deps.ts.';
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src/cli.ts', 'src/cli/deps.ts'];
+  // The not-exported branch: deps.ts imported it back by hand; the harness moves instead of exporting.
+  const notExported = await resolveMissingNames(root, `src/cli/deps.ts(1,10): error TS2459: Module '"../cli.js"' declares 'CliDependencies' locally, but it is not exported.`, ['src/cli.ts', 'src/cli/deps.ts'], 40, namedIdentifiers(session.objective));
+  assert.equal(notExported[0]!.kind, 'move'); assert.deepEqual(notExported[0]!.move, { source: 'src/cli.ts', start: 2, end: 5 });
+  // End to end from a failing check: the harness moves the interface, the check passes, no worker edit.
+  await writeFile(join(root, 'check.mjs'), "import { readFileSync } from 'node:fs'; const d = readFileSync('src/cli/deps.ts', 'utf8'); if (!d.includes('interface CliDependencies')) { console.error(`src/cli/deps.ts(1,43): error TS2304: Cannot find name 'CliDependencies'.`); process.exit(1); }\n");
+  const jev = { decide: async (_s: unknown, q: Questions) => answersFor(q, 'read_files', .1) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'src/cli.ts', start: 1, end: 3 }] }) };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(result.entries.map(e => e.kind).slice(0, 3), ['bash', 'move_lines', 'bash']);
+  const deps = await readFile(join(root, 'src', 'cli', 'deps.ts'), 'utf8'); const cli = await readFile(join(root, 'src', 'cli.ts'), 'utf8');
+  assert.match(deps, /export interface CliDependencies \{\n  create\(config: string\): number;\n  other\?: boolean;\n\}/); assert(!cli.includes('interface CliDependencies'));
+  assert.match(cli, /import type \{ CliDependencies \} from ".\/cli\/deps.js";/, 'the source imports what it still uses');
+  assert.equal(result.lastCheck?.ok, true);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(events.some(e => e.type === 'auto-move'));
+});
+test('A large range whose new text is mostly identical is refused with the lines that differ', async t => {
+  const { root, store } = await fixture(t);
+  const lines = Array.from({ length: 20 }, (_, i) => `  key${i}: (signal?: AbortSignal) => run${i}(signal),`);
+  const text = ['const deps = {', ...lines, '};', ''].join('\n');
+  await writeFile(join(root, 'a.ts'), text);
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
+  const retyped = lines.map((l, i) => i === 4 ? '  key4: (signal: AbortSignal) => run4(signal),' : l).join('\n');
+  await assert.rejects(tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(text), edits: [{ start: 2, end: 21, newText: retyped, prepend: '' }] }), /rewrites 20 lines of which only 1 change \(line 6\); edit only those lines/);
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), text);
+  const ok = await tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(text), edits: [{ start: 6, end: 6, newText: '  key4: (signal: AbortSignal) => run4(signal),', prepend: '' }] });
+  assert(ok.ok);
+  // A genuine rewrite (most lines change) is not a retype.
+  const now = await readFile(join(root, 'a.ts'), 'utf8');
+  const rewritten = lines.map((_, i) => `  key${i}: () => ${i},`).join('\n');
+  assert((await tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(now), edits: [{ start: 2, end: 21, newText: rewritten, prepend: '' }] })).ok);
+});
+
+test('The source still using a moved name is detected by the parser even after an unbalanced quote earlier in the file', async () => {
+  const text = ["const re = /'/; // an apostrophe that a literal stripper mistakes for an open string", 'const other = 1;', 'function invokedAsMain(): boolean {', '  return true;', '}', 'if (invokedAsMain()) {', '  other;', '}', ''].join('\n');
+  const plan = await movePlan('src/cli.ts', text, 3, 5, 'src/cli/deps.ts', '');
+  assert.deepEqual(plan!.stillUsed, ['invokedAsMain']); assert.deepEqual(plan!.replacement, ['import { invokedAsMain } from "./cli/deps.js";']);
+});
+test('Deliverables never move against the session\'s extraction direction; the source imports them instead', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'import { x } from "./x.js";\nif (invokedAsMain()) { x; }\n');
+  await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export function invokedAsMain(): boolean { return true; }\n');
+  const check = "src/cli.ts(2,5): error TS2304: Cannot find name 'invokedAsMain'.";
+  const names = namedIdentifiers('Extract `invokedAsMain()` to src/cli/deps.ts');
+  const back = await resolveMissingNames(root, check, ['src/cli.ts', 'src/cli/deps.ts'], 40, names, { source: 'src/cli.ts', destination: 'src/cli/deps.ts' });
+  assert.equal(back[0]!.kind, undefined); assert.equal(back[0]!.importLine, 'import { invokedAsMain } from "./cli/deps.js";');
+  const free = await resolveMissingNames(root, check, ['src/cli.ts', 'src/cli/deps.ts'], 40, names, null);
+  assert.equal(free[0]!.kind, 'move', 'without a known direction the old rule applies');
+});
+test('A stale destination hash does not refuse a move whose source is current, and the cap needs only one fresh edited file', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'const a = 1;\nconst b = 2;\n'); await writeFile(join(root, 'd.ts'), 'export const z = 0;\n');
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
+  const r = await tools.execute('move_lines', { source: 'a.ts', expectedHash: hash('const a = 1;\nconst b = 2;\n'), start: 2, end: 2, destination: 'd.ts', destinationHash: 'stale', replacement: '', prefix: '' });
+  assert(r.ok); assert.match(r.text, /destinationHash was stale/); assert.equal(await readFile(join(root, 'd.ts'), 'utf8'), 'export const z = 0;\n\nexport const b = 2;\n');
+  const c = { ...defaults, allowWrite: true, allowBash: true };
+  s.phase = 'implement'; s.inspectionCount = 6; s.inspectionsSinceAction = 4; s.writes = ['a.ts', 'd.ts']; s.hashes['a.ts'] = 'h1'; s.hashes['d.ts'] = 'h2'; s.readHashes['a.ts'] = 'h1';
+  const route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert(!('read_files' in route.criteria), 'a.ts is fresh; d.ts was changed by the harness and need not be re-read');
+});
+
+test('A plan\'s extraction targets are the names before the arrow in an extract sentence, never names it merely mentions', () => {
+  const plan = ['94: **Step 1 — Lift pure leaves out of `main()`** (no behavior changes)', '95: 1. Extract `CliDependencies` type + `DEFAULT_DEPENDENCIES` factory →', '96:    `src/cli/deps.ts`. Update `main()`\'s default arg to `deps.DEFAULT_DEPENDENCIES`.', '97: 2. Extract `Writable`, `SignalName`, terminal constants (`PROGRESS_REFRESH_MILLISECONDS`,', '98:    `HIDE_CURSOR`, `SHOW_CURSOR`, `DUPLICATE_SIGNAL_WINDOW_MS`), `invokedAsMain()`,', '99:    `isJsonObject()` → `src/cli/deps.ts`.'].join('\n');
+  const targets = extractionTargets(plan);
+  assert.deepEqual(targets.map(t => t.name), ['CliDependencies', 'DEFAULT_DEPENDENCIES', 'Writable', 'SignalName', 'PROGRESS_REFRESH_MILLISECONDS', 'HIDE_CURSOR', 'SHOW_CURSOR', 'DUPLICATE_SIGNAL_WINDOW_MS', 'invokedAsMain', 'isJsonObject']);
+  assert(targets.every(t => t.destination === 'src/cli/deps.ts')); assert(!targets.some(t => t.name === 'main' || t.name === 'deps'));
+});
+test('After the first move fixes the direction, the harness moves the plan\'s remaining targets itself and withholds finish until none remain', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true }); await mkdir(join(root, 'docs'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'const HIDE_CURSOR = "h";\nconst SHOW_CURSOR = "s";\nfunction isJsonObject(v: unknown): boolean { return typeof v === "object"; }\nexport function main() { return [HIDE_CURSOR, SHOW_CURSOR, isJsonObject(1)]; }\n');
+  await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export const DEFAULT_DEPENDENCIES = {};\n');
+  await writeFile(join(root, 'check.mjs'), "import { readFileSync } from 'node:fs'; const c = readFileSync('src/cli.ts', 'utf8'); const d = readFileSync('src/cli/deps.ts', 'utf8'); for (const n of ['HIDE_CURSOR', 'SHOW_CURSOR', 'isJsonObject']) if (c.includes(n) && !c.includes(`{ ${n} }`) && !c.includes(`${n},`) && !c.includes(`, ${n}`) && !d.includes(`export`)) {} process.exit(0);\n");
+  session.objective = 'Read docs/plan.md. Perform only Step 1 substep 2';
+  session.referenceEvidence = [{ path: 'docs/plan.md', hash: 'p', scope: 'step 1 substep 2', text: '94: **Step 1 — Lift pure leaves**\n97: 2. Extract terminal constants (`HIDE_CURSOR`, `SHOW_CURSOR`), `isJsonObject()` → `src/cli/deps.ts`.' }];
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src/cli.ts', 'src/cli/deps.ts']; session.moveDirection = { source: 'src/cli.ts', destination: 'src/cli/deps.ts' };
+  session.editEvidence = [{ step: 1, route: 'move_lines', path: 'src/cli/deps.ts', summary: 'moved' } as any]; session.lastWriteStep = 1; session.step = 2;
+  const phases: string[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); const a = answersFor(q, 'read_files', .95) as any; if (q.stop_condition) a.stop_condition = { type: 'noul', noul: .05 }; return a; } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'deps.ts now declares HIDE_CURSOR, SHOW_CURSOR and isJsonObject; the check passed.' } : { files: [{ path: 'src/cli.ts', start: 1, end: 2 }] } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 12 }, store, jev, bonsai, root, () => {}).run(session);
+  const kinds = result.entries.map(e => e.kind);
+  assert.equal(kinds.filter(k => k === 'move_lines').length, 3, `three harness moves, got ${kinds.join(',')}`);
+  const deps = await readFile(join(root, 'src', 'cli', 'deps.ts'), 'utf8'); const cli = await readFile(join(root, 'src', 'cli.ts'), 'utf8');
+  assert.match(deps, /export const HIDE_CURSOR/); assert.match(deps, /export const SHOW_CURSOR/); assert.match(deps, /export function isJsonObject/);
+  assert(!/const HIDE_CURSOR =/.test(cli)); assert.match(cli, /import \{ [^}]*isJsonObject[^}]* \} from ".\/cli\/deps.js";/);
+  assert.equal(result.status, 'complete', result.stopReason); assert.deepEqual(result.pendingMoves, []);
+  const finishIdx = kinds.indexOf('finish'); const lastMove = kinds.lastIndexOf('move_lines');
+  assert(finishIdx === -1 || finishIdx > lastMove, 'no finish proposed while targets remained');
 });

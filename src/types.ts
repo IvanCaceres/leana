@@ -4,7 +4,7 @@ export interface Coverage { total: number; ranges: [number, number][] }
 export interface CheckSummary { errors: number; syntax: number; resolution?: number; byFile: Record<string, { count: number; syntax: number; resolution?: number; lines: number[]; samples: string[] }> }
 export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string> }
 export interface SourceEvidence { path: string; hash?: string; facts: Record<string, unknown>[]; excerpt?: string; error?: string; omitted?: number }
-export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused'; line?: number }
+export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move'; line?: number; move?: { source: string; start: number; end: number } }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
   { type: 'choice'; instructions: string; criteria: Record<string, string> };
@@ -50,6 +50,12 @@ export interface Session {
   inspectionsSinceAction: number;
   rejectedEdits: { key: string; identity: string; step: number; undoneAt: number; route: string; summary: string; reason: string }[];
   actions: Record<string, number>; searches: Record<string, string>; blockedRoute: Route | null;
+  // The last tool error per edit route: the same error twice in a row blocks the route.
+  lastToolError: { route: Route; message: string; step: number } | null;
+  // The first successful move fixes the direction of the extraction; deliverables never travel back.
+  moveDirection: { source: string; destination: string } | null;
+  // Deliverables the plan says to extract that the source still declares and the destination lacks.
+  pendingMoves: { name: string; source: string; start: number; end: number; destination: string }[];
   readHashes: Record<string, string>; writeSteps: Record<string, number>;
   editsSinceCheck: number;
 }

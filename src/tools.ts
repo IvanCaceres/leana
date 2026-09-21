@@ -132,12 +132,17 @@ export async function movePlan(source: string, text: string, start: number, end:
   }
   // Names the source still references after the cut need an import from the destination.
   const restRaw = `${lines.slice(0, start - 1).join('\n')}\n${replacementText}\n${lines.slice(end).join('\n')}`;
-  const rest = stripLiterals(restRaw);
+  // The parser, not a regex over stripped text: one unbalanced quote in a large
+  // file would otherwise blank everything after it.
+  const restUsed = new Set<string>();
+  const rf = ts.createSourceFile(source, restRaw, ts.ScriptTarget.Latest, true);
+  const walkRest = (n: any) => { if (ts.isIdentifier(n)) { const p = n.parent; const isProp = p && ((ts.isPropertyAccessExpression(p) && p.name === n) || (ts.isPropertyAssignment(p) && p.name === n) || (ts.isQualifiedName(p) && p.right === n)); if (!isProp) restUsed.add(n.text); } ts.forEachChild(n, walkRest); };
+  walkRest(rf);
   const toDest = (() => { const r = relative(dirname(source), destination).replace(/\\/g, '/').replace(/\.[cm]?ts$/, '.js'); return r.startsWith('.') ? r : `./${r}`; })();
   // Names the source (or the worker's own replacement) already imports from the destination.
   const imported = new Set<string>();
   for (const m of restRaw.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+["']([^"']+)["']/g)) if (m[2] === toDest) for (const part of m[1]!.split(',')) { const local = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/).pop()!.trim(); if (local) imported.add(local); }
-  const stillUsed = declared.filter(d => !imported.has(d.name) && new RegExp(`\\b${d.name.replace(/[$]/g, '\\$&')}\\b`).test(rest));
+  const stillUsed = declared.filter(d => !imported.has(d.name) && restUsed.has(d.name));
   const replacement: string[] = [];
   const types = stillUsed.filter(d => d.typeOnly).map(d => d.name); const values = stillUsed.filter(d => !d.typeOnly).map(d => d.name);
   if (types.length) replacement.push(`import type { ${types.join(', ')} } from "${toDest}";`);
@@ -186,6 +191,58 @@ export async function removeImportBindings(path: string, text: string, names: st
     edits.push({ start, end, newText: parts.length ? `import ${c.isTypeOnly ? 'type ' : ''}${parts.join(', ')} from ${spec};` : '', prepend: '' });
   }
   return edits;
+}
+// The last line of the top-level statement that starts at (or spans) a line.
+export async function declarationEnd(root: string, file: string, line: number): Promise<number | null> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(file)) return null;
+  let text: string; try { text = await boundedRead(await safePath(root, file)); } catch { return null; }
+  const ts = tsModule; const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+  for (const st of sf.statements) {
+    const from = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1; const to = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
+    if (line >= from && line <= to) return to;
+  }
+  return null;
+}
+// A large range whose new text mostly equals the old is a retype, the place
+// where generated code drifts. Name the lines that actually differ instead.
+export function nearRetype(oldLines: string[], newLines: string[], start: number): string | null {
+  if (oldLines.length < 12 || newLines.length !== oldLines.length) return null;
+  const differing = oldLines.map((l, i) => l.trim() === newLines[i]!.trim() ? -1 : start + i).filter(n => n >= 0);
+  if (differing.length === 0 || differing.length > Math.max(2, Math.floor(oldLines.length * .2))) return null;
+  return `this rewrites ${oldLines.length} lines of which only ${differing.length} change (line${differing.length > 1 ? 's' : ''} ${differing.join(', ')}); edit only those lines, in ranges of their own`;
+}
+// What a plan says to extract: the backticked names before the arrow in a
+// sentence that extracts, moves or lifts, and the destination path after it.
+// "Update `main()`'s default arg" mentions main without extracting it.
+export function extractionTargets(text: string): { name: string; destination?: string }[] {
+  const out: { name: string; destination?: string }[] = [];
+  const sentences = text.replace(/^\d+:\s?/gm, '').split(/(?<=[.;])\s+(?=[A-Z`])|\n(?=\s*\d+[.)]\s)/);
+  for (const sentence of sentences) {
+    if (!/\b(extract|move|lift|relocate)\b/i.test(sentence)) continue;
+    const parts = sentence.split(/\s*(?:→|->|=>|\binto\b)\s*/);
+    if (parts.length < 2) continue; // a heading such as "Lift pure leaves out of `main()`" names no destination
+    const left = parts[0]!; const right = parts.slice(1).join(' ');
+    const destination = right.match(/`?([\w./-]+\.(?:[cm]?[jt]sx?))`?/)?.[1];
+    for (const m of left.matchAll(/`([A-Za-z_$][\w$]*)(?:\(\))?`/g)) if (!out.some(o => o.name === m[1])) out.push(destination ? { name: m[1]!, destination } : { name: m[1]! });
+  }
+  return out;
+}
+// Top-level declarations of a file by name, with their line ranges.
+export async function topLevelDeclarations(path: string, text: string): Promise<Map<string, { start: number; end: number; kind: string }>> {
+  const out = new Map<string, { start: number; end: number; kind: string }>();
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return out;
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  for (const st of sf.statements) {
+    const names: string[] = [];
+    if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st) || ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st) || ts.isEnumDeclaration(st)) && st.name) names.push(st.name.text);
+    if (ts.isVariableStatement(st)) for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name)) names.push(d.name.text);
+    if (!names.length) continue;
+    const start = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1; const end = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
+    for (const n of names) out.set(n, { start, end, kind: ts.SyntaxKind[st.kind] });
+  }
+  return out;
 }
 // A check whose output depends on a cache is not a verification: incremental
 // tsc reuses a file's cached diagnostics until that file itself changes, so a
@@ -451,7 +508,7 @@ export function namedIdentifiers(text: string): Set<string> {
   for (const m of text.matchAll(/\b([A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+)\b/g)) out.add(m[1]!);
   return out;
 }
-export async function resolveMissingNames(root: string, checkOutput: string, editedFiles: string[], limit = 40, deliverables: Set<string> = new Set()): Promise<NameOrigin[]> {
+export async function resolveMissingNames(root: string, checkOutput: string, editedFiles: string[], limit = 40, deliverables: Set<string> = new Set(), direction: { source: string; destination: string } | null = null): Promise<NameOrigin[]> {
   // name -> { file it is missing in, kind, module named by the error (if any) }
   const wanted = new Map<string, Map<string, { kind: 'missing' | 'not-exported' | 'wrong-module'; module?: string }>>();
   const add = (file: string, name: string, kind: 'missing' | 'not-exported' | 'wrong-module', module?: string) => {
@@ -476,7 +533,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
   };
   const relPath = (from: string, to: string) => { const r = relative(resolve(root, dirname(from)), resolve(root, to)).replace(/\\/g, '/'); return r.startsWith('.') ? r : `./${r}`; };
   const ambiguous = new Map<string, string[]>();
-  const declare = async (name: string, only?: string): Promise<{ file: string; line: string; exported: boolean; typeLike: boolean } | null> => {
+  const declare = async (name: string, only?: string): Promise<{ file: string; line: string; exported: boolean; typeLike: boolean; endLine: number | null } | null> => {
     const r = await runCommand('rg', ['-n', '-H', '--no-heading', '--color', 'never', '--max-count', '3', '-g', '!node_modules/**', '-g', '!.leana/**', '-g', '!dist/**', '-e', `^(export )?(declare )?(type|interface|const|let|function|async function|class|enum) ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, '--', only ?? '.'], root, 10000).catch(() => null);
     const all = (r?.output.split('\n') ?? []).map(line => line.match(/^(.*?):(\d+):(.*)$/)).filter((m): m is RegExpMatchArray => Boolean(m));
     // A repository-wide first match can be an unrelated test helper. Test and
@@ -487,7 +544,22 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     const files = [...new Set(hits.map(m => m[1]!.replace(/^\.\//, '')))].sort(); // ripgrep searches in parallel; the order must not depend on it
     if (files.length > 1) { ambiguous.set(name, files.slice(0, 5)); return null; }
     const m = hits[0];
-    return m ? { file: m[1]!.replace(/^\.\//, ''), line: m[2]!, exported: /^export /.test(m[3]!), typeLike: /^(export )?(declare )?(type|interface)\b/.test(m[3]!) } : null;
+    if (!m) return null;
+    const file = m[1]!.replace(/^\.\//, '');
+    return { file, line: m[2]!, exported: /^export /.test(m[3]!), typeLike: /^(export )?(declare )?(type|interface)\b/.test(m[3]!), endLine: await declarationEnd(root, file, Number(m[2])) };
+  };
+  // A deliverable declared in an edited file is moved, not imported back or exported:
+  // importing it would satisfy the checker and defeat the extraction.
+  const toMove = (name: string, d: { file: string; line: string; endLine: number | null } | null, inFile: string): NameOrigin | null => {
+    if (!d || !deliverables.has(name) || !editedFiles.some(f => f === d.file || f.endsWith(`/${d.file}`) || d.file.endsWith(`/${f}`)) || d.file === inFile) return null;
+    // With a known direction, only source -> destination is a move; a name the
+    // source now lacks is imported from the destination like any other.
+    const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+    if (direction && !(same(d.file, direction.source) && same(inFile, direction.destination))) return null;
+    const origin: NameOrigin = { name, inFile, kind: 'move', declaredIn: `${d.file}:${d.line}` };
+    if (d.endLine) { origin.move = { source: d.file, start: Number(d.line), end: d.endLine }; origin.note = `named by the objective as something to extract and still declared in ${d.file} at lines ${d.line}-${d.endLine}; the harness moves it into ${inFile}`; }
+    else origin.note = `named by the objective as something to extract and still declared at ${origin.declaredIn}: move that declaration into ${inFile} with move_lines (read its closing line first); do not import it back`;
+    return origin;
   };
   const locate = async (name: string, inFile: string) => {
     for (const source of editedFiles.filter(f => f !== inFile)) {
@@ -504,12 +576,14 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
         // The import is right; the declaration in that module lacks an export.
         const target = relative(root, resolve(dirname(resolve(root, inFile)), want.module)).replace(/\.js$/, '.ts');
         const d = await declare(name, target);
+        const mv = toMove(name, d, inFile); if (mv) { results.push(mv); if (results.length >= limit) return results; continue; }
         origin.declaredIn = d ? `${d.file}:${d.line}` : target; origin.exported = false;
         origin.note = `already imported from ${want.module}; add the export keyword to the declaration at ${origin.declaredIn}: replace_lines edit { start: ${d?.line ?? '?'}, end: ${d?.line ?? '?'}, newText: "", prepend: "export " } on ${d?.file ?? target}`;
         results.push(origin); continue;
       }
       if (want.kind === 'wrong-module') {
         const d = await locate(name, inFile);
+        const mv = toMove(name, d, inFile); if (mv) { results.push(mv); if (results.length >= limit) return results; continue; }
         if (d) {
           origin.declaredIn = `${d.file}:${d.line}`; origin.exported = d.exported;
           origin.importLine = `import ${d.typeLike ? 'type ' : ''}{ ${name} } from "${relPath(inFile, d.file).replace(/\.ts$/, '.js')}";`;
@@ -542,11 +616,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
         const d = await locate(name, inFile);
         // A deliverable declared in another edited file is to be moved, not imported
         // back: importing it would satisfy the checker and defeat the extraction.
-        if (d && deliverables.has(name) && editedFiles.some(f => f === d.file || f.endsWith(`/${d.file}`) || d.file.endsWith(`/${f}`))) {
-          origin.declaredIn = `${d.file}:${d.line}`;
-          origin.note = `named by the objective as something to extract and still declared at ${origin.declaredIn}: move that declaration into ${inFile} with move_lines (read its closing line first); do not import it back`;
-          results.push(origin); if (results.length >= limit) return results; continue;
-        }
+        const mv = toMove(name, d, inFile); if (mv) { results.push(mv); if (results.length >= limit) return results; continue; }
         if (d) {
           origin.declaredIn = `${d.file}:${d.line}`; origin.exported = d.exported;
           origin.importLine = `import ${d.typeLike ? 'type ' : ''}{ ${name} } from "${relPath(inFile, d.file).replace(/\.ts$/, '.js')}";`;
@@ -642,7 +712,7 @@ export class ToolBox {
         if (updated === original) throw new Error('Write produced no change: newText equals oldText. oldText is the exact existing anchor; newText must be the modified text that replaces it');
         assertBalancePreserved(original, updated, a.path);
         await assertParses(a.path, original, updated);
-        assertNoBulkDuplication(original, a.newText.split('\n'), a.path);
+        assertNoBulkDuplication(original.replace(a.oldText, ''), a.newText.split('\n'), a.path);
         const temp = `${path}.leana-${randomUUID()}.tmp`;
         try {
           const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
@@ -684,6 +754,8 @@ export class ToolBox {
           const line = lines[n - 1] ?? '';
           if (/^\s*$/.test(line)) throw new Error(`Line ${n} is blank; prepend "${e.prepend}" belongs on the declaration line`);
           if (/^\s*(import|export)\b/.test(line) && /^\s*export\s*$/.test(e.prepend)) throw new Error(`Line ${n} already starts with ${line.trim().split(/\s+/)[0]} (${JSON.stringify(line.trim().slice(0, 60))}); export is prepended only to a declaration line`);
+          const lastWord = e.prepend.trim().split(/\s+/).pop() ?? '';
+          if (lastWord && line.trimStart().startsWith(`${lastWord} `)) throw new Error(`Line ${n} already starts with ${JSON.stringify(lastWord)} (${JSON.stringify(line.trim().slice(0, 60))}); prepend adds only what is missing, so use prepend ${JSON.stringify(e.prepend.trim().split(/\s+/).slice(0, -1).join(' ') + ' ')}`);
         }
       }
       // An edit that leaves its lines as they are is skipped, not fatal: in a
@@ -695,6 +767,7 @@ export class ToolBox {
       const skipped = all.filter(e => e.end >= e.start && !(e.newText === '' && !e.prepend) && same(lines.slice(e.start - 1, e.end), rendered(e)));
       const edits = all.filter(e => !skipped.includes(e));
       if (!edits.length) throw new Error(`replace_lines produced no change: every newText equals the current lines (${all.map(e => `${e.start}..${e.end}`).join(', ')})`);
+      for (const e of edits) if (!e.prepend && e.end >= e.start) { const why = nearRetype(lines.slice(e.start - 1, e.end), rendered(e), e.start); if (why) throw new Error(`Edit refused: ${why}.`); }
       let result = lines; let delta = 0;
       for (const e of edits) {
         const fresh = rendered(e);
@@ -705,7 +778,10 @@ export class ToolBox {
       const updated = result.join('\n');
       assertBalancePreserved(original, updated, a.path);
       await assertParses(a.path, original, updated);
-      assertNoBulkDuplication(original, edits.filter(e => !e.prepend).flatMap(e => rendered(e)), a.path);
+      // Retyping a range in place is a rewrite, not a paste: judge the inserted
+      // lines against the file without the ranges they replace.
+      const outside = lines.filter((_, i) => !edits.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end)).join('\n');
+      assertNoBulkDuplication(outside, edits.filter(e => !e.prepend).flatMap(e => rendered(e)), a.path);
       const temp = `${path}.leana-${randomUUID()}.tmp`;
       try {
         const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
@@ -734,7 +810,9 @@ export class ToolBox {
       try { existing = await boundedRead(destinationPath); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
       if (existing === null && a.destinationHash !== 'new') throw new StaleWriteError(`${a.destination} does not exist; use destinationHash=new to create it`);
       if (existing !== null && a.destinationHash === 'new') throw new StaleWriteError(`${a.destination} exists: read it and use its sha256 as destinationHash`);
-      if (existing !== null && hash(existing) !== a.destinationHash) throw new StaleWriteError(`Stale file hash for ${a.destination}: read it again`);
+      // Appending does not depend on the destination's content: a stale destination
+      // hash is noted, not refused, as long as the source (whose lines are cut) is current.
+      const destinationStale = existing !== null && hash(existing) !== a.destinationHash;
       if (existing !== null) snapshots[a.destination] = await this.snapshot(a.destination, existing); else snapshots[a.destination] = '@new';
       const moved = lines.slice(a.start - 1, a.end).join('\n');
       // A range that cuts through a block leaves both files broken. Bracket
@@ -794,6 +872,7 @@ export class ToolBox {
       return { ok: true, changed: [a.source, a.destination], hashes: { [a.source]: hash(remaining), [a.destination]: hash(output) }, snapshots,
         text: `Moved lines ${a.start}..${a.end} (${a.end - a.start + 1} lines) from ${a.source} to ${a.destination}. ` +
         `${a.source} sha256=${hash(remaining)} totalLines=${remaining.split('\n').length}; ${a.destination} sha256=${hash(output)} totalLines=${output.split('\n').length}. ` +
+        (destinationStale ? `(destinationHash was stale; the current ${a.destination} was appended to.) ` : '') +
         (plan ? `Exported ${plan.exported.length ? plan.exported.join(', ') : 'nothing new'}; copied ${plan.prefix.length} import line(s) into the destination; ${plan.replacement.length ? `${a.source} now imports ${plan.stillUsed.join(', ')} from the destination` : `${a.source} no longer referenced the moved names`}.` +
           (plan.localDeps.length ? ` The moved code also uses ${plan.localDeps.map(d => `${d.name} (declared at ${a.source}:${d.line}, not exported)`).join(', ')}: export those in ${a.source} and import them in ${a.destination}, or move them too; the check reports them next.` : '') +
           ' The check runs next.'

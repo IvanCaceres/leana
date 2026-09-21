@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
 import { checkDelta, clip, compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
-import { namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { topLevelDeclarations, extractionTargets, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
 import { editRoutes } from './types.js';
@@ -17,7 +17,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1,
+    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [],
     lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
@@ -88,6 +88,7 @@ export class Runner {
     for (const [path, h] of Object.entries(result.hashes ?? {})) { delete s.hashes[path]; s.hashes[path] = h; }
     for (const stale of Object.keys(s.hashes).slice(0, -20)) delete s.hashes[stale];
     if (result.verification) { s.editsSinceCheck = 0; if (kind === 'bash' && args?.command) s.lastCheckCommand = args.command; }
+    if (kind === 'move_lines' && result.ok && !s.moveDirection && args?.source && args?.destination) s.moveDirection = { source: args.source, destination: args.destination };
     // Edits followed by a passing check answer a completion rejection; the pinned
     // text must stop telling Jev the objective is unfinished.
     if (s.completionFeedback && !s.completionFeedback.addressed && result.verification && result.ok && s.lastWriteStep > s.completionFeedback.step)
@@ -134,7 +135,8 @@ export class Runner {
       // Resolve every name the check cannot find, so the fix is a known import line.
       let output = result.text; try { output = JSON.parse(result.text).output ?? result.text; } catch { /* plain text */ }
       const deliverables = namedIdentifiers([s.objective, ...referenceContext(s).map(e => e.text)].join('\n'));
-      s.missingNames = result.ok ? [] : await resolveMissingNames(this.tools.root, output, s.writes, 40, deliverables).catch(() => []);
+      s.missingNames = result.ok ? [] : await resolveMissingNames(this.tools.root, output, s.writes, 40, deliverables, s.moveDirection).catch(() => []);
+      s.pendingMoves = await this.pendingMoves(s).catch(() => []);
     }
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.editSnapshots)) s.editSnapshots[path] = artifact;
     // A failing check ends verification; a failing baseline during inspection
@@ -189,11 +191,42 @@ export class Runner {
   // The harness resolved these fixes from the check; applying them is mechanical,
   // so it does not go through the worker. Each fix set is attempted once; the
   // check that follows commits or rolls it back like any other edit.
+  // Once the extraction has a direction, the plan's remaining targets are known
+  // without a check error naming them: still declared in the source, absent
+  // from the destination, and small enough that a misread cannot move main().
+  private async pendingMoves(s: Session): Promise<Session['pendingMoves']> {
+    const dir = s.moveDirection; if (!dir) return [];
+    const targets = extractionTargets([s.objective, ...referenceContext(s).map(e => e.text)].join('\n'))
+      .filter(t => !t.destination || dir.destination === t.destination || dir.destination.endsWith(`/${t.destination}`) || t.destination.endsWith(`/${dir.destination}`));
+    if (!targets.length) return [];
+    let source: string; let destination = '';
+    try { source = await readFile(await safePath(this.tools.root, dir.source), 'utf8'); } catch { return []; }
+    try { destination = await readFile(await safePath(this.tools.root, dir.destination), 'utf8'); } catch { /* not created yet */ }
+    const declared = await topLevelDeclarations(dir.source, source); const done = await topLevelDeclarations(dir.destination, destination);
+    return targets.flatMap(t => { const d = declared.get(t.name); return d && !done.has(t.name) && d.end - d.start < 600 ? [{ name: t.name, source: dir.source, start: d.start, end: d.end, destination: dir.destination }] : []; });
+  }
+  private async forcedMove(s: Session, mv: { name: string; source: string; start: number; end: number; destination: string }): Promise<boolean> {
+    const key = hash(JSON.stringify({ m: mv }));
+    if (s.autoFixKeys[`move:${mv.name}`] === key) return false;
+    s.autoFixKeys[`move:${mv.name}`] = key;
+    let source: string; let into: string | null = null;
+    try { source = await readFile(await safePath(this.tools.root, mv.source), 'utf8'); } catch { return false; }
+    try { into = await readFile(await safePath(this.tools.root, mv.destination), 'utf8'); } catch { into = null; }
+    const args = { source: mv.source, expectedHash: hash(source), start: mv.start, end: mv.end, destination: mv.destination, destinationHash: into === null ? 'new' : hash(into), replacement: '', prefix: '' };
+    const identity = hash(JSON.stringify({ route: 'move_lines', args: { ...args, expectedHash: undefined, destinationHash: undefined } }));
+    if (s.rejectedEdits.some(r => r.identity === identity)) return false;
+    await this.forced(s, 'move_lines', args, 'auto-move');
+    return true;
+  }
   private async autoFix(s: Session): Promise<boolean> {
+    for (const mv of s.pendingMoves) if (await this.forcedMove(s, mv)) return true;
     // Only errors reported in files this session edits are the harness's to fix;
     // a failing baseline in untouched files is context, not a work order.
     const own = s.missingNames.filter(n => s.writes.some(w => w === n.inFile || w.endsWith(`/${n.inFile}`) || n.inFile.endsWith(`/${w}`)));
     const fixes = compactNames(s, 60, own);
+    // A deliverable the destination needs and the source still declares is moved
+    // first: the extraction the objective asked for, judged by the check that follows.
+    for (const mv of fixes.moveDeclarations) if (await this.forcedMove(s, { ...mv, destination: mv.into })) return true;
     // One file per step, so the check runs between files and each fix is judged alone.
     for (const file of new Set([...Object.keys(fixes.addImports), ...Object.keys(fixes.addExportAtLines), ...Object.keys(fixes.removeImports)])) {
       // Export fixes land in the declaring file, which may be one the session never
@@ -311,7 +344,8 @@ export class Runner {
           await this.store.save(s);
           continue;
         }
-        if (s.lastCheck && !s.lastCheck.ok && this.config.allowWrite && await this.autoFix(s)) { await this.store.save(s); continue; }
+        // Resolved fixes after a failing check; the plan's remaining targets after any check.
+        if (s.lastCheck && (!s.lastCheck.ok || s.pendingMoves.length) && this.config.allowWrite && await this.autoFix(s)) { await this.store.save(s); continue; }
         if (s.lastCheck && !s.lastCheck.ok && s.focusReadAt !== s.lastCheck.step) {
           s.focusReadAt = s.lastCheck.step;
           const regions = this.focusRegions(s);
@@ -335,7 +369,7 @@ export class Runner {
         // completion: the audit judges the proposal, so the harness makes it once per
         // check rather than leaving the worker to read until it feels ready.
         const readyToFinish = Boolean(s.lastCheck?.ok && s.editEvidence.length && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && !s.autoUndo
-          && staleFor(s).length === 0 && !s.missingNames.length && s.finishTriedAtCheck !== s.lastCheck.step && 'finish' in (questions.route as { criteria: Record<string, string> }).criteria);
+          && staleFor(s).length === 0 && !s.missingNames.length && !s.pendingMoves.length && s.finishTriedAtCheck !== s.lastCheck.step && 'finish' in (questions.route as { criteria: Record<string, string> }).criteria);
         if (readyToFinish) s.finishTriedAtCheck = s.lastCheck!.step;
         const jevStarted = performance.now();
         const state = decisionState(s);
@@ -558,6 +592,15 @@ export class Runner {
         if (s.lastWriteStale) s.inspectionsSinceAction = 0; // the recovery read must stay available
         // A blocked route stays off the table until some other action succeeds.
         if (result.ok && route !== s.blockedRoute) s.blockedRoute = null;
+        // The same tool error twice in a row on an edit route means the worker is
+        // not reading the refusal: take the route away until another action lands.
+        if (!result.ok && editRoutes.includes(route)) {
+          const message = result.text.slice(0, 120);
+          if (s.lastToolError && s.lastToolError.route === route && s.lastToolError.message === message && s.lastToolError.step === s.step - 1) {
+            s.blockedRoute = route; await this.store.log('blocked-route', { step: s.step, route, reason: 'the same refusal twice in a row', message });
+          }
+          s.lastToolError = { route, message, step: s.step };
+        } else if (result.ok) s.lastToolError = null;
         await this.evidence(s, route, result, args);
         if (s.completionFeedback && result.ok && (result.changed?.length || route === 'read_files' || route === 'search_codebase'))
           s.completionFeedback.awaitingEvidence = false;

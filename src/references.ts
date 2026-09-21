@@ -12,8 +12,18 @@ function score(text: string, objective: string): number {
   const lower = text.toLowerCase();
   return terms(objective).reduce((n, term) => n + (new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(lower) ? (term.includes(' ') ? 20 : 1) : 0), 0);
 }
-function scope(objective: string): RegExpMatchArray | null {
-  return objective.match(/\b(step|section|phase|part)\s+(\d+(?:\.\d+)*)\s+(?:substep|item)\s+(\d+)\b/i);
+// Every requested item: "step 1 substep 2", "step 1 substep 1 and substep 2",
+// "step 1 substeps 1-3", "step 1 substep 1 and 2". One scope per item.
+export function scopes(objective: string): { key: string; kind: string; section: string; item: string }[] {
+  const out: { key: string; kind: string; section: string; item: string }[] = [];
+  for (const m of objective.matchAll(/\b(step|section|phase|part)\s+(\d+(?:\.\d+)*)\s+(?:substeps?|items?)\s+(\d+(?:\s*(?:,|and|&|-|to|through)\s*(?:substeps?|items?)?\s*\d+)*)\b/gi)) {
+    const [kind, section] = [m[1]!.toLowerCase(), m[2]!];
+    const numbers = [...m[3]!.matchAll(/\d+/g)].map(x => Number(x[0]));
+    const ranged = /-|\bto\b|\bthrough\b/i.test(m[3]!) && numbers.length === 2 && numbers[1]! > numbers[0]!
+      ? Array.from({ length: numbers[1]! - numbers[0]! + 1 }, (_, i) => numbers[0]! + i) : numbers;
+    for (const n of ranged) { const key = `${kind} ${section} substep ${n}`; if (!out.some(o => o.key === key)) out.push({ key, kind, section, item: String(n) }); }
+  }
+  return out;
 }
 export function rememberReferences(s: Session, result: string): void {
   const blocks = result.split(/\n\n(?=\S+ sha256=)/);
@@ -23,23 +33,20 @@ export function rememberReferences(s: Session, result: string): void {
     const [, path, hash] = header as [string, string, string];
     s.referenceEvidence = s.referenceEvidence.filter(e => e.path !== path || e.hash === hash);
     const lines = block.slice(header[0].length).split('\n');
-    const requested = scope(s.objective);
-    if (requested) {
+    for (const requested of scopes(s.objective)) {
       const plain = (line: string) => line.replace(/^\d+:\s?/, '').replace(/^[#*\s]+/, '');
-      const heading = new RegExp(`^${requested[1]}\\s+${requested[2]!.replace(/\./g, '\\.')}\\b`, 'i');
+      const heading = new RegExp(`^${requested.kind}\\s+${requested.section.replace(/\./g, '\\.')}\\b`, 'i');
       const at = lines.findIndex(l => heading.test(plain(l)));
-      if (at >= 0) {
-        const body = lines.slice(at + 1);
-        const nextHeading = body.findIndex(l => /^(?:step|section|phase|part)\s+\d/i.test(plain(l)));
-        const section = nextHeading < 0 ? body : body.slice(0, nextHeading);
-        const item = section.findIndex(l => new RegExp(`^${requested[3]}[.)]\\s`).test(plain(l)));
-        if (item >= 0) {
-          const rest = section.slice(item + 1);
-          const next = rest.findIndex(l => /^\d+[.)]\s/.test(plain(l)));
-          const text = [lines[at], section[item], ...(next < 0 ? rest : rest.slice(0, next))].join('\n').slice(0, 2400);
-          if (!s.referenceEvidence.some(e => e.path === path && e.text === text)) s.referenceEvidence.push({ path, hash, text, scope: requested[0].toLowerCase() });
-        }
-      }
+      if (at < 0) continue;
+      const body = lines.slice(at + 1);
+      const nextHeading = body.findIndex(l => /^(?:step|section|phase|part)\s+\d/i.test(plain(l)));
+      const section = nextHeading < 0 ? body : body.slice(0, nextHeading);
+      const item = section.findIndex(l => new RegExp(`^${requested.item}[.)]\\s`).test(plain(l)));
+      if (item < 0) continue;
+      const rest = section.slice(item + 1);
+      const next = rest.findIndex(l => /^\d+[.)]\s/.test(plain(l)));
+      const text = [lines[at], section[item], ...(next < 0 ? rest : rest.slice(0, next))].join('\n').slice(0, 2400);
+      if (!s.referenceEvidence.some(e => e.path === path && e.text === text)) s.referenceEvidence.push({ path, hash, text, scope: requested.key });
     }
     // Overlapping windows retain headings and the following numbered items.
     for (let start = 0; start < lines.length; start += 12) {
@@ -53,9 +60,9 @@ export function rememberReferences(s: Session, result: string): void {
 }
 export function referenceContext(s: Session, budget = 6000): Session['referenceEvidence'] {
   const out: Session['referenceEvidence'] = [];
-  const requested = scope(s.objective)?.[0].toLowerCase();
+  const requested = new Set(scopes(s.objective).map(r => r.key));
   const current = s.referenceEvidence.filter(e => !s.hashes[e.path] || s.hashes[e.path] === e.hash);
-  const scoped = requested ? current.filter(e => e.scope === requested) : [];
+  const scoped = current.filter(e => e.scope && requested.has(e.scope));
   for (const e of scoped.length ? scoped : current) {
     // A changed document must be read again before its requirements are reused.
     if (s.hashes[e.path] && s.hashes[e.path] !== e.hash) continue;

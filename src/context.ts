@@ -11,7 +11,7 @@ export function clip(text: string, limit: number): string {
 export const routeDescriptions: Record<Route, string> = {
   read_files: 'Read a requirements document, an uninspected file, or an exact source range already located by search or diagnostics; retrieve a stored artifact from @artifact/name. To locate named declarations in an already-read large source file, choose search_codebase instead of rereading its beginning or paging through it.',
   search_codebase: 'Locate files, definitions, references or tests using a text query or file listing; text matches return file:line, which is the one-step way to find where a symbol is defined in a large file before reading that range. Search path @artifacts for archived evidence.',
-  write: 'Apply one exact text replacement to an already-read file, or create a new file.',
+  write: 'Replace one short anchor (at most 6 lines) with new text in an already-read file, or create a new file; never for blocks, import lists, exports or moves, which replace_lines and move_lines do by line number without retyping.',
   replace_lines: 'Replace, delete or prefix up to 40 line ranges of an already-read file in one step, addressed by line numbers instead of exact anchors; the way to remove many unused-import lines at once, to export many declarations at once (prepend), or to rewrite a region.',
   move_lines: 'Move a contiguous line range from an already-read file into another file without retyping it; the way to extract a large block into a new module.',
   bash: 'Run a shell command, including tests, builds or diagnostics, with explicit execution permission.',
@@ -108,7 +108,9 @@ export function routeQuestions(s: Session, c: Config): Questions {
   // Once every edited file is readable at its current version, the source for
   // the next edit is in hand: after four inspections without an action the worker
   // edits, checks or finishes. Before that, novel inspection stays available.
-  const located = s.writes.length > 0 && s.writes.every(p => s.readHashes[p] !== undefined && s.readHashes[p] === s.hashes[p]);
+  // Before the first edit, a source file read at its current version is the located source.
+  const target = s.writes.length ? s.writes : Object.keys(s.readHashes).filter(p => /\.[cm]?[jt]sx?$/.test(p));
+  const located = target.length > 0 && target.every(p => s.readHashes[p] !== undefined && s.readHashes[p] === s.hashes[p]);
   const actionable = editRoutes.some(r => r in criteria) || 'bash' in criteria || 'finish' in criteria;
   if (s.inspectionsSinceAction >= 4 && s.phase !== 'inspect' && located && actionable && !(editFailed && s.lastWriteStale)) {
     delete (criteria as Partial<typeof criteria>).read_files; delete (criteria as Partial<typeof criteria>).search_codebase;

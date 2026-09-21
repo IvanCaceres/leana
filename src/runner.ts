@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
 import { checkDelta, clip, compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
-import { removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
 import { editRoutes } from './types.js';
@@ -133,7 +133,8 @@ export class Runner {
       if (verdict === 'fine') s.transaction = [];
       // Resolve every name the check cannot find, so the fix is a known import line.
       let output = result.text; try { output = JSON.parse(result.text).output ?? result.text; } catch { /* plain text */ }
-      s.missingNames = result.ok ? [] : await resolveMissingNames(this.tools.root, output, s.writes).catch(() => []);
+      const deliverables = namedIdentifiers([s.objective, ...referenceContext(s).map(e => e.text)].join('\n'));
+      s.missingNames = result.ok ? [] : await resolveMissingNames(this.tools.root, output, s.writes, 40, deliverables).catch(() => []);
     }
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.editSnapshots)) s.editSnapshots[path] = artifact;
     // A failing check ends verification; a failing baseline during inspection
@@ -357,6 +358,17 @@ export class Runner {
             const again = await this.jev.decide(decisionState(s, { routingNarrowed: `Routing among ${Object.keys(criteria).length} actions was uncertain; choose among the leading candidates.` }),
               { route: narrowed }, { step: s.step, phase: 'routing-narrowed' });
             route = confidentChoice(again.route, this.config) as Route | null;
+            // An edit against an inspection, after inspections have already run since
+            // the last action, is not a coin flip: a failed edit returns a precise
+            // error in one step, another read returns more of the same.
+            const isEdit = (k: string) => editRoutes.includes(k as Route); const isLook = (k: string) => k === 'read_files' || k === 'search_codebase';
+            if (again.route?.type === 'choice' && s.inspectionsSinceAction >= 2 && leading.some(isEdit) && leading.some(isLook) && (!route || isLook(route))) {
+              const edit = leading.find(isEdit)!;
+              if ((again.route.probabilities[edit] ?? 0) >= this.config.routeProbability * .5) {
+                route = edit as Route;
+                await this.store.log('tie-break', { step: s.step, route, probabilities: again.route.probabilities, rule: 'edit over inspection after inspections' });
+              }
+            }
             // A coin flip between two reasonable actions is not a reason to stop the
             // session: take the narrowed leader when it carries real probability.
             if (!route && again.route?.type === 'choice') {

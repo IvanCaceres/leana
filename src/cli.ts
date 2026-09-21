@@ -149,9 +149,18 @@ async function main(): Promise<void> {
     // A live panel on a terminal; plain lines otherwise (logs, CI, pipes).
     const display = new Display(process.stderr, { objective: session.objective, session: basename(store.path), verbose: config.verbose });
     let result;
+    const startedAt = Date.now(); const stepsBefore = session.step;
     try { result = await new Runner(config, store, jev, bonsai, session.root, line => display.log(line), e => display.update(e)).run(session); }
     finally { display.close(); }
-    console.log(`\n${result.status.toUpperCase()}: ${result.stopReason}\nSession: ${store.path}`);
+    // Wall-clock for this invocation and, when the session was resumed, since its first event.
+    const fmt = (ms: number) => { const sec = Math.round(ms / 1000); return sec >= 60 ? `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s` : `${sec}s`; };
+    let since = '';
+    try {
+      const first = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n')[0];
+      const at = first ? Date.parse(JSON.parse(first).at) : NaN;
+      if (Number.isFinite(at) && at < startedAt - 5000) since = `; ${fmt(Date.now() - at)} since the session began`;
+    } catch { /* no event log */ }
+    console.log(`\n${result.status.toUpperCase()}: ${result.stopReason}\nElapsed: ${fmt(Date.now() - startedAt)} for ${result.step - stepsBefore} steps (${result.step} in total)${since}\nSession: ${store.path}`);
     if (result.status !== 'complete') process.exitCode = 2;
   } finally { await lock.close(); await unlink(lockPath); }
 }

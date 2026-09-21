@@ -443,7 +443,15 @@ export function missingNamesFrom(summary: CheckSummary): { file: string; name: s
   }
   return out;
 }
-export async function resolveMissingNames(root: string, checkOutput: string, editedFiles: string[], limit = 40): Promise<NameOrigin[]> {
+// Identifiers an objective or its referenced plan names: `Writable`, SignalName,
+// PROGRESS_REFRESH_MILLISECONDS, invokedAsMain(). These are deliverables.
+export function namedIdentifiers(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/`([A-Za-z_$][\w$]*)(?:\(\))?`/g)) out.add(m[1]!);
+  for (const m of text.matchAll(/\b([A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+)\b/g)) out.add(m[1]!);
+  return out;
+}
+export async function resolveMissingNames(root: string, checkOutput: string, editedFiles: string[], limit = 40, deliverables: Set<string> = new Set()): Promise<NameOrigin[]> {
   // name -> { file it is missing in, kind, module named by the error (if any) }
   const wanted = new Map<string, Map<string, { kind: 'missing' | 'not-exported' | 'wrong-module'; module?: string }>>();
   const add = (file: string, name: string, kind: 'missing' | 'not-exported' | 'wrong-module', module?: string) => {
@@ -532,6 +540,13 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
       }
       if (!origin.importLine) {
         const d = await locate(name, inFile);
+        // A deliverable declared in another edited file is to be moved, not imported
+        // back: importing it would satisfy the checker and defeat the extraction.
+        if (d && deliverables.has(name) && editedFiles.some(f => f === d.file || f.endsWith(`/${d.file}`) || d.file.endsWith(`/${f}`))) {
+          origin.declaredIn = `${d.file}:${d.line}`;
+          origin.note = `named by the objective as something to extract and still declared at ${origin.declaredIn}: move that declaration into ${inFile} with move_lines (read its closing line first); do not import it back`;
+          results.push(origin); if (results.length >= limit) return results; continue;
+        }
         if (d) {
           origin.declaredIn = `${d.file}:${d.line}`; origin.exported = d.exported;
           origin.importLine = `import ${d.typeLike ? 'type ' : ''}{ ${name} } from "${relPath(inFile, d.file).replace(/\.ts$/, '.js')}";`;
@@ -613,6 +628,13 @@ export class ToolBox {
         if (a.expectedHash === 'new') throw new StaleWriteError(`expectedHash=new is only valid for a new file; ${a.path} exists: read it with read_files and use the returned sha256`);
         if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.path}: read the file again and use the sha256 from that result`);
         snapshots[a.path] = await this.snapshot(a.path, original);
+        // A write is a short anchor. A retyped block is where a small model drifts,
+        // and the line tools already address blocks without retyping anything.
+        const anchorLines = a.oldText.split('\n').length;
+        if (anchorLines > 6) {
+          const first = a.oldText.split('\n')[0]!.trim(); const at = original.split('\n').findIndex(l => l.trim() === first) + 1;
+          throw new Error(`oldText is ${anchorLines} lines; a write anchor is at most 6. ${at ? `That block starts at line ${at}: ` : ''}use replace_lines with line numbers (prepend "export " to export a line, newText "" to delete, the insert form to add imports) or move_lines to relocate it.`);
+        }
         const matches = a.oldText ? original.split(a.oldText).length - 1 : 0;
         if (matches === 0) throw new Error('oldText must match exactly once: it was not found in the current file. Copy a small anchor exactly from the latest read_files result of this path; never paste a truncated excerpt');
         if (matches > 1) throw new Error(`oldText must match exactly once: it matches ${matches} times. Include more surrounding lines so the anchor is unique`);

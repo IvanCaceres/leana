@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { defaults, loadConfig } from '../src/config.js';
 import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
-import { completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
+import { compactNames, completionClaims, completionQuestions, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { referenceContext, rememberReferences } from '../src/references.js';
 import { dirtySessionConflict } from '../src/cli.js';
@@ -14,7 +14,7 @@ import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -1891,4 +1891,63 @@ test('A passing check after edits proposes finish once without asking Jev to rou
   assert.match(result.completionFeedback?.text ?? '', /^The completion proposed at step 2 was rejected/); assert.equal(result.completionFeedback?.addressed, true);
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.some(e => e.type === 'auto-finish'));
+});
+
+test('A deliverable still declared in the move source is reported as something to move, never imported back', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'type Writable = { write(s: string): void };\ntype Other = string;\nexport const x = 1;\n');
+  await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export const HIDE_CURSOR = "x";\nexport function f(w: Writable, o: Other) {}\n');
+  const plan = 'Step 1\n2. Extract `Writable`, `SignalName`, terminal constants (`HIDE_CURSOR`), `invokedAsMain()` -> src/cli/deps.ts.';
+  const names = namedIdentifiers(plan);
+  assert(names.has('Writable') && names.has('HIDE_CURSOR') && names.has('invokedAsMain') && names.has('SignalName') && !names.has('Extract'));
+  const check = "src/cli/deps.ts(2,22): error TS2304: Cannot find name 'Writable'.\nsrc/cli/deps.ts(2,35): error TS2304: Cannot find name 'Other'.";
+  const out = await resolveMissingNames(root, check, ['src/cli.ts', 'src/cli/deps.ts'], 40, names);
+  assert.equal(out[0]!.importLine, undefined); assert.equal(out[0]!.declaredIn, 'src/cli.ts:1'); assert.match(out[0]!.note ?? '', /move that declaration into src\/cli\/deps\.ts/);
+  assert.equal(out[1]!.importLine, 'import type { Other } from "../cli.js";', 'a helper that is not a deliverable is imported as before');
+  const fixes = compactNames({ missingNames: out } as any, 40);
+  assert.deepEqual(fixes.addImports, { 'src/cli/deps.ts': ['import type { Other } from "../cli.js";'] }); assert.deepEqual(fixes.addExportAtLines, { 'src/cli.ts': [2] }, 'the export fix belongs to the imported helper only, at its own line');
+  assert.match(fixes.unresolved[0] ?? '', /^Writable: named by the objective/);
+});
+
+test('Before any edit, a source file read at its current version counts as located for the inspection cap', async t => {
+  const { session: s } = await fixture(t);
+  const c = { ...defaults, allowWrite: true, allowBash: true };
+  s.phase = 'implement'; s.inspectionCount = 8; s.inspectionsSinceAction = 6;
+  s.hashes['docs/plan.md'] = 'p'; s.readHashes['docs/plan.md'] = 'p';
+  let route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert('read_files' in route.criteria, 'only a document was read: the source is not located');
+  s.hashes['src/cli.ts'] = 'h'; s.readHashes['src/cli.ts'] = 'h';
+  route = routeQuestions(s, c).route!;
+  assert(route.type === 'choice'); assert(!('read_files' in route.criteria)); assert('move_lines' in route.criteria);
+});
+test('An uncertain vote between an edit and a read goes to the edit once inspections have run', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'const a = 1;\n');
+  session.phase = 'implement'; session.inspectionCount = 3; session.inspectionsSinceAction = 2; session.hashes['a.ts'] = hash('const a = 1;\n'); session.readHashes['a.ts'] = session.hashes['a.ts']!;
+  const phases: string[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    phases.push(ctx!.phase);
+    const keys = Object.keys(q.route!.type === 'choice' ? q.route!.criteria : {});
+    if (ctx!.phase === 'routing-narrowed') return { route: { type: 'choice', choice: 'read_files', confidence: .1, probabilities: { read_files: .55, write: .45 } } } as Answers;
+    const p: Record<string, number> = Object.fromEntries(keys.map(k => [k, 0])); p.write = .33; p.read_files = .28; p.search_codebase = .12; p.replace_lines = .27;
+    return { route: { type: 'choice', choice: 'write', confidence: .2, probabilities: p } } as Answers;
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ path: 'a.ts', expectedHash: session.hashes['a.ts'], oldText: 'const a = 1;', newText: 'const a = 2;' }) };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.entries[0]!.kind, 'write'); assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'const a = 2;\n');
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(events.find(e => e.type === 'tie-break')?.data.rule, 'edit over inspection after inspections');
+});
+
+test('A write anchor longer than six lines is refused with the line number for replace_lines', async t => {
+  const { root, store } = await fixture(t);
+  const text = Array.from({ length: 12 }, (_, i) => `const v${i + 1} = ${i + 1};`).join('\n') + '\n';
+  await writeFile(join(root, 'a.ts'), text);
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
+  const block = text.split('\n').slice(3, 11).join('\n');
+  await assert.rejects(tools.execute('write', { path: 'a.ts', expectedHash: hash(text), oldText: block, newText: `export ${block}` }), /oldText is 8 lines; a write anchor is at most 6\. That block starts at line 4: use replace_lines/);
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), text);
+  const ok = await tools.execute('write', { path: 'a.ts', expectedHash: hash(text), oldText: 'const v4 = 4;', newText: 'export const v4 = 4;' });
+  assert(ok.ok);
 });

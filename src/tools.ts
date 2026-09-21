@@ -254,6 +254,48 @@ export async function importBindings(path: string, text: string): Promise<{ name
   }
   return out;
 }
+// A configured check that cannot run here: its directory is missing or its
+// executable is not installed. Such a command is dropped, not retried forever.
+export async function checkUnusable(root: string, command: string): Promise<string | null> {
+  const dir = command.match(/(?:--dir|-C|--prefix)\s+(\S+)/)?.[1] ?? command.match(/^\s*cd\s+(\S+)/)?.[1];
+  if (dir) { try { await stat(resolve(root, dir)); } catch { return `its directory ${dir} does not exist in this repository`; } }
+  const exe = command.replace(/^\s*cd\s+\S+\s*(?:&&|;)\s*/, '').trim().split(/\s+/)[0] ?? '';
+  if (exe && !exe.includes('/')) { const r = await runCommand('bash', ['--noprofile', '--norc', '-c', `command -v -- ${JSON.stringify(exe)}`], root, 5000).catch(() => null); if (!r || r.code !== 0) return `${exe} is not installed on this machine`; }
+  return null;
+}
+// What the repository looks like right now, for inference: git status, the
+// package scripts, and the top-level entries. Works without git.
+export async function repositoryStatus(root: string): Promise<{ git: boolean; changed: string[]; changedCount: number; scripts: Record<string, string>; topLevel: string[]; packages: { dir: string; scripts: Record<string, string>; tools: string[] }[] }> {
+  const ignore = /(^|\/)(node_modules|dist|build|\.leana|\.git|coverage|target|__pycache__)(\/|$)/;
+  const r = await runCommand('git', ['status', '--porcelain=v1', '--untracked-files=all'], root, 10000).catch(() => null);
+  const git = Boolean(r && r.code === 0);
+  const all = git ? r!.output.split('\n').filter(Boolean).map(l => l.slice(3).trim().replace(/^"|"$/g, '')).filter(p => !ignore.test(p)) : [];
+  let scripts: Record<string, string> = {};
+  try { const pkg = JSON.parse(await boundedRead(await safePath(root, 'package.json'))); if (pkg && typeof pkg.scripts === 'object') scripts = Object.fromEntries(Object.entries(pkg.scripts).slice(0, 20).map(([k, v]) => [k, String(v).slice(0, 120)])); } catch { /* none */ }
+  let topLevel: string[] = [];
+  try { topLevel = (await readdir(root)).filter(n => !/^(node_modules|\.git|\.leana)$/.test(n)).sort().slice(0, 40); } catch { /* none */ }
+  // Packages below the root, to depth 3: a monorepo's checks live with the package.
+  const packages: { dir: string; scripts: Record<string, string>; tools: string[] }[] = [];
+  const manifests = ['package.json', 'tsconfig.json', 'pyproject.toml', 'setup.py', 'Cargo.toml', 'go.mod', 'Makefile', 'pom.xml', 'build.gradle'];
+  const walk = async (dir: string, depth: number) => {
+    if (depth > 3 || packages.length >= 12) return;
+    let entries: string[]; try { entries = await readdir(resolve(root, dir)); } catch { return; }
+    const found = entries.filter(n => manifests.includes(n));
+    if (found.length && dir !== '.') {
+      let pkgScripts: Record<string, string> = {};
+      if (found.includes('package.json')) { try { const pkg = JSON.parse(await boundedRead(resolve(root, dir, 'package.json'))); if (pkg && typeof pkg.scripts === 'object') pkgScripts = Object.fromEntries(Object.entries(pkg.scripts).slice(0, 12).map(([k, v]) => [k, String(v).slice(0, 100)])); } catch { /* none */ } }
+      packages.push({ dir, scripts: pkgScripts, tools: found });
+    }
+    for (const n of entries) if (!/^(node_modules|\.git|\.leana|dist|build|coverage|target|vendor|\.[^/]*)$/.test(n)) { try { if ((await stat(resolve(root, dir, n))).isDirectory()) await walk(dir === '.' ? n : `${dir}/${n}`, depth + 1); } catch { /* skip */ } }
+  };
+  await walk('.', 0);
+  return { git, changed: all.slice(0, 40), changedCount: all.length, scripts, topLevel, packages };
+}
+// A shell command that only reads is an inspection, not an action.
+export function readOnlyCommand(command: string): boolean {
+  const parts = command.split(/\s*(?:&&|\|\||;|\|)\s*/).map(p => p.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every(p => /^(?:ls|cat|head|tail|grep|rg|find|echo|pwd|wc|stat|tree|file|which|type|printf|du|df|env|git (?:status|log|diff|show|ls-files)|node -e ["']require\(['"]fs['"]\)\.readFileSync)/.test(p));
+}
 // A check whose output depends on a cache is not a verification: incremental
 // tsc reuses a file's cached diagnostics until that file itself changes, so a
 // new module that stops declaring globals leaves stale results elsewhere.

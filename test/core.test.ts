@@ -11,13 +11,13 @@ import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
 import { compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { referenceContext, rememberReferences, scopes } from '../src/references.js';
-import { anchorPath, candidatesFrom, completionQuestions, diffChunks, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from '../src/ledger.js';
+import { anchorPath, candidatesFrom, checkSchema, completionQuestions, diffChunks, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from '../src/ledger.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -2245,4 +2245,110 @@ test('The completion audit state stays under the Jev budget with a large diff an
   await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'passed' }, { command: 'node check.mjs' });
   const result = await runner.run(s);
   assert.equal(result.status, 'complete', result.stopReason); assert(sizes.every(n => n <= 22000), `state sizes ${sizes.join(',')}`);
+});
+
+test('A configured check that cannot run in this repository is dropped, and the worker\'s own build then counts as verification', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.mjs'), 'export const a = 1;\n');
+  assert.match((await checkUnusable(root, 'pnpm --dir sdk/typescript exec tsc --noEmit')) ?? '', /directory sdk\/typescript does not exist/);
+  assert.match((await checkUnusable(root, 'definitely-not-a-tool-xyz --check')) ?? '', /not installed/);
+  assert.equal(await checkUnusable(root, 'node --check a.mjs'), null);
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['a.mjs']; session.step = 2; session.lastWriteStep = 2;
+  session.editEvidence = [{ step: 2, route: 'write', paths: ['a.mjs'], artifact: '', text: 'edited' } as any];
+  const routes = ['bash', 'read_files']; let n = 0;
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => answersFor(q, ctx?.phase === 'completion-check' ? 'finish' : routes[n++] ?? 'read_files', .9) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.bash ? { command: 'node --check a.mjs', purpose: 'syntax' } : schema === schemas.finish ? { summary: 'a.mjs is valid.' } : schema === checkSchema ? { command: '', rationale: 'none' } : { files: [{ path: 'a.mjs', start: 1, end: 1 }] } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'pnpm --dir sdk/typescript exec tsc --noEmit --incremental false', maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(events.find(e => e.type === 'check-unusable')?.data.reason, 'its directory sdk/typescript does not exist in this repository');
+  assert.equal(result.entries[0]!.kind, 'bash'); assert.equal(result.lastCheck?.ok, true, 'the worker\'s node --check counted as the verification');
+  assert.equal(result.status, 'complete', result.stopReason);
+});
+test('With no check configured, the worker proposes one from the repository, Jev classifies it, and the harness runs it before proposing finish', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts: { build: 'node check.mjs' } })); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  await writeFile(join(root, 'src.mjs'), 'export const hello = "Hello World";\n');
+  session.objective = 'Make src.mjs say Hello World and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src.mjs']; session.step = 2; session.lastWriteStep = 2;
+  session.editEvidence = [{ step: 2, route: 'write', paths: ['src.mjs'], artifact: '', text: 'edited' } as any];
+  const phases: string[] = []; let candidate: any = null;
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); if (ctx!.phase === 'check-inference') { candidate = state.candidateCheck; assert.deepEqual(Object.keys(state.repository.scripts), ['build']); return { valid: { type: 'noul', noul: .92 } } as Answers; } return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
+    if (schema === checkSchema) { assert.match(m[1].content, /"build":"node check\.mjs"/, 'the package scripts reach the worker'); return { command: 'npm run build', rationale: 'the package build script' }; }
+    if (schema === schemas.finish) return { summary: 'done' };
+    return { files: [{ path: 'src.mjs', start: 1, end: 1 }] };
+  } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
+  const trail = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(e => !['prompt', 'bonsai-request', 'bonsai', 'jev-request', 'jev', 'compact'].includes(e.type)).map(e => `${e.data?.step ?? ''}:${e.type}${e.type === 'check-inferred' ? JSON.stringify(e.data) : ''}`);
+  assert.equal(candidate?.command, 'npm run build', trail.join(' | '));
+  assert.deepEqual(result.entries.map(e => e.kind), ['bash'], `the inferred check is the only action before completion; steps: ${result.entries.map(e => e.kind).join(',')}`);
+  assert.equal(result.lastCheckCommand, 'npm run build'); assert.equal(result.lastCheck?.ok, true); assert.equal(result.status, 'complete', result.stopReason);
+  assert(phases.includes('check-inference'));
+});
+test('The completion diff takes the repository\'s view of change from git, including files a scaffold created', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await runCommand('git', ['init', '-q'], root, 10000); await runCommand('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init'], root, 10000);
+  await writeFile(join(root, 'tracked.ts'), 'export const before = 1;\n');
+  await runCommand('git', ['add', 'tracked.ts'], root, 10000); await runCommand('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'add'], root, 10000);
+  await writeFile(join(root, 'tracked.ts'), 'export const after = 2;\n'); await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'App.jsx'), 'export default function App() { return <h1>Hello World</h1>; }\n');
+  await mkdir(join(root, 'node_modules', 'x'), { recursive: true }); await writeFile(join(root, 'node_modules', 'x', 'index.js'), 'ignored');
+  const status = await repositoryStatus(root);
+  assert(status.git); assert.deepEqual(status.changed.sort(), ['src/App.jsx', 'tracked.ts']);
+  const diff = await structuralDiff(root, s, store.artifacts);
+  const byPath = Object.fromEntries(diff.files.map(f => [f.path, f]));
+  assert.deepEqual(byPath['tracked.ts']!.declarationsRemoved, ['before']); assert.match(byPath['tracked.ts']!.declarationsAdded[0]!, /^after /); assert.match(byPath['tracked.ts']!.hunks ?? '', /-export const before/);
+  assert.equal(byPath['src/App.jsx']!.created, true); assert(!('node_modules/x/index.js' in byPath));
+  // Files already untracked or modified when the session began are not the session's changes.
+  s.baselineStatus = ['src/App.jsx'];
+  const later = await structuralDiff(root, s, store.artifacts);
+  assert.deepEqual(later.files.map(f => f.path), ['tracked.ts'], 'the pre-existing untracked file is excluded');
+  s.writes = ['src/App.jsx'];
+  assert(( await structuralDiff(root, s, store.artifacts)).files.some(f => f.path === 'src/App.jsx'), 'unless the session wrote it');
+});
+test('Read-only shell commands are inspections: they count toward the cap and are refused once it applies', async t => {
+  assert(readOnlyCommand('ls -la && cat src/App.jsx && cat package.json')); assert(readOnlyCommand('node -e "require(\'fs\').readFileSync(\'src/App.jsx\',\'utf8\')" && echo OK'));
+  assert(!readOnlyCommand('npm run build 2>&1 | tail -20')); assert(!readOnlyCommand('ls && rm -rf dist'));
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'const a = 1;\n');
+  session.phase = 'implement'; session.inspectionCount = 3; session.inspectionsSinceAction = 4; session.hashes['a.ts'] = hash('const a = 1;\n'); session.readHashes['a.ts'] = session.hashes['a.ts']!;
+  const jev = { decide: async (_s: unknown, q: Questions) => answersFor(q, 'bash', .1) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ command: 'ls -la && cat a.ts', purpose: 'look' }) };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.entries[0]!.kind, 'generation_error'); assert.match(result.entries[0]!.text, /Read-only command refused: 4 inspections/);
+});
+
+test('Repository status lists nested packages, and an inferred check is tried once so Jev judges its real behaviour', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'sdk', 'typescript', 'src'), { recursive: true });
+  await writeFile(join(root, 'sdk', 'typescript', 'package.json'), JSON.stringify({ scripts: { lint: 'node check.mjs' } })); await writeFile(join(root, 'sdk', 'typescript', 'tsconfig.json'), '{}');
+  await writeFile(join(root, 'sdk', 'typescript', 'check.mjs'), 'console.log("ok"); process.exit(0);\n'); await writeFile(join(root, 'sdk', 'typescript', 'src', 'a.ts'), 'export const a = 1;\n');
+  const status = await repositoryStatus(root);
+  assert.deepEqual(status.packages, [{ dir: 'sdk/typescript', scripts: { lint: 'node check.mjs' }, tools: ['package.json', 'tsconfig.json'] }]);
+  session.objective = 'Change a in sdk/typescript/src/a.ts and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['sdk/typescript/src/a.ts']; session.step = 2; session.lastWriteStep = 2;
+  session.editEvidence = [{ step: 2, route: 'write', paths: ['sdk/typescript/src/a.ts'], artifact: '', text: 'edited' } as any];
+  let seen: any = null;
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'check-inference') { seen = state.candidateCheck; return { valid: { type: 'noul', noul: state.candidateCheck.trial.code === 0 ? .9 : .2 } } as Answers; } return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
+    if (schema === checkSchema) { assert.match(m[1].content, /"packages":\[\{"dir":"sdk\/typescript"/); return { command: 'cd sdk/typescript && npm run lint', rationale: 'the package lint script' }; }
+    if (schema === schemas.finish) return { summary: 'done' };
+    return { files: [{ path: 'sdk/typescript/src/a.ts', start: 1, end: 1 }] };
+  } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(seen?.trial?.code, 0); assert.match(seen?.trial?.output ?? '', /ok/);
+  assert.equal(result.lastCheckCommand, 'cd sdk/typescript && npm run lint'); assert.equal(result.status, 'complete', result.stopReason);
+});
+test('With no check at all, the harness still performs the ledger\'s moves and refreshes the ledger after each edit', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'const HIDE_CURSOR = "h";\nfunction isJsonObject(v: unknown) { return typeof v === "object"; }\nexport function main() { return [HIDE_CURSOR, isJsonObject(1)]; }\n');
+  session.objective = 'Move HIDE_CURSOR and isJsonObject into src/cli/deps.ts.'; session.phase = 'implement'; session.inspectionCount = 3; session.knownFiles.push('src/cli.ts');
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'HIDE_CURSOR', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'm' }, { kind: 'move', name: 'isJsonObject', from: 'src/cli/main.ts', to: 'src/cli/deps.ts', detail: 'm' }] });
+  session.ledgerBuilt = true;
+  await refreshLedger(root, session); session.pendingMoves = [{ name: 'HIDE_CURSOR', source: 'src/cli.ts', start: 1, end: 1, destination: 'src/cli/deps.ts' }];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => answersFor(q, ctx?.phase === 'completion-check' ? 'finish' : 'read_files', .9) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === checkSchema ? { command: '', rationale: 'no tooling' } : schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src/cli.ts', start: 1, end: 3 }] } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 6 }, store, jev, bonsai, root, () => {}).run(session);
+  const kinds = result.entries.map(e => e.kind);
+  assert.equal(kinds.filter(k => k === 'move_lines').length, 2, `steps: ${kinds.join(',')}`);
+  assert.deepEqual(result.ledger.map(d => [d.name, d.from, d.status]), [['HIDE_CURSOR', 'src/cli.ts', 'done'], ['isJsonObject', 'src/cli.ts', 'done']], 'the second item was repaired from its sibling after the first move created the destination');
+  assert.match(await readFile(join(root, 'src', 'cli', 'deps.ts'), 'utf8'), /export function isJsonObject/);
 });

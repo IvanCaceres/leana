@@ -3,8 +3,8 @@ import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
 import { checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
-import { topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
-import { anchorPath, candidatesFrom, completionQuestions, diffChunks, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from './ledger.js';
+import { runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { anchorPath, candidatesFrom, checkPrompt, checkQuestions, checkSchema, completionQuestions, diffChunks, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from './ledger.js';
 const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
@@ -19,7 +19,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], ledgerAttempts: 0, ledgerBuilt: false, ledgerComplete: 0, baselineArtifacts: {},
+    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], ledgerAttempts: 0, ledgerBuilt: false, ledgerComplete: 0, baselineArtifacts: {}, checkInferences: 0, checkInferredFor: -1, baselineStatus: null,
     lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
@@ -99,7 +99,7 @@ export class Runner {
     if (s.completionFeedback && !s.completionFeedback.addressed && result.verification && result.ok && s.lastWriteStep > s.completionFeedback.step)
       s.completionFeedback = { step: s.completionFeedback.step, addressed: true, awaitingEvidence: false, text: `The completion proposed at step ${s.completionFeedback.step} was rejected (${clip(s.completionFeedback.text.replace(/^Completion rejected /, ''), 300)}); edits at step ${s.lastWriteStep} and the passing check at step ${s.step} followed. Propose finish again with claims that match currentSource.` };
     if (result.changed?.length) { s.editsSinceCheck++; s.pendingCheck = Boolean(s.lastCheckCommand); }
-    if ((kind === 'read_files' || kind === 'search_codebase') && result.ok) s.inspectionsSinceAction++;
+    if ((kind === 'read_files' || kind === 'search_codebase' || (kind === 'bash' && typeof args?.command === 'string' && readOnlyCommand(args.command))) && result.ok) s.inspectionsSinceAction++;
     if (result.changed?.length || result.verification || kind === 'undo') s.inspectionsSinceAction = 0;
     for (const changed of result.changed ?? []) {
       if (!s.writes.includes(changed)) s.writes.push(changed);
@@ -146,6 +146,8 @@ export class Runner {
     }
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.editSnapshots)) s.editSnapshots[path] = artifact;
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.baselineArtifacts)) s.baselineArtifacts[path] = artifact;
+    // The ledger follows every edit, the harness's included, whether or not a check runs.
+    if (result.ok && result.changed?.length && s.ledger.length) { await refreshLedger(this.tools.root, s).catch(() => {}); s.pendingMoves = await this.pendingMoves(s).catch(() => []); }
     // A failing check ends verification; a failing baseline during inspection
     // is context, not a reason to start editing before the code has been read.
     if (!result.ok && s.phase === 'verify' && (kind === 'bash' || editRoutes.includes(kind as Route))) s.phase = 'implement';
@@ -233,7 +235,8 @@ export class Runner {
     s.ledgerAttempts++;
     const note = s.ledger.length ? `These deliverables are already listed: ${s.ledger.map(d => `${d.kind} ${d.name ?? ''} ${d.to ?? ''}`).join('; ')}. Jev judged the list incomplete: add only the missing ones.` : undefined;
     let raw: Record<string, any>;
-    try { raw = await this.bonsai.generate(ledgerPrompt(s, note), ledgerSchema, .1, { step: s.step, route: 'ledger' }); }
+    const repository = await repositoryStatus(this.tools.root).catch(() => undefined);
+    try { raw = await this.bonsai.generate(ledgerPrompt(s, note, repository), ledgerSchema, .1, { step: s.step, route: 'ledger' }); }
     catch (e) { await this.store.log('ledger', { step: s.step, error: (e as Error).message }); s.ledgerBuilt = s.ledgerAttempts >= 2; return false; }
     const fresh = candidatesFrom(raw).filter(c => !s.ledger.some(d => d.kind === c.kind && d.name === c.name && d.to === c.to && d.from === c.from));
     const candidates = fresh.map((c, i) => ({ ...c, id: `d${s.ledger.length + i + 1}` }));
@@ -264,6 +267,28 @@ export class Runner {
     if (!inside.length || !outside.length) return null;
     const ranges = wanted.flatMap(n => { const d = decls.get(n); return d ? [`${n} lines ${d.start}-${d.end}`] : []; });
     return `The range ${args.start}..${args.end} of ${source} also declares ${outside.slice(0, 6).join(', ')}${outside.length > 6 ? ` and ${outside.length - 6} more` : ''}, which the deliverables do not ask to move. Move only the deliverables' declarations: ${ranges.join('; ')}.`;
+  }
+  // No configured check: the worker proposes one from the repository and Jev
+  // classifies it before it becomes the verification.
+  private async inferCheck(s: Session): Promise<boolean> {
+    s.checkInferences++; s.checkInferredFor = s.writes.length;
+    const repository = await repositoryStatus(this.tools.root);
+    let raw: Record<string, any>;
+    try { raw = await this.bonsai.generate(checkPrompt(s, repository), checkSchema, .1, { step: s.step, route: 'check' }); } catch (e) { await this.store.log('check-inferred', { step: s.step, error: (e as Error).message }); return false; }
+    const command = typeof raw.command === 'string' ? raw.command.trim() : '';
+    if (!command) { await this.store.log('check-inferred', { step: s.step, command: '', accepted: false }); return false; }
+    const unusable = await checkUnusable(this.tools.root, command);
+    // Run the candidate once: how it actually behaves is the best evidence Jev can get.
+    const trial = unusable ? null : await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', command], this.tools.root, this.config.commandTimeoutMs).then(t => ({ code: t.code, timedOut: t.timedOut, output: clip(t.output, 1200) })).catch(e => ({ code: -1, timedOut: false, output: clip(String((e as Error).message), 300) }));
+    const answers = unusable ? null : await this.jev.decide(decisionState(s, { candidateCheck: { command, rationale: raw.rationale, trial }, repository }), checkQuestions(), { step: s.step, phase: 'check-inference' });
+    const valid = answers?.valid?.type === 'noul' ? answers.valid.noul : 0;
+    const accepted = !unusable && valid >= this.config.completeProbability;
+    await this.store.log('check-inferred', { step: s.step, command, rationale: raw.rationale, unusable, trial, valid, accepted });
+    this.observe({ kind: 'warning', step: s.step, text: accepted ? `verification inferred: ${command} (Jev ${valid.toFixed(2)})` : `verification candidate rejected: ${command} (${unusable ?? `Jev ${valid.toFixed(2)}`})` });
+    if (!accepted) return false;
+    // From here on this command is the verification, exactly as a configured one would be.
+    s.lastCheckCommand = command; s.pendingCheck = true; this.tools.config.checkCommand = command;
+    return true;
   }
   private async forcedMove(s: Session, mv: { name: string; source: string; start: number; end: number; destination: string }): Promise<boolean> {
     const key = hash(JSON.stringify({ m: mv }));
@@ -375,11 +400,23 @@ export class Runner {
   }
   async run(s: Session): Promise<Session> {
     s.status = 'running'; s.stopReason = '';
+    // What was already modified or untracked before the first step is not this session's change.
+    if (s.baselineStatus === null) s.baselineStatus = await repositoryStatus(this.tools.root).then(r => r.git ? r.changed : []).catch(() => []);
     // A declared check is the verification: baseline it before any edit.
     if (this.config.checkCommand) {
-      s.lastCheckCommand = this.config.checkCommand; if (!s.lastCheck) s.pendingCheck = true;
-      const advice = await checkAdvice(this.tools.root, this.config.checkCommand);
-      if (advice) { this.observe({ kind: 'warning', step: s.step, text: advice }); await this.store.log('warning', { step: s.step, text: advice }); }
+      // A check that cannot run here (another repository's directory, a tool
+      // not installed) is dropped; verification is then inferred from this one.
+      const unusable = await checkUnusable(this.tools.root, this.config.checkCommand);
+      if (unusable) {
+        const text = `The configured check "${this.config.checkCommand}" cannot run here: ${unusable}. It is ignored for this session; verification will be inferred from the repository.`;
+        this.observe({ kind: 'warning', step: s.step, text }); await this.store.log('check-unusable', { step: s.step, command: this.config.checkCommand, reason: unusable });
+        this.config.checkCommand = ''; this.tools.config.checkCommand = '';
+        s.lastCheckCommand = null; s.pendingCheck = false;
+      } else {
+        s.lastCheckCommand = this.config.checkCommand; if (!s.lastCheck) s.pendingCheck = true;
+        const advice = await checkAdvice(this.tools.root, this.config.checkCommand);
+        if (advice) { this.observe({ kind: 'warning', step: s.step, text: advice }); await this.store.log('warning', { step: s.step, text: advice }); }
+      }
     }
     const endStep = s.step + this.config.maxSteps;
     let generationFailures = 0;
@@ -405,7 +442,8 @@ export class Runner {
           continue;
         }
         // Resolved fixes after a failing check; the plan's remaining targets after any check.
-        if (s.lastCheck && (!s.lastCheck.ok || s.pendingMoves.length) && this.config.allowWrite && await this.autoFix(s)) { await this.store.save(s); continue; }
+        if (!s.lastCheckCommand && this.config.allowBash && s.writes.length && s.checkInferences < 3 && s.checkInferredFor !== s.writes.length && await this.inferCheck(s)) { await this.store.save(s); continue; }
+        if ((s.pendingMoves.length || (s.lastCheck && !s.lastCheck.ok)) && this.config.allowWrite && await this.autoFix(s)) { await this.store.save(s); continue; }
         if (s.lastCheck && !s.lastCheck.ok && s.focusReadAt !== s.lastCheck.step) {
           s.focusReadAt = s.lastCheck.step;
           const regions = this.focusRegions(s);
@@ -551,6 +589,8 @@ export class Runner {
           }
           }
           if (route === 'move_lines' && s.ledger.length) { const why = await this.moveOutsideLedger(s, args); if (why) throw new Error(why); }
+          if (route === 'bash' && typeof args.command === 'string' && readOnlyCommand(args.command) && s.inspectionsSinceAction >= 4 && (s.ledger.length || Object.keys(s.readHashes).length))
+            throw new Error(`Read-only command refused: ${s.inspectionsSinceAction} inspections have run since the last action and the evidence already holds these files. Edit, run the build or tests, or finish.`);
           if (route === 'move_lines' && typeof args.destination === 'string' && args.destinationHash === 'new') {
             const anchored = await anchorPath(this.tools.root, ledgerFile(s, args.source) ?? args.source, args.destination);
             if (anchored !== args.destination) { await this.store.log('anchored-path', { step: s.step, from: args.destination, to: anchored }); args = { ...args, destination: anchored }; }

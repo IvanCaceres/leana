@@ -60,6 +60,10 @@ export interface Session {
   pendingMoves: { name: string; source: string; start: number; end: number; destination: string }[];
   // The harness's own deliverable list, classified by Jev; statuses come from source facts.
   ledger: Deliverable[]; ledgerAttempts: number; ledgerBuilt: boolean; ledgerComplete: number;
+  // Verification inferred from the repository when none is configured: attempts, and the change count at the last one.
+  checkInferences: number; checkInferredFor: number;
+  // Git's view of the tree when the session began: changes already present are not the session's.
+  baselineStatus: string[] | null;
   // The first pre-edit snapshot of each changed file, for the completion diff ('@new' for created files).
   baselineArtifacts: Record<string, string>;
   readHashes: Record<string, string>; writeSteps: Record<string, number>;

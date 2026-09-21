@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { referenceContext } from './references.js';
 import { relevantFiles } from './context.js';
-import { boundedRead, declarationFiles, hash, importBindings, runCommand, safePath, topLevelDeclarations } from './tools.js';
+import { boundedRead, declarationFiles, hash, importBindings, repositoryStatus, runCommand, safePath, topLevelDeclarations } from './tools.js';
 import type { Deliverable, JsonSchema, Message, Questions, Session } from './types.js';
 
 // The ledger is the harness's own list of deliverables: typed, concrete items
@@ -21,9 +21,10 @@ export const ledgerSchema: JsonSchema = {
     type: 'object', additionalProperties: false, required: ['kind', 'name', 'from', 'to', 'detail'],
     properties: { kind: { type: 'string', enum: [...kinds] }, name: str(120), from: str(300), to: str(300), detail: str(300) } } } },
 };
-export function ledgerPrompt(s: Session, note?: string): Message[] {
+export function ledgerPrompt(s: Session, note?: string, repository?: Awaited<ReturnType<typeof repositoryStatus>>): Message[] {
   const request = {
     objective: s.objective,
+    ...(repository ? { repository } : {}),
     referenceEvidence: referenceContext(s, 8000),
     changedFiles: s.writes, readFiles: Object.keys(s.readHashes), relevantFiles: [...new Set([...namedPaths(s), ...relevantFiles(s, 40)])],
     ...(note ? { harnessNote: note } : {}),
@@ -121,7 +122,7 @@ export async function refreshLedger(root: string, s: Session): Promise<void> {
       if (!knownPath(s, d.from)) {
         const files = (await declarationFiles(root, d.name)).filter(f => !(d.to && same(f, d.to)));
         // Ambiguous across modules: the file the sibling items resolved to wins, if it declares the name.
-        const sibling = s.ledger.filter(o => o !== d && o.kind === 'move' && o.to === d.to && o.from && knownPath(s, o.from)).map(o => ledgerFile(s, o.from)!).find(f => files.some(x => same(x, f)));
+        const sibling = s.ledger.filter(o => o !== d && o.kind === 'move' && o.to && d.to && same(o.to, d.to) && o.from && knownPath(s, o.from)).map(o => ledgerFile(s, o.from)!).find(f => files.some(x => same(x, f)));
         const pick = files.length === 1 ? files[0]! : sibling;
         if (pick) { d.from = pick; if (!s.knownFiles.includes(d.from)) s.knownFiles.push(d.from); }
       }
@@ -167,19 +168,26 @@ export interface StructuralDiff { files: DiffFile[]; moved: { name: string; from
 // plus raw hunks: derived from the pre-edit snapshots the tools took.
 export async function structuralDiff(root: string, s: Session, artifacts: string, hunkBudget = 9000): Promise<StructuralDiff> {
   const files: DiffFile[] = [];
+  // Files a shell command created or changed are in git's view, not the harness's edit list.
+  const status = await repositoryStatus(root);
+  // Changes already present when the session began are excluded unless the session wrote the file.
+  const baseline = new Set(s.baselineStatus ?? []);
+  const paths = [...new Set([...s.writes, ...status.changed.filter(p => !baseline.has(p))])].slice(0, 40);
+  const fromHead = async (path: string): Promise<string | null> => { const r = await runCommand('git', ['show', `HEAD:${path}`], root, 10000).catch(() => null); return r && r.code === 0 ? r.output : null; };
   const removedBy = new Map<string, string>(); const addedBy = new Map<string, string>();
   const dir = await mkdtemp(join(tmpdir(), 'leana-diff-'));
   try {
-    for (const path of s.writes) {
+    for (const path of paths) {
       const artifact = s.baselineArtifacts[path];
       let before = ''; let after = '';
       if (artifact && artifact !== '@new') { try { before = await boundedRead(await safePath(artifacts, artifact.replace(/^@artifact\//, ''))); } catch { before = ''; } }
       try { after = await boundedRead(await safePath(root, path)); } catch { after = ''; }
-      if (!artifact) before = after; // never snapshotted: nothing known to have changed
+      if (!artifact) { const head = status.git ? await fromHead(path) : null; before = head ?? (status.changed.includes(path) ? '' : after); }
+      const created = artifact === '@new' || (!artifact && status.git && before === '' && after !== '');
       const [db, da] = await Promise.all([topLevelDeclarations(path, before), topLevelDeclarations(path, after)]);
       const [ib, ia] = await Promise.all([importBindings(path, before), importBindings(path, after)]);
       const key = (b: { name: string; from: string }) => `${b.name} from ${b.from}`;
-      const f: DiffFile = { path, ...(artifact === '@new' ? { created: true } : {}), ...(after === '' && before !== '' ? { deleted: true } : {}),
+      const f: DiffFile = { path, ...(created ? { created: true } : {}), ...(after === '' && before !== '' ? { deleted: true } : {}),
         declarationsAdded: [...da.keys()].filter(n => !db.has(n)).map(n => `${n} (${da.get(n)!.kind}${da.get(n)!.exported ? ', exported' : ''}, lines ${da.get(n)!.start}-${da.get(n)!.end})`),
         declarationsRemoved: [...db.keys()].filter(n => !da.has(n)),
         importsAdded: ia.map(key).filter(k => !ib.map(key).includes(k)), importsRemoved: ib.map(key).filter(k => !ia.map(key).includes(k)) };
@@ -229,4 +237,16 @@ export function completionQuestions(items: Deliverable[], withObjective: boolean
   return q;
 }
 export function resolveArtifactPath(artifacts: string, artifact: string): string { return resolve(artifacts, artifact.replace(/^@artifact\//, '')); }
+// Verification by inference: the worker proposes a command from what the
+// repository offers, Jev classifies it, and only then does it become the check.
+export const checkSchema: JsonSchema = { type: 'object', additionalProperties: false, required: ['command', 'rationale'], properties: { command: str(300), rationale: str(300) } };
+export function checkPrompt(s: Session, repository: Awaited<ReturnType<typeof repositoryStatus>>): Message[] {
+  return [
+    { role: 'system', content: 'You are Bonsai, the implementation worker in Leana. Propose the single shell command that verifies the objective\'s deliverables in this repository: a build, type-check or test that the repository already supports (see repository.scripts and the files present), that terminates on its own, needs nothing that is not installed, and starts no server or watcher. Prefer a package script (npm run build, npm test) or a language tool (tsc --noEmit, node --check FILE, pytest, cargo check); in a monorepo, run it in the package that holds the deliverables (repository.packages lists each package directory, its scripts and manifests), for example cd PACKAGE_DIR && npx tsc --noEmit. If nothing applicable exists, return command "". Output only the JSON object.' },
+    { role: 'user', content: JSON.stringify({ objective: s.objective, deliverables: s.ledger.map(d => `${d.kind} ${d.name ?? ''}${d.to ? ` in ${d.to}` : ''}`), changedFiles: s.writes.slice(-12), repository, schema: checkSchema }) },
+  ];
+}
+export function checkQuestions(): Questions {
+  return { valid: { type: 'noul', instructions: 'Is candidateCheck.command a verification of the objective\'s deliverables in this repository: it builds, type-checks or tests them using tools, scripts or manifests the repository shows it has (repository.scripts, repository.packages, repository.topLevel), terminates on its own, and starts no server or watcher? candidateCheck.trial shows how the command actually behaved when run once: an exit code of 0, or diagnostics from the expected tool, is evidence that it works; "command not found" or a missing directory is evidence that it does not.' } };
+}
 export { hash as ledgerHash };

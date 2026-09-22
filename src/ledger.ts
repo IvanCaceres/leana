@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { referenceContext } from './references.js';
 import { pinnedBlock, relevantFiles, SYSTEM, type FileContract } from './context.js';
-import { boundedRead, declarationFiles, exportedSignatures, hash, importBindings, importCandidates, relativeImports, repositoryStatus, runCommand, safePath, topLevelDeclarations } from './tools.js';
+import { boundedRead, declarationFiles, exportedSignatures, hash, importBindings, importCandidates, relativeImports, repositoryStatus, runCommand, safePath, solutionTsconfigReferences, topLevelDeclarations } from './tools.js';
 import type { Deliverable, JsonSchema, Message, Questions, Session } from './types.js';
 import { commandLike, verifyRun } from './decide.js';
 
@@ -22,12 +22,12 @@ export const kinds = ['move', 'create', 'modify', 'delete', 'export', 'import', 
 // never by refusing a finished generation.
 const strings = (maxItems: number): JsonSchema => ({ type: 'array', minItems: 0, maxItems, items: str(200) });
 export const ledgerSchema: JsonSchema = {
-  type: 'object', additionalProperties: false, required: ['summary', 'conventions', 'deliverables'],
-  properties: { summary: str(), conventions: str(), deliverables: { type: 'array', minItems: 0, maxItems: 24, items: {
-    type: 'object', additionalProperties: false, required: ['kind', 'name', 'from', 'to', 'detail', 'contents', 'exports', 'dependsOn'],
-    properties: { kind: { type: 'string', enum: [...kinds] }, name: str(120), from: str(300), to: str(300), detail: str(), contents: strings(8), exports: strings(10), dependsOn: strings(8) } } } },
+  type: 'object', additionalProperties: false, required: ['summary', 'conventions', 'pageComposition', 'copy', 'deliverables'],
+  properties: { summary: str(), conventions: str(), pageComposition: str(), copy: str(), deliverables: { type: 'array', minItems: 0, maxItems: 24, items: {
+    type: 'object', additionalProperties: false, required: ['kind', 'name', 'from', 'to', 'detail', 'contents', 'layout', 'exports', 'dependsOn'],
+    properties: { kind: { type: 'string', enum: [...kinds] }, name: str(120), from: str(300), to: str(300), detail: str(), contents: strings(12), layout: str(), exports: strings(10), dependsOn: strings(8) } } } },
 };
-const designInstructions = 'Design the work, then list its concrete deliverables; every file will later be generated separately against this design, so it must be complete and consistent. summary: what the finished result is and does, in the terms a professional would ship it (for an application: its pages, sections, behaviour, content and data flow; for a refactor: the resulting structure); be specific, up to a few paragraphs. conventions: the stack with versions, the build tool and its entry file layout, styling, naming, module conventions (import style, extensions, default or named exports), and the quality bar every file follows. Then the deliverables the objective asks for, within its requested scope only, as typed items. kind: move (a declaration from one file to another), create (a file), delete (a declaration), export (add export to a declaration), import (make a file import a name from a module), modify (a change inside a declaration), verify (a command that must pass), other. name: the declaration, file or command. from: the file (or module) it is in now; to: the file it must end in; use "" when not applicable. detail: one or two sentences describing exactly what the item is. contents: up to eight short points on what that file or declaration must contain so that the summary holds (components rendered, props, state, data, behaviour, styling). exports: for a file to create, each export as a declaration head, exactly as the file will declare it (for example "export function Button(props: ButtonProps)", "export type ButtonVariant = \'primary\' | \'secondary\' | \'outline\'", "export default App"); other files will import exactly these names. dependsOn: the repository paths (as listed in to) of the other deliverables this file imports from; configuration and entry files (manifests, tsconfig, build config, index.html) depend on nothing and everything else depends on them implicitly, so list only source dependencies. Order the list so that a file appears after the files it depends on: manifests and configuration first, then shared types and data, styles, small components, composite components, pages, the app root, the entry point. Every module a file will import must itself be a deliverable, and every name it imports must appear in that deliverable\'s exports. An objective that asks for something advanced or polished means substantive contents, not placeholders. Do not list work the objective does not request, and do not list names a requirement merely mentions without asking for a change to them. from and to are repository paths copied exactly from changedFiles, readFiles or relevantFiles (a plan may abbreviate a path; use the real one); name is a bare identifier without parentheses.';
+const designInstructions = 'Design the work, then list its concrete deliverables; every file will later be generated separately against this design, so it must be complete and consistent. summary: what the finished result is and does, in the terms a professional would ship it (for an application: its pages, sections, behaviour, content and data flow; for a refactor: the resulting structure); be specific, up to a few paragraphs. conventions: the stack with versions, the build tool and its entry file layout, styling, naming, module conventions (import style, extensions, default or named exports), and the quality bar every file follows. Then the deliverables the objective asks for, within its requested scope only, as typed items. kind: move (a declaration from one file to another), create (a file), delete (a declaration), export (add export to a declaration), import (make a file import a name from a module), modify (a change inside a declaration), verify (a command that must pass), other. name: the declaration, file or command. from: the file (or module) it is in now; to: the file it must end in; use "" when not applicable. detail: one or two sentences describing exactly what the item is. contents: for a source or style file, at least six and up to twelve points that specify what the file renders and how: the elements and their hierarchy, the layout (container, grid or flex, spacing), the copy it renders or the data keys it reads, its state and interactions, its styling and responsive behaviour, and its accessibility; a point is a specification ("a three-column responsive grid of feature cards with icon, title and description"), never wiring ("import X", "render the section"), which belongs in dependsOn and exports. layout: for a page section or component, one sentence on where it sits and how it is sized: its container width, vertical padding, background, and its relation to the sticky header; sections stack in normal document flow inside main below the header, with no negative margins and no viewport-height boxes other than the hero\'s minimum height. exports: for a file to create, each export as a declaration head, exactly as the file will declare it (for example "export function Button(props: ButtonProps)", "export type ButtonVariant = \'primary\' | \'secondary\' | \'outline\'", "export default App"); other files will import exactly these names. dependsOn: the repository paths (as listed in to) of the other deliverables this file imports from; configuration and entry files (manifests, tsconfig, build config, index.html) depend on nothing and everything else depends on them implicitly, so list only source dependencies. Order the list so that a file appears after the files it depends on: manifests and configuration first, then shared types and data, styles, small components, composite components, pages, the app root, the entry point. pageComposition: the page as a whole, top to bottom: each section in order with the id its navigation anchor targets, its container width, vertical padding and background, and the layout rules every section follows. copy: the literal copy inventory the data file holds and every component renders from, never invents: the site name and tagline, the hero headline, subheadline and the labels of its actions, the navigation labels with the ids they scroll to, at least four features with title and one-sentence description, at least three testimonials with quote, name and role, the call to action\'s headline and label, and the footer text. Every build-time integration the conventions name must appear in the configuration items\' contents (with Tailwind v4 and Vite: @tailwindcss/vite in the manifest\'s devDependencies and tailwindcss() in vite.config\'s plugins, the stylesheet importing tailwindcss). Every module a file will import must itself be a deliverable, and every name it imports must appear in that deliverable\'s exports. An objective that asks for something advanced or polished means substantive contents, not placeholders. Do not list work the objective does not request, and do not list names a requirement merely mentions without asking for a change to them. from and to are repository paths copied exactly from changedFiles, readFiles or relevantFiles (a plan may abbreviate a path; use the real one); name is a bare identifier without parentheses.';
 // The design is generated as text, not under a grammar: the architect may
 // reason first, and a design cut by the token budget is repaired, not lost.
 // The last message asks for one fenced JSON block under ledgerSchema.
@@ -90,15 +90,41 @@ export function candidatesFrom(raw: Record<string, any>): Deliverable[] {
     if (it.kind === 'create' && !to && !from && /[./]/.test(name)) to = name;
     const key = `${it.kind}:${name}:${from}:${to}`;
     if (out.some(o => `${o.kind}:${o.name ?? ''}:${o.from ?? ''}:${o.to ?? ''}` === key)) continue;
-    const contents = cleanList(it.contents, 8, 200); const exports = cleanList(it.exports, 10, 200); const dependsOn = cleanList(it.dependsOn, 8, 300);
+    const contents = cleanList(it.contents, 12, 240); const exports = cleanList(it.exports, 10, 200); const dependsOn = cleanList(it.dependsOn, 8, 300);
+    const layout = typeof it.layout === 'string' && it.layout.trim() ? clip(it.layout.trim(), 300) : undefined;
     out.push({ id: `d${out.length + 1}`, kind: it.kind, name: name || undefined, from: from || undefined, to: to || undefined, detail: clip(String(it.detail ?? ''), 400), required: 0, status: 'unknown',
-      ...(contents.length ? { contents } : {}), ...(exports.length ? { exports } : {}), ...(dependsOn.length ? { dependsOn } : {}) });
+      ...(contents.length ? { contents } : {}), ...(layout ? { layout } : {}), ...(exports.length ? { exports } : {}), ...(dependsOn.length ? { dependsOn } : {}) });
   }
   return out;
 }
-export function designFrom(raw: Record<string, any>): { summary: string; conventions: string } | null {
+export function designFrom(raw: Record<string, any>): { summary: string; conventions: string; pageComposition?: string; copy?: string } | null {
   const summary = typeof raw?.summary === 'string' ? clip(raw.summary.trim(), 2500) : ''; const conventions = typeof raw?.conventions === 'string' ? clip(raw.conventions.trim(), 1200) : '';
-  return summary || conventions ? { summary, conventions } : null;
+  const text = (v: unknown, limit: number) => typeof v === 'string' && v.trim() ? clip(v.trim(), limit) : Array.isArray(v) || (v && typeof v === 'object') ? clip(JSON.stringify(v), limit) : undefined;
+  const pageComposition = text(raw?.pageComposition, 1800); const copy = text(raw?.copy, 3000);
+  return summary || conventions ? { summary, conventions, ...(pageComposition ? { pageComposition } : {}), ...(copy ? { copy } : {}) } : null;
+}
+// A source or style item the design left thin (fewer than six contents points)
+// is specified in one more generation over the design it belongs to: the
+// architect writes the missing contents and layout for those items only.
+export const thinItem = (d: Deliverable): boolean => d.kind === 'create' && Boolean(d.to) && /\.(?:[cm]?[jt]sx?|css|scss|html)$/.test(d.to!) && !configLike(d.to!) && (d.contents?.length ?? 0) < 6;
+export function enrichPrompt(s: Session, items: Deliverable[]): Message[] {
+  const request = {
+    role: 'You are the architect. The design below lists items whose contents are too thin to generate a substantive file from. For each item, write the specification the file will be generated against: at least six and up to twelve contents points on what the file renders and how (elements and hierarchy, layout, the copy it renders or the data keys it reads, state and interactions, styling and responsive behaviour, accessibility), and a one-sentence layout (container width, vertical padding, background, relation to the sticky header; no negative margins, no viewport-height boxes other than the hero). Keep every existing point that is a specification; replace wiring points. Reply with exactly one fenced code block (```json … ```) holding {"items": [{"to": "<path as given>", "contents": [...], "layout": "..."}]} and nothing else outside it.',
+    objective: s.objective, design: s.design,
+    items: items.map(d => ({ to: d.to, detail: d.detail, contents: d.contents ?? [], ...(d.layout ? { layout: d.layout } : {}), exports: d.exports ?? [] })),
+  };
+  return [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(pinnedBlock(s)) }, { role: 'user', content: JSON.stringify(request) }];
+}
+export function mergeEnrichment(items: Deliverable[], raw: Record<string, any> | null): number {
+  const list = Array.isArray(raw?.items) ? raw!.items : []; let merged = 0;
+  for (const it of list) {
+    if (!it || typeof it !== 'object' || typeof it.to !== 'string') continue;
+    const d = items.find(x => x.to === it.to.trim() || (x.to && it.to.trim().endsWith(`/${x.to}`)) || (x.to && x.to.endsWith(`/${it.to.trim()}`))); if (!d) continue;
+    const contents = cleanList(it.contents, 12, 240);
+    if (contents.length > (d.contents?.length ?? 0)) { d.contents = contents; merged++; }
+    if (typeof it.layout === 'string' && it.layout.trim()) d.layout = clip(it.layout.trim(), 300);
+  }
+  return merged;
 }
 // Configuration and entry files come before source: a build cannot be tried
 // without them, and every other file implicitly depends on them.
@@ -336,6 +362,9 @@ export async function missingExports(path: string, text: string, declared: strin
 const neverCheck = /\b(dev|start|serve|preview|watch|format|fix|deploy|publish|storybook|release|clean)\b|--watch|--write|--fix/;
 export async function checkCandidates(root: string, repository: Awaited<ReturnType<typeof repositoryStatus>>): Promise<{ command: string; source: string }[]> {
   const out: { command: string; source: string }[] = [];
+  // A solution tsconfig (references, no include) makes a bare tsc check nothing:
+  // the referenced configs that include the sources are the candidates.
+  for (const ref of (await solutionTsconfigReferences(root).catch(() => null)) ?? []) if (/tsconfig[\w.-]*\.json$/.test(ref) || !/\./.test(ref)) out.push({ command: `npx tsc --noEmit -p ${ref}`, source: `tsconfig.json references ${ref}` });
   const rank = ['typecheck', 'type-check', 'check', 'build', 'compile', 'test', 'lint'];
   const usable = ([k, v]: [string, string]) => !neverCheck.test(k) && !neverCheck.test(v.replace(/\bvite build\b/, 'build'));
   for (const name of rank) for (const [k, v] of Object.entries(repository.scripts)) if ((k === name || k.startsWith(`${name}:`)) && usable([k, v]) && !out.some(o => o.command === `npm run ${k}`)) out.push({ command: `npm run ${k}`, source: `package script ${k}: ${v}` });

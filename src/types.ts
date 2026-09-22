@@ -13,7 +13,7 @@ export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export'
 // provides, and which other deliverables it imports, so creation can be ordered
 // and every prompt can carry the exact signatures a file may import. A derived
 // item was added by the harness for an import a generated file made.
-export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string; setAside?: boolean }
+export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string; setAside?: boolean; layout?: string }
 export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move' | 'reexport' | 'alias' | 'respec'; line?: number; move?: { source: string; start: number; end: number } }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
@@ -72,7 +72,8 @@ export interface Session {
   // The harness's own deliverable list, classified by Jev; statuses come from source facts.
   ledger: Deliverable[]; ledgerAttempts: number; ledgerBuilt: boolean; ledgerComplete: number;
   // The worker's design for an open-ended objective: what the whole should be and the conventions every file follows.
-  design: { summary: string; conventions: string } | null;
+  // pageComposition: the ordered sections and the layout rules every one follows; copy: the literal copy inventory the data file holds and components render.
+  design: { summary: string; conventions: string; pageComposition?: string; copy?: string } | null;
   // Verification selected from the repository when none is configured: attempts, the change count at the last one, and the configuration files' state at the last trial.
   checkInferences: number; checkInferredFor: number; checkTrialKey?: string;
   // Dependencies installed by the harness when a check trial showed them missing:

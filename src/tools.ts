@@ -3,6 +3,7 @@ import { open, readFile, realpath, rename, stat, unlink, mkdir, readdir } from '
 import { dirname, isAbsolute, posix, relative, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { builtinModules } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import type { CheckSummary, Config, NameOrigin, Route, SourceEvidence, ToolResult } from './types.js';
 import { clip } from './context.js';
 export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex');
@@ -367,6 +368,14 @@ export async function checkUnusable(root: string, command: string): Promise<stri
   if (dir) { try { await stat(resolve(root, dir)); } catch { return `its directory ${dir} does not exist in this repository`; } }
   const exe = command.replace(/^\s*cd\s+\S+\s*(?:&&|;)\s*/, '').trim().split(/\s+/)[0] ?? '';
   if (exe && !exe.includes('/')) { const r = await runCommand('bash', ['--noprofile', '--norc', '-c', `command -v -- ${JSON.stringify(exe)}`], root, 5000).catch(() => null); if (!r || r.code !== 0) return `${exe} is not installed on this machine`; }
+  // A script that is only `tsc` against a solution tsconfig checks no file.
+  let body = command;
+  const script = command.match(/^\s*(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([\w:-]+)\s*$/)?.[1];
+  if (script) { try { const pkg = JSON.parse(await boundedRead(await safePath(root, 'package.json'))); if (typeof pkg?.scripts?.[script] === 'string') body = pkg.scripts[script]; } catch { /* keep */ } }
+  if (/^\s*(?:npx\s+)?tsc\b[^&|;]*$/.test(body) && !/(?:^|\s)(?:-p|--project|-b|--build)\b/.test(body)) {
+    const refs = await solutionTsconfigReferences(root);
+    if (refs) return `it checks no source files: tsconfig.json is a solution file (references ${refs.join(', ')}, no include); use tsc -p ${refs[0]}`;
+  }
   return null;
 }
 // What the repository looks like right now, for inference: git status, the
@@ -1257,4 +1266,90 @@ export class ToolBox {
     }
     throw new Error(`Not an executable filesystem tool: ${route}`);
   }
+}
+
+// Tailwind v4 emits utility classes only through its Vite or PostCSS plugin: a
+// stylesheet that imports tailwindcss in a Vite project whose config does not
+// load @tailwindcss/vite builds without error and styles nothing. The wiring is
+// mechanical: the import and the plugin entry, added to the config as text.
+export function wireTailwindVite(config: string): string | null {
+  if (/@tailwindcss\/vite/.test(config)) return null;
+  const quote = /from\s+"/.test(config) ? '"' : "'"; const semi = /;\s*$/m.test(config) ? ';' : '';
+  const line = `import tailwindcss from ${quote}@tailwindcss/vite${quote}${semi}`;
+  const lines = config.split('\n'); let last = -1;
+  for (let i = 0; i < lines.length; i++) if (/^import\b/.test(lines[i]!)) last = i;
+  lines.splice(last + 1, 0, line);
+  let text = lines.join('\n');
+  if (/plugins\s*:\s*\[\s*\]/.test(text)) text = text.replace(/plugins\s*:\s*\[\s*\]/, 'plugins: [tailwindcss()]');
+  else if (/plugins\s*:\s*\[/.test(text)) text = text.replace(/plugins\s*:\s*\[/, m => `${m}tailwindcss(), `);
+  else if (/defineConfig\(\s*\{/.test(text)) text = text.replace(/defineConfig\(\s*\{/, m => `${m}\n  plugins: [tailwindcss()],`);
+  else return null;
+  return text;
+}
+// Class tokens that are never a style: an arbitrary value that closes with
+// the wrong bracket ("h-[300px)") is repaired; a negative margin measured in
+// viewport heights ("-mt-[calc(100vh-100px)]"), which pulls a section off the
+// top of the page, is removed.
+export function fixClassBrackets(text: string): { text: string; fixed: string[] } {
+  const fixed: string[] = [];
+  const out = text.replace(/(className\s*=\s*(?:"[^"]*"|'[^']*'|\{`[^`]*`\}))/g, attr => attr
+    // A token whose arbitrary value never closes its bracket and ends with one
+    // closing parenthesis too many: that parenthesis is the bracket.
+    .replace(/([-\w:/.!]+\[)([^\]\s"'`]*)\)(?=[\s"'`]|$)/g, (m, head, value) => { const opens = (value.match(/\(/g) ?? []).length; const closes = (value.match(/\)/g) ?? []).length + 1; if (closes <= opens) return m; fixed.push(m); return `${head}${value}]`; })
+    .replace(/(^|[\s"'`{])((?:[a-z]+:)*-m[tbxylrse]?-\[[^\]\s]*\d+(?:d|s|l)?vh[^\]\s]*\])(?=[\s"'`}]|$)/g, (_m, before, token) => { fixed.push(token); return before; })
+    .replace(/  +(?=[^\s"'`])/g, ' '));
+  return { text: out, fixed };
+}
+
+// Quality the checks cannot see, judged by code right after a file is written:
+// a heading or paragraph nested in its own kind (invalid HTML), and class
+// tokens the project's Tailwind cannot compile (a colour no theme defines, an
+// invented utility), asked of Tailwind's own parser loaded from the project's
+// node_modules with the project's stylesheet. Each finding is a diagnostic in
+// the checker's own form, so the repair path is the same as for any error.
+const designSystems = new Map<string, any>();
+export async function invalidTailwindClasses(root: string, path: string, text: string): Promise<string[]> {
+  try {
+    let css = '';
+    const names = await readdir(resolve(root, 'src'), { recursive: true }).catch(() => [] as string[]);
+    for (const f of names.filter(f => f.endsWith('.css'))) { const c = await boundedRead(resolve(root, 'src', f)).catch(() => ''); if (/@import\s+["']tailwindcss["']/.test(c)) css += `${c}\n`; }
+    if (!css) return [];
+    const key = `${root}@${hash(css)}`;
+    let ds = designSystems.get(key);
+    if (!ds) {
+      let mod: any = null;
+      try { mod = await import(pathToFileURL(resolve(root, 'node_modules', '@tailwindcss', 'node', 'dist', 'index.mjs')).href); } catch { return []; }
+      if (typeof mod?.__unstable__loadDesignSystem !== 'function') return [];
+      ds = await mod.__unstable__loadDesignSystem(css, { base: resolve(root, 'src') });
+      designSystems.set(key, ds);
+    }
+    const bad = new Map<string, number>();
+    for (const m of text.matchAll(/className\s*=\s*(?:"([^"]*)"|'([^']*)'|\{`([^`]*)`\})/g)) {
+      const value = (m[1] ?? m[2] ?? m[3] ?? '').replace(/\$\{[^}]*\}/g, ' ');
+      const line = text.slice(0, m.index).split('\n').length;
+      for (const token of value.split(/\s+/).filter(Boolean)) {
+        if (bad.has(token) || /^(?:group|peer)(?:[/-]|$)/.test(token) || token.includes('$')) continue;
+        const out = ds.candidatesToCss([token]);
+        if (Array.isArray(out) && out[0] === null) bad.set(token, line);
+      }
+      if (bad.size >= 12) break;
+    }
+    return [...bad.entries()].map(([token, line]) => `${path}(${line},1): error: class "${token}" is not a utility the project's Tailwind can compile (no theme or plugin defines it); use a built-in utility, a colour the theme defines, or an arbitrary value`);
+  } catch { return []; }
+}
+export async function qualityDiagnostics(root: string, path: string, text: string): Promise<string[]> {
+  if (!/\.(?:[jt]sx|html)$/.test(path)) return [];
+  const out: string[] = [];
+  for (const m of text.matchAll(/<(h[1-6]|p)\b[^>]*>\s*<\1\b/g)) { const line = text.slice(0, m.index).split('\n').length; out.push(`${path}(${line},1): error: <${m[1]}> is nested inside another <${m[1]}>, which is invalid HTML (React reports a DOM nesting error); keep one element`); }
+  out.push(...await invalidTailwindClasses(root, path, text));
+  return out;
+}
+// A package script that only runs tsc against a solution tsconfig (references
+// and no include) checks nothing: the verification of record must be a config
+// that includes the sources.
+export async function solutionTsconfigReferences(root: string): Promise<string[] | null> {
+  let cfg: any; try { cfg = JSON.parse((await boundedRead(await safePath(root, 'tsconfig.json'))).replace(/\/\*[\s\S]*?\*\/|(^|\s)\/\/[^\n]*/g, '')); } catch { return null; }
+  const refs = Array.isArray(cfg?.references) ? cfg.references.map((r: any) => String(r?.path ?? '')).filter(Boolean) : [];
+  const includes = (Array.isArray(cfg?.include) && cfg.include.length) || (Array.isArray(cfg?.files) && cfg.files.length);
+  return refs.length && !includes ? refs : null;
 }

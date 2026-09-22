@@ -327,9 +327,13 @@ export function pinnedBlock(s: Session): Record<string, unknown> {
   return { objective: s.objective, repositoryInstructions: s.instructions, directories: repoOverview(s, 30), fileCount: s.knownFiles.length, files: relevantFiles(s, 40) };
 }
 // The design block changes only when the ledger grows: cacheable within a session.
+// The design every file is generated against: summary, conventions, the page
+// composition and the copy inventory, and each file's full detail (a shortened
+// detail with a read-guidance marker in it told the worker nothing).
 export function designBlock(s: Session, packages: string[]): Record<string, unknown> {
+  const short = (text: string, limit: number) => text.length > limit ? `${text.slice(0, limit)}…` : text;
   return { ...(s.design ? { design: s.design } : {}), installedPackages: packages.slice(0, 60),
-    deliverables: s.ledger.filter(x => x.kind === 'create').slice(0, 30).map(x => `${x.to ?? x.name ?? ''}: ${clip(x.detail, 90)}`) };
+    deliverables: s.ledger.filter(x => x.kind === 'create').slice(0, 30).map(x => `${x.to ?? x.name ?? ''}: ${short(x.detail, 300)}`) };
 }
 export const language = (path: string): string => ({ ts: 'ts', tsx: 'tsx', js: 'js', jsx: 'jsx', mjs: 'js', cjs: 'js', json: 'json', css: 'css', scss: 'scss', html: 'html', md: 'md', yml: 'yaml', yaml: 'yaml', toml: 'toml', py: 'python', rs: 'rust', go: 'go', sh: 'bash' } as Record<string, string>)[path.split('.').pop() ?? ''] ?? '';
 // The fence for a file's code block: four backticks for documents that may
@@ -358,7 +362,7 @@ export function focusedMessages(s: Session, route: Route, target: { path: string
 // it from and its exported surface (parsed from the file when it exists, from
 // the design when it is still planned), and who will import this file.
 export interface FileContract { path: string; importPath: string; status: 'exists' | 'planned'; exports: string[] }
-export interface CreateTarget { path: string; deliverable: Deliverable; contracts: FileContract[]; importers: { path: string; expects: string[]; usage?: string[] }[]; packages: string[]; problems?: string[] }
+export interface CreateTarget { path: string; deliverable: Deliverable; contracts: FileContract[]; importers: { path: string; expects: string[]; usage?: string[] }[]; packages: string[]; problems?: string[]; siblings?: { path: string; detail: string; contents: string[]; layout?: string }[] }
 // A file is generated as code, not as a JSON string: the design, the file's
 // contract and its neighbours' exact signatures; the reply is the code, which
 // the harness has already opened with the fence. shrink drops the optional
@@ -367,14 +371,17 @@ export function createFileMessages(s: Session, t: CreateTarget, shrink = 0): Mes
   const d = t.deliverable;
   const request = {
     role: `Write the complete file ${t.path} as code. The harness has opened the code block; write only the file content and close the block.`,
-    file: t.path, purpose: d.detail, mustContain: d.contents ?? [], mustExport: d.exports ?? [],
+    file: t.path, purpose: d.detail, mustContain: d.contents ?? [], ...(d.layout ? { layout: d.layout } : {}), mustExport: d.exports ?? [],
+    // The files beside this one and the file that composes it, with their own
+    // specifications: the worker sees the same picture the architect had.
+    ...(!shrink && t.siblings?.length ? { siblings: t.siblings } : {}),
     dependencies: t.contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, status: c.status, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
     importedBy: t.importers,
     ...(s.referenceEvidence.length && !shrink ? { requirements: referenceContext(s, 2500).map(e => e.text) } : {}),
     ...(t.problems?.length ? { previousAttempt: t.problems } : {}),
     rules: [
       `Write the complete content of ${t.path}: substantive, working code with no placeholders, TODOs or omitted sections.`,
-      'Provide every item of mustContain and every export of mustExport, following design.conventions.',
+      'Provide every item of mustContain and every export of mustExport, following design.conventions; where layout, design.pageComposition or design.copy apply, the file follows them exactly and renders copy from the data module rather than inventing it.',
       'Import only from dependencies (using the exact import paths and names listed) or from installedPackages; never from a module that is not listed.',
       'Export exactly what importedBy expects, under those names; where importedBy shows usage (how a file already renders or calls an export), declare that export to accept exactly those props or arguments.',
       'Write the file content only, then the closing fence; no explanation before or after it.',

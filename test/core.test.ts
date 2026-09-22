@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -8,17 +9,17 @@ import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults, ledger: false };
 import { Bonsai, Jev, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
-import { createFileMessages, fenceFor, SYSTEM, focusedMessages, rewriteRegionMessages, trimContext, pinnedBlock, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
+import { createFileMessages, designBlock, fenceFor, SYSTEM, focusedMessages, rewriteRegionMessages, trimContext, pinnedBlock, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { referenceContext, rememberReferences, scopes } from '../src/references.js';
 import { unaccountedFiles, auditQuestions, auditVerdict, candidates, commandLike, completionEvidence, decideStep, readyToFinish, runnableForever, stepQuestions, taskRecord } from '../src/decide.js';
-import { designFrom, anchorPath, candidatesFrom, checkCandidates, checkSchema, completionQuestions, configLike, contractsFor, creationOrder, deriveDeliverables, diffChunks, exportNames, importContracts, ledgerQuestions, ledgerSchema, missingExports, parseDesign, readyCreates, refreshLedger, structuralDiff, trialFacts, usageOf, usageSnippets } from '../src/ledger.js';
+import { designFrom, anchorPath, candidatesFrom, checkCandidates, checkSchema, completionQuestions, configLike, contractsFor, creationOrder, deriveDeliverables, diffChunks, enrichPrompt, exportNames, importContracts, ledgerQuestions, ledgerSchema, mergeEnrichment, missingExports, parseDesign, readyCreates, refreshLedger, structuralDiff, thinItem, trialFacts, usageOf, usageSnippets } from '../src/ledger.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { extractCode, focusedEditSchema, samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { addPackagesCommand, aliasImportBinding, manifestFailures, missingDependencies, missingPackages, installCommand, repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
+import { addPackagesCommand, aliasImportBinding, fixClassBrackets, invalidTailwindClasses, manifestFailures, missingDependencies, missingPackages, installCommand, qualityDiagnostics, repositoryStatus, solutionTsconfigReferences, wireTailwindVite, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -2903,7 +2904,7 @@ test('With a design, each candidate is judged as part of it, extra, or out of sc
     return answersFor(q, 'read_files', .9);
   } };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => { throw new Error('the design is not a grammar-constrained generation'); },
-    generateText: async (_m: any, o: any) => { assert.equal(o.thinking, true, 'the architect thinks first'); assert.equal(o.fence, null); return { text, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+    generateText: async (m: any, o: any) => { const enrichment = /too thin to generate/.test(m[2].content); if (!enrichment) { assert.equal(o.thinking, true, 'the architect thinks first'); assert.equal(o.temperature, .2); assert.equal(o.thinkingBudget, 3072); } assert.equal(o.fence, null); return { text: enrichment ? '```json\n{"items": []}\n```' : text, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
   const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
   assert.deepEqual(Object.keys(seen.q).filter(k => k.startsWith('tier_')), ['tier_d2', 'tier_d3', 'tier_d4', 'tier_d5'], 'a manifest the repository lacks is part of the design by construction: Jev is not asked');
   assert.deepEqual(Object.keys((seen.q.tier_d2 as any).criteria), ['part_of_design', 'extra', 'out_of_scope']); assert.equal(seen.state.design.summary, design.summary); assert.deepEqual(Object.keys(seen.state), ['objective', 'design', 'items', 'allItems']); assert.equal(seen.state.allItems.length, 5); assert.match((seen.q.complete as any).instructions, /`allItems`/);
@@ -3406,4 +3407,119 @@ test('A repair prompt names the source line each error points at and the callee 
   const vite = summarizeCheck(JSON.stringify({ command: 'npm run build', output: 'error during build:\n[vite:css] Cannot apply unknown utility class `bg-brand`\nfile: /home/u/repo/src/index.css:12:3\n', code: 1 }), '/home/u/repo');
   assert.equal(vite.errors, 1); assert.deepEqual(vite.byFile['src/index.css']?.lines, [12], 'the heading introduces the line that follows, whatever it says, and the file line attributes it');
   assert.equal(summarizeCheck(JSON.stringify({ command: 'x', output: 'error during build:\n', code: 1 })).errors, 1, 'a heading nothing follows is the diagnostic');
+});
+
+test('Tailwind v4 in a Vite project is wired by code when the config loads no plugin, and a mistyped class bracket is repaired without a generation', async t => {
+  assert.equal(wireTailwindVite("import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  base: './',\n  plugins: [react()],\n})\n"),
+    "import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\nimport tailwindcss from '@tailwindcss/vite'\n\nexport default defineConfig({\n  base: './',\n  plugins: [tailwindcss(), react()],\n})\n");
+  assert.equal(wireTailwindVite('import { defineConfig } from "vite";\nexport default defineConfig({\n  server: { port: 3000 },\n});\n'), 'import { defineConfig } from "vite";\nimport tailwindcss from "@tailwindcss/vite";\nexport default defineConfig({\n  plugins: [tailwindcss()],\n  server: { port: 3000 },\n});\n');
+  assert.equal(wireTailwindVite("import tailwindcss from '@tailwindcss/vite'\nexport default { plugins: [tailwindcss()] }\n"), null, 'already wired');
+  assert.equal(wireTailwindVite("export default { plugins: [] }\n"), "import tailwindcss from '@tailwindcss/vite'\nexport default { plugins: [tailwindcss()] }\n", 'an empty plugins array gets the plugin without a dangling comma');
+  const fixed = fixClassBrackets('<div className="absolute h-[300px) w-[300px] rounded-full" /><p className={`mt-[calc(1rem+2px)) text-lg`}>x</p><span className="w-[calc(100%-1rem)]">ok</span>');
+  assert.deepEqual(fixed.fixed, ['h-[300px)', 'mt-[calc(1rem+2px))']); assert.match(fixed.text, /h-\[300px\] w-\[300px\]/); assert.match(fixed.text, /mt-\[calc\(1rem\+2px\)\] text-lg/); assert.match(fixed.text, /w-\[calc\(100%-1rem\)\]/);
+  const hero = fixClassBrackets('<section className="relative isolate -mt-[calc(100vh-100px)] h-[100vh] flex sm:-mb-[50vh] -mt-4 -mx-2 mt-[10vh]">');
+  assert.deepEqual(hero.fixed, ['-mt-[calc(100vh-100px)]', 'sm:-mb-[50vh]']); assert.equal(hero.text, '<section className="relative isolate h-[100vh] flex -mt-4 -mx-2 mt-[10vh]">', 'negative viewport-height margins go; ordinary negative margins and positive viewport values stay');
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', scripts: { build: 'vite build' }, devDependencies: { tailwindcss: '^4.0.0', vite: '^6.0.0' } }));
+  await writeFile(join(root, 'vite.config.ts'), "import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n})\n");
+  await writeFile(join(root, 'src', 'index.css'), '@import "tailwindcss";\n\nbody { margin: 0; }\n');
+  await writeFile(join(root, 'src', 'components', 'Hero.tsx'), 'export function Hero() {\n  return <div className="absolute h-[300px) w-[300px]" />;\n}\n');
+  s.phase = 'implement'; s.inspectionCount = 3; s.writes = ['package.json', 'vite.config.ts', 'src/index.css', 'src/components/Hero.tsx']; s.knownFiles.push(...s.writes); s.lastCheckCommand = 'npm run build';
+  for (const p of s.writes) s.hashes[p] = hash(await readFile(join(root, p), 'utf8'));
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 2 }, store, { decide: async (_st: unknown, q: Questions) => answersFor(q, 'read_files', .9) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({ files: [] }) }, root, () => {});
+  const ran: string[] = []; const realExecute = (runner as any).tools.execute.bind((runner as any).tools);
+  (runner as any).tools.execute = async (route: string, args: any) => { if (route === 'bash') { ran.push(args.command); return { ok: true, text: 'added 1 package' }; } return realExecute(route, args); };
+  const result = await runner.run(s);
+  assert.equal(await readFile(join(root, 'src', 'components', 'Hero.tsx'), 'utf8'), 'export function Hero() {\n  return <div className="absolute h-[300px] w-[300px]" />;\n}\n', 'the bracket is repaired in place');
+  assert.match(await readFile(join(root, 'vite.config.ts'), 'utf8'), /import tailwindcss from '@tailwindcss\/vite'\n[\s\S]*plugins: \[tailwindcss\(\), react\(\)\]/, 'the plugin is wired into the config');
+  assert.deepEqual(ran, ["npm install --save-dev --no-audit --no-fund '@tailwindcss/vite'"], 'and installed');
+  assert.equal(result.pendingCheck, true);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.deepEqual(events.filter(e => ['auto-classfix', 'auto-tailwind', 'auto-install'].includes(e.type)).map(e => e.type), ['auto-classfix', 'auto-tailwind', 'auto-install']);
+  // Nothing to do the second time: the config is wired and the class is fixed.
+  ran.length = 0; const again = await runner.run({ ...result, status: 'running' } as any).catch(() => result);
+  assert.deepEqual(ran, ['npm run build'], 'only the check that was due runs; no second wiring or install'); assert(!(await readFile(join(store.path, 'events.jsonl'), 'utf8')).includes('"type":"auto-tailwind","data":{"step":' + (again.step)));
+});
+
+test('The design carries a page composition, a copy inventory and a layout per item; thin items are specified further in one generation and every creation prompt sees its siblings', async t => {
+  assert.deepEqual(ledgerSchema.required, ['summary', 'conventions', 'pageComposition', 'copy', 'deliverables']);
+  assert.deepEqual((ledgerSchema.properties!.deliverables!.items!.required), ['kind', 'name', 'from', 'to', 'detail', 'contents', 'layout', 'exports', 'dependsOn']);
+  const raw = { summary: 'A landing page.', conventions: 'React 19, Tailwind 4.', pageComposition: 'header (sticky, 64px), hero#top, features#features, testimonials#testimonials, cta#cta, footer', copy: { siteName: 'Aurora', hero: { headline: 'Ship faster' } },
+    deliverables: [
+      { kind: 'create', name: 'src/data.ts', from: '', to: 'src/data.ts', detail: 'the copy', contents: ['siteMeta', 'features', 'testimonials'], exports: ['export const features: Feature[]'], dependsOn: [] },
+      { kind: 'create', name: 'src/components/Hero.tsx', from: '', to: 'src/components/Hero.tsx', detail: 'the hero', contents: ['Import siteMeta', 'Render hero'], layout: 'full-width, py-24, below the sticky header, min-h-[70vh]', exports: ['export function Hero()'], dependsOn: ['src/data.ts'] },
+      { kind: 'create', name: 'src/components/Features.tsx', from: '', to: 'src/components/Features.tsx', detail: 'features', contents: ['a', 'b', 'c', 'd', 'e', 'f', 'g'], exports: ['export function Features()'], dependsOn: ['src/data.ts'] },
+      { kind: 'create', name: 'src/components/CTA.tsx', from: '', to: 'src/components/CTA.tsx', detail: 'cta', contents: ['x'], exports: ['export function CTA()'], dependsOn: [] },
+      { kind: 'create', name: 'src/pages/LandingPage.tsx', from: '', to: 'src/pages/LandingPage.tsx', detail: 'the page', contents: ['composes Hero, Features, CTA in order', 'main below header', 'ids', 'container', 'padding', 'footer'], exports: ['export function LandingPage()'], dependsOn: ['src/components/Hero.tsx', 'src/components/Features.tsx', 'src/components/CTA.tsx'] },
+      { kind: 'create', name: 'package.json', from: '', to: 'package.json', detail: 'manifest', contents: ['deps'], exports: [], dependsOn: [] } ] };
+  const design = designFrom(raw)!;
+  assert.equal(design.pageComposition, raw.pageComposition); assert.equal(design.copy, JSON.stringify(raw.copy), 'an inventory the architect wrote as an object is kept as text');
+  const items = candidatesFrom(raw);
+  assert.equal(items[1]!.layout, 'full-width, py-24, below the sticky header, min-h-[70vh]'); assert.equal(items[2]!.contents!.length, 7);
+  assert.deepEqual(items.filter(thinItem).map(d => d.to), ['src/data.ts', 'src/components/Hero.tsx', 'src/components/CTA.tsx'], 'source items under six points are thin; the manifest is not judged');
+  const { session: s } = await fixture(t); s.design = design; s.objective = 'Bootstrap a landing page.';
+  const m = enrichPrompt(s, items.filter(thinItem)); const req = JSON.parse(m[2]!.content);
+  assert.equal(req.items.length, 3); assert.deepEqual(req.items[1].contents, ['Import siteMeta', 'Render hero']); assert.match(req.role, /at least six and up to twelve contents points/);
+  const merged = mergeEnrichment(items, { items: [{ to: 'src/components/Hero.tsx', contents: ['a full-width hero with a two-line headline from copy.hero.headline', 'a subheadline paragraph', 'two Button actions: primary and outline', 'a decorative gradient blob behind the text', 'responsive type from text-4xl to lg:text-6xl', 'the section id top'], layout: 'centered, py-24, no negative margins' }, { to: 'src/components/CTA.tsx', contents: ['only one'] }, { to: 'nope.tsx', contents: ['a', 'b', 'c', 'd', 'e', 'f'] }] });
+  assert.equal(merged, 1, 'only an enrichment longer than what the item has replaces it'); assert.equal(items[1]!.contents!.length, 6); assert.equal(items[1]!.layout, 'centered, py-24, no negative margins'); assert.deepEqual(items[3]!.contents, ['x']);
+  s.ledger = items; s.knownFiles.push('src/data.ts');
+  const block = designBlock(s, ['react@19']) as any;
+  assert.equal(block.design.pageComposition, raw.pageComposition); assert(!JSON.stringify(block.deliverables).includes('truncated'), 'no read-guidance marker in a design block');
+  const target = { path: 'src/components/Hero.tsx', deliverable: items[1]!, contracts: [], importers: [{ path: 'src/pages/LandingPage.tsx', expects: ['export function Hero()'] }], packages: [], siblings: [{ path: 'src/components/Features.tsx', detail: 'features', contents: items[2]!.contents! }, { path: 'src/pages/LandingPage.tsx', detail: 'the page', contents: items[4]!.contents! }] };
+  const cm = JSON.parse(createFileMessages(s, target as any)[3]!.content);
+  assert.equal(cm.layout, 'centered, py-24, no negative margins'); assert.equal(cm.siblings.length, 2); assert.match(cm.rules.join(' '), /renders copy from the data module rather than inventing it/);
+  assert(!('siblings' in JSON.parse(createFileMessages(s, target as any, 1)[3]!.content)), 'the shrunk prompt drops the siblings first');
+});
+test('Quality no check reports is judged at creation: nested headings, classes the project Tailwind cannot compile, a solution tsconfig that checks nothing', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-quality-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true });
+  const nested = await qualityDiagnostics(root, 'src/CTA.tsx', '<section>\n  <h2 className="a">\n    <h2>{title}</h2>\n  </h2>\n  <p><p>x</p></p>\n</section>\n');
+  assert.deepEqual(nested.map(d => d.slice(0, 40)), ['src/CTA.tsx(2,1): error: <h2> is nested ', 'src/CTA.tsx(5,1): error: <p> is nested i']);
+  assert.deepEqual(await qualityDiagnostics(root, 'src/data.ts', 'export const x = "<p><p>";'), [], 'only markup files');
+  const tw = '/home/sosajiggy/react-demo-v10/node_modules/@tailwindcss/node/dist/index.mjs';
+  if (existsSync(tw)) {
+    await symlink('/home/sosajiggy/react-demo-v10/node_modules', join(root, 'node_modules'));
+    await writeFile(join(root, 'src', 'index.css'), '@import "tailwindcss";\n@theme {\n  --color-brand-500: #4f46e5;\n}\n');
+    const bad = await invalidTailwindClasses(root, 'src/Button.tsx', 'const a = <button className="inline-flex bg-primary-500 hover:bg-primary-600 text-brand-500 h-[300px] group peer/x md:grid-cols-3" />;\nconst b = <i className={`mt-4 ${x} text-muted`} />;\n');
+    assert.deepEqual(bad.map(d => d.match(/class "([^"]+)"/)![1]), ['bg-primary-500', 'hover:bg-primary-600', 'text-muted'], 'a theme colour, built-ins, arbitrary values and marker classes compile; invented colours do not');
+    assert.match(bad[0]!, /^src\/Button\.tsx\(1,1\): error: class "bg-primary-500" is not a utility/);
+  }
+  await writeFile(join(root, 'tsconfig.json'), '{\n  // solution file\n  "files": [],\n  "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }]\n}\n');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', scripts: { typecheck: 'tsc --noEmit', build: 'tsc -noEmit && vite build', lint: 'eslint .' } }));
+  assert.deepEqual(await solutionTsconfigReferences(root), ['./tsconfig.app.json', './tsconfig.node.json']);
+  assert.match((await checkUnusable(root, 'npm run typecheck')) ?? '', /checks no source files: tsconfig\.json is a solution file/);
+  assert.equal(await checkUnusable(root, 'npm run build'), null, 'a script that also builds still verifies something');
+  assert.equal(await checkUnusable(root, 'npx tsc --noEmit -p tsconfig.app.json'), null);
+  const cands = await checkCandidates(root, await repositoryStatus(root));
+  assert.deepEqual(cands.slice(0, 2).map(c => c.command), ['npx tsc --noEmit -p ./tsconfig.app.json', 'npx tsc --noEmit -p ./tsconfig.node.json'], 'the referenced configs come first');
+  await writeFile(join(root, 'tsconfig.json'), '{ "include": ["src"] }'); assert.equal(await solutionTsconfigReferences(root), null);
+});
+test('A created file is reviewed against its points: one that misses most of them is generated once more with the missed points named, and the dark variant is wired when a toggle needs it', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true }); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  s.objective = 'Build the hero.'; s.phase = 'implement'; s.inspectionCount = 3; s.lastCheckCommand = 'node check.mjs';
+  s.design = { summary: 'A landing page.', conventions: 'React 19.' };
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/components/Hero.tsx', from: '', to: 'src/components/Hero.tsx', detail: 'the hero', contents: ['a headline', 'a subheadline', 'two actions', 'a gradient accent'], exports: ['export function Hero()'], dependsOn: [] }] }); s.ledgerBuilt = true;
+  const thin = 'export function Hero() {\n  return <section><h1>Hi</h1></section>;\n}\n';
+  const rich = 'export function Hero() {\n  return (\n    <section className="py-24">\n      <h1>Ship faster</h1>\n      <p>A subheadline.</p>\n      <a href="#start">Start</a>\n      <a href="#docs">Docs</a>\n      <div className="bg-gradient-to-br" />\n    </section>\n  );\n}\n';
+  const prompts: any[] = []; let n = 0;
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'file-review') { const low = /Hi<\/h1>/.test(state.content); return Object.fromEntries(Object.keys(q).map(k => [k, { type: 'noul', noul: low && k !== 'p1' ? .1 : .9 }])) as Answers; }
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('implement:')) ?? 'ask'; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: pick === 'ask' ? .9 : .05 } } as Answers; }
+    return answersFor(q, 'ask_user', .9); } };
+  const bonsai = { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({ question: '?' }), generateText: async (m: any) => { prompts.push(m); return { text: n++ === 0 ? thin : rich, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 2 }, store, jev, bonsai, root, () => {}).run(s);
+  assert.equal(await readFile(join(root, 'src', 'components', 'Hero.tsx'), 'utf8'), rich, 'the second attempt lands as a whole-file edit');
+  const second = JSON.parse(prompts[1][3].content); assert.deepEqual(second.previousAttempt, ['The first attempt did not implement: a subheadline', 'The first attempt did not implement: two actions', 'The first attempt did not implement: a gradient accent']);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.deepEqual(events.find(e => e.type === 'file-review')?.data.missed, ['a subheadline', 'two actions', 'a gradient accent']); assert(events.some(e => e.type === 'regenerated'));
+  assert.equal(result.autoFixKeys['regenerations'], '1');
+  // The dark variant: dark: utilities plus a class toggle need @custom-variant in the entry stylesheet.
+  await writeFile(join(root, 'src', 'index.css'), '@import "tailwindcss";\n\nbody { margin: 0; }\n'); await writeFile(join(root, 'vite.config.ts'), "import tailwindcss from '@tailwindcss/vite'\nexport default { plugins: [tailwindcss()] }\n");
+  await writeFile(join(root, 'src', 'App.tsx'), 'export function App() {\n  document.documentElement.classList.toggle("dark", true);\n  return <div className="dark:bg-slate-950">x</div>;\n}\n');
+  s.writes.push('src/index.css', 'vite.config.ts', 'src/App.tsx'); s.knownFiles.push('src/index.css', 'vite.config.ts', 'src/App.tsx'); for (const p of ['src/index.css', 'vite.config.ts', 'src/App.tsx']) s.hashes[p] = hash(await readFile(join(root, p), 'utf8'));
+  const runner2 = new Runner({ ...defaults, allowWrite: true, allowBash: false, maxSteps: 1 }, store, { decide: async (_st: unknown, q: Questions) => answersFor(q, 'read_files', .9) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({ files: [] }) }, root, () => {});
+  await runner2.run({ ...result, status: 'running', pendingCheck: false } as any).catch(() => {});
+  assert.equal(await readFile(join(root, 'src', 'index.css'), 'utf8'), '@import "tailwindcss";\n@custom-variant dark (&:where(.dark, .dark *));\n\nbody { margin: 0; }\n');
 });

@@ -7,7 +7,7 @@ export const defaults: Config = {
   routeProbability: .55, routeMargin: .12, compactProbability: .75, completeProbability: .9,
   compactCooldown: 4, maxSteps: 80, toolChars: 6000, commandTimeoutMs: 60000,
   allowWrite: false, allowBash: false, verbose: false, ledger: true, checkCommand: '',
-  createTokens: 12000, designTokens: 8000, designThinking: true,
+  createTokens: 12000, designTokens: 14000, designThinking: true,
 };
 export async function loadConfig(path?: string, overrides: Partial<Config> = {}): Promise<Config> {
   const input = path ? JSON.parse(await readFile(path, 'utf8')) : {};

@@ -3,9 +3,9 @@ import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
 import { createFileMessages, rewriteRegionMessages, trimContext, fenceFor, focusedMessages, checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, type CreateTarget, type RegionTarget } from './context.js';
 import { extractCode, focusedEditSchema, schemas } from './schema.js';
-import { addPackagesCommand, aliasImportBinding, manifestFailures, missingDependencies, missingPackages, installCommand, installedPackages, runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, statementBounds, summarizeCheck, syntaxErrors, ToolBox } from './tools.js';
+import { addPackagesCommand, aliasImportBinding, fixClassBrackets, manifestFailures, missingDependencies, missingPackages, installCommand, installedPackages, qualityDiagnostics, runCommand, wireTailwindVite, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, statementBounds, summarizeCheck, syntaxErrors, ToolBox } from './tools.js';
 import { unaccountedFiles, auditQuestions, auditVerdict, candidates, commandLike, completionEvidence, completionState, decideStep, readyToFinish, stepQuestions, taskRecord } from './decide.js';
-import { designFrom, anchorPath, candidatesFrom, checkCandidates, checkPrompt, checkSchema, checkSelectionQuestions, configLike, contractsFor, deriveDeliverables, exportedNames, importContracts, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, missingExports, parseDesign, refreshLedger, structuralDiff, tierQuestions, tierState, trialFacts } from './ledger.js';
+import { designFrom, anchorPath, candidatesFrom, checkCandidates, checkPrompt, checkSchema, checkSelectionQuestions, configLike, contractsFor, deriveDeliverables, enrichPrompt, exportedNames, importContracts, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, mergeEnrichment, missingExports, parseDesign, refreshLedger, structuralDiff, thinItem, tierQuestions, tierState, trialFacts } from './ledger.js';
 const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
@@ -292,7 +292,14 @@ export class Runner {
     // parsed leniently: a design cut by the budget keeps its complete items.
     try {
       if (this.bonsai.generateText) {
-        const g = await this.generateCode(s, 'ledger' as Route, [ledgerPrompt(s, note, repository)], this.config.designTokens, null, { thinking: this.config.designThinking });
+        // The design is one generation per run and decides the richness of every
+        // file after it: sampled tighter than code, with room to think, and kept
+        // whole as an artifact so a thin design is visible at step one.
+        // A second pass continues a design the budget cut or Jev found short:
+        // it adds items only, so it does not think again.
+        const g = await this.generateCode(s, 'ledger' as Route, [ledgerPrompt(s, note, repository)], this.config.designTokens, null, { thinking: this.config.designThinking && s.ledgerAttempts === 1, temperature: .2, thinkingBudget: 3072 });
+        await this.store.snapshot(s.step, `design${s.ledgerAttempts > 1 ? `-${s.ledgerAttempts}` : ''}.md`, g.text).catch(() => '');
+        if (g.finish !== 'stop') this.observe({ kind: 'warning', step: s.step, text: `design: the reply ${g.finish === 'length' ? `reached the ${this.config.designTokens}-token budget (designTokens)` : 'started repeating and was cut'}; the complete items are kept and the rest is asked for next` });
         raw = parseDesign(g.text);
         if (!raw) throw new Error(`The design reply held no JSON object (${g.finish}; ${g.text.length} characters)`);
       } else raw = await this.bonsai.generate(ledgerPrompt(s, note, repository), ledgerSchema, .1, { step: s.step, route: 'ledger' }, this.config.designTokens);
@@ -300,6 +307,19 @@ export class Runner {
     const design = designFrom(raw); if (design && (!s.design || design.summary.length > s.design.summary.length)) s.design = design;
     const fresh = candidatesFrom(raw).filter(c => !s.ledger.some(d => d.kind === c.kind && d.name === c.name && d.to === c.to && d.from === c.from));
     const candidates = fresh.map((c, i) => ({ ...c, id: `d${s.ledger.length + i + 1}` }));
+    // Items the design left thin are specified in one more generation before
+    // any file is written from them: cheaper than regenerating the files.
+    const thin = candidates.filter(thinItem);
+    if (thin.length >= 3 && this.bonsai.generateText) {
+      try {
+        const e = await this.generateCode(s, 'ledger' as Route, [enrichPrompt(s, thin.slice(0, 14))], this.config.designTokens, null, { thinking: false, temperature: .2 });
+        const merged = mergeEnrichment(candidates, parseDesign(e.text));
+        await this.store.log('design-enriched', { step: s.step, thin: thin.length, merged, items: thin.slice(0, 14).map(d => ({ to: d.to, contents: d.contents?.length ?? 0, layout: Boolean(d.layout) })) });
+        this.observe({ kind: 'warning', step: s.step, text: `design: ${thin.length} thin item(s), ${merged} specified further` });
+      } catch (e) { await this.store.log('design-enriched', { step: s.step, thin: thin.length, error: (e as Error).message }); }
+    }
+    const perItem = candidates.filter(c => c.kind === 'create').map(c => c.contents?.length ?? 0);
+    await this.store.log('design-stats', { step: s.step, items: candidates.length, contentsPerItem: perItem, median: perItem.length ? [...perItem].sort((a, b) => a - b)[Math.floor(perItem.length / 2)] : 0, withLayout: candidates.filter(c => c.layout).length, pageComposition: Boolean(design?.pageComposition), copy: Boolean(design?.copy) });
     if (!candidates.length) { s.ledgerBuilt = true; await this.store.log('ledger', { step: s.step, candidates: [], kept: s.ledger }); return false; }
     let kept: Deliverable[]; let complete = 0;
     if (s.design && candidates.some(c => c.kind === 'create')) {
@@ -438,6 +458,66 @@ export class Runner {
     await this.installDependencies(s, install, '.');
     return true;
   }
+  // Tailwind v4 in a Vite project styles nothing unless the config loads its
+  // plugin, and no check reports that: the stylesheet imports tailwindcss, the
+  // build passes, the page is unstyled. Code wires the plugin into the config
+  // and installs it, once per config version. A class whose arbitrary value
+  // closes with the wrong bracket is repaired the same way.
+  private async wireStack(s: Session): Promise<boolean> {
+    const read = async (p: string) => { try { return await readFile(await safePath(this.tools.root, p), 'utf8'); } catch { return null; } };
+    const files = [...new Set([...s.writes, ...s.knownFiles])];
+    // Mistyped class brackets in written markup, one file per step.
+    for (const p of s.writes) {
+      if (!/\.(?:[jt]sx|html)$/.test(p)) continue;
+      const text = await read(p); if (text === null) continue;
+      const key = `classfix:${p}`; const h = hash(text); if (s.autoFixKeys[key] === h) continue;
+      s.autoFixKeys[key] = h;
+      const { text: repaired, fixed } = fixClassBrackets(text);
+      if (!fixed.length) continue;
+      const lines = text.split('\n'); const total = lines.length > 1 && lines.at(-1) === '' ? lines.length - 1 : lines.length;
+      this.observe({ kind: 'warning', step: s.step, text: `class brackets: ${p}: ${fixed.join(', ')}` });
+      await this.forced(s, 'replace_lines', { path: p, expectedHash: h, edits: [{ start: 1, end: total, newText: repaired.replace(/\n$/, ''), prepend: '' }], harness: true, fixed }, 'auto-classfix');
+      return true;
+    }
+    const styles = files.filter(p => /\.css$/.test(p));
+    let tailwind = false; let entryCss: { path: string; text: string } | null = null;
+    for (const p of styles) { const t = await read(p); if (t && /@import\s+["']tailwindcss["']/.test(t)) { tailwind = true; entryCss ??= { path: p, text: t }; } }
+    if (!tailwind) return false;
+    // Tailwind v4's dark variant follows the system unless the stylesheet says
+    // otherwise: a theme toggle that sets a class or data attribute does nothing
+    // to dark: utilities without @custom-variant. The variant is added as text.
+    if (entryCss && !/@custom-variant\s+dark/.test(entryCss.text) && s.autoFixKeys['dark-variant'] !== hash(entryCss.text)) {
+      let usesDark = false; let byClass = false; let byData = false;
+      for (const p of s.writes.filter(p => /\.[jt]sx$/.test(p))) { const t = await read(p); if (!t) continue; if (/\bdark:/.test(t)) usesDark = true; if (/classList\.(?:toggle|add|remove)\(\s*['"]dark['"]/.test(t) || /className=\{[^}]*['"]dark['"]/.test(t)) byClass = true; if (/data-theme/.test(t)) byData = true; }
+      s.autoFixKeys['dark-variant'] = hash(entryCss.text);
+      if (usesDark && (byClass || byData)) {
+        const variant = byClass ? '@custom-variant dark (&:where(.dark, .dark *));' : '@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));';
+        const lines = entryCss.text.split('\n'); const at = lines.findIndex(l => /@import\s+["']tailwindcss["']/.test(l));
+        lines.splice(at + 1, 0, variant);
+        const total = entryCss.text.split('\n').length > 1 && entryCss.text.endsWith('\n') ? entryCss.text.split('\n').length - 1 : entryCss.text.split('\n').length;
+        this.observe({ kind: 'warning', step: s.step, text: `tailwind: ${entryCss.path} declares no dark variant while the app toggles ${byClass ? 'a class' : 'a data attribute'}; adding it` });
+        await this.forced(s, 'replace_lines', { path: entryCss.path, expectedHash: hash(entryCss.text), edits: [{ start: 1, end: total, newText: lines.join('\n').replace(/\n$/, ''), prepend: '' }], harness: true }, 'auto-darkvariant');
+        return true;
+      }
+    }
+    const config = files.find(p => /^vite\.config\.[cm]?[jt]s$/.test(p)); if (!config) return false;
+    const html = await read('index.html'); if (html && /cdn\.tailwindcss\.com/.test(html)) return false;
+    for (const p of files) if (/^postcss\.config\./.test(p)) { const t = await read(p); if (t && /@tailwindcss\/postcss/.test(t)) return false; }
+    const text = await read(config); if (text === null) return false;
+    const key = 'tailwind-wiring'; const h = hash(text); if (s.autoFixKeys[key] === h) return false;
+    s.autoFixKeys[key] = h;
+    const wired = wireTailwindVite(text); if (!wired) return false;
+    const lines = text.split('\n'); const total = lines.length > 1 && lines.at(-1) === '' ? lines.length - 1 : lines.length;
+    this.observe({ kind: 'warning', step: s.step, text: `tailwind: ${config} loads no @tailwindcss/vite plugin; wiring it` });
+    const r = await this.forced(s, 'replace_lines', { path: config, expectedHash: h, edits: [{ start: 1, end: total, newText: wired.replace(/\n$/, ''), prepend: '' }], harness: true }, 'auto-tailwind');
+    if (r.ok && this.config.allowBash && !(await installedPackages(this.tools.root)).some(i => i.startsWith('@tailwindcss/vite@')) && !s.autoFixKeys['install:@tailwindcss/vite']) {
+      s.autoFixKeys['install:@tailwindcss/vite'] = `step ${s.step}`;
+      await this.forced(s, 'bash', { command: await addPackagesCommand(this.tools.root, ['@tailwindcss/vite'], true), purpose: 'Install @tailwindcss/vite: the stylesheet imports tailwindcss and the Vite config now loads its plugin.' }, 'auto-install');
+      try { s.hashes['package.json'] = hash(await readFile(await safePath(this.tools.root, 'package.json'), 'utf8')); } catch { /* unchanged */ }
+    }
+    s.pendingCheck = Boolean(s.lastCheckCommand);
+    return true;
+  }
   // The latest published version of a package, from the registry; null when
   // the registry cannot answer (offline, or the package does not exist).
   async lookupVersion(name: string): Promise<string | null> {
@@ -530,12 +610,17 @@ export class Runner {
   private async createTarget(s: Session, path: string, d: Deliverable, problems?: string[]): Promise<CreateTarget> {
     const { contracts, importers } = await contractsFor(this.tools.root, s, d);
     const packages = await installedPackages(this.tools.root).catch(() => [] as string[]);
-    return { path, deliverable: d, contracts, importers, packages, ...(problems?.length ? { problems } : {}) };
+    // The files beside this one and the ones that import it, with their own
+    // specifications, so a component and its page agree on what it renders.
+    const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+    const related = s.ledger.filter(o => o !== d && o.kind === 'create' && o.to && o.contents?.length && (o.to.slice(0, o.to.lastIndexOf('/')) === dir || importers.some(i => i.path === o.to)));
+    const siblings = related.slice(0, 8).map(o => ({ path: o.to!, detail: clip(o.detail, 200), contents: o.contents!.slice(0, 8), ...(o.layout ? { layout: o.layout } : {}) }));
+    return { path, deliverable: d, contracts, importers, packages, ...(problems?.length ? { problems } : {}), ...(siblings.length ? { siblings } : {}) };
   }
   // Code is generated as code: a raw completion continued across requests
   // until the model stops. Without a raw path the same prompt runs under a
   // one-field schema. The result is the unwrapped code, never refused for shape.
-  private async generateCode(s: Session, route: Route, prompts: Message[][], budget: number, fence: string | null, options: { thinking?: boolean } = {}): Promise<{ code: string; finish: 'stop' | 'length' | 'repetition'; text: string }> {
+  private async generateCode(s: Session, route: Route, prompts: Message[][], budget: number, fence: string | null, options: { thinking?: boolean; temperature?: number; thinkingBudget?: number } = {}): Promise<{ code: string; finish: 'stop' | 'length' | 'repetition'; text: string }> {
     // The prompt is shrunk before it is refused, never swapped for a generic one.
     let prompt = prompts[0]!; let counted = await this.bonsai.count(prompt);
     for (const smaller of prompts.slice(1)) { if (counted.tokens <= this.config.workingTokens) break; prompt = smaller; counted = await this.bonsai.count(prompt); }
@@ -544,7 +629,7 @@ export class Runner {
     this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
     await this.logPrompt(s, route, prompt, counted.tokens, 1);
     if (this.bonsai.generateText) {
-      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, thinking: options.thinking });
+      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, thinking: options.thinking, ...(options.temperature !== undefined ? { temperature: options.temperature } : {}), ...(options.thinkingBudget !== undefined ? { thinkingBudget: options.thinkingBudget } : {}) });
       this.observe({ kind: 'generated', step: s.step, route, meta: g.meta, args: { chars: g.text.length, finish: g.finish, continuations: g.meta.continuations ?? 0 } });
       // With the fence prefilled the reply is the code itself; a reply that
       // opens its own fence anyway (the same backtick run or a longer one) is
@@ -577,11 +662,47 @@ export class Runner {
       const errors = pending ? (await missingExports(target.path, code, d.exports ?? []).catch(() => [] as string[])).map(n => `contract: ${target.path} must export ${n === 'default' ? 'a default export' : n} (${target.importers.map(i => i.path).join(', ') || 'the design'} imports it)`)
         : await this.contractRepair(s, target.path, code, d.exports ?? [], `${target.importers.map(i => i.path).join(', ') || 'the design'} imports it`);
       if (errors.length) { if (pending) pending.errors.push(...errors); else s.pendingRepairs.push({ path: target.path, errors, attempts: 0 }); }
+      // What the checks cannot see is judged now: markup nested in its own
+      // kind, classes the project's Tailwind cannot compile, and whether the
+      // file implements the points it was specified with.
+      const text = await this.reviewCreated(s, target, code);
+      const quality = await qualityDiagnostics(this.tools.root, target.path, text).catch(() => [] as string[]);
+      if (quality.length) { const q = s.pendingRepairs.find(r => r.path === target.path); if (q) q.errors.push(...quality); else s.pendingRepairs.push({ path: target.path, errors: quality, attempts: 0 }); }
     } catch (e) {
       d.attempts = (d.attempts ?? 0) + 1;
       if (d.attempts >= 3) { d.unresolvable = true; d.setAside = true; d.note = `set aside after ${d.attempts} failed attempts: ${clip((e as Error).message, 160)}`; }
       throw e;
     }
+  }
+  // A created file is reviewed against the points it was specified with: Jev
+  // reads the file and answers one Noul per point. A file that misses more
+  // than a third of them is generated once more, told which points the first
+  // attempt missed, and lands as a whole-file edit when it parses. Returns the
+  // text now on disk.
+  private async reviewCreated(s: Session, target: CreateTarget, code: string): Promise<string> {
+    const d = target.deliverable; const points = (d.contents ?? []).slice(0, 8);
+    if (!/\.(?:[jt]sx?|css|html)$/.test(target.path) || points.length < 3 || s.autoFixKeys[`review:${target.path}`]) return code;
+    s.autoFixKeys[`review:${target.path}`] = `step ${s.step}`;
+    let answers: Answers;
+    try {
+      answers = await this.jev.decide({ file: target.path, purpose: d.detail, ...(d.layout ? { layout: d.layout } : {}), points: Object.fromEntries(points.map((b, i) => [`p${i + 1}`, b])), content: clip(code, 3500) },
+        Object.fromEntries(points.map((_b, i) => [`p${i + 1}`, { type: 'noul' as const, instructions: `Does content implement points.p${i + 1} in substance, as a professional would ship it? Answer low when the point is missing, a placeholder, or only partly done.` }])), { step: s.step, phase: 'file-review' });
+    } catch { return code; }
+    const missed = points.filter((_b, i) => { const a = answers[`p${i + 1}`]; return a?.type === 'noul' && a.noul < .5; });
+    await this.store.log('file-review', { step: s.step, path: target.path, points: points.length, missed });
+    if (!missed.length || missed.length * 3 <= points.length || (s.autoFixKeys['regenerations'] ?? '0') >= '6') return code;
+    s.autoFixKeys['regenerations'] = String(Number(s.autoFixKeys['regenerations'] ?? '0') + 1);
+    this.observe({ kind: 'warning', step: s.step, text: `${target.path} misses ${missed.length} of ${points.length} points; generating it once more` });
+    const again = await this.createTarget(s, target.path, d, missed.map(m => `The first attempt did not implement: ${m}`));
+    const { code: next } = await this.generateCode(s, 'create_file', [createFileMessages(s, again), createFileMessages(s, again, 1)], this.config.createTokens, fenceFor(target.path));
+    const problems = await syntaxErrors(target.path, next).catch(() => [] as string[]);
+    if (problems.length || next.trim() === code.trim()) { await this.store.log('regenerated', { step: s.step, path: target.path, kept: 'first', reason: problems.length ? problems.join('; ') : 'identical' }); return code; }
+    const lines = code.split('\n'); const total = lines.length > 1 && lines.at(-1) === '' ? lines.length - 1 : lines.length;
+    const r = await this.forced(s, 'replace_lines', { path: target.path, expectedHash: hash(code), edits: [{ start: 1, end: total, newText: next.replace(/\n$/, ''), prepend: '' }], harness: true }, 'regenerated');
+    if (!r.ok) return code;
+    const contract = await this.contractRepair(s, target.path, next, d.exports ?? [], `${target.importers.map(i => i.path).join(', ') || 'the design'} imports it`);
+    if (contract.length) { const q = s.pendingRepairs.find(x => x.path === target.path); if (q) q.errors.push(...contract); else s.pendingRepairs.push({ path: target.path, errors: contract, attempts: 0 }); }
+    return next;
   }
   // A repair is a region rewrite: code chooses the region (the whole file when
   // small, else the statements around the reported lines), the worker returns
@@ -880,6 +1001,9 @@ export class Runner {
         // A package a written file imports and the manifest lacks is installed
         // by code: a mechanical repair, never a manifest edit to generate.
         if (this.config.allowBash && this.config.allowWrite && await this.installMissing(s)) { await this.store.save(s); continue; }
+        // Stack wiring the checks cannot see (Tailwind's plugin, a mistyped class
+        // bracket) is verified and repaired by code before the next decision.
+        if (this.config.allowWrite && await this.wireStack(s)) { await this.store.save(s); continue; }
         if (s.pendingCheck && s.lastCheckCommand && this.config.allowBash) {
           s.pendingCheck = false;
           await this.forced(s, 'bash', { command: s.lastCheckCommand, purpose: 'Verification after the last edit; re-running the check command.' }, 'auto-check');

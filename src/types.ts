@@ -6,14 +6,14 @@ export interface Coverage { total: number; ranges: [number, number][] }
 // samples are short heads for decision state; diagnostics are the complete
 // messages with their continuation lines, for a repair prompt.
 export interface CheckSummary { errors: number; syntax: number; resolution?: number; byFile: Record<string, { count: number; syntax: number; resolution?: number; lines: number[]; samples: string[]; diagnostics?: string[] }> }
-export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string> }
+export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string>; command?: string }
 export interface SourceEvidence { path: string; hash?: string; facts: Record<string, unknown>[]; excerpt?: string; error?: string; omitted?: number }
 export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export' | 'import' | 'verify' | 'other';
 // exports and dependsOn are the design's contract for a file to create: what it
 // provides, and which other deliverables it imports, so creation can be ordered
 // and every prompt can carry the exact signatures a file may import. A derived
 // item was added by the harness for an import a generated file made.
-export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string }
+export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string; setAside?: boolean }
 export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move' | 'reexport' | 'alias' | 'respec'; line?: number; move?: { source: string; start: number; end: number } }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
@@ -42,7 +42,10 @@ export interface Session {
   editEvidence: EditEvidence[];
   // Tool-observed excerpts of documents explicitly referenced by the objective.
   referenceEvidence: { path: string; hash: string; text: string; scope?: string }[];
-  completionFeedback: { step: number; text: string; awaitingEvidence: boolean; addressed?: boolean; unmet?: string[] } | null;
+  // unmet: the deliverables the audit did not accept; unmetPending: those of
+  // them that were pending by source facts at the time, the only ones whose
+  // later completion by facts answers the rejection without an edit.
+  completionFeedback: { step: number; text: string; awaitingEvidence: boolean; addressed?: boolean; unmet?: string[]; unmetPending?: string[] } | null;
   // The passing check for which the harness already proposed a finish; one attempt per check.
   finishTriedAtCheck: number;
   // Coverage per content hash, so a rollback to known content restores read state.

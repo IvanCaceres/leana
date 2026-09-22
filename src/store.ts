@@ -33,7 +33,7 @@ export class Store {
     // Superseded reads from older checkpoints: keep only their header line.
     for (const e of s.entries) if (e.text.startsWith('[superseded') && e.text.split('\n').length > 2) { const l = e.text.split('\n'); e.text = `${l[0]}\n${l.find(x => x.includes(' sha256=')) ?? ''}`; e.relevance = Math.min(e.relevance, .1); }
     if (!s.lastCheckCommand && s.lastCheck) { const m = s.lastCheck.text.match(/^\{"command":"((?:[^"\\]|\\.)*)"/); if (m) { try { s.lastCheckCommand = JSON.parse(`"${m[1]}"`); } catch { /* leave null */ } } }
-    for (const c of [s.lastCheck, s.previousCheck]) if (c && !c.summary) c.summary = summarizeCheck(c.text);
+    for (const c of [s.lastCheck, s.previousCheck]) if (c && !c.summary) c.summary = summarizeCheck(c.text, s.root);
     if (!s.editEvidence) {
       s.editEvidence = [];
       await this.recoverEditEvidence(s);

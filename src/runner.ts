@@ -3,8 +3,8 @@ import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
 import { createFileMessages, rewriteRegionMessages, trimContext, fenceFor, focusedMessages, checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, type CreateTarget, type RegionTarget } from './context.js';
 import { extractCode, focusedEditSchema, schemas } from './schema.js';
-import { addPackagesCommand, aliasImportBinding, missingDependencies, missingPackages, installCommand, installedPackages, runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, statementBounds, summarizeCheck, syntaxErrors, ToolBox } from './tools.js';
-import { unaccountedFiles, auditQuestions, auditVerdict, candidates, completionEvidence, completionState, decideStep, readyToFinish, stepQuestions, taskRecord } from './decide.js';
+import { addPackagesCommand, aliasImportBinding, manifestFailures, missingDependencies, missingPackages, installCommand, installedPackages, runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, statementBounds, summarizeCheck, syntaxErrors, ToolBox } from './tools.js';
+import { unaccountedFiles, auditQuestions, auditVerdict, candidates, commandLike, completionEvidence, completionState, decideStep, readyToFinish, stepQuestions, taskRecord } from './decide.js';
 import { designFrom, anchorPath, candidatesFrom, checkCandidates, checkPrompt, checkSchema, checkSelectionQuestions, configLike, contractsFor, deriveDeliverables, exportedNames, importContracts, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, missingExports, parseDesign, refreshLedger, structuralDiff, tierQuestions, tierState, trialFacts } from './ledger.js';
 const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
 import { Store } from './store.js';
@@ -59,6 +59,23 @@ export class Runner {
         for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
     s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
+    // A shell command that is not read-only may have edited files (sed -i, a
+    // formatter): every written or named file whose hash changed is an edit of
+    // this step, so reads of it go stale and the check is due again.
+    if (kind === 'bash' && typeof args?.command === 'string' && !readOnlyCommand(args.command)) {
+      const named = s.knownFiles.filter(p => p.length > 3 && args.command.includes(p));
+      // The baseline is the current hash, or the last check's record of it: the
+      // hash map keeps only recent files, the check recorded every written one.
+      const baseline = (p: string) => s.hashes[p] ?? s.lastCheck?.fileHashes?.[p];
+      const watched = [...new Set([...s.writes, ...named])].filter(p => baseline(p) && baseline(p) !== 'unavailable');
+      const now = await sourceHashes(s.root, watched);
+      const changed = watched.filter(p => now[p] !== 'unavailable' && now[p] !== baseline(p));
+      if (changed.length) {
+        result.changed = [...new Set([...(result.changed ?? []), ...changed])];
+        result.hashes = { ...(result.hashes ?? {}), ...Object.fromEntries(changed.map(p => [p, now[p]!])) };
+        await this.store.log('bash-edit', { step: s.step, files: changed, command: clip(args.command, 200) });
+      }
+    }
     if (result.ok && result.changed?.length && editRoutes.includes(kind as Route)) {
       rememberEdit(s, s.step, kind, result.changed, artifact, result.text, args);
       // An edit, the harness's included, means implementation has begun: finish and edits are on the menu.
@@ -95,7 +112,7 @@ export class Runner {
     // Current hashes are ground truth for expectedHash and outlive evidence eviction.
     for (const [path, h] of Object.entries(result.hashes ?? {})) { delete s.hashes[path]; s.hashes[path] = h; }
     for (const stale of Object.keys(s.hashes).slice(0, -20)) delete s.hashes[stale];
-    if (kind === 'bash' && typeof args?.command === 'string') (s.commandRuns ??= {})[args.command.trim()] = { step: s.step, ok: result.ok };
+    if (kind === 'bash' && typeof args?.command === 'string') { (s.commandRuns ??= {})[args.command.trim()] = { step: s.step, ok: result.ok }; if (s.ledger.some(d => d.kind === 'verify')) await refreshLedger(s.root, s).catch(() => {}); }
     if (result.verification) { s.editsSinceCheck = 0; if (kind === 'bash' && args?.command) s.lastCheckCommand = args.command; }
     if (kind === 'move_lines' && result.ok && !s.moveDirection && args?.source && args?.destination) s.moveDirection = { source: args.source, destination: args.destination };
     // Edits followed by a passing check answer a completion rejection; the pinned
@@ -130,18 +147,9 @@ export class Runner {
     // until the next check replaces it, whatever compaction does to the entry.
     if (result.verification) {
       s.previousCheck = s.lastCheck;
-      s.lastCheck = { step: s.step, ok: result.ok, text: clip(result.text, 1500), summary: summarizeCheck(result.text), fileHashes: await sourceHashes(s.root, s.writes) };
+      s.lastCheck = { step: s.step, ok: result.ok, text: clip(result.text, 1500), summary: summarizeCheck(result.text, s.root), fileHashes: await sourceHashes(s.root, s.writes), ...(kind === 'bash' && typeof args?.command === 'string' ? { command: args.command.trim() } : {}) };
       s.pendingCheck = false;
-      // The versions the check found errors in are known wrong: a repair that
-      // reproduces one is refused before it lands, so a fix cannot oscillate
-      // between two versions the check has already judged.
-      if (!result.ok) for (const [file, v] of Object.entries(s.lastCheck.summary.byFile)) {
-        if (!v.count) continue;
-        const path = Object.keys(s.lastCheck.fileHashes ?? {}).find(p => p === file || p.endsWith(`/${file}`) || file.endsWith(`/${p}`));
-        const h = path ? s.lastCheck.fileHashes![path] : undefined; if (!path || !h) continue;
-        const list = ((s.failedVersions ??= {})[path] ??= []);
-        if (!list.includes(h)) { list.push(h); if (list.length > 8) list.shift(); }
-      }
+      if (!result.ok) this.recordFailedVersions(s);
       // The edits since the previous check are now judged by this one. An
       // objective regression in the files that existed is rolled back
       // deterministically; an improvement or a pass is committed silently.
@@ -153,7 +161,10 @@ export class Runner {
       const created = new Set(s.transaction.filter(t => t.route === 'create_file').flatMap(t => t.paths));
       const edited = Object.fromEntries(Object.entries(s.editSnapshots).filter(([p]) => !created.has(p)));
       const scope = { files: [...new Set([...s.transaction.flatMap(t => t.paths), ...Object.keys(edited)])].filter(p => !created.has(p)), structural: s.transaction.some(t => t.route === 'move_lines') };
-      const judged = !result.ok && Object.keys(edited).length > 0;
+      // Two checks are comparable only when they are the same command: a build's
+      // failure is no baseline for the type checker's count, or the reverse.
+      const comparable = !s.previousCheck?.command || !s.lastCheck.command || s.previousCheck.command === s.lastCheck.command;
+      const judged = !result.ok && Object.keys(edited).length > 0 && comparable;
       const verdict = judged ? regression(s.previousCheck?.summary ?? null, s.lastCheck.summary, scope) : 'fine';
       s.autoUndo = verdict === 'worse' ? { files: edited, reason: clip(`the check went from ${s.previousCheck?.summary.errors ?? 0} errors (${s.previousCheck?.summary.syntax ?? 0} syntax) to ${s.lastCheck.summary.errors} (${s.lastCheck.summary.syntax} syntax) in scope ${scope.files.join(', ')}; first new: ${Object.entries(s.lastCheck.summary.byFile).find(([f]) => scope.files.some(p => f.endsWith(p) || p.endsWith(f)))?.[1].samples[0] ?? ''}`, 300) } : null;
       s.editSnapshots = {};
@@ -222,7 +233,7 @@ export class Runner {
     return hash(JSON.stringify({ route, args, hashes }));
   }
   // Execute a harness-chosen action with the same bookkeeping as a routed one.
-  private async forced(s: Session, route: Route, args: Record<string, any>, kind: string): Promise<void> {
+  private async forced(s: Session, route: Route, args: Record<string, any>, kind: string): Promise<ToolResult> {
     await this.store.log(kind, { step: s.step, ...args });
     await this.store.log('action', { step: s.step, route, args, forced: true });
     this.observe({ kind: 'route', step: s.step, route, tokens: 0, entries: s.entries.length });
@@ -236,6 +247,7 @@ export class Runner {
     if (result.ok && editRoutes.includes(route)) s.transaction.push({ key: Runner.actionKey(s, route, args), identity: hash(JSON.stringify({ route, args: { ...args, expectedHash: undefined, destinationHash: undefined } })), step: s.step, route, paths: result.changed ?? [], summary: clip(JSON.stringify({ ...args, expectedHash: undefined }), 200), kind });
     this.observe({ kind: 'result', step: s.step, route, ok: result.ok, ms: performance.now() - started, chars: result.text.length, text: clip(result.text, 200) });
     await this.store.log('result', { step: s.step, ok: result.ok, ms: performance.now() - started, artifact: s.entries.at(-1)?.artifact });
+    return result;
   }
   // The harness resolved these fixes from the check; applying them is mechanical,
   // so it does not go through the worker. Each fix set is attempted once; the
@@ -364,18 +376,106 @@ export class Runner {
     if (trial.code !== 0 && missingDependencies(trial.output) && (!s.setupDone || s.setupKey !== setupKey)) {
       const dir = command.match(/(?:--dir|-C|--prefix)\s+(\S+)/)?.[1] ?? command.match(/^\s*cd\s+(\S+)/)?.[1] ?? '.';
       const install = await installCommand(this.tools.root, dir);
-      if (install) {
-        s.setupDone = true; s.setupKey = setupKey;
-        const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', install], this.tools.root, Math.max(this.config.commandTimeoutMs, 300000)).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
-        await this.store.log('setup', { step: s.step, command: install, code: r.code, output: clip(r.output, 800) });
-        this.observe({ kind: 'warning', step: s.step, text: `setup: ${install} (exit ${r.code})` });
-        await this.evidence(s, 'setup', { ok: r.code === 0, text: `Installed dependencies with ${install}: exit ${r.code}\n${clip(r.output, 600)}` });
-        // A failed install names what the manifest got wrong: that is fix work for the manifest.
-        s.setupError = r.code === 0 ? null : clip(r.output.split('\n').filter(l => /error|ERR|not found|notarget|E404|ETARGET|EUNSUPPORTED|peer/i.test(l)).slice(0, 6).join(' | ') || r.output, 500);
-        if (r.code === 0) trial = await run();
-      }
+      if (install && await this.installDependencies(s, install, dir)) trial = await run();
     }
     return trial;
+  }
+  // A rejection whose unmet items are now done by source facts (the
+  // verifications it named ran and passed, wherever the run came from) is
+  // answered: the pinned text stops saying the objective is unfinished, and
+  // the finish latch opens without a read or an edit.
+  private settleFeedback(s: Session): void {
+    const f = s.completionFeedback;
+    // An item the audit contradicted although the facts already called it done
+    // is answered only by an edit and a passing check, never by the same facts.
+    if (!f || f.addressed || !f.unmetPending?.length || !f.unmet?.every(id => s.ledger.find(x => x.id === id)?.status === 'done')) return;
+    s.completionFeedback = { ...f, addressed: true, awaitingEvidence: false, text: `The completion proposed at step ${f.step} was rejected (${clip(f.text.replace(/^Completion rejected /, ''), 300)}); the deliverables it named are done since. Propose finish again.` };
+    s.finishTriedAtCheck = -1;
+  }
+  // The versions the check found errors in are known wrong: a repair that
+  // reproduces one is refused before it lands, so a fix cannot oscillate
+  // between two versions the check has already judged.
+  private recordFailedVersions(s: Session): void {
+    if (!s.lastCheck) return;
+    for (const [file, v] of Object.entries(s.lastCheck.summary.byFile)) {
+      if (!v.count) continue;
+      const path = Object.keys(s.lastCheck.fileHashes ?? {}).find(p => p === file || p.endsWith(`/${file}`) || file.endsWith(`/${p}`));
+      const h = path ? s.lastCheck.fileHashes![path] : undefined; if (!path || !h || h === 'unavailable') continue;
+      const list = ((s.failedVersions ??= {})[path] ??= []);
+      if (!list.includes(h)) { list.push(h); if (list.length > 8) list.shift(); }
+    }
+  }
+  private async manifestKey(): Promise<string> {
+    return hash((await Promise.all(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'requirements.txt', 'pyproject.toml'].map(f => readFile(join(this.tools.root, f), 'utf8').catch(() => '')))).join('\u0000'));
+  }
+  // One install per manifest version. A failed install that names a version or a
+  // package that does not exist is repaired by code and installed again, at most
+  // twice; a failure code cannot name is recorded as fix work for the manifest,
+  // and its manifest version is known bad. Returns whether the install passed.
+  private async installDependencies(s: Session, install: string, dir: string): Promise<boolean> {
+    s.setupDone = true; s.setupKey = await this.manifestKey();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', install], this.tools.root, Math.max(this.config.commandTimeoutMs, 300000)).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
+      await this.store.log('setup', { step: s.step, command: install, code: r.code, output: clip(r.output, 800) });
+      this.observe({ kind: 'warning', step: s.step, text: `setup: ${install} (exit ${r.code})` });
+      await this.evidence(s, 'setup', { ok: r.code === 0, text: `Installed dependencies with ${install}: exit ${r.code}\n${clip(r.output, 600)}` });
+      s.setupError = r.code === 0 ? null : clip(r.output.split('\n').filter(l => /error|ERR|not found|notarget|E404|ETARGET|EUNSUPPORTED|peer/i.test(l)).slice(0, 6).join(' | ') || r.output, 500);
+      if (r.code === 0) { s.checkInferences = 0; return true; }
+      const manifest = dir === '.' ? 'package.json' : `${dir.replace(/\/$/, '')}/package.json`;
+      try { const list = ((s.failedVersions ??= {})[manifest] ??= []); const h = hash(await readFile(await safePath(this.tools.root, manifest), 'utf8')); if (!list.includes(h)) list.push(h); } catch { /* no manifest */ }
+      if (attempt === 2 || !(await this.repairManifest(s, r.output, dir))) return false;
+      s.setupKey = await this.manifestKey();
+    }
+    return false;
+  }
+  // A manifest rewritten since the install that failed is installed again by
+  // code, before any decision: the install is the check of a manifest fix, and
+  // it does not depend on the budget for selecting a verification command.
+  private async retrySetup(s: Session): Promise<boolean> {
+    if (!s.setupError || !s.setupDone || s.setupKey === await this.manifestKey()) return false;
+    const install = await installCommand(this.tools.root, '.', true);
+    if (!install) return false;
+    await this.installDependencies(s, install, '.');
+    return true;
+  }
+  // The latest published version of a package, from the registry; null when
+  // the registry cannot answer (offline, or the package does not exist).
+  async lookupVersion(name: string): Promise<string | null> {
+    const r = await runCommand('npm', ['view', name, 'version'], this.tools.root, 60000).catch(() => null);
+    // The version is the line that looks like one: npm's update notice may follow it.
+    const v = r && r.code === 0 ? r.output.split('\n').map(l => l.trim()).find(l => /^\d+\.\d+\.\d+/.test(l)) ?? '' : '';
+    return v || null;
+  }
+  // A dependency the registry rejected is repaired in the manifest by code: a
+  // version that does not exist becomes the latest that does, a package that
+  // does not exist is dropped. Once per package name; the manifest is rewritten
+  // as a whole, as a harness edit with its snapshot.
+  async repairManifest(s: Session, output: string, dir = '.'): Promise<boolean> {
+    const manifest = dir === '.' ? 'package.json' : `${dir.replace(/\/$/, '')}/package.json`;
+    const failures = manifestFailures(output).filter(f => !s.autoFixKeys[`manifest:${f.name}`]);
+    if (!failures.length) return false;
+    let text: string; let pkg: any;
+    try { text = await readFile(await safePath(this.tools.root, manifest), 'utf8'); pkg = JSON.parse(text); } catch { return false; }
+    const sections = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'].filter(k => pkg[k] && typeof pkg[k] === 'object');
+    const changes: { name: string; from: string; to: string | null }[] = [];
+    for (const f of failures) {
+      s.autoFixKeys[`manifest:${f.name}`] = `step ${s.step}`;
+      // Every section that lists the name: the package manager reads the later one.
+      const listed = sections.filter(k => f.name in pkg[k]); if (!listed.length) continue;
+      const version = f.kind === 'notarget' ? await this.lookupVersion(f.name) : null;
+      for (const section of listed) {
+        const from = String(pkg[section][f.name]);
+        if (version) pkg[section][f.name] = `^${version}`; else delete pkg[section][f.name];
+        changes.push({ name: f.name, from, to: version ? `^${version}` : null });
+      }
+    }
+    if (!changes.length) return false;
+    const lines = text.split('\n'); const trailing = lines.length > 1 && lines.at(-1) === ''; const total = trailing ? lines.length - 1 : lines.length;
+    const newText = JSON.stringify(pkg, null, 2);
+    await this.store.log('auto-manifest', { step: s.step, path: manifest, changes });
+    this.observe({ kind: 'warning', step: s.step, text: `manifest: ${changes.map(c => `${c.name} ${c.from} -> ${c.to ?? 'removed'}`).join(', ')}` });
+    const result = await this.forced(s, 'replace_lines', { path: manifest, expectedHash: hash(text), edits: [{ start: 1, end: total, newText, prepend: '' }], harness: true }, 'auto-manifest');
+    return result.ok;
   }
   // No configured check: select, do not generate. Code enumerates the commands
   // the repository offers (package scripts, language tools), tries them, and
@@ -479,7 +579,7 @@ export class Runner {
       if (errors.length) { if (pending) pending.errors.push(...errors); else s.pendingRepairs.push({ path: target.path, errors, attempts: 0 }); }
     } catch (e) {
       d.attempts = (d.attempts ?? 0) + 1;
-      if (d.attempts >= 3) { d.unresolvable = true; d.note = `set aside after ${d.attempts} failed attempts: ${clip((e as Error).message, 160)}`; }
+      if (d.attempts >= 3) { d.unresolvable = true; d.setAside = true; d.note = `set aside after ${d.attempts} failed attempts: ${clip((e as Error).message, 160)}`; }
       throw e;
     }
   }
@@ -502,7 +602,15 @@ export class Runner {
     // The exported declarations of the modules the file imports: a call site is
     // repaired against the callee as it is, not against a guess of it.
     const imports = kind === 'decided-fix' ? await importContracts(this.tools.root, path, text, errors).catch(() => []) : [];
-    const t: RegionTarget = { path, start, end, totalLines: total, region: whole ? text : region, before, after, errors: [...errors.slice(0, 8), ...previous.filter(p => !errors.some(e => e.startsWith('previous attempt:')))], note, ...(imports.length ? { imports } : {}) };
+    // The source line each error points at and, for a call or a JSX element
+    // there, the callee's declaration from the contracts: the mismatch is then
+    // stated, not left to be inferred from two places in the prompt.
+    const declared = /^export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|class|const|let|var|type|interface|enum)\s+([A-Za-z_$][\w$]*)/;
+    const sites = errors.slice(0, 4).map(e => { const m = e.match(/(?:\((\d+),(\d+)\))|(?::(\d+):(\d+))/); if (!m) return null; const line = Number(m[1] ?? m[3]); const col = Number(m[2] ?? m[4]); const src = lines[line - 1]; if (!src) return null;
+      const seg = src.slice(Math.max(0, col - 1)); const name = seg.match(/^<\s*([A-Za-z_$][\w$.]*)/)?.[1] ?? seg.match(/^([A-Za-z_$][\w$]*)\s*\(/)?.[1] ?? seg.match(/^([A-Za-z_$][\w$]*)/)?.[1];
+      const callee = name ? imports.flatMap(c => c.exports).find(x => { const d = x.match(declared)?.[1]; return d === name || (name === 'default' && /^export default/.test(x)); }) ?? (name ? imports.flatMap(c => c.exports).find(x => /^export default function\b/.test(x) && imports.some(c => c.exports.includes(x) && c.importPath.split('/').pop() === name)) : undefined) : undefined;
+      return { line, text: clip(src.trim(), 160), ...(callee ? { callee } : {}) }; }).filter((x): x is { line: number; text: string; callee?: string } => x !== null);
+    const t: RegionTarget = { path, start, end, totalLines: total, region: whole ? text : region, before, after, errors: [...errors.slice(0, 8), ...previous.filter(p => !errors.some(e => e.startsWith('previous attempt:')))], note, ...(imports.length ? { imports } : {}), ...(sites.length ? { sites } : {}) };
     const { code } = await this.generateCode(s, 'replace_lines', [rewriteRegionMessages(s, t)], this.config.createTokens, fenceFor(path));
     // A reply that returned the whole file for a region that did not start at
     // line 1 is applied as the whole file (it begins like the file, ends like
@@ -741,6 +849,10 @@ export class Runner {
         const advice = await checkAdvice(this.tools.root, this.config.checkCommand);
         if (advice) { this.observe({ kind: 'warning', step: s.step, text: advice }); await this.store.log('warning', { step: s.step, text: advice }); }
       }
+    } else if (s.lastCheckCommand) {
+      // The check this session selected is the verification of record on resume
+      // too: no other command a worker runs is mistaken for it.
+      this.tools.config.checkCommand = s.lastCheckCommand;
     }
     const endStep = s.step + this.config.maxSteps;
     let generationFailures = 0;
@@ -759,9 +871,12 @@ export class Runner {
           await this.store.save(s);
           continue;
         }
+        this.settleFeedback(s);
         // A created file that does not parse, or lacks a promised export, is
         // repaired before it is checked: cheaper than a check, a decision and a fix.
         if (s.pendingRepairs.length && this.config.allowWrite && await this.repairPending(s)) { await this.store.save(s); continue; }
+        // A manifest rewritten since a failed install is installed again by code.
+        if (this.config.allowBash && await this.retrySetup(s)) { await this.store.save(s); continue; }
         // A package a written file imports and the manifest lacks is installed
         // by code: a mechanical repair, never a manifest edit to generate.
         if (this.config.allowBash && this.config.allowWrite && await this.installMissing(s)) { await this.store.save(s); continue; }
@@ -846,23 +961,33 @@ export class Runner {
           } else if (d.kind === 'verify' && d.target?.name && d.target.deliverable) {
             // The design's own verification command: run by code, judged like a check.
             const dl = d.target.deliverable; dl.attempts = (dl.attempts ?? 0) + 1;
-            await this.forced(s, 'bash', { command: d.target.name, purpose: `Run ${d.target.name}: the design's verification ${dl.id} (${clip(dl.detail, 120)}).` }, 'decided-verify');
+            const vr = await this.forced(s, 'bash', { command: d.target.name, purpose: `Run ${d.target.name}: the design's verification ${dl.id} (${clip(dl.detail, 120)}).` }, 'decided-verify');
+            // A verification that fails is a failing check: its errors, attributed
+            // to files, are the fix work that follows; the check command itself is
+            // unchanged, so the edits are still judged by the cheaper check.
+            if (!vr.ok && !vr.verification) {
+              s.previousCheck = s.lastCheck;
+              s.lastCheck = { step: s.step, ok: false, text: clip(vr.text, 1500), summary: summarizeCheck(vr.text, s.root), fileHashes: await sourceHashes(s.root, s.writes), command: d.target.name };
+              s.editSnapshots = {}; s.transaction = [];
+              this.recordFailedVersions(s);
+              // Three failed runs of one verification, each on inputs that changed
+              // since the last, set it aside: the audit judges it, the loop does not.
+              if (dl.attempts >= 3) { dl.unresolvable = true; dl.setAside = true; dl.note = `set aside after ${dl.attempts} failed runs; last: ${clip(vr.text.replace(/\s+/g, ' '), 160)}`; }
+            }
             await refreshLedger(this.tools.root, s).catch(() => {});
-            // A rejection whose unmet items were verifications is answered by their runs.
-            const f = s.completionFeedback;
-            if (f && !f.addressed && f.unmet?.length && f.unmet.every(id => s.ledger.find(x => x.id === id)?.status === 'done'))
-              s.completionFeedback = { ...f, addressed: true, awaitingEvidence: false, text: `The completion proposed at step ${f.step} was rejected (${clip(f.text.replace(/^Completion rejected /, ''), 300)}); the verifications it named have since run and passed. Propose finish again.` };
+            this.settleFeedback(s);
             await this.store.save(s); continue;
           } else if (d.kind === 'fix' && d.target?.path) {
             // A fix is a region rewrite from the text code holds: no read, no line arithmetic.
             const v = s.lastCheck && d.id !== 'fix:setup' ? Object.entries(s.lastCheck.summary.byFile).find(([f]) => d.target!.path!.endsWith(f) || f.endsWith(d.target!.path!))?.[1] : undefined;
             if (s.phase === 'inspect') s.phase = 'implement';
-            const fixKey = `${d.target.path}@${s.hashes[d.target.path] ?? ''}`;
+            const fixKey = d.id === 'fix:setup' ? `setup@${hash(s.setupError ?? '')}` : `${d.target.path}@${s.hashes[d.target.path] ?? ''}`;
+            if (d.id === 'fix:setup') (s.fixAttempts ??= {})[fixKey] = (s.fixAttempts[fixKey] ?? 0) + 1;
             try {
               const ok = await this.rewriteRegion(s, d.target.path, (v?.diagnostics?.length ? v.diagnostics : v?.samples) ?? d.target.errors ?? [], d.id === 'fix:setup' ? `Fix ${d.target.path} so that dependencies install: the package manager reported the errors listed (a version that does not exist, a package that cannot be found). Use versions that exist.` : `Fix the verification errors the check reports in ${d.target.path}${v?.lines.length ? ` at lines ${v.lines.join(', ')}` : ''}; the check command was ${s.lastCheckCommand ?? 'the configured check'}.`, 'decided-fix');
-              if (!ok) (s.fixAttempts ??= {})[fixKey] = (s.fixAttempts[fixKey] ?? 0) + 1;
+              if (!ok && d.id !== 'fix:setup') (s.fixAttempts ??= {})[fixKey] = (s.fixAttempts[fixKey] ?? 0) + 1;
             } catch (e) {
-              (s.fixAttempts ??= {})[fixKey] = (s.fixAttempts[fixKey] ?? 0) + 1;
+              if (d.id !== 'fix:setup') (s.fixAttempts ??= {})[fixKey] = (s.fixAttempts[fixKey] ?? 0) + 1;
               this.observe({ kind: 'generation_error', step: s.step, message: (e as Error).message }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${(e as Error).message}` });
             }
             await this.store.save(s); continue;
@@ -877,7 +1002,11 @@ export class Runner {
           if (decision.stuck >= .8 && route && editRoutes.includes(route)) harnessNote = `${harnessNote ?? ''} The last attempts did not work; take a different approach than before.`.trim();
           if (route && (editRoutes.includes(route) || route === 'finish') && s.phase === 'inspect') s.phase = 'implement';
         }
-        const questions = routeQuestions(s, this.config);
+        // A deliverable still pending by source facts (a file not created, a
+        // verification not passed) makes a finish pointless: the audit would only
+        // say what the facts already say, so the worker is not offered it.
+        const finishBlocked = s.ledger.some(d => d.status === 'pending' && !d.optional && !d.unresolvable && (d.kind !== 'verify' || Boolean(d.name && commandLike(d.name))));
+        const questions = routeQuestions(s, this.config, !finishBlocked);
         // A passing check after edits, with nothing pending, is the moment to propose
         // completion: the audit judges the proposal, so the harness makes it once per
         // check rather than leaving the worker to read until it feels ready. The
@@ -1097,7 +1226,7 @@ export class Runner {
             const unmetItems = s.ledger.filter(d => unmet.includes(d.id));
             const feedback = `Completion rejected (${objectiveMet !== null ? `objective met=${objectiveMet.toFixed(2)}, ` : ''}out-of-scope changes=${outOfScope.toFixed(2)}). ${unmetItems.length ? `Deliverables the evidence does not show as done: ${unmetItems.map(d => `${d.id} ${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} [${d.status}${d.note ? `: ${d.note}` : ''}; supports ${(perItem[d.id]?.supports ?? 0).toFixed(2)}, contradicts ${(perItem[d.id]?.contradicts ?? 0).toFixed(2)}]`).join('; ')}. ` : ''}${outOfScope >= threshold ? 'The diff contains changes the objective did not ask for; revert them. ' : ''}Continue the implementation; the harness re-proposes completion after the next passing check.`;
             await this.evidence(s, 'finish_rejected', { ok: false, text: feedback });
-            s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true, unmet: [...unmet] };
+            s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true, unmet: [...unmet], unmetPending: unmet.filter(id => s.ledger.find(d => d.id === id)?.status !== 'done') };
             if (s.lastCheck) s.finishTriedAtCheck = s.lastCheck.step;
             s.phase = 'implement'; s.inspectionsSinceAction = 0;
             s.lastRoute = 'finish'; s.lastResultOk = false;

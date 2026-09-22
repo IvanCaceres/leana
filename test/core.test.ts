@@ -18,7 +18,7 @@ import { extractCode, focusedEditSchema, samplingSchema, schemas, validate } fro
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { addPackagesCommand, aliasImportBinding, missingDependencies, missingPackages, installCommand, repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
+import { addPackagesCommand, aliasImportBinding, manifestFailures, missingDependencies, missingPackages, installCommand, repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -2126,8 +2126,9 @@ test('A finish is rejected on the diff when a deliverable is unmet, and the feed
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'a.ts'), 'const K = 1;\nexport const done = 2;\n'); await writeFile(join(root, 'src', 'b.ts'), 'export const other = 0;\n');
   s.objective = 'Move K from src/a.ts to src/b.ts.'; s.phase = 'implement'; s.step = 3; s.lastWriteStep = 2; s.writes = ['src/a.ts', 'src/b.ts']; s.inspectionCount = 3;
-  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'K', from: 'src/a.ts', to: 'src/b.ts', detail: 'move K' }] });
-  s.moveDirection = { source: 'src/b.ts', destination: 'src/a.ts' }; // a direction that forbids the harness move, so the audit is exercised
+  // An item judged by the diff (a modification) reaches the audit; one pending by
+  // source facts never does, since finish is not offered while facts say no.
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'modify', name: 'K', from: 'src/a.ts', to: 'src/a.ts', detail: 'change K' }] });
   const jev = { decide: async (_st: unknown, q: Questions, ctx?: { phase: string }) => {
     if (ctx?.phase === 'completion-check') { const a = answersFor(q, 'finish', .9) as Answers; a.d_d1 = { type: 'choice', choice: 'contradicts', confidence: .7, probabilities: { supports: .2, contradicts: .7, says_nothing: .1 } }; return a; }
     return answersFor(q, 'finish', .9);
@@ -2137,7 +2138,7 @@ test('A finish is rejected on the diff when a deliverable is unmet, and the feed
   await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'passed' }, { command: 'node --check src/a.ts' });
   const result = await runner.run(s);
   assert.equal(result.status, 'paused');
-  assert.match(result.entries.at(-1)!.text, /Completion rejected \(out-of-scope changes=0\.00\)\. Deliverables the evidence does not show as done: d1 move K to src\/b\.ts \[pending: still declared in src\/a\.ts lines 1-1; supports 0\.20/);
+  assert.match(result.entries.at(-1)!.text, /Completion rejected \(out-of-scope changes=0\.\d\d\)\. Deliverables the evidence does not show as done: d1 modify K to src\/a\.ts \[unknown: judged from the diff at completion; supports 0\.20/);
   assert.equal(result.completionFeedback?.awaitingEvidence, true);
 });
 
@@ -3040,9 +3041,10 @@ test('A repair that fails twice is given up to the check: the file stays, a fix 
 test('A failed dependency install is fix work for the manifest: the harness rewrites it, installs again for the new manifest, and selects the check', async t => {
   const { root, store, session } = await fixture(t);
   const bin = join(root, 'bin'); await mkdir(bin, { recursive: true });
-  await writeFile(join(bin, 'npm'), `#!/bin/bash\nif [ "$1" = "install" ]; then if grep -q bogus package.json; then echo "npm error code ETARGET"; echo "npm error notarget No matching version found for bogus-plugin@^8.0.0."; exit 1; fi; mkdir -p node_modules && exit 0; fi\nif [ "$1" = "run" ]; then [ -d node_modules ] && exec node check.mjs; echo "sh: line 1: tsc: command not found"; exit 127; fi\n`, { mode: 0o755 });
+  // A fake npm: the install fails while the manifest asks for the version that does not exist, `npm view` knows the real one.
+  await writeFile(join(bin, 'npm'), `#!/bin/bash\nif [ "$1" = "install" ]; then if grep -q '\\^8.0.0' package.json; then echo "npm error code ETARGET"; echo "npm error notarget No matching version found for bogus-plugin@^8.0.0."; exit 1; fi; mkdir -p node_modules && exit 0; fi\nif [ "$1" = "view" ]; then echo "7.37.5"; exit 0; fi\nif [ "$1" = "run" ]; then [ -d node_modules ] && exec node check.mjs; echo "sh: line 1: tsc: command not found"; exit 127; fi\n`, { mode: 0o755 });
   const bad = JSON.stringify({ name: 'demo', scripts: { typecheck: 'node check.mjs' }, devDependencies: { 'bogus-plugin': '^8.0.0' } }, null, 2) + '\n';
-  const good = JSON.stringify({ name: 'demo', scripts: { typecheck: 'node check.mjs' }, devDependencies: { 'real-plugin': '^7.0.0' } }, null, 2) + '\n';
+  const good = JSON.stringify({ name: 'demo', scripts: { typecheck: 'node check.mjs' }, devDependencies: { 'bogus-plugin': '^7.37.5' } }, null, 2) + '\n';
   await writeFile(join(root, 'package.json'), bad); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n'); await writeFile(join(root, 'src.mjs'), 'export const a = 1;\n');
   const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath}`; t.after(() => { process.env.PATH = oldPath; });
   session.objective = 'Bootstrap and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['package.json', 'src.mjs']; session.step = 2; session.lastWriteStep = 2; session.hashes['package.json'] = hash(bad);
@@ -3058,8 +3060,10 @@ test('A failed dependency install is fix work for the manifest: the harness rewr
   const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 6 }, store, jev, bonsai, root, () => {}).run(session);
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   const setups = events.filter(e => e.type === 'setup'); assert.equal(setups.length, 2, `one install per manifest version; steps: ${result.entries.map(e => e.kind).join(',')}`); assert.equal(setups[0].data.code, 1); assert.equal(setups[1].data.code, 0);
-  assert.match(JSON.parse(prompts[0][2].content).errors.join(' '), /npm install failed: .*No matching version found for bogus-plugin/); assert.equal(await readFile(join(root, 'package.json'), 'utf8'), good);
+  const repair = events.find(e => e.type === 'auto-manifest'); assert.deepEqual(repair?.data.changes, [{ name: 'bogus-plugin', from: '^8.0.0', to: '^7.37.5' }], 'the version that does not exist becomes the one the registry has, by code');
+  assert.equal(prompts.length, 0, 'no generation is spent on a manifest the registry can correct'); assert.equal(await readFile(join(root, 'package.json'), 'utf8'), good);
   assert.equal(result.setupError, null); assert.equal(result.lastCheckCommand, 'npm run typecheck'); assert.equal(result.lastCheck?.ok, true); assert.equal(result.status, 'complete', result.stopReason);
+  assert.match(result.autoFixKeys['manifest:bogus-plugin'] ?? '', /^step \d+$/);
 });
 
 test('A check summary keeps each diagnostic whole, with the continuation lines tsc prints, beside the clipped sample the decision state shows', () => {
@@ -3196,11 +3200,210 @@ test('A verify deliverable that names a command is done only when that command p
   const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('verify:'))!; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; } return answersFor(q, 'read_files', .9); } };
   const runner = new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}) }, root, () => {});
   const ran: string[] = []; (runner as any).tools.execute = async (route: string, args: any) => { ran.push(`${route}: ${args.command}`); return { ok: true, text: JSON.stringify({ command: args.command, output: 'built', code: 0 }), verification: true, check: true }; };
-  s.completionFeedback = { step: 4, text: 'Completion rejected: d3 not shown as done', awaitingEvidence: true, unmet: ['d3'] };
+  s.completionFeedback = { step: 4, text: 'Completion rejected: d3 not shown as done', awaitingEvidence: true, unmet: ['d3'], unmetPending: ['d3'] };
   const result = await runner.run(s);
   assert.deepEqual(ran, ['bash: npm run build']);
   assert.equal(result.completionFeedback!.addressed, true); assert.equal(result.completionFeedback!.awaitingEvidence, false, 'the verification the rejection named has run: no read or edit is needed before the next proposal');
+  assert.equal(result.finishTriedAtCheck, -1, 'the finish latch opens with it');
   assert.equal(result.commandRuns!['npm run build']!.ok, true); assert.equal(result.ledger.find(d => d.name === 'npm run build')!.status, 'done');
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.some(e => e.type === 'decided-verify' && e.data.command === 'npm run build'));
+});
+
+test('manifestFailures reads the package the registry rejected; a package that does not exist is dropped, and an install failure code cannot name is capped fix work for the worker', async t => {
+  assert.deepEqual(manifestFailures("npm error code ETARGET\nnpm error notarget No matching version found for eslint-plugin-react@^8.0.0.\nnpm error notarget In most cases"), [{ name: 'eslint-plugin-react', kind: 'notarget' }]);
+  assert.deepEqual(manifestFailures("npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/@scope%2fno-such-pkg - Not found\nnpm error 404  '@scope/no-such-pkg@^1.0.0' is not in this registry."), [{ name: '@scope/no-such-pkg', kind: 'notfound' }]);
+  assert.deepEqual(manifestFailures('npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree'), []);
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'demo', dependencies: { react: '^19.0.0', '@scope/no-such-pkg': '^1.0.0' }, devDependencies: { vite: '^6.0.0' } }, null, 2) + '\n');
+  session.writes = ['package.json']; session.hashes['package.json'] = hash(await readFile(join(root, 'package.json'), 'utf8')); session.step = 3;
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}) }, root, () => {});
+  (runner as any).lookupVersion = async () => { throw new Error('the registry is not consulted for a package that does not exist'); };
+  assert.equal(await runner.repairManifest(session, "npm error 404  '@scope/no-such-pkg@^1.0.0' is not in this registry.", '.'), true);
+  assert.deepEqual(JSON.parse(await readFile(join(root, 'package.json'), 'utf8')), { name: 'demo', dependencies: { react: '^19.0.0' }, devDependencies: { vite: '^6.0.0' } });
+  assert.equal(await runner.repairManifest(session, "npm error 404  '@scope/no-such-pkg@^1.0.0' is not in this registry.", '.'), false, 'once per package name');
+  assert.equal(await runner.repairManifest(session, 'npm error code ERESOLVE', '.'), false);
+  // A failure code cannot name goes to the worker, three times per manifest version at most.
+  session.setupError = 'ERESOLVE unable to resolve dependency tree'; session.phase = 'implement';
+  const offered = (fa: number) => { session.fixAttempts = { [`setup@${hash(session.setupError!)}`]: fa }; return candidates(session, { ...defaults, allowWrite: true, allowBash: true }, false).some(c => c.id === 'fix:setup'); };
+  assert.equal(offered(2), true); assert.equal(offered(3), false);
+});
+test('A check summary attributes a diagnostic whose file appears only on a continuation line, relative to the repository, and never to node_modules', () => {
+  const output = ['> demo@1.0.0 build', '> tsc --noEmit && vite build', '', 'vite v6.4.3 building for production...', '✗ Build failed in 21ms', 'error during build:',
+    '[vite:build-html] Unable to parse HTML; parse5 error code disallowed-content-in-noscript-in-head', ' at /home/u/repo/index.html:10:7', '8  |      <title>Demo</title>', '9  |      <noscript>', '10 |        <p>Enable JavaScript.</p>', '   |        ^^^', 'file: /home/u/repo/index.html',
+    '    at handleParseError (file:///home/u/repo/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:36308:9)', '    at Parser.onParseError (file:///home/u/repo/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:36221:7)'].join('\n');
+  const s = summarizeCheck(JSON.stringify({ command: 'npm run build', output, code: 1 }), '/home/u/repo');
+  assert.equal(s.errors, 1, 'the bundler\'s "error during build:" heading is not a diagnostic');
+  assert.deepEqual(s.byFile['index.html']?.lines, [10]); assert.equal(s.byFile['index.html']?.count, 1); assert.match(s.byFile['index.html']!.diagnostics![0]!, /^\[vite:build-html\] Unable to parse HTML/);
+  assert.match(s.byFile['index.html']!.diagnostics![0]!, /\n at \/home\/u\/repo\/index\.html:10:7\n8 {2}\|/, 'the code frame stays in the diagnostic');
+  assert.equal(s.byFile['(other)'], undefined);
+  assert.equal(summarizeCheck(JSON.stringify({ command: 'x', output: 'error: something\n at /elsewhere/other.ts:3:1' }), '/home/u/repo').byFile['(other)']?.count, 1, 'a path outside the repository is not attributed');
+  const rust = summarizeCheck('error[E0425]: cannot find value `x` in this scope\n --> src/main.rs:4:13\n  |\n4 |     let y = x;');
+  assert.deepEqual(rust.byFile['src/main.rs'], { count: 1, syntax: 0, resolution: 0, lines: [4], samples: ['error[E0425]: cannot find value `x` in this scope'], diagnostics: ['error[E0425]: cannot find value `x` in this scope\n --> src/main.rs:4:13\n  |\n4 |     let y = x;'] });
+});
+test('A shell command that edits a written file is tracked as an edit: hashes and write step move, reads of it go stale, and the check is due again', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'index.html'), '<html>\n<p>one</p>\n</html>\n'); await writeFile(join(root, 'a.ts'), 'export const a = 1;\n');
+  s.writes = ['index.html', 'a.ts']; s.hashes['index.html'] = hash('<html>\n<p>one</p>\n</html>\n'); s.hashes['a.ts'] = hash('export const a = 1;\n'); s.readHashes['index.html'] = s.hashes['index.html']; s.lastWriteStep = 2; s.step = 5; s.lastCheckCommand = 'node check.mjs';
+  s.entries.push({ id: 'e3', step: 3, kind: 'read_files', text: 'index.html sha256=x totalLines=3 shown=1..3\n1: <html>', artifact: '', relevance: .5 });
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}) }, root, () => {});
+  await writeFile(join(root, 'index.html'), '<html>\n</html>\n'); // what `sed -i '2d' index.html` did
+  await runner.evidence(s, 'bash', { ok: true, text: JSON.stringify({ command: "sed -i '2d' index.html", output: '', code: 0 }) }, { command: "sed -i '2d' index.html", purpose: 'remove the line' });
+  assert.equal(s.hashes['index.html'], hash('<html>\n</html>\n')); assert.equal(s.hashes['a.ts'], hash('export const a = 1;\n'));
+  assert.equal(s.lastWriteStep, 5); assert.equal(s.writeSteps['index.html'], 5); assert.equal(s.pendingCheck, true); assert.equal(s.readHashes['index.html'], undefined);
+  assert.match(s.entries[0]!.stale ?? '', /edited at step 5/);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.deepEqual(events.find(e => e.type === 'bash-edit')?.data.files, ['index.html']);
+  // A read-only command touches nothing.
+  s.pendingCheck = false; await runner.evidence(s, 'bash', { ok: true, text: '{}' }, { command: 'cat index.html', purpose: 'look' }); assert.equal(s.pendingCheck, false);
+});
+test('A design verification that fails becomes the failing check: its errors are attributed to the file, the fix is offered, and the check command stays the cheaper one', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'index.html'), '<html>\n<head>\n<noscript><p>x</p></noscript>\n</head>\n</html>\n'); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  await writeFile(join(root, 'build.mjs'), `import { readFileSync } from "node:fs";\nif (/<head>[\\s\\S]*<noscript>[\\s\\S]*<\\/head>/.test(readFileSync("index.html", "utf8"))) { console.log("error during build:\\n[vite:build-html] Unable to parse HTML; parse5 error code disallowed-content-in-noscript-in-head\\n at ${root}/index.html:3:11"); process.exit(1); }\n`);
+  s.objective = 'Build the app.'; s.phase = 'implement'; s.inspectionCount = 3; s.step = 6; s.writes = ['index.html']; s.hashes['index.html'] = hash(await readFile(join(root, 'index.html'), 'utf8')); s.lastWriteStep = 5; s.editEvidence = [{ step: 5, route: 'create_file', paths: ['index.html'], artifact: '', text: 'created' } as any];
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'index.html', from: '', to: 'index.html', detail: 'page' }, { kind: 'verify', name: 'node build.mjs', from: '', to: '', detail: 'the production build completes' }] }); s.ledgerBuilt = true;
+  s.lastCheckCommand = 'node check.mjs'; s.lastCheck = { step: 6, ok: true, text: 'ok', summary: summarizeCheck('') };
+  await refreshLedger(root, s);
+  const seen: string[][] = [];
+  const jev = { decide: async (_st: unknown, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); seen.push(ids); const pick = ids.find(i => i.startsWith('verify:')) ?? ids.find(i => i.startsWith('fix:')) ?? 'ask'; assert(!ids.includes('fix:project'), `the bundler heading is not unattributed work: ${ids.join(',')}`); return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; } return answersFor(q, 'read_files', .9); } };
+  const prompts: any[] = [];
+  const bonsai = { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}), generateText: async (m: any) => { prompts.push(m); return { text: '<html>\n<head>\n</head>\n<body><noscript><p>x</p></noscript></body>\n</html>\n', finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(s);
+  const kinds = result.entries.map(e => e.kind);
+  assert.equal(kinds[0], 'bash', `steps: ${kinds.join(',')}`);
+  assert.deepEqual(seen[0], ['verify:d2', 'ask', 'free']); assert(seen[1]!.includes('fix:index.html'), `after the failed build the fix is offered: ${seen[1]!.join(',')}`);
+  assert.equal(kinds[1], 'replace_lines', `the region rewrite of index.html lands: ${result.entries[1]!.text.slice(0, 300)}`); assert.equal(kinds[2], 'bash', 'then the cheaper check runs'); assert.equal(result.lastCheckCommand, 'node check.mjs');
+  assert.match(JSON.parse(prompts[0][2].content).errors[0], /disallowed-content-in-noscript-in-head\n at .*index\.html:3:11/, 'the fix prompt carries the bundler diagnostic whole');
+  assert.equal(kinds[3], 'bash', 'the verification runs again once its inputs changed'); assert.equal(result.ledger.find(d => d.kind === 'verify')!.status, 'done');
+});
+
+test('The worker is offered finish only when the harness would propose it, and a repair or creation prompt shows the types a contract names one hop out', async t => {
+  const { root, session: s } = await fixture(t);
+  s.phase = 'implement'; s.lastCheck = { step: 3, ok: true, text: 'ok', summary: summarizeCheck('') }; s.lastCheckStep = 3; s.lastWriteStep = 2; s.step = 4;
+  assert('finish' in (routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }, true).route as any).criteria);
+  assert(!('finish' in (routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }, false).route as any).criteria));
+  assert('finish' in (routeQuestions(s, { ...defaults, allowWrite: true, allowBash: true }).route as any).criteria, 'the default keeps the older callers whole');
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  await writeFile(join(root, 'src', 'types.ts'), 'export type Theme = "light" | "dark";\nexport type ThemeToggleProps = {\n  theme: Theme;\n  onToggle: () => void;\n};\nexport type Unrelated = { x: number };\n');
+  await writeFile(join(root, 'src', 'components', 'ThemeToggle.tsx'), 'import type { ThemeToggleProps } from "../types";\nexport function ThemeToggle(props: ThemeToggleProps) {\n  return <button onClick={props.onToggle}>{props.theme}</button>;\n}\n');
+  const app = 'import { ThemeToggle } from "./components/ThemeToggle";\nexport function App() {\n  return <ThemeToggle>x</ThemeToggle>;\n}\n';
+  const contracts = await importContracts(root, 'src/App.tsx', app, ["src/App.tsx(3,11): error TS2559: Type '{ children: string; }' has no properties in common with type 'IntrinsicAttributes'."]);
+  assert.deepEqual(contracts.map(c => [c.path, c.importPath]), [['src/components/ThemeToggle.tsx', './components/ThemeToggle'], ['src/types.ts', './types']]);
+  assert.deepEqual(contracts[1]!.exports, ['export type ThemeToggleProps = {\n  theme: Theme;\n  onToggle: () => void;\n};'], 'only the type the signature names, not the whole module');
+  // A creation prompt gets the same hop through its designed dependency.
+  s.ledger = candidatesFrom({ summary: 's', conventions: 'c', deliverables: [{ kind: 'create', name: 'src/App.tsx', from: '', to: 'src/App.tsx', detail: 'app', contents: [], exports: ['export function App(): JSX.Element'], dependsOn: ['src/components/ThemeToggle.tsx'] }, { kind: 'create', name: 'src/components/ThemeToggle.tsx', from: '', to: 'src/components/ThemeToggle.tsx', detail: 'toggle', contents: [], exports: [], dependsOn: [] }] }); s.design = { summary: 's', conventions: 'c' }; s.knownFiles.push('src/components/ThemeToggle.tsx', 'src/types.ts');
+  await refreshLedger(root, s);
+  const c = await contractsFor(root, s, s.ledger[0]!);
+  assert.deepEqual(c.contracts.map(x => x.path), ['src/components/ThemeToggle.tsx', 'src/types.ts']); assert.match(c.contracts[1]!.exports.join('\n'), /ThemeToggleProps/); assert(!c.contracts[1]!.exports.join('\n').includes('Unrelated'));
+});
+
+test('A rejection whose unmet item was already done by source facts is not settled by those facts: no finish is re-proposed until an edit and a passing check', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'export const a = 1;\n'); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  s.objective = 'Write a.ts.'; s.phase = 'implement'; s.inspectionCount = 3; s.step = 6; s.writes = ['a.ts']; s.lastWriteStep = 4; s.editEvidence = [{ step: 4, route: 'create_file', paths: ['a.ts'], artifact: '', text: 'created' } as any];
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'a.ts', from: '', to: 'a.ts', detail: 'a substantial module' }] }); s.ledgerBuilt = true;
+  s.lastCheckCommand = 'node check.mjs'; s.lastCheck = { step: 5, ok: true, text: 'ok', summary: summarizeCheck(''), command: 'node check.mjs' }; s.lastCheckStep = 5; s.finishTriedAtCheck = 5;
+  await refreshLedger(root, s); assert.equal(s.ledger[0]!.status, 'done');
+  // The audit contradicted an item the facts call done: unmet, but not pending.
+  s.completionFeedback = { step: 5, text: 'Completion rejected: d1 is a stub', awaitingEvidence: true, unmet: ['d1'], unmetPending: [] };
+  const jev = { decide: async (_st: unknown, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); assert(!ids.includes('finish'), `finish is not offered again on the same facts: ${ids.join(',')}`); return { next: { type: 'choice', choice: 'ask', confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === 'ask' ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .9 } } as Answers; } assert.notEqual(ctx!.phase, 'completion-check', 'no audit is spent on unchanged facts'); return answersFor(q, 'ask_user', .9); } };
+  const finishes: number[] = [];
+  const bonsai = { count: async () => ({ tokens: 1, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => { if (schema === schemas.finish) finishes.push(1); return schema === schemas.ask_user ? { question: 'what next?' } : {}; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(s);
+  assert.equal(finishes.length, 0, 'no finish summary is generated'); assert.equal(result.completionFeedback!.addressed, undefined); assert.equal(result.finishTriedAtCheck, 5);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(!events.some(e => e.type === 'auto-finish'));
+});
+test('An install failure code cannot name is capped by that failure, each rewritten manifest is installed again without spending the check-inference budget, and the version lookup ignores npm notices', async t => {
+  const { root, store, session } = await fixture(t);
+  const bin = join(root, 'bin'); await mkdir(bin, { recursive: true });
+  // The install always fails with a peer conflict; `npm view` answers with a notice after the version.
+  await writeFile(join(bin, 'npm'), `#!/bin/bash\nif [ "$1" = "install" ]; then echo "npm error code ERESOLVE"; echo "npm error ERESOLVE unable to resolve dependency tree"; echo "npm error peer eslint@\\"^8\\" from eslint-plugin-react-hooks@4.6.2"; exit 1; fi\nif [ "$1" = "view" ]; then echo "7.37.5"; echo "npm notice New major version of npm available! 10.8.2 -> 11.0.0"; exit 0; fi\nif [ "$1" = "run" ]; then echo "sh: line 1: tsc: command not found"; exit 127; fi\n`, { mode: 0o755 });
+  const manifest = (minor: number) => JSON.stringify({ name: 'demo', scripts: { typecheck: 'tsc --noEmit' }, devDependencies: { 'eslint-plugin-react-hooks': `^4.${minor}.0`, eslint: '^9.0.0' } }, null, 2) + '\n';
+  await writeFile(join(root, 'package.json'), manifest(6)); await writeFile(join(root, 'src.mjs'), 'export const a = 1;\n');
+  const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath}`; t.after(() => { process.env.PATH = oldPath; });
+  session.objective = 'Bootstrap and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['package.json', 'src.mjs']; session.step = 2; session.lastWriteStep = 2; session.hashes['package.json'] = hash(manifest(6));
+  session.ledger = candidatesFrom({ summary: 's', conventions: 'c', deliverables: [{ kind: 'create', name: 'package.json', from: '', to: 'package.json', detail: 'manifest', contents: [], exports: [], dependsOn: [] }, { kind: 'create', name: 'src.mjs', from: '', to: 'src.mjs', detail: 'src', contents: [], exports: [], dependsOn: [] }] }); session.ledgerBuilt = true; session.design = { summary: 's', conventions: 'c' };
+  await refreshLedger(root, session);
+  let minor = 6; const picks: string[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.includes('fix:setup') ? 'fix:setup' : 'ask'; picks.push(pick); return { next: { type: 'choice', choice: pick, confidence: .95, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .95 : .05 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: pick === 'ask' ? .9 : .05 } } as Answers; }
+    return answersFor(q, 'ask_user', .9);
+  } };
+  // The worker returns a fresh, valid manifest every time; it still conflicts.
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.ask_user ? { question: 'which eslint?' } : {}, generateText: async () => ({ text: manifest(++minor), finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }) };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 12 }, store, jev, bonsai, root, () => {}).run(session);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const fixes = events.filter(e => e.type === 'decided-fix').length; const setups = events.filter(e => e.type === 'setup').length;
+  assert.equal(fixes, 3, `three manifest rewrites against one install error, then no more: picks ${picks.join(',')}`);
+  assert.equal(setups, 4, 'the first install, then one per landed rewrite, none skipped for want of inference budget');
+  assert.equal(result.fixAttempts![`setup@${hash(result.setupError!)}`], 3); assert.match(result.setupError!, /ERESOLVE/);
+  assert.equal(result.failedVersions!['package.json']!.length, 4, 'every manifest version an install rejected is known bad');
+  assert(picks.slice(3).every(p => p === 'ask'), 'after the cap the loop asks instead of rewriting');
+  // The lookup takes the version line, not npm's notice; both sections listing a name are repaired.
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, jev, bonsai, root, () => {});
+  assert.equal(await runner.lookupVersion('anything'), '7.37.5');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'demo', dependencies: { 'eslint-plugin-react': '^7.0.0' }, devDependencies: { 'eslint-plugin-react': '^8.0.0' } }, null, 2) + '\n');
+  const s2 = await fixture(t); s2.session.step = 9;
+  assert.equal(await runner.repairManifest(s2.session, 'npm error notarget No matching version found for eslint-plugin-react@^8.0.0.', '.'), true);
+  const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')); assert.equal(pkg.dependencies['eslint-plugin-react'], '^7.37.5'); assert.equal(pkg.devDependencies['eslint-plugin-react'], '^7.37.5');
+});
+test('A verification that fails three times on changed inputs is set aside, and a fix that reproduces a version the build rejected is refused', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'index.html'), '<html>\n<head>\n<noscript><p>x</p></noscript>\n</head>\n</html>\n'); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  await writeFile(join(root, 'build.mjs'), `console.log("error during build:\\n[vite:build-html] Unable to parse HTML; parse5 error code disallowed-content-in-noscript-in-head\\n at ${root}/index.html:3:11"); process.exit(1);\n`);
+  s.objective = 'Build the app.'; s.phase = 'implement'; s.inspectionCount = 3; s.step = 6; s.writes = ['index.html']; s.hashes['index.html'] = hash(await readFile(join(root, 'index.html'), 'utf8')); s.lastWriteStep = 5; s.editEvidence = [{ step: 5, route: 'create_file', paths: ['index.html'], artifact: '', text: 'created' } as any];
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'index.html', from: '', to: 'index.html', detail: 'page' }, { kind: 'verify', name: 'node build.mjs', from: '', to: '', detail: 'the production build completes' }] }); s.ledgerBuilt = true;
+  s.lastCheckCommand = 'node check.mjs'; s.lastCheck = { step: 6, ok: true, text: 'ok', summary: summarizeCheck(''), command: 'node check.mjs' }; s.lastCheckStep = 6;
+  await refreshLedger(root, s);
+  const seen: string[][] = [];
+  const jev = { decide: async (_st: unknown, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); seen.push(ids); const pick = ids.find(i => i.startsWith('verify:')) ?? ids.find(i => i.startsWith('fix:') && i !== 'fix:project') ?? 'ask'; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: pick === 'ask' ? .9 : .05 } } as Answers; } return answersFor(q, 'ask_user', .9); } };
+  let n = 0; const versions = ['<html>\n<head>\n</head>\n<body><noscript><p>x</p></noscript></body>\n</html>\n', '<html>\n<head>\n<noscript><p>x</p></noscript>\n</head>\n</html>\n', '<html>\n<head>\n</head>\n<body><noscript><p>y</p></noscript></body>\n</html>\n', '<html>\n<head></head>\n<body><noscript><p>z</p></noscript></body>\n</html>\n'];
+  const bonsai = { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({ question: 'help?' }), generateText: async () => ({ text: versions[n++ % versions.length]!, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }) };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 14 }, store, jev, bonsai, root, () => {}).run(s);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(events.filter(e => e.type === 'decided-verify').length, 3, `three failed runs, each after the inputs changed: ${result.entries.map(e => e.step + ':' + e.kind).join(',')}`);
+  const v = result.ledger.find(d => d.kind === 'verify')!; assert.equal(v.unresolvable, true); assert.match(v.note ?? '', /set aside after 3 failed runs/);
+  assert(result.entries.some(e => e.kind === 'generation_error' && /reproduces a version of the file the check already reported errors in/.test(e.text)), 'the second version is the one the build rejected first: refused, not landed');
+  assert(!seen.at(-1)!.some(i => i.startsWith('verify:')), 'a verification set aside is not offered again');
+});
+test('Shell edits are watched for every written file, not only the recently hashed ones, and checks of different commands are not compared for regression', async t => {
+  const { root, store, session: s } = await fixture(t);
+  const files = Array.from({ length: 25 }, (_, i) => `f${i}.ts`);
+  for (const f of files) await writeFile(join(root, f), `export const ${f.slice(0, -3)} = 1;\n`);
+  s.writes = [...files]; s.step = 30; s.lastWriteStep = 28; s.lastCheckCommand = 'node check.mjs';
+  const all = await sourceHashes(root, files);
+  for (const f of files.slice(5)) s.hashes[f] = all[f]!; // the hash map holds only the last twenty
+  s.lastCheck = { step: 29, ok: true, text: 'ok', summary: summarizeCheck(''), fileHashes: all, command: 'node check.mjs' };
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}) }, root, () => {});
+  await writeFile(join(root, 'f0.ts'), 'export const f0 = 2;\n');
+  await runner.evidence(s, 'bash', { ok: true, text: '{}' }, { command: "sed -i 's/1/2/' f0.ts", purpose: 'bump' });
+  assert.equal(s.writeSteps['f0.ts'], 30, 'the earliest written file is still watched'); assert.equal(s.pendingCheck, true);
+  // A build's failure is no baseline for the type checker: the edit is not judged against it.
+  const { session: s2 } = await fixture(t);
+  s2.writes = ['a.ts']; s2.editSnapshots = { 'a.ts': '@artifact/x' }; s2.transaction = [{ key: 'k', identity: 'i', step: 3, route: 'replace_lines', paths: ['a.ts'], summary: '{}' }];
+  s2.lastCheck = { step: 2, ok: false, text: 'x', summary: summarizeCheck('other.ts(1,1): error TS2322: a\nother.ts(2,1): error TS2322: b'), command: 'npm run build' };
+  await runner.evidence(s2, 'bash', { ok: false, verification: true, text: JSON.stringify({ command: 'npm run typecheck', output: 'a.ts(1,1): error TS2322: new', code: 2 }) }, { command: 'npm run typecheck' });
+  assert.equal(s2.autoUndo, null, 'not comparable: no rollback');
+  const { session: s3 } = await fixture(t);
+  s3.writes = ['a.ts']; s3.editSnapshots = { 'a.ts': '@artifact/x' }; s3.transaction = [{ key: 'k', identity: 'i', step: 3, route: 'replace_lines', paths: ['a.ts'], summary: '{}' }];
+  s3.lastCheck = { step: 2, ok: true, text: 'ok', summary: summarizeCheck(''), command: 'npm run typecheck' };
+  await runner.evidence(s3, 'bash', { ok: false, verification: true, text: JSON.stringify({ command: 'npm run typecheck', output: 'a.ts(1,1): error TS2322: new', code: 2 }) }, { command: 'npm run typecheck' });
+  assert.notEqual(s3.autoUndo, null, 'the same command, more errors in the edited file: rolled back');
+});
+test('A repair prompt names the source line each error points at and the callee declared there, and a check summary reads a bundler heading and a file line', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  await writeFile(join(root, 'src', 'components', 'Header.tsx'), 'export default function Header() {\n  return <header>x</header>;\n}\n');
+  const app = ['import Header from "./components/Header";', 'export function App() {', '  return (', '    <Header>', '      <span>child</span>', '    </Header>', '  );', '}', ''].join('\n');
+  await writeFile(join(root, 'src', 'App.tsx'), app); s.writes = ['src/App.tsx']; s.hashes['src/App.tsx'] = hash(app); s.step = 4;
+  const prompts: any[] = [];
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}), generateText: async (m: any) => { prompts.push(m); return { text: app.replace('<Header>\n      <span>child</span>\n    </Header>', '<Header />'), finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } }, root, () => {});
+  await (runner as any).rewriteRegion(s, 'src/App.tsx', ["src/App.tsx(4,5): error TS2559: Type '{ children: Element; }' has no properties in common with type 'IntrinsicAttributes'."], 'fix', 'decided-fix');
+  const req = JSON.parse(prompts[0][2].content);
+  assert.deepEqual(req.errorSites, [{ line: 4, text: '<Header>', callee: 'export default function Header()' }]); assert.match(req.rules.join(' '), /a component declared without props accepts neither props nor children/);
+  const vite = summarizeCheck(JSON.stringify({ command: 'npm run build', output: 'error during build:\n[vite:css] Cannot apply unknown utility class `bg-brand`\nfile: /home/u/repo/src/index.css:12:3\n', code: 1 }), '/home/u/repo');
+  assert.equal(vite.errors, 1); assert.deepEqual(vite.byFile['src/index.css']?.lines, [12], 'the heading introduces the line that follows, whatever it says, and the file line attributes it');
+  assert.equal(summarizeCheck(JSON.stringify({ command: 'x', output: 'error during build:\n', code: 1 })).errors, 1, 'a heading nothing follows is the diagnostic');
 });

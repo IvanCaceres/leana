@@ -408,10 +408,10 @@ export async function installedPackages(root: string): Promise<string[]> {
 export function missingDependencies(output: string): boolean {
   return /command not found|Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|ModuleNotFoundError|No module named|is not recognized as|not found: /i.test(output);
 }
-export async function installCommand(root: string, dir = '.'): Promise<string | null> {
+export async function installCommand(root: string, dir = '.', force = false): Promise<string | null> {
   const has = async (p: string) => { try { await stat(resolve(root, dir, p)); return true; } catch { return false; } };
   if (await has('package.json')) {
-    if (await has('node_modules')) return null;
+    if (!force && await has('node_modules')) return null;
     const cmd = await has('pnpm-lock.yaml') ? 'pnpm install --frozen-lockfile' : await has('yarn.lock') ? 'yarn install --frozen-lockfile' : await has('bun.lockb') ? 'bun install' : await has('package-lock.json') ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund';
     return dir === '.' ? cmd : `cd ${dir} && ${cmd}`;
   }
@@ -571,40 +571,66 @@ export async function sourceHashes(root: string, paths: string[]): Promise<Recor
 // file, with the lines they name. Syntax errors are singled out because a file
 // that fails to parse is not semantically checked, so a broken edit can make the
 // total drop while the code is worse.
-export function summarizeCheck(text: string): CheckSummary {
+export function summarizeCheck(text: string, root?: string): CheckSummary {
   let output = text;
   try { const parsed = JSON.parse(text); if (typeof parsed?.output === 'string') output = parsed.output; } catch { /* plain text */ }
   const byFile: CheckSummary['byFile'] = {}; let errors = 0; let syntax = 0; let resolution = 0;
-  // A diagnostic's continuation lines (indented, as tsc prints the property
-  // that does not exist) belong to the message a repair prompt needs whole.
-  let current: { f: CheckSummary['byFile'][string]; i: number } | null = null;
-  const whole = (text: string) => text.length > 900 ? `${text.slice(0, 900)} …` : text;
+  // Test runners report failures without the word error: TAP 'not ok', Jest 'FAIL',
+  // Node's AssertionError. Summary lines ('# fail 1') are not failures.
+  // A bundler's heading ("error during build:") introduces the diagnostics that follow; it is not one.
+  const isHeading = (line: string) => /^errors? (?:during|while|in) [\w -]+:$/i.test(line);
+  const isError = (line: string) => !isHeading(line) && (/\berror\b/i.test(line) || /\bAssertionError\b|\bSyntaxError\b|\bFAIL(?:ED)?\b|^not ok\b/.test(line));
+  // A diagnostic is an error line with its continuation lines (indented, as tsc
+  // prints the property that does not exist, or a bundler the file and line).
+  // A heading introduces the line that follows it, whatever that line says; a
+  // heading nothing follows is the diagnostic itself.
+  const blocks: { head: string; tail: string[] }[] = []; let current: { head: string; tail: string[] } | null = null; let heading: string | null = null;
   for (const raw of output.split('\n')) {
     const line = raw.trim();
-    // Test runners report failures without the word error: TAP 'not ok', Jest 'FAIL',
-    // Node's AssertionError. Summary lines ('# fail 1') are not failures.
-    if (!/\berror\b/i.test(line) && !/\bAssertionError\b|\bSyntaxError\b|\bFAIL(?:ED)?\b|^not ok\b/.test(line)) {
-      if (current && /^\s+\S/.test(raw) && line) current.f.diagnostics![current.i] = whole(`${current.f.diagnostics![current.i]}\n${raw.replace(/\s+$/, '')}`);
-      else current = null;
-      continue;
-    }
+    if (isHeading(line)) { if (heading) blocks.push({ head: heading, tail: [] }); heading = line; current = null; continue; }
+    if (isError(line) || (heading && line)) { current = { head: line, tail: [] }; blocks.push(current); heading = null; continue; }
+    // Continuations are indented, a code frame's gutter lines ("10 |  <p>", "   |  ^^^"), or a bundler's "file: path".
+    if (current && line && (/^\s+\S/.test(raw) || /^\s*\d*\s*\|/.test(raw) || /^file:\s/.test(raw))) current.tail.push(raw.replace(/\s+$/, '')); else current = null;
+  }
+  if (heading) blocks.push({ head: heading, tail: [] });
+  const whole = (s: string) => s.length > 900 ? `${s.slice(0, 900)} …` : s;
+  const prefix = root ? `${root.replace(/\/$/, '')}/` : null;
+  for (const { head, tail } of blocks) {
     errors++;
-    const isSyntax = /\bTS1\d{3}\b|SyntaxError|Unexpected token|[a-z')\]}] expected\.$/.test(line);
+    const isSyntax = /\bTS1\d{3}\b|SyntaxError|Unexpected token|[a-z')\]}] expected\.$/.test(head);
     if (isSyntax) syntax++;
     // A name or module the checker cannot resolve: the class of error an
     // extraction leaves behind, and the one a correct fix removes first.
-    const isResolution = !isSyntax && /\bTS(?:2304|2305|2306|2307|2459|2503|2552|2613|2614|2694|2724|7016)\b|Cannot find (?:name|module)|has no exported member|is not exported|Could not find a declaration file/.test(line);
+    const isResolution = !isSyntax && /\bTS(?:2304|2305|2306|2307|2459|2503|2552|2613|2614|2694|2724|7016)\b|Cannot find (?:name|module)|has no exported member|is not exported|Could not find a declaration file/.test(head);
     if (isResolution) resolution++;
-    const m = line.match(/^([\w@./\\-]+\.\w+)(?:\((\d+)|:(\d+))?/);
-    const file = m?.[1] ?? '(other)'; const at = Number(m?.[2] ?? m?.[3] ?? 0);
+    const m = head.match(/^([\w@./\\-]+\.\w+)(?:\((\d+)|:(\d+))?/);
+    let file = m?.[1] ?? '(other)'; let at = Number(m?.[2] ?? m?.[3] ?? 0);
+    // A tool that names the file only on a later line (a bundler's "at /abs/path:10:7",
+    // "file: /abs/path", rustc's "--> path:10:7") still attributes the error, relative
+    // to the repository when the path is absolute; a path in node_modules is not the file.
+    if (file === '(other)') for (const t of tail) {
+      const n = t.match(/^\s*(?:at\s+|file:\s+|-->\s+)((?:\/|\.{1,2}\/)?[\w@./\\-]+\.\w+)(?::(\d+)(?::\d+)?)?\s*$/);
+      if (!n || n[1]!.includes('/node_modules/') || n[1]!.startsWith('file:')) continue;
+      let p = n[1]!; if (p.startsWith('/')) { if (prefix && p.startsWith(prefix)) p = p.slice(prefix.length); else continue; }
+      file = p.replace(/^\.\//, ''); at = Number(n[2] ?? 0); break;
+    }
     const f = byFile[file] ??= { count: 0, syntax: 0, resolution: 0, lines: [], samples: [] };
     f.count++; if (isSyntax) f.syntax++; if (isResolution) f.resolution = (f.resolution ?? 0) + 1;
     if (at && f.lines.length < 12 && !f.lines.includes(at)) f.lines.push(at);
-    if (f.samples.length < 3) f.samples.push(clip(line, 140));
+    if (f.samples.length < 3) f.samples.push(clip(head, 140));
     f.diagnostics ??= [];
-    if (f.diagnostics.length < 6) { f.diagnostics.push(whole(line)); current = { f, i: f.diagnostics.length - 1 }; } else current = null;
+    if (f.diagnostics.length < 6) f.diagnostics.push(whole([head, ...tail].join('\n')));
   }
   return { errors, syntax, resolution, byFile: Object.fromEntries(Object.entries(byFile).sort((a, b) => b[1].count - a[1].count)) };
+}
+// What a failed install says the manifest got wrong: a version that does not
+// exist (ETARGET) or a package that does not (E404). Repairing either is code's
+// work: look the real version up, or drop the dependency.
+export function manifestFailures(output: string): { name: string; kind: 'notarget' | 'notfound' }[] {
+  const out = new Map<string, 'notarget' | 'notfound'>();
+  for (const m of output.matchAll(/No matching version found for ((?:@[\w.-]+\/)?[\w.-]+)@/g)) out.set(m[1]!, 'notarget');
+  for (const m of output.matchAll(/404\s+(?:Not Found\s+-\s+GET\s+\S+\/((?:@[\w.-]+(?:%2f|\/))?[\w.-]+)(?:\s|$)|'((?:@[\w.-]+\/)?[\w.-]+)@[^']*' is not in this registry)/g)) { const n = (m[1] ?? m[2] ?? '').replace('%2f', '/'); if (n && !out.has(n)) out.set(n, 'notfound'); }
+  return [...out.entries()].map(([name, kind]) => ({ name, kind }));
 }
 // Bracket balance of code, ignoring string literals and comments so an ANSI
 // escape such as "\u001B[?25l" or a "{" in a comment does not skew the count.

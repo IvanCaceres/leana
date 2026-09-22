@@ -20,8 +20,9 @@ export const routeDescriptions: Record<Route, string> = {
   finish: 'Report completion when the objective is met and the supplied evidence supports completion.',
   ask_user: 'Pause because essential user information or a permission is missing; no other action fits.',
 };
-export function routeQuestions(s: Session, c: Config): Questions {
+export function routeQuestions(s: Session, c: Config, finishReady = true): Questions {
   const criteria = { ...routeDescriptions };
+  if (!finishReady) delete (criteria as Partial<typeof criteria>).finish;
   const tasksJustHandled = s.phase === 'implement' && s.lastRoute === 'tasks';
   const editFailed = s.lastRoute !== null && editRoutes.includes(s.lastRoute) && !s.lastResultOk;
   const dropEdits = () => { for (const r of editRoutes) delete (criteria as Partial<typeof criteria>)[r]; };
@@ -389,7 +390,7 @@ export function createFileMessages(s: Session, t: CreateTarget, shrink = 0): Mes
 // A repair is a region rewrite: the region as it is, the errors reported in
 // it, and the surrounding lines for context. The worker returns the corrected
 // region as code; the harness splices it in.
-export interface RegionTarget { path: string; start: number; end: number; totalLines: number; region: string; before: string; after: string; errors: string[]; note: string; imports?: FileContract[] }
+export interface RegionTarget { path: string; start: number; end: number; totalLines: number; region: string; before: string; after: string; errors: string[]; note: string; imports?: FileContract[]; sites?: { line: number; text: string; callee?: string }[] }
 export function rewriteRegionMessages(s: Session, t: RegionTarget): Message[] {
   const whole = t.start === 1 && t.end === t.totalLines;
   const regionLines = t.region.split('\n');
@@ -397,11 +398,13 @@ export function rewriteRegionMessages(s: Session, t: RegionTarget): Message[] {
     role: `Repair ${t.path} as code. The harness has opened the code block; write only the corrected code and close the block.`,
     task: t.note, file: t.path, ...(s.design ? { conventions: s.design.conventions } : {}), errors: t.errors,
     ...(t.imports?.length ? { imports: t.imports.map(c => ({ importPath: c.importPath, path: c.path, exports: c.exports })) } : {}),
+    ...(t.sites?.length ? { errorSites: t.sites } : {}),
     ...(whole ? { content: t.region } : { region: { firstLine: t.start, lastLine: t.end, text: t.region }, ...(t.before ? { contextBefore: { endsAtLine: t.start - 1, text: t.before } } : {}), ...(t.after ? { contextAfter: { startsAtLine: t.end + 1, text: t.after } } : {}) }),
     rules: [
       whole ? `Output the complete corrected content of ${t.path}.` : `Output only the corrected replacement for lines ${t.start}..${t.end}: begin with the corrected form of ${JSON.stringify(clip(regionLines[0] ?? '', 80))} and end with the corrected form of ${JSON.stringify(clip(regionLines.at(-1) ?? '', 80))}. contextBefore and contextAfter are shown for orientation only and must not be part of the output; the harness replaces exactly lines ${t.start}..${t.end} with your output.`,
       'Fix every listed error and change nothing that the errors do not require; keep correct lines byte for byte.',
       ...(t.imports?.length ? ['imports lists the exported declarations of the modules this file imports, exactly as they are now: make the call sites in this file match those declarations (the props a component accepts, the parameters a function takes); do not invent members they do not declare.'] : []),
+      ...(t.sites?.length ? ['errorSites shows the source line each error points at and, for a call or a JSX element, the callee\'s declaration as it is: change that call site to fit the declaration (a component declared without props accepts neither props nor children).'] : []),
       'Write the code only, then the closing fence; no explanation before or after it.',
     ],
   };

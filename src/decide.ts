@@ -1,6 +1,6 @@
 import { referenceContext } from './references.js';
 import { ledgerFile, describe, readyCreates, dependencyItems, type StructuralDiff } from './ledger.js';
-import { boundedRead, importCandidates, safePath, topLevelDeclarations } from './tools.js';
+import { boundedRead, hash, importCandidates, safePath, topLevelDeclarations } from './tools.js';
 import { staleFor } from './context.js';
 import type { Answers, Config, Deliverable, Questions, Session } from './types.js';
 
@@ -34,7 +34,7 @@ export function readyToFinish(s: Session): boolean {
     // A required deliverable still pending by source facts (a file not created, a
     // declaration not moved or exported) makes a proposal pointless: the audit would
     // only say what the facts already say. Items judged by the diff alone are the audit's.
-    && !s.ledger.some(d => d.status === 'pending' && !d.optional && !d.unresolvable && (d.kind !== 'verify' || (Boolean(d.name && commandLike(d.name)) && (d.attempts ?? 0) < 2))) && s.finishTriedAtCheck !== s.lastCheck.step
+    && !s.ledger.some(d => d.status === 'pending' && !d.optional && !d.unresolvable && (d.kind !== 'verify' || Boolean(d.name && commandLike(d.name)))) && s.finishTriedAtCheck !== s.lastCheck.step
     && !s.tasks.some(t => t.status === 'pending') && !s.completionFeedback?.awaitingEvidence);
 }
 export interface TaskRecord {
@@ -97,7 +97,10 @@ export function candidates(s: Session, c: Config, ready: boolean): Candidate[] {
     for (const d of [...others.filter(d => !d.optional), ...others.filter(d => d.optional)].slice(0, 5)) offer(d);
     // Dependencies that would not install are the manifest's problem, and until
     // they install nothing can be verified: the manifest is fix work first.
-    if (s.setupError) { const manifest = [...s.writes, ...s.knownFiles].find(f => /(^|\/)package\.json$/.test(f)) ?? 'package.json'; out.push({ id: 'fix:setup', kind: 'fix', target: { path: manifest, errors: [`npm install failed: ${s.setupError}`] }, description: `Fix ${manifest}: dependencies could not be installed (${clip(s.setupError, 140)}); nothing can be verified until they do.` }); }
+    // The manifest fix is capped by the failure it addresses, not by the manifest
+    // version: three rewrites against one install error, landed or refused, and
+    // the worker is not asked again while that error stands.
+    if (s.setupError) { const manifest = [...s.writes, ...s.knownFiles].find(f => /(^|\/)package\.json$/.test(f)) ?? 'package.json'; if ((s.fixAttempts?.[`setup@${hash(s.setupError)}`] ?? 0) < 3) out.push({ id: 'fix:setup', kind: 'fix', target: { path: manifest, errors: [`npm install failed: ${s.setupError}`] }, description: `Fix ${manifest}: dependencies could not be installed (${clip(s.setupError, 140)}); nothing can be verified until they do.` }); }
     if (failed) for (const [file, v] of Object.entries(s.lastCheck!.summary.byFile).slice(0, 4)) {
       if (file === '(other)') {
         // Errors the check attributes to no file (a bundler's missing entry, a
@@ -127,7 +130,7 @@ export function candidates(s: Session, c: Config, ready: boolean): Candidate[] {
   // check passes after the last edit: the command is known, so nothing is
   // generated, and its outcome is judged like a check.
   if (c.allowBash && s.lastCheck?.ok && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck) {
-    for (const d of s.ledger) if (d.kind === 'verify' && d.status !== 'done' && !d.unresolvable && d.name && commandLike(d.name) && !runnableForever(d.name) && (d.attempts ?? 0) < 2 && (verifyRun(s, d.name)?.step ?? -1) <= s.lastWriteStep)
+    for (const d of s.ledger) if (d.kind === 'verify' && d.status !== 'done' && !d.unresolvable && d.name && commandLike(d.name) && !runnableForever(d.name) && (verifyRun(s, d.name)?.step ?? -1) <= s.lastWriteStep)
       out.push({ id: `verify:${d.id}`, kind: 'verify', target: { deliverable: d, name: d.name.trim() }, description: `Run ${d.name}: the design's verification ${d.id} (${clip(d.detail, 100)}) has not run since the last edit.` });
   }
   out.push({ id: 'ask', kind: 'ask', description: 'Pause and ask the user: the objective cannot be carried out without a decision or information only they have.' });

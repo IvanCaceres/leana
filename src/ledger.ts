@@ -139,6 +139,36 @@ export function readyCreates(s: Session): Deliverable[] {
 // The contract a file to create is written against: for each dependency the
 // import path and the exported surface, parsed from the file when it exists and
 // taken from the design when it is still planned; and who will import it.
+// The import specifier one file uses for another: relative, extensionless.
+export function relativeImportPath(from: string, to: string): string {
+  const r = relative(dirname(from), to).replace(/\\/g, '/').replace(/\.(tsx?|jsx?|mts|cts)$/, '');
+  return r.startsWith('.') ? r : `./${r}`;
+}
+// The types a module's exported signatures name that it imports from a sibling
+// file: one hop out, so a prompt that shows `ThemeToggle(props: ThemeToggleProps)`
+// also shows what ThemeToggleProps is. Only relative imports are followed, and
+// only the declarations the signatures name are taken.
+export async function referencedTypeContracts(root: string, modulePath: string, moduleText: string, signatures: string[], target: string, limit = 6): Promise<FileContract[]> {
+  const declared = /^export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|class|const|let|var|type|interface|enum)\s+([A-Za-z_$][\w$]*)/;
+  const own = new Set(signatures.map(e => e.match(declared)?.[1]).filter((n): n is string => Boolean(n)));
+  const names = new Set<string>();
+  for (const sig of signatures) for (const m of sig.matchAll(/\b([A-Z][A-Za-z0-9_]*)\b/g)) if (!own.has(m[1]!)) names.add(m[1]!);
+  if (!names.size) return [];
+  const imports = await relativeImports(modulePath, moduleText).catch(() => [] as { spec: string; names: string[] }[]);
+  const out = new Map<string, FileContract>();
+  for (const imp of imports) {
+    const wanted = imp.names.filter(n => names.has(n)); if (!wanted.length) continue;
+    for (const candidate of importCandidates(modulePath, imp.spec)) {
+      if (!/\.[cm]?[jt]sx?$/.test(candidate) || candidate === target) continue;
+      let text: string | null = null; try { text = await boundedRead(await safePath(root, candidate)); } catch { continue; }
+      const sigs = (await exportedSignatures(candidate, text, 40).catch(() => [] as string[])).filter(e => { const n = e.match(declared)?.[1]; return Boolean(n && wanted.includes(n)); });
+      if (sigs.length) { const c = out.get(candidate) ?? { path: candidate, importPath: relativeImportPath(target, candidate), status: 'exists' as const, exports: [] as string[] }; for (const x of sigs) if (!c.exports.includes(x)) c.exports.push(x); out.set(candidate, c); }
+      break;
+    }
+    if (out.size >= limit) break;
+  }
+  return [...out.values()];
+}
 // The contracts a repair must satisfy: the exported declarations, as they are
 // now, of every module the file imports. A type error at a call site is fixed
 // against the callee's real signature, never against a guess; modules whose
@@ -146,17 +176,19 @@ export function readyCreates(s: Session): Deliverable[] {
 // keeps the prompt small.
 export async function importContracts(root: string, path: string, text: string, diagnostics: string[] = [], budget = 6000): Promise<FileContract[]> {
   const imports = await relativeImports(path, text).catch(() => [] as { spec: string; names: string[] }[]);
-  const found: FileContract[] = []; const seen = new Set<string>();
+  const found: FileContract[] = []; const seen = new Set<string>(); const extras: FileContract[] = [];
   for (const imp of imports) {
     for (const candidate of importCandidates(path, imp.spec)) {
       if (seen.has(candidate) || !/\.[cm]?[jt]sx?$/.test(candidate)) continue;
       let content: string | null = null; try { content = await boundedRead(await safePath(root, candidate)); } catch { continue; }
       seen.add(candidate);
       const exports = await exportedSignatures(candidate, content).catch(() => [] as string[]);
-      if (exports.length) found.push({ path: candidate, importPath: imp.spec, status: 'exists', exports });
+      if (exports.length) { found.push({ path: candidate, importPath: imp.spec, status: 'exists', exports }); extras.push(...await referencedTypeContracts(root, candidate, content, exports, path).catch(() => [])); }
       break;
     }
   }
+  // The types those signatures name, one hop out, unless the file imports that module itself.
+  for (const x of extras) { if (x.path === path) continue; const have = found.find(c => c.path === x.path); if (have) { for (const e of x.exports) if (!have.exports.includes(e)) have.exports.push(e); } else found.push(x); }
   const mentioned = diagnostics.join('\n');
   const named = (c: FileContract) => c.exports.some(e => { const m = e.match(/^export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|class|const|let|var|type|interface|enum)\s+([A-Za-z_$][\w$]*)/); return Boolean(m && new RegExp(`\\b${m[1]}\\b`).test(mentioned)); });
   found.sort((a, b) => Number(named(b)) - Number(named(a)));
@@ -166,8 +198,8 @@ export async function importContracts(root: string, path: string, text: string, 
 }
 export async function contractsFor(root: string, s: Session, d: Deliverable): Promise<{ contracts: FileContract[]; importers: { path: string; expects: string[] }[] }> {
   const path = d.to ?? d.name ?? '';
-  const importPath = (from: string, to: string) => { const r = relative(dirname(from), to).replace(/\\/g, '/').replace(/\.(tsx?|jsx?|mts|cts)$/, ''); return r.startsWith('.') ? r : `./${r}`; };
-  const contracts: FileContract[] = [];
+  const importPath = relativeImportPath;
+  const contracts: FileContract[] = []; const hops: FileContract[] = [];
   const deps = dependencyItems(s, d);
   // Files the design names as dependencies, plus files it created in the same
   // package that the design did not list, capped so the prompt stays small.
@@ -177,6 +209,7 @@ export async function contractsFor(root: string, s: Session, d: Deliverable): Pr
     let text: string | null = null; try { text = await boundedRead(await safePath(root, p)); } catch { text = null; }
     const exports = text !== null ? await exportedSignatures(p, text) : dep.exports ?? [];
     contracts.push({ path: p, importPath: importPath(path, p), status: text !== null ? 'exists' : 'planned', exports: exports.length ? exports : dep.exports ?? [] });
+    if (text !== null && exports.length) hops.push(...await referencedTypeContracts(root, p, text, exports, path).catch(() => []));
   }
   for (const other of s.ledger) {
     if (contracts.length >= 12) break;
@@ -190,6 +223,9 @@ export async function contractsFor(root: string, s: Session, d: Deliverable): Pr
   // An importer that already exists shows how it uses each export: the props
   // it renders a component with, the arguments it calls a function with. The
   // file is then written to fit its call sites, not the call sites guessed.
+  // The types the dependencies' signatures name, one hop out, after the
+  // designed dependencies and neighbours so a shrunk prompt keeps those first.
+  for (const x of hops) { if (x.path === path) continue; const have = contracts.find(c => c.path === x.path); if (have) { for (const e of x.exports) if (!have.exports.includes(e)) have.exports.push(e); } else if (contracts.length < 14) { seen.add(x.path); contracts.push(x); } }
   const importers: { path: string; expects: string[]; usage?: string[] }[] = [];
   for (const o of s.ledger.filter(o => o !== d && o.kind === 'create' && o.to && dependencyItems(s, o).includes(d)).slice(0, 8)) {
     let text: string | null = null; try { text = await boundedRead(await safePath(root, o.to!)); } catch { text = null; }
@@ -449,6 +485,8 @@ export async function refreshLedger(root: string, s: Session): Promise<void> {
     const looksPath = (p?: string) => Boolean(p && /[\/\\]/.test(p) && /\.[cm]?[jt]sx?$/.test(p));
     const resolvable = async (p?: string) => !looksPath(p) || knownPath(s, p) || (await read(p!)) !== null;
     // A move's destination may not exist yet: only an invented source makes a move unjudgeable.
+    // An item the harness set aside (three failed creations or verification runs) stays aside across refreshes.
+    if (d.setAside) { d.unresolvable = true; continue; }
     d.unresolvable = !(await resolvable(d.from)) || (d.kind !== 'create' && d.kind !== 'move' && !(await resolvable(d.to))) || undefined;
     if (d.unresolvable) d.note = `${d.from && !knownPath(s, d.from) ? d.from : d.to} is not a file in the repository`;
     const from = ledgerFile(s, d.from); const to = ledgerFile(s, d.to);

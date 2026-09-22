@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { open, readFile, realpath, rename, stat, unlink, mkdir, readdir } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, posix, relative, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
+import { builtinModules } from 'node:module';
 import type { CheckSummary, Config, NameOrigin, Route, SourceEvidence, ToolResult } from './types.js';
 import { clip } from './context.js';
 export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex');
@@ -11,12 +12,11 @@ export class StaleWriteError extends Error {}
 // Did a check get worse after edits? Any in-scope increase, or new in-scope syntax
 // errors without a net decrease, is a regression and is rolled back with no vote;
 // a structural move is judged on syntax only. Anything else is committed.
-export function regression(before: CheckSummary | null, after: CheckSummary, scope: { files?: string[]; structural?: boolean; created?: boolean } = {}): 'worse' | 'fine' {
+// Only edits of files that existed are judged here: a created file is never
+// rolled back (its errors are work for the fixer, not grounds to discard a
+// generation), so callers pass the edited paths as the scope.
+export function regression(before: CheckSummary | null, after: CheckSummary, scope: { files?: string[]; structural?: boolean } = {}): 'worse' | 'fine' {
   if (!before) return 'fine';
-  // A transaction that created a file is judged on the whole: the new file's own
-  // errors are new by definition (a sibling it imports may not exist yet), and a
-  // falling total is the progress that matters. A rising total still rolls back.
-  if (scope.created && !(after.syntax > before.syntax && after.errors >= before.errors)) return after.errors <= before.errors ? 'fine' : 'worse';
   // Judge the files this transaction touched, not the whole repository: errors
   // cascading into test files must not blunt the signal, and pre-existing errors
   // elsewhere are not this edit's doing. Errors the check does not attribute to a
@@ -35,6 +35,16 @@ export function regression(before: CheckSummary | null, after: CheckSummary, sco
   // New syntax errors with no net progress are a regression. New syntax errors
   // alongside a net decrease are progress with one known line to fix: keep them.
   if (a.syntax > b.syntax && a.errors >= b.errors) return 'worse';
+  // Fewer errors in the files the transaction edited is progress whatever
+  // appears elsewhere: once its own errors are fixed the check reaches a later
+  // stage (a bundler after the type checker) or type-checks other files against
+  // it, and what it reports there is work, not this edit's regression.
+  const own = (s: CheckSummary) => Object.entries(s.byFile).reduce((n, [f, v]) => n + (f !== '(other)' && matches(f) ? v.count : 0), 0);
+  if (attributed && own(after) < own(before)) return 'fine';
+  // Fewer syntax errors is progress whatever the total does: a file that did
+  // not parse was not checked at all, so the errors its repair surfaces are
+  // the ones that were always there, now visible.
+  if (a.syntax < b.syntax) return 'fine';
   // Unresolved names and modules come first: an edit that adds one is never
   // progress, and one that removes one is progress even when the types it
   // brings in surface further errors (an any-typed import hides them).
@@ -46,14 +56,22 @@ export function regression(before: CheckSummary | null, after: CheckSummary, sco
   if (!scope.structural && a.errors > b.errors) return 'worse';
   return 'fine';
 }
-// An edit that pastes lines the file already contains (a header copied again,
-// a block duplicated) is refused: the recurring way a small model breaks a file.
+// An import or export line the file already has is dropped from an insertion:
+// the intent (have that import) is already met, so the edit is repaired, not
+// refused. Returns the lines to insert and the ones dropped.
+export function dropDuplicateImports(before: string, inserted: string[]): { kept: string[]; dropped: string[] } {
+  const norm = (l: string) => l.trim().replace(/'/g, '"').replace(/;$/, '').replace(/\s+/g, ' ');
+  const present = new Set(before.split('\n').map(norm));
+  const kept: string[] = []; const dropped: string[] = [];
+  for (const line of inserted) { if (/^\s*(import|export)\b.*\bfrom\b/.test(line) && present.has(norm(line))) dropped.push(line); else kept.push(line); }
+  return { kept, dropped };
+}
+// An edit that pastes a block the file already contains (a header copied
+// again, a function duplicated) is wrong content, the recurring way a small
+// model breaks a file: refused, so the worker generates something else.
 export function assertNoBulkDuplication(before: string, inserted: string[], label: string, countRule = true): void {
   const trimmed = (xs: string[]) => xs.map(l => l.trim());
   const beforeLines = trimmed(before.split('\n'));
-  const present = new Set(beforeLines);
-  const dupImport = trimmed(inserted).find(l => /^(import|export)\b.*\bfrom\b/.test(l) && present.has(l));
-  if (dupImport) throw new Error(`Edit refused: ${label} already contains the line ${JSON.stringify(dupImport.slice(0, 80))}; an import or export is never added twice. Add only the names that are missing.`);
   if (!countRule) return;
   // A run of five consecutive substantive inserted lines that already appears
   // consecutively in the file is a pasted block, not a shared idiom.
@@ -217,13 +235,97 @@ export async function declarationEnd(root: string, file: string, line: number): 
   }
   return null;
 }
-// A large range whose new text mostly equals the old is a retype, the place
-// where generated code drifts. Name the lines that actually differ instead.
+// A large range whose new text mostly equals the old is a retype. The lines
+// that differ are the change the worker meant, so the edit is applied and the
+// note names them; refusing it would only discard the generation.
 export function nearRetype(oldLines: string[], newLines: string[], start: number): string | null {
   if (oldLines.length < 12 || newLines.length !== oldLines.length) return null;
   const differing = oldLines.map((l, i) => l.trim() === newLines[i]!.trim() ? -1 : start + i).filter(n => n >= 0);
   if (differing.length === 0 || differing.length > Math.max(2, Math.floor(oldLines.length * .2))) return null;
-  return `this rewrites ${oldLines.length} lines of which only ${differing.length} change (line${differing.length > 1 ? 's' : ''} ${differing.join(', ')}); edit only those lines, in ranges of their own`;
+  return `this rewrote ${oldLines.length} lines of which only ${differing.length} changed (line${differing.length > 1 ? 's' : ''} ${differing.join(', ')}); next time edit only those lines, in ranges of their own`;
+}
+// The exported surface of a file as short signatures: what another file may
+// import from it. Interfaces and type aliases are shown whole when short; a
+// function, class or const shows its first line up to the body.
+export async function exportedSignatures(path: string, text: string, limit = 14): Promise<string[]> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return [];
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  const out: string[] = [];
+  const hasExport = (st: any) => (ts.canHaveModifiers(st) ? ts.getModifiers(st) ?? [] : []).some((m: any) => m.kind === ts.SyntaxKind.ExportKeyword);
+  const isDefault = (st: any) => (ts.canHaveModifiers(st) ? ts.getModifiers(st) ?? [] : []).some((m: any) => m.kind === ts.SyntaxKind.DefaultKeyword);
+  const upTo = (st: any, pos: number) => text.slice(st.getStart(sf), pos).replace(/\s+$/, '').replace(/\s+/g, ' ');
+  for (const st of sf.statements) {
+    if (out.length >= limit) break;
+    if (ts.isExportAssignment(st)) { out.push(`export default ${clip(st.expression.getText(sf).split('\n')[0]!, 120)}`); continue; }
+    if (ts.isExportDeclaration(st)) { out.push(clip(st.getText(sf).replace(/\s+/g, ' '), 160)); continue; }
+    if (!hasExport(st)) continue;
+    const full = st.getText(sf);
+    if ((ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st) || ts.isEnumDeclaration(st)) && full.split('\n').length <= 24) { out.push(full); continue; }
+    // A function or class shows its head up to the body; an arrow function up to its arrow.
+    if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st))) { const body = ts.isFunctionDeclaration(st) ? st.body : null; const at = body ? body.getStart(sf) : ts.isClassDeclaration(st) ? full.indexOf('{') + st.getStart(sf) : st.getEnd(); out.push(clip(upTo(st, at), 200)); continue; }
+    if (ts.isVariableStatement(st)) {
+      const init = st.declarationList.declarations[0]?.initializer;
+      if (init && ts.isArrowFunction(init)) { out.push(clip(upTo(st, init.equalsGreaterThanToken.getEnd()), 200)); continue; }
+      if (init && ts.isFunctionExpression(init)) { out.push(clip(upTo(st, init.body.getStart(sf)), 200)); continue; }
+    }
+    out.push(clip(full.split('\n')[0]!.replace(/\s*\{\s*$/, ''), 160) + (isDefault(st) ? '' : ''));
+  }
+  return out;
+}
+// The relative imports of a file (a spec starting with . or /), with the local
+// names each binds: 'default', '*', the named bindings, or none for a
+// side-effect import such as a stylesheet.
+export async function relativeImports(path: string, text: string): Promise<{ spec: string; names: string[]; typeOnly?: boolean }[]> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return [];
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  const out: { spec: string; names: string[]; typeOnly?: boolean }[] = [];
+  for (const st of sf.statements) {
+    let spec: string | null = null; const names: string[] = []; let typeOnly = false;
+    if (ts.isImportDeclaration(st)) {
+      spec = st.moduleSpecifier.text; const c = st.importClause; typeOnly = Boolean(c?.isTypeOnly);
+      if (c?.name) names.push('default');
+      if (c?.namedBindings && ts.isNamespaceImport(c.namedBindings)) names.push('*');
+      if (c?.namedBindings && ts.isNamedImports(c.namedBindings)) { const els = c.namedBindings.elements; for (const b of els) names.push(b.propertyName?.text ?? b.name.text); if (els.length && els.every((b: any) => b.isTypeOnly)) typeOnly = true; }
+    } else if (ts.isExportDeclaration(st) && st.moduleSpecifier) {
+      spec = st.moduleSpecifier.text; typeOnly = Boolean(st.isTypeOnly);
+      for (const b of st.exportClause && ts.isNamedExports(st.exportClause) ? st.exportClause.elements : []) names.push(b.propertyName?.text ?? b.name.text);
+    }
+    if (spec && /^\.\.?\//.test(spec)) out.push({ spec, names, ...(typeOnly ? { typeOnly: true } : {}) });
+  }
+  return out;
+}
+// The repository paths an import specifier can denote, in resolution order:
+// the exact path, then the source extensions, then an index file.
+export function importCandidates(importer: string, spec: string): string[] {
+  const cleaned = posix.normalize(posix.join(posix.dirname(importer.replace(/\\/g, '/')), spec)).replace(/^\.\//, '');
+  if (/\.(?:[cm]?[jt]sx?|json|css|scss|svg|png|jpe?g|webp|gif|md)$/i.test(cleaned)) {
+    // TypeScript convention: an import of ./x.js may denote ./x.ts.
+    const swapped = cleaned.replace(/\.js$/, '.ts').replace(/\.jsx$/, '.tsx').replace(/\.mjs$/, '.mts');
+    return [...new Set([cleaned, swapped])];
+  }
+  return [cleaned, ...['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'json'].map(e => `${cleaned}.${e}`), ...['ts', 'tsx', 'js', 'jsx'].map(e => `${cleaned}/index.${e}`)];
+}
+// The smallest line range containing from..to that starts and ends at
+// top-level statement boundaries, so a region rewrite never cuts a declaration.
+export async function statementBounds(path: string, text: string, from: number, to: number): Promise<{ start: number; end: number }> {
+  const total = text.split('\n').length;
+  let start = Math.max(1, Math.min(from, total)); let end = Math.max(start, Math.min(to, total));
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return { start, end };
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  const spans: { a: number; b: number }[] = sf.statements.map((st: any) => ({ a: sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1, b: sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1 }));
+  let startFound = false; let endFound = false;
+  for (const { a, b } of spans) {
+    if (a <= start && b >= start) { start = a; startFound = true; }
+    if (a <= end && b >= end) { end = b; endFound = true; }
+  }
+  // A bound that fell between statements moves to the nearest statement edge
+  // inside the range, so the region never begins or ends on blank lines.
+  if (!startFound) { const next = spans.filter(x => x.a > start && x.a <= end).map(x => x.a); if (next.length) start = Math.min(...next); }
+  if (!endFound) { const prev = spans.filter(x => x.b < end && x.b >= start).map(x => x.b); if (prev.length) end = Math.max(...prev); }
+  return { start, end };
 }
 // Top-level declarations of a file by name, with their line ranges.
 export async function topLevelDeclarations(path: string, text: string): Promise<Map<string, { start: number; end: number; kind: string; exported: boolean }>> {
@@ -295,6 +397,13 @@ export async function repositoryStatus(root: string): Promise<{ git: boolean; ch
   await walk('.', 0);
   return { git, changed: all.slice(0, 40), changedCount: all.length, scripts, topLevel, packages };
 }
+// The packages a generated file may import: the manifest's dependencies, so
+// the worker never invents one.
+export async function installedPackages(root: string): Promise<string[]> {
+  let pkg: any; try { pkg = JSON.parse(await boundedRead(await safePath(root, 'package.json'))); } catch { return []; }
+  const names = (o: unknown) => o && typeof o === 'object' ? Object.entries(o as Record<string, string>).map(([k, v]) => `${k}@${String(v).replace(/^[\^~]/, '')}`) : [];
+  return [...new Set([...names(pkg?.dependencies), ...names(pkg?.devDependencies), ...names(pkg?.peerDependencies)])];
+}
 // A trial that failed for want of dependencies, and the install the manifest implies.
 export function missingDependencies(output: string): boolean {
   return /command not found|Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|ModuleNotFoundError|No module named|is not recognized as|not found: /i.test(output);
@@ -309,6 +418,38 @@ export async function installCommand(root: string, dir = '.'): Promise<string | 
   if (await has('requirements.txt')) return `${dir === '.' ? '' : `cd ${dir} && `}python3 -m pip install -r requirements.txt`;
   if (await has('pyproject.toml')) return `${dir === '.' ? '' : `cd ${dir} && `}python3 -m pip install -e .`;
   return null;
+}
+// A bare package the check cannot find that a file this session wrote imports:
+// installing it is mechanical (the manager and its flag are known from the
+// lockfile), never a manifest edit for the worker to generate. Relative and
+// built-in specifiers, packages the manifest already declares, and names no
+// written file imports are not candidates.
+export function missingPackages(summary: CheckSummary, importers: Record<string, string>, installed: string[]): { name: string; importers: string[] }[] {
+  const have = new Set(installed.map(i => i.replace(/@[^@]*$/, '')));
+  const builtin = new Set(builtinModules);
+  const out = new Map<string, Set<string>>();
+  for (const v of Object.values(summary.byFile)) for (const d of v.diagnostics?.length ? v.diagnostics : v.samples) {
+    for (const m of d.matchAll(/Cannot find (?:package|module) '([^'\s]+)'|Failed to resolve import "([^"\s]+)"|Cannot find package "([^"\s]+)"/g)) {
+      const spec = m[1] ?? m[2] ?? m[3] ?? '';
+      if (!spec || /^[./#]/.test(spec) || spec.startsWith('node:') || builtin.has(spec)) continue;
+      const name = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0]!;
+      if (!name || have.has(name)) continue;
+      const users = Object.entries(importers).filter(([, text]) => new RegExp(`(?:from\\s*|import\\s*|require\\(\\s*)['"]${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/[^'"]*)?['"]`).test(text)).map(([p]) => p);
+      if (!users.length) continue;
+      const set = out.get(name) ?? new Set<string>(); for (const u of users) set.add(u); out.set(name, set);
+    }
+  }
+  return [...out.entries()].map(([name, users]) => ({ name, importers: [...users] }));
+}
+// The command that adds packages to the manifest and installs them, by the
+// package manager the lockfile implies.
+export async function addPackagesCommand(root: string, names: string[], dev: boolean): Promise<string> {
+  const has = async (p: string) => { try { await stat(resolve(root, p)); return true; } catch { return false; } };
+  const list = names.map(n => `'${n}'`).join(' ');
+  if (await has('pnpm-lock.yaml')) return `pnpm add ${dev ? '-D ' : ''}${list}`;
+  if (await has('yarn.lock')) return `yarn add ${dev ? '-D ' : ''}${list}`;
+  if (await has('bun.lockb') || await has('bun.lock')) return `bun add ${dev ? '-d ' : ''}${list}`;
+  return `npm install ${dev ? '--save-dev ' : ''}--no-audit --no-fund ${list}`;
 }
 // A shell command that only reads is an inspection, not an action.
 export function readOnlyCommand(command: string): boolean {
@@ -434,11 +575,19 @@ export function summarizeCheck(text: string): CheckSummary {
   let output = text;
   try { const parsed = JSON.parse(text); if (typeof parsed?.output === 'string') output = parsed.output; } catch { /* plain text */ }
   const byFile: CheckSummary['byFile'] = {}; let errors = 0; let syntax = 0; let resolution = 0;
+  // A diagnostic's continuation lines (indented, as tsc prints the property
+  // that does not exist) belong to the message a repair prompt needs whole.
+  let current: { f: CheckSummary['byFile'][string]; i: number } | null = null;
+  const whole = (text: string) => text.length > 900 ? `${text.slice(0, 900)} …` : text;
   for (const raw of output.split('\n')) {
     const line = raw.trim();
     // Test runners report failures without the word error: TAP 'not ok', Jest 'FAIL',
     // Node's AssertionError. Summary lines ('# fail 1') are not failures.
-    if (!/\berror\b/i.test(line) && !/\bAssertionError\b|\bSyntaxError\b|\bFAIL(?:ED)?\b|^not ok\b/.test(line)) continue;
+    if (!/\berror\b/i.test(line) && !/\bAssertionError\b|\bSyntaxError\b|\bFAIL(?:ED)?\b|^not ok\b/.test(line)) {
+      if (current && /^\s+\S/.test(raw) && line) current.f.diagnostics![current.i] = whole(`${current.f.diagnostics![current.i]}\n${raw.replace(/\s+$/, '')}`);
+      else current = null;
+      continue;
+    }
     errors++;
     const isSyntax = /\bTS1\d{3}\b|SyntaxError|Unexpected token|[a-z')\]}] expected\.$/.test(line);
     if (isSyntax) syntax++;
@@ -452,6 +601,8 @@ export function summarizeCheck(text: string): CheckSummary {
     f.count++; if (isSyntax) f.syntax++; if (isResolution) f.resolution = (f.resolution ?? 0) + 1;
     if (at && f.lines.length < 12 && !f.lines.includes(at)) f.lines.push(at);
     if (f.samples.length < 3) f.samples.push(clip(line, 140));
+    f.diagnostics ??= [];
+    if (f.diagnostics.length < 6) { f.diagnostics.push(whole(line)); current = { f, i: f.diagnostics.length - 1 }; } else current = null;
   }
   return { errors, syntax, resolution, byFile: Object.fromEntries(Object.entries(byFile).sort((a, b) => b[1].count - a[1].count)) };
 }
@@ -465,15 +616,17 @@ export function summarizeCheck(text: string): CheckSummary {
 const parseable = /\.(?:[cm]?[jt]sx?)$/i;
 let tsModule: any | null | undefined;
 export async function syntaxErrors(path: string, text: string): Promise<string[]> {
-  if (!parseable.test(path)) return [];
+  const json = /\.json$/i.test(path);
+  if (!parseable.test(path) && !json) return [];
   if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
-  if (!tsModule) return [];
+  if (!tsModule) { if (json) { try { JSON.parse(text); return []; } catch (e) { return [`invalid JSON: ${(e as Error).message}`]; } } return []; }
   const ts = tsModule;
+  const where = (d: any) => d.file && d.start !== undefined ? d.file.getLineAndCharacterOfPosition(d.start) : null;
+  const message = (d: any) => { const w = where(d); return `${w ? `line ${w.line + 1}: ` : ''}${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`; };
+  // JSON with the parser tsconfig uses: comments and trailing commas allowed.
+  if (json) return (ts.parseJsonText(path, text).parseDiagnostics ?? []).slice(0, 5).map(message);
   const out = ts.transpileModule(text, { reportDiagnostics: true, fileName: path, compilerOptions: { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.Preserve, allowJs: true } });
-  return (out.diagnostics ?? []).slice(0, 5).map((d: any) => {
-    const where = d.file && d.start !== undefined ? d.file.getLineAndCharacterOfPosition(d.start) : null;
-    return `${where ? `line ${where.line + 1}: ` : ''}${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`;
-  });
+  return (out.diagnostics ?? []).slice(0, 5).map(message);
 }
 export async function assertParses(path: string, before: string, after: string): Promise<void> {
   const problems = await syntaxErrors(path, after);
@@ -602,6 +755,32 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     if (!wanted.has(file)) wanted.set(file, new Map()); if (!wanted.get(file)!.has(name)) wanted.get(file)!.set(name, { kind, module });
   };
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS(?:2304|2552): Cannot find name '([^']+)'/gm)) add(m[1]!, m[2]!, 'missing');
+  // A relative module the file cannot find, when a file of that name exists
+  // once in the repository at another relative path: the specifier is
+  // rewritten, mechanically. A module nobody has yet is left to the ledger.
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2307: Cannot find module '(\.[^']+)'/gm)) {
+    const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); const spec = m[3]!; if (!inFile) continue;
+    if (results.some(r => r.kind === 'respec' && r.inFile === inFile && r.name === spec)) continue;
+    const exists = async (p: string) => { try { await stat(await safePath(root, p)); return true; } catch { return false; } };
+    let found = false; for (const c of importCandidates(inFile, spec)) if (await exists(c)) { found = true; break; }
+    if (found) continue;
+    const base = spec.replace(/\/$/, '').split('/').pop()!.replace(/\.[cm]?[jt]sx?$/, '');
+    if (!/^[\w.-]+$/.test(base)) continue;
+    const r = await runCommand('rg', ['--files', '-g', '!node_modules/**', '-g', '!.leana/**', '-g', '!dist/**', '-g', `**/${base}.{ts,tsx,js,jsx,mts,cts,mjs,cjs}`, '-g', `**/${base}/index.{ts,tsx,js,jsx}`, '--', '.'], root, 10000).catch(() => null);
+    const files = [...new Set((r?.output.split('\n') ?? []).map(f => f.trim().replace(/^\.\//, '')).filter(Boolean))].sort();
+    if (files.length !== 1) continue;
+    const target = files[0]!; const rel = relative(dirname(inFile), target.replace(/\/index\.[cm]?[jt]sx?$/, '')).replace(/\\/g, '/').replace(/\.(tsx?|jsx?|mts|cts|mjs|cjs)$/, '');
+    const keepExt = /\.[cm]?[jt]sx?$/.test(spec) ? target.slice(target.lastIndexOf('.')).replace(/\.tsx?$/, '.js') : '';
+    const to = (rel.startsWith('.') ? rel : `./${rel}`) + keepExt;
+    if (to === spec) continue;
+    results.push({ name: spec, inFile, kind: 'respec', line: Number(m[2]), importLine: to, note: `${spec} does not resolve from ${inFile}; ${target} does, so the harness rewrites the specifier to ${to}` });
+  }
+  // React 19's types declare JSX under the react module, not globally: a
+  // file that names JSX.Element imports the namespace, mechanically.
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2503: Cannot find namespace 'JSX'/gm)) {
+    const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (!inFile || results.some(r => r.name === 'JSX' && r.inFile === inFile)) continue;
+    results.push({ name: 'JSX', inFile, importLine: 'import type { JSX } from "react";', line: Number(m[2]), note: 'JSX is a namespace of the react module; the harness imports it' });
+  }
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS2459: Module '"([^"]+)"' declares '([^']+)' locally, but it is not exported/gm)) add(m[1]!, m[3]!, 'not-exported', m[2]!);
   for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS(?:2305|2724): (?:Module )?'"([^"]+)"' has no exported member(?: named)? '([^']+)'\.(?: Did you mean '([^']+)'\?)?/gm)) {
     // The checker names the export that exists: alias the import to it, usage untouched.
@@ -610,7 +789,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
   }
   // An unused import binding is mechanical to remove, and removing the whole
   // line is the classic mistake when it also carries a used binding.
-  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS6133: '([^']+)' is declared but its value is never read/gm)) {
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS(?:6133|6196): '([^']+)' is declared but (?:its value is never read|never used)/gm)) {
     const reported = m[1]!; const line = Number(m[2]); const name = m[3]!;
     const inFile = editedFiles.find(f => f.endsWith(reported) || reported.endsWith(f)); if (!inFile) continue;
     let text: string; try { text = await boundedRead(await safePath(root, inFile)); } catch { continue; }
@@ -799,49 +978,61 @@ export class ToolBox {
       return { ok: !r.timedOut && !r.truncated && (r.code === 0 || r.code === 1),
         text: JSON.stringify({ ...r, output: output || none }) };
     }
+    if (route === 'create_file') {
+      // Creation has one meaning: a file that does not exist gets this content.
+      // The content is validated after it lands, never refused for its shape:
+      // a parse problem is reported for the harness's own repair, and the
+      // relative imports are reported so the deliverables they imply can be added.
+      if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
+      if (typeof a.path !== 'string' || /[\\/]$/.test(a.path) || a.path === '.' || a.path === '..') throw new Error('create_file requires a regular file path; directory path rejected');
+      const content = typeof a.content === 'string' ? a.content : '';
+      if (!content.trim()) throw new Error(`create_file for ${a.path} produced no content`);
+      const path = await safePath(this.root, a.path, true);
+      let exists = true; try { await stat(path); } catch (e: any) { if (e.code !== 'ENOENT') throw e; exists = false; }
+      if (exists) throw new Error(`${a.path} already exists; edit it with replace_lines or write instead of creating it`);
+      await mkdir(dirname(path), { recursive: true });
+      await safePath(this.root, a.path, true);
+      const handle = await open(path, 'wx', 0o644);
+      try { await handle.writeFile(content); } finally { await handle.close(); }
+      const parseErrors = await syntaxErrors(a.path, content);
+      const imports = await relativeImports(a.path, content);
+      const h = hash(content);
+      return { ok: true, changed: [a.path], hashes: { [a.path]: h }, snapshots: { [a.path]: '@new' }, parseErrors, imports,
+        text: `Created ${a.path} (${content.split('\n').length} lines); sha256=${h}.${parseErrors.length ? ` It does not parse yet (${parseErrors.join('; ')}); the harness repairs that region next.` : ''}${imports.length ? ` Imports ${imports.map(i => i.spec).join(', ')}.` : ''}` };
+    }
     if (route === 'write') {
+      // An anchor replacement in a file that exists; nothing else.
       if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
       if (/[\\/]$/.test(a.path) || a.path === '.' || a.path === '..') throw new Error('write requires a regular file path; directory path rejected');
       const path = await safePath(this.root, a.path, true);
-      const snapshots: Record<string, string> = {};
       let original: string | null = null;
       try { original = await boundedRead(path); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
-      if (original === null) {
-        if (a.expectedHash !== 'new' || a.oldText !== '') throw new Error('New files require expectedHash=new and empty oldText');
-        await mkdir(dirname(path), { recursive: true });
-        await safePath(this.root, a.path, true);
-        const handle = await open(path, 'wx', 0o644);
-        try { await handle.writeFile(a.newText); } finally { await handle.close(); }
-        snapshots[a.path] = '@new';
-      } else {
-        if (a.expectedHash === 'new') throw new StaleWriteError(`expectedHash=new is only valid for a new file; ${a.path} exists: read it with read_files and use the returned sha256`);
-        if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.path}: read the file again and use the sha256 from that result`);
-        snapshots[a.path] = await this.snapshot(a.path, original);
-        // A write is a short anchor. A retyped block is where a small model drifts,
-        // and the line tools already address blocks without retyping anything.
-        const anchorLines = a.oldText.split('\n').length;
-        if (anchorLines > 6) {
-          const first = a.oldText.split('\n')[0]!.trim(); const at = original.split('\n').findIndex(l => l.trim() === first) + 1;
-          throw new Error(`oldText is ${anchorLines} lines; a write anchor is at most 6. ${at ? `That block starts at line ${at}: ` : ''}use replace_lines with line numbers (prepend "export " to export a line, newText "" to delete, the insert form to add imports) or move_lines to relocate it.`);
-        }
-        const matches = a.oldText ? original.split(a.oldText).length - 1 : 0;
-        if (matches === 0) throw new Error('oldText must match exactly once: it was not found in the current file. Copy a small anchor exactly from the latest read_files result of this path; never paste a truncated excerpt');
-        if (matches > 1) throw new Error(`oldText must match exactly once: it matches ${matches} times. Include more surrounding lines so the anchor is unique`);
-        const updated = original.replace(a.oldText, () => a.newText);
-        if (updated === original) throw new Error('Write produced no change: newText equals oldText. oldText is the exact existing anchor; newText must be the modified text that replaces it');
-        assertBalancePreserved(original, updated, a.path);
-        await assertParses(a.path, original, updated);
-        assertNoBulkDuplication(original.replace(a.oldText, ''), a.newText.split('\n'), a.path);
-        const temp = `${path}.leana-${randomUUID()}.tmp`;
-        try {
-          const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
-          try { await h.writeFile(updated); } finally { await h.close(); }
-          if (hash(await boundedRead(path)) !== a.expectedHash) throw new StaleWriteError('File changed while preparing edit; read it again');
-          await rename(temp, path);
-        } finally { await unlink(temp).catch(() => {}); }
-      }
-      const updatedHash = hash(await boundedRead(path));
-      return { ok: true, changed: [a.path], hashes: { [a.path]: updatedHash }, snapshots, text: `Updated ${a.path}; sha256=${updatedHash}. Run focused validation.` };
+      if (original === null) throw new StaleWriteError(`${a.path} does not exist: write replaces an anchor in an existing file; a new file is made with create_file`);
+      if (a.expectedHash === 'new') throw new StaleWriteError(`expectedHash=new is not a hash; ${a.path} exists: read it with read_files and use the returned sha256`);
+      if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.path}: read the file again and use the sha256 from that result`);
+      const snapshots = { [a.path]: await this.snapshot(a.path, original) };
+      const matches = a.oldText ? original.split(a.oldText).length - 1 : 0;
+      if (matches === 0) throw new Error('oldText must match exactly once: it was not found in the current file. Copy a small anchor exactly from the latest read_files result of this path; never paste a truncated excerpt');
+      if (matches > 1) throw new Error(`oldText must match exactly once: it matches ${matches} times. Include more surrounding lines so the anchor is unique`);
+      // An import the file already has is dropped from the replacement, not refused.
+      const { kept, dropped } = dropDuplicateImports(original.replace(a.oldText, ''), String(a.newText).split('\n'));
+      const newText = kept.join('\n');
+      const updated = original.replace(a.oldText, () => newText);
+      if (updated === original) throw new Error(dropped.length ? `Write produced no change: the only new lines were imports ${a.path} already has (${dropped.map(l => l.trim()).join('; ')})` : 'Write produced no change: newText equals oldText. oldText is the exact existing anchor; newText must be the modified text that replaces it');
+      assertBalancePreserved(original, updated, a.path);
+      await assertParses(a.path, original, updated);
+      assertNoBulkDuplication(original.replace(a.oldText, ''), kept, a.path);
+      const temp = `${path}.leana-${randomUUID()}.tmp`;
+      try {
+        const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
+        try { await h.writeFile(updated); } finally { await h.close(); }
+        if (hash(await boundedRead(path)) !== a.expectedHash) throw new StaleWriteError('File changed while preparing edit; read it again');
+        await rename(temp, path);
+      } finally { await unlink(temp).catch(() => {}); }
+      const updatedHash = hash(updated);
+      const anchorLines = String(a.oldText).split('\n').length;
+      const notes = [dropped.length ? `Dropped ${dropped.length} import line(s) the file already had.` : '', anchorLines > 6 ? `The anchor was ${anchorLines} lines; replace_lines addresses a block by line number without retyping it.` : ''].filter(Boolean).join(' ');
+      return { ok: true, changed: [a.path], hashes: { [a.path]: updatedHash }, snapshots, text: `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.` };
     }
     if (route === 'replace_lines') {
       if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
@@ -879,14 +1070,28 @@ export class ToolBox {
       }
       // An edit that leaves its lines as they are is skipped, not fatal: in a
       // batch of forty deletions one redundant rewrite must not void the rest.
-      const rendered = (e: { start: number; end: number; newText: string; prepend?: string }): string[] =>
-        e.prepend ? lines.slice(e.start - 1, e.end).map(l => `${e.prepend}${l}`) : e.newText === '' ? [] : e.newText.replace(/\n$/, '').split('\n');
+      // Import lines the file already has (outside the replaced ranges) are
+      // dropped from the inserted text: the intent is met, so the edit is repaired.
+      const outsideText = lines.filter((_, i) => !all.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end)).join('\n');
+      const droppedImports: string[] = [];
+      const rendered = (e: { start: number; end: number; newText: string; prepend?: string }): string[] => {
+        if (e.prepend) return lines.slice(e.start - 1, e.end).map(l => `${e.prepend}${l}`);
+        if (e.newText === '') return [];
+        const { kept, dropped } = dropDuplicateImports(outsideText, e.newText.replace(/\n$/, '').split('\n'));
+        for (const d of dropped) if (!droppedImports.includes(d)) droppedImports.push(d);
+        return kept;
+      };
       const same = (x: string[], y: string[]) => x.length === y.length && x.every((l, i) => l === y[i]);
       // A deletion is never a no-op; a rewrite is one only when every line is unchanged.
       const skipped = all.filter(e => e.end >= e.start && !(e.newText === '' && !e.prepend) && same(lines.slice(e.start - 1, e.end), rendered(e)));
-      const edits = all.filter(e => !skipped.includes(e));
-      if (!edits.length) throw new Error(`replace_lines produced no change: every newText equals the current lines (${all.map(e => `${e.start}..${e.end}`).join(', ')})`);
-      for (const e of edits) if (!e.prepend && e.end >= e.start) { const why = nearRetype(lines.slice(e.start - 1, e.end), rendered(e), e.start); if (why) throw new Error(`Edit refused: ${why}.`); }
+      const edits = all.filter(e => !skipped.includes(e) && !(e.end < e.start && rendered(e).length === 0));
+      if (!edits.length) throw new Error(droppedImports.length ? `replace_lines produced no change: the only new lines were imports ${a.path} already has (${droppedImports.map(l => l.trim()).join('; ')})` : `replace_lines produced no change: every newText equals the current lines (${all.map(e => `${e.start}..${e.end}`).join(', ')})`);
+      // A harness-chosen rewrite (a region the code picked, validated before
+      // it got here) is applied as it is: the paste and retype rules are for
+      // the worker's own line edits.
+      const harness = a.harness === true;
+      const retypes: string[] = [];
+      if (!harness) for (const e of edits) if (!e.prepend && e.end >= e.start) { const why = nearRetype(lines.slice(e.start - 1, e.end), rendered(e), e.start); if (why) retypes.push(why); }
       let result = lines; let delta = 0;
       for (const e of edits) {
         const fresh = rendered(e);
@@ -900,7 +1105,7 @@ export class ToolBox {
       // Retyping a range in place is a rewrite, not a paste: judge the inserted
       // lines against the file without the ranges they replace.
       const outside = lines.filter((_, i) => !edits.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end)).join('\n');
-      assertNoBulkDuplication(outside, edits.filter(e => !e.prepend).flatMap(e => rendered(e)), a.path);
+      if (!harness) assertNoBulkDuplication(outside, edits.filter(e => !e.prepend).flatMap(e => rendered(e)), a.path);
       const temp = `${path}.leana-${randomUUID()}.tmp`;
       try {
         const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
@@ -909,7 +1114,8 @@ export class ToolBox {
         await rename(temp, path);
       } finally { await unlink(temp).catch(() => {}); }
       const summary = edits.map(e => `${e.start}..${e.end}`).reverse().join(', ');
-      const note = skipped.length ? ` Skipped ${skipped.length} unchanged range(s): ${skipped.map(e => `${e.start}..${e.end}`).reverse().join(', ')}.` : '';
+      const note = [skipped.length ? ` Skipped ${skipped.length} unchanged range(s): ${skipped.map(e => `${e.start}..${e.end}`).reverse().join(', ')}.` : '',
+        droppedImports.length ? ` Dropped ${droppedImports.length} import line(s) the file already had.` : '', retypes.length ? ` Note: ${retypes.join('; ')}.` : ''].join('');
       return { ok: true, changed: [a.path], hashes: { [a.path]: hash(updated) }, snapshots,
         text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${note} Line numbers below the first edit shifted by ${delta} in total; re-read before addressing them. Run focused validation.` };
     }

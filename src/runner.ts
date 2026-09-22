@@ -1,11 +1,11 @@
-import { readFile, rm, writeFile } from 'node:fs/promises';
+import { readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
-import { focusedCreateMessages, focusedMessages, checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
-import { schemas } from './schema.js';
-import { aliasImportBinding, missingDependencies, installCommand, runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
-import { unaccountedFiles, auditQuestions, auditVerdict, candidates, completionEvidence, completionState, decideStep, stepQuestions, taskRecord } from './decide.js';
-import { designFrom, anchorPath, candidatesFrom, checkPrompt, checkQuestions, checkSchema, completionQuestions, diffChunks, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from './ledger.js';
+import { createFileMessages, rewriteRegionMessages, trimContext, fenceFor, focusedMessages, checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, type CreateTarget, type RegionTarget } from './context.js';
+import { extractCode, focusedEditSchema, schemas } from './schema.js';
+import { addPackagesCommand, aliasImportBinding, missingDependencies, missingPackages, installCommand, installedPackages, runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, statementBounds, summarizeCheck, syntaxErrors, ToolBox } from './tools.js';
+import { unaccountedFiles, auditQuestions, auditVerdict, candidates, completionEvidence, completionState, decideStep, readyToFinish, stepQuestions, taskRecord } from './decide.js';
+import { designFrom, anchorPath, candidatesFrom, checkCandidates, checkPrompt, checkSchema, checkSelectionQuestions, configLike, contractsFor, deriveDeliverables, exportedNames, importContracts, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, missingExports, parseDesign, refreshLedger, structuralDiff, tierQuestions, tierState, trialFacts } from './ledger.js';
 const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
@@ -21,7 +21,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
     phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], design: null, ledgerAttempts: 0, ledgerBuilt: false, ledgerComplete: 0, baselineArtifacts: {}, checkInferences: 0, checkInferredFor: -1, setupDone: false, baselineStatus: null,
-    lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
+    lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {}, pendingRepairs: [] };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
   if (new Set(tasks.map(t => t.id)).size !== tasks.length) throw new Error('Task IDs must be unique');
@@ -36,7 +36,9 @@ export class Runner {
   readonly tools: ToolBox;
   private current = 0;
   constructor(readonly config: Config, readonly store: Store, readonly jev: Pick<Jev, 'decide'>,
-    readonly bonsai: Pick<Bonsai, 'count' | 'generate'> & { lastMeta?: GenerationMeta | null }, root: string,
+    // generateText is the raw-code path; a worker without it (a test double, an
+    // API without a completion endpoint) gets the same prompt under a one-field JSON schema.
+    readonly bonsai: Pick<Bonsai, 'count' | 'generate'> & { lastMeta?: GenerationMeta | null; generateText?: Bonsai['generateText'] }, root: string,
     readonly progress: (message: string) => void = console.error,
     observer?: (e: ProgressEvent) => void) {
     this.tools = new ToolBox(root, store.artifacts, config, (path, text) => store.snapshot(this.current, path, text));
@@ -93,6 +95,7 @@ export class Runner {
     // Current hashes are ground truth for expectedHash and outlive evidence eviction.
     for (const [path, h] of Object.entries(result.hashes ?? {})) { delete s.hashes[path]; s.hashes[path] = h; }
     for (const stale of Object.keys(s.hashes).slice(0, -20)) delete s.hashes[stale];
+    if (kind === 'bash' && typeof args?.command === 'string') (s.commandRuns ??= {})[args.command.trim()] = { step: s.step, ok: result.ok };
     if (result.verification) { s.editsSinceCheck = 0; if (kind === 'bash' && args?.command) s.lastCheckCommand = args.command; }
     if (kind === 'move_lines' && result.ok && !s.moveDirection && args?.source && args?.destination) s.moveDirection = { source: args.source, destination: args.destination };
     // Edits followed by a passing check answer a completion rejection; the pinned
@@ -129,12 +132,30 @@ export class Runner {
       s.previousCheck = s.lastCheck;
       s.lastCheck = { step: s.step, ok: result.ok, text: clip(result.text, 1500), summary: summarizeCheck(result.text), fileHashes: await sourceHashes(s.root, s.writes) };
       s.pendingCheck = false;
+      // The versions the check found errors in are known wrong: a repair that
+      // reproduces one is refused before it lands, so a fix cannot oscillate
+      // between two versions the check has already judged.
+      if (!result.ok) for (const [file, v] of Object.entries(s.lastCheck.summary.byFile)) {
+        if (!v.count) continue;
+        const path = Object.keys(s.lastCheck.fileHashes ?? {}).find(p => p === file || p.endsWith(`/${file}`) || file.endsWith(`/${p}`));
+        const h = path ? s.lastCheck.fileHashes![path] : undefined; if (!path || !h) continue;
+        const list = ((s.failedVersions ??= {})[path] ??= []);
+        if (!list.includes(h)) { list.push(h); if (list.length > 8) list.shift(); }
+      }
       // The edits since the previous check are now judged by this one. An
-      // objective regression is rolled back deterministically; a small increase
-      // is put to Jev; an improvement or a pass is committed silently.
-      const scope = { files: [...new Set([...s.transaction.flatMap(t => t.paths), ...Object.keys(s.editSnapshots)])], structural: s.transaction.some(t => t.route === 'move_lines'), created: Object.values(s.editSnapshots).some(a => a === '@new') };
-      const verdict = (s.transaction.length || Object.keys(s.editSnapshots).length) && !result.ok ? regression(s.previousCheck?.summary ?? null, s.lastCheck.summary, scope) : 'fine';
-      s.autoUndo = verdict === 'worse' ? { files: { ...s.editSnapshots }, reason: clip(`the check went from ${s.previousCheck?.summary.errors ?? 0} errors (${s.previousCheck?.summary.syntax ?? 0} syntax) to ${s.lastCheck.summary.errors} (${s.lastCheck.summary.syntax} syntax) in scope ${scope.files.join(', ')}; first new: ${Object.entries(s.lastCheck.summary.byFile).find(([f]) => scope.files.some(p => f.endsWith(p) || p.endsWith(f)))?.[1].samples[0] ?? ''}`, 300) } : null;
+      // objective regression in the files that existed is rolled back
+      // deterministically; an improvement or a pass is committed silently.
+      // A file the transaction created is never rolled back: a scaffold's own
+      // errors (a sibling it imports not written yet, a type to fix) are work
+      // for the fixer, not grounds to discard the generation that produced it.
+      // (A move into a new file is different: its destination is part of the
+      // move and is removed with it when the move is rolled back.)
+      const created = new Set(s.transaction.filter(t => t.route === 'create_file').flatMap(t => t.paths));
+      const edited = Object.fromEntries(Object.entries(s.editSnapshots).filter(([p]) => !created.has(p)));
+      const scope = { files: [...new Set([...s.transaction.flatMap(t => t.paths), ...Object.keys(edited)])].filter(p => !created.has(p)), structural: s.transaction.some(t => t.route === 'move_lines') };
+      const judged = !result.ok && Object.keys(edited).length > 0;
+      const verdict = judged ? regression(s.previousCheck?.summary ?? null, s.lastCheck.summary, scope) : 'fine';
+      s.autoUndo = verdict === 'worse' ? { files: edited, reason: clip(`the check went from ${s.previousCheck?.summary.errors ?? 0} errors (${s.previousCheck?.summary.syntax ?? 0} syntax) to ${s.lastCheck.summary.errors} (${s.lastCheck.summary.syntax} syntax) in scope ${scope.files.join(', ')}; first new: ${Object.entries(s.lastCheck.summary.byFile).find(([f]) => scope.files.some(p => f.endsWith(p) || p.endsWith(f)))?.[1].samples[0] ?? ''}`, 300) } : null;
       s.editSnapshots = {};
       // Anything not rolled back is committed: the transaction is closed.
       if (verdict === 'fine') s.transaction = [];
@@ -145,8 +166,26 @@ export class Runner {
       await refreshLedger(this.tools.root, s).catch(() => {});
       s.pendingMoves = await this.pendingMoves(s).catch(() => []);
     }
-    for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.editSnapshots)) s.editSnapshots[path] = artifact;
+    // A created file has no pre-edit content to restore and is never rolled
+    // back, so it never enters the rollback set; it does enter the baseline so
+    // the completion diff knows it was created.
+    for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.editSnapshots) && kind !== 'create_file') s.editSnapshots[path] = artifact;
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.baselineArtifacts)) s.baselineArtifacts[path] = artifact;
+    // A created file that does not parse is repaired by the harness before any
+    // decision is asked; its imports of modules nobody planned become deliverables.
+    if (kind === 'create_file' && result.ok && args?.path) {
+      const path = String(args.path);
+      s.pendingRepairs = s.pendingRepairs.filter(r => r.path !== path);
+      if (result.parseErrors?.length) s.pendingRepairs.push({ path, errors: result.parseErrors, attempts: 0 });
+      if (result.imports?.length && s.ledger.length) {
+        const added = deriveDeliverables(s, path, result.imports, String(args.content ?? ''));
+        if (added.length) {
+          await this.store.log('derived', { step: s.step, importer: path, added: added.map(d => ({ id: d.id, to: d.to, detail: d.detail })) });
+          this.observe({ kind: 'warning', step: s.step, text: `${path} imports ${added.map(d => d.to).join(', ')}, which no deliverable planned; added as deliverables to create` });
+        }
+      }
+    }
+    if (result.changed?.length) for (const p of result.changed) s.pendingRepairs = s.pendingRepairs.filter(r => r.path !== p || kind === 'create_file');
     // The ledger follows every edit, the harness's included, whether or not a check runs.
     if (result.ok && result.changed?.length && s.ledger.length) { await refreshLedger(this.tools.root, s).catch(() => {}); s.pendingMoves = await this.pendingMoves(s).catch(() => []); }
     // A failing check ends verification; a failing baseline during inspection
@@ -194,7 +233,7 @@ export class Runner {
     s.lastRoute = route; s.lastResultOk = result.ok;
     if (result.ok && route !== s.blockedRoute) s.blockedRoute = null;
     await this.evidence(s, route, result, args);
-    if (result.ok && editRoutes.includes(route)) s.transaction.push({ key: Runner.actionKey(s, route, args), identity: hash(JSON.stringify({ route, args: { ...args, expectedHash: undefined, destinationHash: undefined } })), step: s.step, route, paths: result.changed ?? [], summary: clip(JSON.stringify({ ...args, expectedHash: undefined }), 200) });
+    if (result.ok && editRoutes.includes(route)) s.transaction.push({ key: Runner.actionKey(s, route, args), identity: hash(JSON.stringify({ route, args: { ...args, expectedHash: undefined, destinationHash: undefined } })), step: s.step, route, paths: result.changed ?? [], summary: clip(JSON.stringify({ ...args, expectedHash: undefined }), 200), kind });
     this.observe({ kind: 'result', step: s.step, route, ok: result.ok, ms: performance.now() - started, chars: result.text.length, text: clip(result.text, 200) });
     await this.store.log('result', { step: s.step, ok: result.ok, ms: performance.now() - started, artifact: s.entries.at(-1)?.artifact });
   }
@@ -235,26 +274,62 @@ export class Runner {
     if (s.ledgerAttempts >= 2) { s.ledgerBuilt = true; return false; }
     s.ledgerAttempts++;
     const note = s.ledger.length ? `These deliverables are already listed: ${s.ledger.map(d => `${d.kind} ${d.name ?? ''} ${d.to ?? ''}`).join('; ')}. Jev judged the list incomplete: add only the missing ones.` : undefined;
-    let raw: Record<string, any>;
+    let raw: Record<string, any> | null;
     const repository = await repositoryStatus(this.tools.root).catch(() => undefined);
-    try { raw = await this.bonsai.generate(ledgerPrompt(s, note, repository), ledgerSchema, .1, { step: s.step, route: 'ledger' }); }
-    catch (e) { await this.store.log('ledger', { step: s.step, error: (e as Error).message }); s.ledgerBuilt = s.ledgerAttempts >= 2; return false; }
+    // The design is generated as text (the architect may think first) and
+    // parsed leniently: a design cut by the budget keeps its complete items.
+    try {
+      if (this.bonsai.generateText) {
+        const g = await this.generateCode(s, 'ledger' as Route, [ledgerPrompt(s, note, repository)], this.config.designTokens, null, { thinking: this.config.designThinking });
+        raw = parseDesign(g.text);
+        if (!raw) throw new Error(`The design reply held no JSON object (${g.finish}; ${g.text.length} characters)`);
+      } else raw = await this.bonsai.generate(ledgerPrompt(s, note, repository), ledgerSchema, .1, { step: s.step, route: 'ledger' }, this.config.designTokens);
+    } catch (e) { await this.store.log('ledger', { step: s.step, error: (e as Error).message }); this.observe({ kind: 'warning', step: s.step, text: `design failed: ${clip((e as Error).message, 200)}` }); s.ledgerBuilt = s.ledgerAttempts >= 2; return false; }
     const design = designFrom(raw); if (design && (!s.design || design.summary.length > s.design.summary.length)) s.design = design;
     const fresh = candidatesFrom(raw).filter(c => !s.ledger.some(d => d.kind === c.kind && d.name === c.name && d.to === c.to && d.from === c.from));
     const candidates = fresh.map((c, i) => ({ ...c, id: `d${s.ledger.length + i + 1}` }));
     if (!candidates.length) { s.ledgerBuilt = true; await this.store.log('ledger', { step: s.step, candidates: [], kept: s.ledger }); return false; }
-    const answers = await this.jev.decide(decisionState(s, { candidateDeliverables: candidates.map(c => ({ id: c.id, kind: c.kind, name: c.name, from: c.from, to: c.to, detail: c.detail })) }), ledgerQuestions(candidates), { step: s.step, phase: 'ledger' });
-    const kept = candidates.filter(c => {
-      const a = answers[`required_${c.id}`]; const p = a?.type === 'noul' ? a.noul : 0; c.required = p;
-      const f = answers[`fits_${c.id}`]; const fits = f?.type === 'noul' ? f.noul : 0;
-      if (p >= this.config.completeProbability) return true;
-      if (fits >= this.config.completeProbability) { c.optional = true; return true; }
-      return false;
-    });
+    let kept: Deliverable[]; let complete = 0;
+    if (s.design && candidates.some(c => c.kind === 'create')) {
+      // A designed application: each item is judged against the design it came
+      // from, one Choice per item, in requests sized for Jev's budget.
+      kept = []; s.droppedCandidates ??= [];
+      // A manifest or build configuration the repository lacks is part of the
+      // design by construction: nothing builds or is verified without it. It
+      // is kept, required and created first, and Jev is not asked about it.
+      const given = candidates.filter(c => c.kind === 'create' && c.to && configLike(c.to) && !s.knownFiles.includes(c.to));
+      for (const c of given) { c.required = 1; kept.push(c); }
+      const asked = candidates.filter(c => !given.includes(c));
+      for (let i = 0; i < Math.max(1, asked.length); i += 12) {
+        const batch = asked.slice(i, i + 12); const last = i + 12 >= asked.length;
+        const answers = await this.jev.decide(tierState(s, batch, last ? [...s.ledger, ...candidates] : undefined), tierQuestions(batch, last), { step: s.step, phase: 'ledger' });
+        for (const c of batch) {
+          const a = answers[`tier_${c.id}`]; const p = a?.type === 'choice' ? a.probabilities : {};
+          const tier = a?.type === 'choice' ? a.choice : 'part_of_design';
+          c.required = p.part_of_design ?? 0;
+          if (tier === 'out_of_scope' && (p.out_of_scope ?? 0) >= .5) { s.droppedCandidates.push(c); continue; }
+          if (tier === 'extra') c.optional = true;
+          kept.push(c);
+        }
+        const done = answers.complete?.type === 'noul' ? answers.complete.noul : 0; complete = Math.max(complete, done);
+      }
+    } else {
+      const answers = await this.jev.decide(decisionState(s, { candidateDeliverables: candidates.map(c => ({ id: c.id, kind: c.kind, name: c.name, from: c.from, to: c.to, detail: c.detail })) }), ledgerQuestions(candidates), { step: s.step, phase: 'ledger' });
+      kept = candidates.filter(c => {
+        const a = answers[`required_${c.id}`]; const p = a?.type === 'noul' ? a.noul : 0; c.required = p;
+        const f = answers[`fits_${c.id}`]; const fits = f?.type === 'noul' ? f.noul : 0;
+        if (p >= this.config.completeProbability) return true;
+        if (fits >= this.config.completeProbability) { c.optional = true; return true; }
+        return false;
+      });
+      complete = answers.complete?.type === 'noul' ? answers.complete.noul : 0;
+    }
     s.ledger = [...s.ledger, ...kept];
-    const complete = answers.complete?.type === 'noul' ? answers.complete.noul : 0;
     s.ledgerComplete = Math.max(s.ledgerComplete, complete);
-    s.ledgerBuilt = complete >= this.config.completeProbability || s.ledgerAttempts >= 2;
+    // A second design pass is a generation of minutes: it is spent only when
+    // Jev reads the list as more likely incomplete than complete (the literal
+    // Noul), not whenever the reading falls short of the completion-audit bar.
+    s.ledgerBuilt = complete >= .5 || s.ledgerAttempts >= 2;
     await refreshLedger(this.tools.root, s).catch(() => {});
     s.pendingMoves = await this.pendingMoves(s).catch(() => []);
     await this.store.log('ledger', { step: s.step, candidates, kept: s.ledger, complete });
@@ -276,52 +351,237 @@ export class Runner {
     const ranges = wanted.flatMap(n => { const d = decls.get(n); return d ? [`${n} lines ${d.start}-${d.end}`] : []; });
     return `The range ${args.start}..${args.end} of ${source} also declares ${outside.slice(0, 6).join(', ')}${outside.length > 6 ? ` and ${outside.length - 6} more` : ''}, which the deliverables do not ask to move. Move only the deliverables' declarations: ${ranges.join('; ')}.`;
   }
-  // No configured check: the worker proposes one from the repository and Jev
-  // classifies it before it becomes the verification.
-  private async inferCheck(s: Session): Promise<boolean> {
-    s.checkInferences++; s.checkInferredFor = s.writes.length;
-    const repository = await repositoryStatus(this.tools.root);
-    let raw: Record<string, any>;
-    try { raw = await this.bonsai.generate(checkPrompt(s, repository), checkSchema, .1, { step: s.step, route: 'check' }); } catch (e) { await this.store.log('check-inferred', { step: s.step, error: (e as Error).message }); return false; }
-    const command = typeof raw.command === 'string' ? raw.command.trim() : '';
-    if (!command) { await this.store.log('check-inferred', { step: s.step, command: '', accepted: false }); return false; }
-    const unusable = await checkUnusable(this.tools.root, command);
-    // Run the candidate once: how it actually behaves is the best evidence Jev can get.
+  // Run a candidate check once: how it actually behaves is the evidence Jev
+  // judges. A trial that fails for want of dependencies is an environment fact,
+  // not a verdict on the command: install what the manifest implies, once.
+  private async trialCheck(s: Session, command: string): Promise<{ code: number | null; timedOut: boolean; output: string }> {
     const run = () => runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', command], this.tools.root, this.config.commandTimeoutMs).then(t => ({ code: t.code, timedOut: t.timedOut, output: clip(t.output, 1200) })).catch(e => ({ code: -1, timedOut: false, output: clip(String((e as Error).message), 300) }));
-    let trial = unusable ? null : await run();
-    // A trial that fails for want of dependencies is an environment fact, not a
-    // verdict on the command: install what the manifest implies, once, and try again.
-    if (trial && trial.code !== 0 && missingDependencies(trial.output) && !s.setupDone) {
+    let trial = await run();
+    // One install per manifest version: a manifest the session rewrites after a
+    // failed install earns another attempt.
+    const manifests = await Promise.all(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'requirements.txt', 'pyproject.toml'].map(f => readFile(join(this.tools.root, f), 'utf8').catch(() => '')));
+    const setupKey = hash(manifests.join('\u0000'));
+    if (trial.code !== 0 && missingDependencies(trial.output) && (!s.setupDone || s.setupKey !== setupKey)) {
       const dir = command.match(/(?:--dir|-C|--prefix)\s+(\S+)/)?.[1] ?? command.match(/^\s*cd\s+(\S+)/)?.[1] ?? '.';
       const install = await installCommand(this.tools.root, dir);
       if (install) {
-        s.setupDone = true;
+        s.setupDone = true; s.setupKey = setupKey;
         const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', install], this.tools.root, Math.max(this.config.commandTimeoutMs, 300000)).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
         await this.store.log('setup', { step: s.step, command: install, code: r.code, output: clip(r.output, 800) });
         this.observe({ kind: 'warning', step: s.step, text: `setup: ${install} (exit ${r.code})` });
         await this.evidence(s, 'setup', { ok: r.code === 0, text: `Installed dependencies with ${install}: exit ${r.code}\n${clip(r.output, 600)}` });
+        // A failed install names what the manifest got wrong: that is fix work for the manifest.
+        s.setupError = r.code === 0 ? null : clip(r.output.split('\n').filter(l => /error|ERR|not found|notarget|E404|ETARGET|EUNSUPPORTED|peer/i.test(l)).slice(0, 6).join(' | ') || r.output, 500);
         if (r.code === 0) trial = await run();
       }
     }
-    const answers = unusable ? null : await this.jev.decide(decisionState(s, { candidateCheck: { command, rationale: raw.rationale, trial }, repository }), checkQuestions(), { step: s.step, phase: 'check-inference' });
-    const valid = answers?.valid?.type === 'noul' ? answers.valid.noul : 0;
-    const accepted = !unusable && valid >= this.config.completeProbability;
-    await this.store.log('check-inferred', { step: s.step, command, rationale: raw.rationale, unusable, trial, valid, accepted });
-    this.observe({ kind: 'warning', step: s.step, text: accepted ? `verification inferred: ${command} (Jev ${valid.toFixed(2)})` : `verification candidate rejected: ${command} (${unusable ?? `Jev ${valid.toFixed(2)}`})` });
-    if (!accepted) return false;
+    return trial;
+  }
+  // No configured check: select, do not generate. Code enumerates the commands
+  // the repository offers (package scripts, language tools), tries them, and
+  // Jev chooses among them or none; the worker proposes a command only when
+  // nothing is enumerable.
+  private async inferCheck(s: Session): Promise<boolean> {
+    s.checkInferences++; s.checkInferredFor = s.writes.length;
+    const repository = await repositoryStatus(this.tools.root);
+    let cands = await checkCandidates(this.tools.root, repository);
+    if (!cands.length) {
+      let raw: Record<string, any>;
+      try { raw = await this.bonsai.generate(checkPrompt(s, repository), checkSchema, .1, { step: s.step, route: 'check' }); } catch (e) { await this.store.log('check-inferred', { step: s.step, error: (e as Error).message }); return false; }
+      const command = typeof raw.command === 'string' ? raw.command.trim() : '';
+      if (!command) { await this.store.log('check-inferred', { step: s.step, command: '', accepted: false }); return false; }
+      cands = [{ command, source: `proposed by the worker: ${clip(String(raw.rationale ?? ''), 200)}` }];
+    }
+    const tried: { command: string; source: string; unusable: string | null; trial: ReturnType<typeof trialFacts> }[] = [];
+    for (const c of cands) {
+      const unusable = await checkUnusable(this.tools.root, c.command);
+      if (unusable) { tried.push({ ...c, unusable, trial: null }); continue; }
+      tried.push({ ...c, unusable: null, trial: trialFacts(await this.trialCheck(s, c.command)) });
+      // Two commands that actually ran are enough to choose between.
+      if (tried.filter(t => t.trial?.ran).length >= 2) break;
+    }
+    // Candidates that failed to start or did not terminate are facts, not options.
+    const usable = tried.filter(t => !t.unusable && t.trial?.ran);
+    if (!usable.length) { await this.store.log('check-inferred', { step: s.step, candidates: tried, accepted: false }); this.observe({ kind: 'warning', step: s.step, text: `no verification candidate ran: ${tried.map(t => `${t.command} (${t.unusable ?? t.trial?.outcome})`).join('; ')}` }); return false; }
+    let chosen: typeof usable[number] | undefined; let probabilities: Record<string, number> = {}; let choice: string | null = null;
+    if (usable.length === 1 && usable[0]!.trial && (usable[0]!.trial.exitCode === 0 || usable[0]!.trial.errorsListed > 0)) {
+      // One candidate that ran and either passed or listed errors in the code: nothing to judge.
+      chosen = usable[0]; choice = chosen!.command;
+    } else {
+      // A small, literal state: what the deliverables are and how each candidate behaved.
+      const state = { objective: clip(s.objective, 400), deliverables: s.ledger.slice(0, 12).map(d => `${d.kind} ${d.name ?? ''}${d.to ? ` in ${d.to}` : ''}`), changedFiles: s.writes.slice(-12),
+        candidates: Object.fromEntries(usable.map(t => [t.command, { command: t.command, source: t.source, outcome: t.trial!.outcome, exitCode: t.trial!.exitCode, errorsListed: t.trial!.errorsListed, outputHead: t.trial!.outputHead }])) };
+      const answers = await this.jev.decide(state, checkSelectionQuestions(usable), { step: s.step, phase: 'check-selection' });
+      choice = confidentChoice(answers.check, this.config);
+      // Two valid candidates split the probability: the code preference decides typecheck > build > test.
+      if (!choice && answers.check?.type === 'choice' && (answers.check.probabilities.none ?? 0) < .3) choice = usable[0]!.command;
+      chosen = choice && choice !== 'none' ? usable.find(t => t.command === choice) : undefined;
+      probabilities = answers.check?.type === 'choice' ? answers.check.probabilities : {};
+    }
+    await this.store.log('check-inferred', { step: s.step, candidates: tried, choice, probabilities, accepted: Boolean(chosen), command: chosen?.command });
+    this.observe({ kind: 'warning', step: s.step, text: chosen ? `verification selected: ${chosen.command}${choice && choice in probabilities ? ` (Jev ${(probabilities[choice] ?? 0).toFixed(2)})` : ' (the only candidate that ran)'}` : `no verification selected among ${usable.map(t => t.command).join(', ')} (${choice ?? 'uncertain'})` });
+    if (!chosen) return false;
     // From here on this command is the verification, exactly as a configured one would be.
-    s.lastCheckCommand = command; s.pendingCheck = true; this.tools.config.checkCommand = command;
+    s.lastCheckCommand = chosen.command; s.pendingCheck = true; this.tools.config.checkCommand = chosen.command;
     return true;
   }
-  // A file to create is prompted from the design: what it must contain, the
-  // conventions, and the exports of the files near it that it may import.
-  private async createMessages(s: Session, path: string, d: Deliverable): Promise<Message[]> {
-    const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
-    const related: { path: string; exports: string[] }[] = [];
-    for (const f of [...s.writes, ...s.knownFiles].filter(f => f !== path && /\.[cm]?[jt]sx?$/.test(f) && (dir === '' || f.startsWith(dir.split('/')[0]!))).slice(0, 12)) {
-      try { const text = await readFile(await safePath(this.tools.root, f), 'utf8'); const decls = await topLevelDeclarations(f, text); const exports = [...decls].filter(([, v]) => v.exported).map(([n]) => n).slice(0, 12); if (exports.length) related.push({ path: f, exports }); } catch { /* skip */ }
+  // The contract a file is written against: the design, its dependencies'
+  // exact exports, who imports it, and the packages it may use.
+  private async createTarget(s: Session, path: string, d: Deliverable, problems?: string[]): Promise<CreateTarget> {
+    const { contracts, importers } = await contractsFor(this.tools.root, s, d);
+    const packages = await installedPackages(this.tools.root).catch(() => [] as string[]);
+    return { path, deliverable: d, contracts, importers, packages, ...(problems?.length ? { problems } : {}) };
+  }
+  // Code is generated as code: a raw completion continued across requests
+  // until the model stops. Without a raw path the same prompt runs under a
+  // one-field schema. The result is the unwrapped code, never refused for shape.
+  private async generateCode(s: Session, route: Route, prompts: Message[][], budget: number, fence: string | null, options: { thinking?: boolean } = {}): Promise<{ code: string; finish: 'stop' | 'length' | 'repetition'; text: string }> {
+    // The prompt is shrunk before it is refused, never swapped for a generic one.
+    let prompt = prompts[0]!; let counted = await this.bonsai.count(prompt);
+    for (const smaller of prompts.slice(1)) { if (counted.tokens <= this.config.workingTokens) break; prompt = smaller; counted = await this.bonsai.count(prompt); }
+    if (counted.tokens > this.config.workingTokens) throw new Error(`The ${route} prompt (${counted.tokens} tokens) exceeds the working budget; reduce the design or the contracts`);
+    s.lastPromptTokens = counted.tokens;
+    this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
+    await this.logPrompt(s, route, prompt, counted.tokens, 1);
+    if (this.bonsai.generateText) {
+      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, thinking: options.thinking });
+      this.observe({ kind: 'generated', step: s.step, route, meta: g.meta, args: { chars: g.text.length, finish: g.finish, continuations: g.meta.continuations ?? 0 } });
+      // With the fence prefilled the reply is the code itself; a reply that
+      // opens its own fence anyway (the same backtick run or a longer one) is
+      // unwrapped. A shorter run is content: a code block inside a document.
+      const run = fence?.match(/^`+/)?.[0].length ?? 3;
+      const opened = g.text.match(/^\s*(`{3,})[^\n]*\n/);
+      const code = fence && !options.thinking ? (opened && opened[1]!.length >= run ? extractCode(g.text) : g.text.replace(/\s+$/, '') + '\n') : extractCode(g.text);
+      return { code, finish: g.finish, text: g.text };
     }
-    return focusedCreateMessages(s, path, d, related);
+    const raw = await this.bonsai.generate(prompt, { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false }, .2, { step: s.step, route }, budget);
+    this.observe({ kind: 'generated', step: s.step, route, meta: this.bonsai.lastMeta ?? null, args: { chars: String(raw.content ?? '').length, finish: 'stop' } });
+    return { code: extractCode(String(raw.content ?? '')), finish: 'stop', text: String(raw.content ?? '') };
+  }
+  // Create a file from its contract, then execute the creation with the same
+  // bookkeeping as any edit. The content is validated after it lands: a parse
+  // problem or a missing promised export queues a repair, an unplanned import
+  // derives a deliverable. Failures count against the deliverable, never
+  // against a route: three, and the item is set aside with its reason.
+  private async createFile(s: Session, target: CreateTarget, kind: string): Promise<void> {
+    const d = target.deliverable;
+    try {
+      const { code, finish } = await this.generateCode(s, 'create_file', [createFileMessages(s, target), createFileMessages(s, target, 1)], this.config.createTokens, fenceFor(target.path));
+      if (finish !== 'stop') this.observe({ kind: 'warning', step: s.step, text: `${target.path}: the content ${finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : 'started repeating itself and was cut'}; the parser reports where it ends` });
+      await this.forced(s, 'create_file', { path: target.path, content: code }, kind);
+      if (!s.lastResultOk) throw new Error(s.entries.at(-1)?.text ?? 'create_file failed');
+      // The contract is checked where it can be: every export the design
+      // promised exists, the keyword added mechanically where the declaration
+      // is there, the rest queued for the repair with the parse errors.
+      const pending = s.pendingRepairs.find(r => r.path === target.path);
+      const errors = pending ? (await missingExports(target.path, code, d.exports ?? []).catch(() => [] as string[])).map(n => `contract: ${target.path} must export ${n === 'default' ? 'a default export' : n} (${target.importers.map(i => i.path).join(', ') || 'the design'} imports it)`)
+        : await this.contractRepair(s, target.path, code, d.exports ?? [], `${target.importers.map(i => i.path).join(', ') || 'the design'} imports it`);
+      if (errors.length) { if (pending) pending.errors.push(...errors); else s.pendingRepairs.push({ path: target.path, errors, attempts: 0 }); }
+    } catch (e) {
+      d.attempts = (d.attempts ?? 0) + 1;
+      if (d.attempts >= 3) { d.unresolvable = true; d.note = `set aside after ${d.attempts} failed attempts: ${clip((e as Error).message, 160)}`; }
+      throw e;
+    }
+  }
+  // A repair is a region rewrite: code chooses the region (the whole file when
+  // small, else the statements around the reported lines), the worker returns
+  // the corrected region as code, and it is applied as a replace_lines edit,
+  // judged by the parser before it lands and by the check afterwards.
+  private async rewriteRegion(s: Session, path: string, errors: string[], note: string, kind: string): Promise<boolean> {
+    let text: string; try { text = await readFile(await safePath(this.tools.root, path), 'utf8'); } catch (e) { throw new Error(`${path} cannot be read for repair: ${(e as Error).message}`); }
+    const lines = text.split('\n'); const trailing = lines.length > 1 && lines.at(-1) === ''; const total = trailing ? lines.length - 1 : lines.length;
+    const numbers = errors.flatMap(e => [...e.matchAll(/(?:\bline\s+(\d+))|(?:\((\d+),\d+\))|(?::(\d+):\d+)/g)].map(m => Number(m[1] ?? m[2] ?? m[3]))).filter(n => n >= 1 && n <= total);
+    let start = 1; let end = total;
+    if (total > 200 && numbers.length) ({ start, end } = await statementBounds(path, text, Math.max(1, Math.min(...numbers) - 25), Math.min(total, Math.max(...numbers) + 25)));
+    if (end - start + 1 > 400 && numbers.length) { start = Math.max(1, Math.min(...numbers) - 60); end = Math.min(total, Math.max(...numbers) + 60); }
+    const region = lines.slice(start - 1, end).join('\n');
+    const whole = start === 1 && end === total;
+    const before = lines.slice(Math.max(0, start - 13), start - 1).join('\n'); const after = lines.slice(end, Math.min(total, end + 12)).join('\n');
+    // The previous attempt's refusal, if it concerned this file, tells the worker what not to repeat.
+    const previous = s.lastError && s.lastError.includes(path) && /rewrite of /.test(s.lastError) ? [`previous attempt: ${clip(s.lastError.replace(/^No action executed: /, ''), 300)}`] : [];
+    // The exported declarations of the modules the file imports: a call site is
+    // repaired against the callee as it is, not against a guess of it.
+    const imports = kind === 'decided-fix' ? await importContracts(this.tools.root, path, text, errors).catch(() => []) : [];
+    const t: RegionTarget = { path, start, end, totalLines: total, region: whole ? text : region, before, after, errors: [...errors.slice(0, 8), ...previous.filter(p => !errors.some(e => e.startsWith('previous attempt:')))], note, ...(imports.length ? { imports } : {}) };
+    const { code } = await this.generateCode(s, 'replace_lines', [rewriteRegionMessages(s, t)], this.config.createTokens, fenceFor(path));
+    // A reply that returned the whole file for a region that did not start at
+    // line 1 is applied as the whole file (it begins like the file, ends like
+    // the file, and is at least as long); a reply that repeated the context
+    // lines is trimmed.
+    const first = (lines[0] ?? '').trim(); const lastLine = [...lines.slice(0, total)].reverse().find(l => l.trim())?.trim() ?? '';
+    const codeLines = code.replace(/\n$/, '').split('\n');
+    const looksWhole = !whole && start > 1 && first.length > 3 && codeLines[0]!.trim() === first && codeLines.length >= total * .8 && (codeLines.at(-1)?.trim() ?? '') === lastLine;
+    const newText = (whole || looksWhole ? code : trimContext(code, before, after)).replace(/\n$/, '');
+    const [from, to] = looksWhole ? [1, total] : [start, end];
+    if (newText === lines.slice(from - 1, to).join('\n')) throw new Error(`The rewrite of ${path} lines ${from}..${to} returned the region unchanged; the errors remain: ${errors.slice(0, 3).join('; ')}`);
+    // Validated before it lands: a repair must leave the file parsing, not
+    // merely move the error. (Free-path edits keep the tolerant rule.)
+    const spliced = [...lines.slice(0, from - 1), ...newText.split('\n'), ...lines.slice(to)].join('\n');
+    const problems = await syntaxErrors(path, spliced);
+    if (problems.length) throw new Error(`The rewrite of ${path} lines ${from}..${to} would still not parse: ${problems.join('; ')}`);
+    // A version the check already found errors in is known wrong: the same
+    // content would fail the same way, so it is not landed or checked again.
+    if ((s.failedVersions?.[path] ?? []).includes(hash(spliced))) throw new Error(`The rewrite of ${path} lines ${from}..${to} reproduces a version of the file the check already reported errors in; the errors listed are real, so produce a different fix that addresses them`);
+    // A rewrite that ends early or drops a declaration loses what other files
+    // import: an export the file had must still be there, or the content is wrong.
+    const had = await exportedNames(path, text); const now = new Set(await exportedNames(path, spliced));
+    const lost = had.filter(n => !now.has(n));
+    if (lost.length) throw new Error(`The rewrite of ${path} dropped the export${lost.length > 1 ? 's' : ''} ${lost.map(n => n === 'default' ? 'default' : n).join(', ')}, which other files import; return the complete corrected ${whole || looksWhole ? 'file' : 'region'} with ${lost.length > 1 ? 'them' : 'it'} kept`);
+    // Content that was rolled back is known-bad: the same rewrite is not applied twice.
+    const args = { path, expectedHash: hash(text), edits: [{ start: from, end: to, newText, prepend: '' }], harness: true };
+    const identity = hash(JSON.stringify({ route: 'replace_lines', args: { ...args, expectedHash: undefined, destinationHash: undefined } }));
+    const bad = s.rejectedEdits.find(r => r.identity === identity);
+    if (bad) throw new Error(`The rewrite of ${path} lines ${from}..${to} is the one rolled back at step ${bad.undoneAt} (${clip(bad.reason, 200)}); produce a different fix`);
+    await this.forced(s, 'replace_lines', args, kind);
+    // A rewrite must keep the file's contract: an export the design promised
+    // that the rewrite dropped is repaired next, at most twice per file.
+    if (s.lastResultOk && kind !== 'repair') {
+      const d = s.ledger.find(x => x.kind === 'create' && x.to && (x.to === path || path.endsWith(`/${x.to}`) || x.to.endsWith(`/${path}`)) && x.exports?.length);
+      const key = `contract:${path}`; const tries = s.fixAttempts?.[key] ?? 0;
+      if (d && tries < 2 && !s.pendingRepairs.some(r => r.path === path)) {
+        const missing = await this.contractRepair(s, path, spliced, d.exports!, 'other files import it');
+        if (missing.length) { (s.fixAttempts ??= {})[key] = tries + 1; s.pendingRepairs.push({ path, errors: missing, attempts: 0 }); }
+      }
+    }
+    return s.lastResultOk;
+  }
+  // A promised export that the file declares without the keyword is a
+  // mechanical fix (prepend "export "), never a generation; only a name the
+  // file does not declare at all needs the worker. Returns the errors that remain.
+  private async contractRepair(s: Session, path: string, text: string, declared: string[], why: string): Promise<string[]> {
+    const missing = await missingExports(path, text, declared).catch(() => [] as string[]);
+    if (!missing.length) return [];
+    const decls = await topLevelDeclarations(path, text).catch(() => new Map<string, { start: number; end: number; kind: string; exported: boolean }>());
+    const lines = text.split('\n');
+    const edits: { start: number; end: number; newText: string; prepend: string }[] = [];
+    for (const n of missing) {
+      const d = n === 'default' ? undefined : decls.get(n);
+      if (d && !d.exported && /^(declare\s+)?(abstract\s+)?(type|interface|const|let|var|function|async\s+function|class|enum|namespace)\b/.test(lines[d.start - 1] ?? '') && !edits.some(e => e.start === d.start)) edits.push({ start: d.start, end: d.start, newText: '', prepend: 'export ' });
+    }
+    if (edits.length) {
+      await this.forced(s, 'replace_lines', { path, expectedHash: hash(text), edits, harness: true }, 'auto-export');
+      if (s.lastResultOk) { const now = await readFile(await safePath(this.tools.root, path), 'utf8').catch(() => text); return (await missingExports(path, now, declared).catch(() => [] as string[])).map(n => `contract: ${path} must export ${n === 'default' ? 'a default export' : n} (${why})`); }
+    }
+    return missing.map(n => `contract: ${path} must export ${n === 'default' ? 'a default export' : n} (${why})`);
+  }
+  // Harness-owned: a created file that does not parse or lacks a promised
+  // export is rewritten before any decision, at most twice; after that the
+  // check's errors carry it.
+  private async repairPending(s: Session): Promise<boolean> {
+    const r = s.pendingRepairs[0]; if (!r) return false;
+    if (r.attempts >= 2) { s.pendingRepairs.shift(); return false; }
+    r.attempts++;
+    try {
+      await this.rewriteRegion(s, r.path, r.errors, `Repair ${r.path}: the errors listed were reported by the parser or by the file's contract; make the file parse, provide what the contract requires, and keep its behaviour.`, 'repair');
+      if (!s.lastResultOk) { r.errors = [clip(s.entries.at(-1)?.text ?? '', 400)]; return true; }
+      const after = await syntaxErrors(r.path, await readFile(await safePath(this.tools.root, r.path), 'utf8')).catch(() => [] as string[]);
+      if (after.length) r.errors = after; else s.pendingRepairs = s.pendingRepairs.filter(x => x !== r);
+    } catch (e) {
+      r.errors = [...r.errors.filter(x => !x.startsWith('previous attempt:')), `previous attempt: ${clip((e as Error).message, 300)}`];
+      this.observe({ kind: 'generation_error', step: s.step, message: (e as Error).message });
+      await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${(e as Error).message}` });
+    }
+    return true;
   }
   private async forcedMove(s: Session, mv: { name: string; source: string; start: number; end: number; destination: string }): Promise<boolean> {
     const key = hash(JSON.stringify({ m: mv }));
@@ -336,6 +596,26 @@ export class Runner {
     await this.forced(s, 'move_lines', args, 'auto-move');
     return true;
   }
+  // The packages the last check could not find, imported by files this session
+  // wrote, are added to the manifest and installed with one command, once per
+  // package; the check then runs again. Packages only configuration imports
+  // are development dependencies.
+  private async installMissing(s: Session): Promise<boolean> {
+    if (!s.lastCheck || s.lastCheck.ok || !s.writes.length) return false;
+    try { await stat(await safePath(this.tools.root, 'package.json')); } catch { return false; }
+    const texts: Record<string, string> = {};
+    for (const p of s.writes) if (/\.[cm]?[jt]sx?$/.test(p)) { try { texts[p] = await readFile(await safePath(this.tools.root, p), 'utf8'); } catch { /* removed */ } }
+    const found = missingPackages(s.lastCheck.summary, texts, await installedPackages(this.tools.root)).filter(m => !s.autoFixKeys[`install:${m.name}`]);
+    if (!found.length) return false;
+    for (const m of found) s.autoFixKeys[`install:${m.name}`] = `step ${s.step}`;
+    const dev = found.filter(m => m.importers.every(configLike)); const prod = found.filter(m => !m.importers.every(configLike));
+    const commands = [prod.length ? await addPackagesCommand(this.tools.root, prod.map(m => m.name), false) : '', dev.length ? await addPackagesCommand(this.tools.root, dev.map(m => m.name), true) : ''].filter(Boolean);
+    await this.forced(s, 'bash', { command: commands.join(' && '), purpose: `Install ${found.map(m => m.name).join(', ')}: imported by ${[...new Set(found.flatMap(m => m.importers))].join(', ')} and not declared in package.json.` }, 'auto-install');
+    // The manager rewrote the manifest: the session's view of it follows.
+    try { s.hashes['package.json'] = hash(await readFile(await safePath(this.tools.root, 'package.json'), 'utf8')); } catch { /* unchanged */ }
+    s.pendingCheck = Boolean(s.lastCheckCommand);
+    return true;
+  }
   private async autoFix(s: Session): Promise<boolean> {
     for (const mv of s.pendingMoves) if (await this.forcedMove(s, mv)) return true;
     // Only errors reported in files this session edits are the harness's to fix;
@@ -346,11 +626,11 @@ export class Runner {
     // first: the extraction the objective asked for, judged by the check that follows.
     for (const mv of fixes.moveDeclarations) if (await this.forcedMove(s, { ...mv, destination: mv.into })) return true;
     // One file per step, so the check runs between files and each fix is judged alone.
-    for (const file of new Set([...Object.keys(fixes.addImports), ...Object.keys(fixes.addExportAtLines), ...Object.keys(fixes.removeImports), ...Object.keys(fixes.aliasImports)])) {
+    for (const file of new Set([...Object.keys(fixes.addImports), ...Object.keys(fixes.addExportAtLines), ...Object.keys(fixes.removeImports), ...Object.keys(fixes.aliasImports), ...Object.keys(fixes.respecImports)])) {
       // Export fixes land in the declaring file, which may be one the session never
       // touched; those stay listed for the worker but are not applied unasked.
       if (!s.writes.some(w => w === file || w.endsWith(`/${file}`) || file.endsWith(`/${w}`))) continue;
-      const key = hash(JSON.stringify({ i: fixes.addImports[file] ?? [], e: fixes.addExportAtLines[file] ?? [], r: fixes.removeImports[file] ?? [], a: fixes.aliasImports[file] ?? [] }));
+      const key = hash(JSON.stringify({ i: fixes.addImports[file] ?? [], e: fixes.addExportAtLines[file] ?? [], r: fixes.removeImports[file] ?? [], a: fixes.aliasImports[file] ?? [], s: fixes.respecImports[file] ?? [] }));
       if (s.autoFixKeys[file] === key) continue;
       s.autoFixKeys[file] = key;
       let text: string;
@@ -370,6 +650,11 @@ export class Runner {
       }
       if (fixes.removeImports[file]?.length) edits.push(...await removeImportBindings(file, text, fixes.removeImports[file]!, fixes.removeImportLines[file] ?? {}));
       for (const al of fixes.aliasImports[file] ?? []) { const e = await aliasImportBinding(file, text, al.name, al.actual, al.line); if (e && !edits.some(x => x.start === e.start)) edits.push(e); }
+      // A module specifier that resolves nowhere is rewritten in place on its import line.
+      for (const rs of fixes.respecImports[file] ?? []) {
+        const at = lines.findIndex((l, i) => Math.abs(i + 1 - rs.line) <= 6 && /^\s*(import|export)\b/.test(l) && l.includes(`'${rs.from}'`) || l.includes(`"${rs.from}"`)) + 1;
+        if (at > 0 && !edits.some(x => x.start === at)) edits.push({ start: at, end: at, newText: lines[at - 1]!.replace(`'${rs.from}'`, `'${rs.to}'`).replace(`"${rs.from}"`, `"${rs.to}"`), prepend: '' });
+      }
       if (!edits.length) continue;
       // An identical fix already rolled back is not tried again.
       const identity = hash(JSON.stringify({ route: 'replace_lines', args: { path: file, edits, expectedHash: undefined, destinationHash: undefined } }));
@@ -410,10 +695,15 @@ export class Runner {
       hashes[path] = hash(text); restored.push(path);
     }
     const what = [restored.length ? `reverted ${restored.join(', ')} to the content before the edits` : '', removed.length ? `removed ${removed.join(', ')}, which those edits created` : ''].filter(Boolean).join(' and ');
-    // The edits just reverted are now known-bad: the same edit content will not be accepted again.
-    const rejected = s.transaction.filter(t => t.paths.some(p => p in files) || !t.paths.length).map(t => ({ ...t, undoneAt: s.step, reason }));
+    // The edits just reverted are now known-bad: the same edit content will not
+    // be accepted again. A file creation is never among them.
+    const rejected = s.transaction.filter(t => t.route !== 'create_file' && (t.paths.some(p => p in files) || !t.paths.length)).map(t => ({ ...t, undoneAt: s.step, reason }));
     s.editEvidence = s.editEvidence.filter(e => !rejected.some(r => r.step === e.step));
     s.rejectedEdits = [...s.rejectedEdits, ...rejected].slice(-20);
+    // A decided fix the check rejected counts against the file version it was
+    // generated from, like a refused one: after three, the fix is not offered
+    // again for that version, and the errors stay work for another route.
+    for (const r of rejected) if (r.kind === 'decided-fix') for (const p of r.paths) if (hashes[p]) { const k = `${p}@${hashes[p]}`; (s.fixAttempts ??= {})[k] = (s.fixAttempts[k] ?? 0) + 1; }
     s.transaction = [];
     await this.evidence(s, 'undo', { ok: true, changed: [...restored, ...removed], hashes, text: `Rolled back: ${what} made after the check at step ${s.previousCheck?.step ?? 'start'}, because the check at step ${s.lastCheck?.step} was worse (${reason}). Those exact edits are now rejected and will not run again; make a different, smaller change.` });
     // Restored content counts as read only if it was read at that hash (a write
@@ -469,17 +759,31 @@ export class Runner {
           await this.store.save(s);
           continue;
         }
+        // A created file that does not parse, or lacks a promised export, is
+        // repaired before it is checked: cheaper than a check, a decision and a fix.
+        if (s.pendingRepairs.length && this.config.allowWrite && await this.repairPending(s)) { await this.store.save(s); continue; }
+        // A package a written file imports and the manifest lacks is installed
+        // by code: a mechanical repair, never a manifest edit to generate.
+        if (this.config.allowBash && this.config.allowWrite && await this.installMissing(s)) { await this.store.save(s); continue; }
         if (s.pendingCheck && s.lastCheckCommand && this.config.allowBash) {
           s.pendingCheck = false;
           await this.forced(s, 'bash', { command: s.lastCheckCommand, purpose: 'Verification after the last edit; re-running the check command.' }, 'auto-check');
           await this.store.save(s);
           continue;
         }
-        // Resolved fixes after a failing check; the plan's remaining targets after any check.
-        // Verification is inferred after edits; later attempts wait for the change set to grow.
-        if (!s.lastCheckCommand && this.config.allowBash && s.writes.length && s.checkInferences < 6 && (s.checkInferredFor < 0 || s.writes.length - s.checkInferredFor >= (s.checkInferences < 2 ? 1 : 3)) && await this.inferCheck(s)) { await this.store.save(s); continue; }
+        // Verification is selected once something exists to verify, and tried
+        // again only when a manifest or configuration file changed since the
+        // last trial: that, not the count of edits, is what makes a build behave differently.
+        if (!s.lastCheckCommand && this.config.allowBash && s.writes.length && s.checkInferences < 6) {
+          // The trial is repeated when configuration changed, and every few
+          // files otherwise: a build with no inputs behaves differently once it has some.
+          const key = hash(JSON.stringify([s.writes.filter(configLike).map(p => [p, s.hashes[p] ?? '']), Math.floor(s.writes.length / 4)]));
+          if (key !== s.checkTrialKey) { s.checkTrialKey = key; if (await this.inferCheck(s)) { await this.store.save(s); continue; } }
+        }
         if ((s.pendingMoves.length || (s.lastCheck && !s.lastCheck.ok)) && this.config.allowWrite && await this.autoFix(s)) { await this.store.save(s); continue; }
-        if (s.lastCheck && !s.lastCheck.ok && s.focusReadAt !== s.lastCheck.step) {
+        // Without a ledger the worker edits by line number from a read; with one,
+        // a fix is a region rewrite from text code already holds, so no read.
+        if (s.lastCheck && !s.lastCheck.ok && s.focusReadAt !== s.lastCheck.step && !s.ledger.length) {
           s.focusReadAt = s.lastCheck.step;
           const regions = this.focusRegions(s);
           if (regions.length) { await this.forced(s, 'read_files', { files: regions }, 'auto-read'); await this.store.save(s); continue; }
@@ -500,10 +804,11 @@ export class Runner {
         if (this.config.ledger && !s.ledgerBuilt && await this.buildLedger(s)) { await this.store.save(s); continue; }
         // Jev decides the step from a small task record and code-enumerated actions.
         // Verification, rollback, resolved fixes and ledger moves never reach it: code owns those.
-        const readyNow = Boolean(s.lastCheck?.ok && s.editEvidence.length && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && !s.autoUndo
-          && staleFor(s).length === 0 && !s.missingNames.length && !s.pendingMoves.length && !s.ledger.some(d => d.status === 'pending' && d.kind === 'move' && !d.optional) && s.finishTriedAtCheck !== s.lastCheck.step);
+        const readyNow = readyToFinish(s);
         let route: Route | null = null; let harnessNote: string | undefined; let needsUser: number | null = null;
-        let target: { path: string; start: number; end: number } | null = null; let createTarget: { path: string; deliverable: Deliverable } | null = null;
+        let target: { path: string; start: number; end: number } | null = null; let decidedDeliverable: Deliverable | null = null;
+        // A decided edit's failure counts against its deliverable, never against a route.
+        const chargeDeliverable = (why: string) => { if (!decidedDeliverable) return; decidedDeliverable.attempts = (decidedDeliverable.attempts ?? 0) + 1; if (decidedDeliverable.attempts >= 3) { decidedDeliverable.unresolvable = true; decidedDeliverable.note = `set aside after ${decidedDeliverable.attempts} failed attempts: ${clip(why, 160)}`; } };
         const cands = this.config.ledger ? candidates(s, this.config, readyNow) : [];
         if (cands.length > 2) {
           const record = taskRecord(s); const stepQ = stepQuestions(cands);
@@ -525,18 +830,44 @@ export class Runner {
           if (d.kind === 'search' && d.target?.name) { await this.forced(s, 'search_codebase', { query: d.target.name, path: '.', mode: 'text' }, 'decided-search'); await this.store.save(s); continue; }
           if (d.kind === 'finish') route = 'finish';
           else if (d.kind === 'ask') route = 'ask_user';
-          else if (d.kind === 'implement' && d.target?.deliverable) {
-            const dl = d.target.deliverable;
-            route = dl.kind === 'move' ? 'move_lines' : dl.kind === 'create' ? 'write' : 'replace_lines';
+          else if (d.kind === 'implement' && d.target?.deliverable && d.target.deliverable.kind === 'create') {
+            // A file is created from its contract, as code; failures count on the deliverable.
+            const dl = d.target.deliverable; const path = dl.to ?? dl.name ?? '';
+            if (s.phase === 'inspect') s.phase = 'implement';
+            try { await this.createFile(s, await this.createTarget(s, path, dl), 'decided-create'); }
+            catch (e) { this.observe({ kind: 'generation_error', step: s.step, message: (e as Error).message }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${(e as Error).message}` }); }
+            await this.store.save(s); continue;
+          } else if (d.kind === 'implement' && d.target?.deliverable) {
+            const dl = d.target.deliverable; decidedDeliverable = dl;
+            route = dl.kind === 'move' ? 'move_lines' : 'replace_lines';
             harnessNote = `Work on deliverable ${dl.id} only: ${dl.kind} ${dl.name ?? ''}${dl.from ? ` from ${dl.from}` : ''}${dl.to ? ` to ${dl.to}` : ''}. ${dl.detail}${dl.note ? ` Current status: ${dl.note}.` : ''} Produce the single ${route} action that advances it.`;
             const p = route === 'replace_lines' ? (ledgerFile(s, dl.to ?? dl.from) ?? null) : null;
-            if (p && s.knownFiles.includes(p)) target = { path: p, start: 1, end: 250 };
-            if (route === 'write' && dl.kind === 'create') { const path = dl.to ?? dl.name ?? ''; if (path) { createTarget = { path, deliverable: dl }; target = { path, start: 1, end: 1 }; } }
+            if (p && (s.knownFiles.includes(p) || s.writes.includes(p))) target = { path: p, start: 1, end: 250 };
+          } else if (d.kind === 'verify' && d.target?.name && d.target.deliverable) {
+            // The design's own verification command: run by code, judged like a check.
+            const dl = d.target.deliverable; dl.attempts = (dl.attempts ?? 0) + 1;
+            await this.forced(s, 'bash', { command: d.target.name, purpose: `Run ${d.target.name}: the design's verification ${dl.id} (${clip(dl.detail, 120)}).` }, 'decided-verify');
+            await refreshLedger(this.tools.root, s).catch(() => {});
+            // A rejection whose unmet items were verifications is answered by their runs.
+            const f = s.completionFeedback;
+            if (f && !f.addressed && f.unmet?.length && f.unmet.every(id => s.ledger.find(x => x.id === id)?.status === 'done'))
+              s.completionFeedback = { ...f, addressed: true, awaitingEvidence: false, text: `The completion proposed at step ${f.step} was rejected (${clip(f.text.replace(/^Completion rejected /, ''), 300)}); the verifications it named have since run and passed. Propose finish again.` };
+            await this.store.save(s); continue;
           } else if (d.kind === 'fix' && d.target?.path) {
-            route = 'replace_lines';
-            const v = s.lastCheck ? Object.entries(s.lastCheck.summary.byFile).find(([f]) => d.target!.path!.endsWith(f) || f.endsWith(d.target!.path!))?.[1] : undefined;
-            harnessNote = `Fix the verification errors in ${d.target.path} at lines ${(v?.lines ?? []).join(', ')}: ${(v?.samples ?? []).join(' | ')}. Edit only those lines.`;
-            const lines = v?.lines ?? []; target = { path: d.target.path, start: lines.length ? Math.max(1, Math.min(...lines) - 25) : 1, end: lines.length ? Math.max(...lines) + 40 : 250 };
+            // A fix is a region rewrite from the text code holds: no read, no line arithmetic.
+            const v = s.lastCheck && d.id !== 'fix:setup' ? Object.entries(s.lastCheck.summary.byFile).find(([f]) => d.target!.path!.endsWith(f) || f.endsWith(d.target!.path!))?.[1] : undefined;
+            if (s.phase === 'inspect') s.phase = 'implement';
+            const fixKey = `${d.target.path}@${s.hashes[d.target.path] ?? ''}`;
+            try {
+              const ok = await this.rewriteRegion(s, d.target.path, (v?.diagnostics?.length ? v.diagnostics : v?.samples) ?? d.target.errors ?? [], d.id === 'fix:setup' ? `Fix ${d.target.path} so that dependencies install: the package manager reported the errors listed (a version that does not exist, a package that cannot be found). Use versions that exist.` : `Fix the verification errors the check reports in ${d.target.path}${v?.lines.length ? ` at lines ${v.lines.join(', ')}` : ''}; the check command was ${s.lastCheckCommand ?? 'the configured check'}.`, 'decided-fix');
+              if (!ok) (s.fixAttempts ??= {})[fixKey] = (s.fixAttempts[fixKey] ?? 0) + 1;
+            } catch (e) {
+              (s.fixAttempts ??= {})[fixKey] = (s.fixAttempts[fixKey] ?? 0) + 1;
+              this.observe({ kind: 'generation_error', step: s.step, message: (e as Error).message }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${(e as Error).message}` });
+            }
+            await this.store.save(s); continue;
+          } else if (d.kind === 'free' && d.id === 'fix:project') {
+            harnessNote = `The verification reports errors it attributes to no file: ${(d.target?.errors ?? []).join(' | ')}. Propose the one action that addresses them: create the missing file, edit the file responsible, or run the command that shows more.`;
           }
           // A line edit needs the file as it is now: read it first, and re-decide next step.
           if (target && route === 'replace_lines' && s.readHashes[target.path] !== s.hashes[target.path]) {
@@ -549,16 +880,16 @@ export class Runner {
         const questions = routeQuestions(s, this.config);
         // A passing check after edits, with nothing pending, is the moment to propose
         // completion: the audit judges the proposal, so the harness makes it once per
-        // check rather than leaving the worker to read until it feels ready.
-        const readyToFinish = Boolean(s.lastCheck?.ok && s.editEvidence.length && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && !s.autoUndo
-          && staleFor(s).length === 0 && !s.missingNames.length && !s.pendingMoves.length && !s.ledger.some(d => d.status === 'pending' && d.kind === 'move') && s.finishTriedAtCheck !== s.lastCheck.step && 'finish' in (questions.route as { criteria: Record<string, string> }).criteria);
-        if (readyToFinish) s.finishTriedAtCheck = s.lastCheck!.step;
+        // check rather than leaving the worker to read until it feels ready. The
+        // same readiness offers the finish candidate: one policy, one place.
+        const proposeFinish = readyNow && (this.config.allowBash || s.lastCheck?.ok === true);
+        if (proposeFinish) s.finishTriedAtCheck = s.lastCheck!.step;
         const decided = route !== null;
         const jevStarted = performance.now();
-        const state = decided ? null : decisionState(s);
-        const answers: Answers = decided ? { route: { type: 'choice', choice: route!, confidence: 1, probabilities: { [route!]: 1 } } } : await this.jev.decide(state, questions, { step: s.step, phase: 'routing-and-context' });
-        if (readyToFinish) { answers.route = { type: 'choice', choice: 'finish', confidence: 1, probabilities: { finish: 1 } }; await this.store.log('auto-finish', { step: s.step, check: s.lastCheck!.step }); }
-        if (!decided) this.observe({ kind: 'jev', step: s.step, ms: performance.now() - jevStarted, questions: Object.keys(questions).length, stateBytes: Buffer.byteLength(JSON.stringify(state)),
+        const state = decided || proposeFinish ? null : decisionState(s);
+        const answers: Answers = decided ? { route: { type: 'choice', choice: route!, confidence: 1, probabilities: { [route!]: 1 } } } : proposeFinish ? { route: { type: 'choice', choice: 'finish', confidence: 1, probabilities: { finish: 1 } } } : await this.jev.decide(state, questions, { step: s.step, phase: 'routing-and-context' });
+        if (proposeFinish && !decided) { route = 'finish'; await this.store.log('auto-finish', { step: s.step, check: s.lastCheck!.step }); }
+        if (!decided && !proposeFinish) this.observe({ kind: 'jev', step: s.step, ms: performance.now() - jevStarted, questions: Object.keys(questions).length, stateBytes: Buffer.byteLength(JSON.stringify(state)),
           route: answers.route?.type === 'choice' ? Object.entries(answers.route.probabilities).sort((a, b) => b[1] - a[1]) : [],
           nouls: Object.fromEntries(Object.entries(answers).filter(([, a]) => a.type === 'noul').map(([k, a]) => [k, (a as { noul: number }).noul])) });
         const criteria = (questions.route as { criteria: Record<string, string> }).criteria;
@@ -566,7 +897,7 @@ export class Runner {
         if (!route) route = confidentChoice(routeAnswer, this.config) as Route | null;
         // finish proposes a summary, not completion. Audit that concrete proposal
         // below instead of redirecting a finish vote into unrelated inspections.
-        if (!decided && (!route || !Object.hasOwn(criteria, route)) && routeAnswer?.type === 'choice') {
+        if (!decided && !proposeFinish && (!route || !Object.hasOwn(criteria, route)) && routeAnswer?.type === 'choice') {
           // Probability spread thinly over many options is not the same as not
           // knowing. Re-ask among the leading candidates before pausing.
           const leading = Object.entries(routeAnswer.probabilities).sort((a, b) => b[1] - a[1]).map(([k]) => k).filter(k => Object.hasOwn(criteria, k)).slice(0, 2);
@@ -591,7 +922,7 @@ export class Runner {
             if (!route && again.route?.type === 'choice') {
               // Ties go to the action that changes state: edit before check, check
               // before read, read before search. The rule is logged with the choice.
-              const preference = ['replace_lines', 'write', 'move_lines', 'bash', 'read_files', 'search_codebase', 'tasks', 'finish', 'ask_user'];
+              const preference = ['replace_lines', 'write', 'create_file', 'move_lines', 'bash', 'read_files', 'search_codebase', 'tasks', 'finish', 'ask_user'];
               const top = Object.entries(again.route.probabilities).sort((a, b) => (b[1] - a[1]) || (preference.indexOf(a[0]) - preference.indexOf(b[0])))[0]!;
               if (top[1] >= this.config.routeProbability * .5 && Object.hasOwn(criteria, top[0])) {
                 route = top[0] as Route;
@@ -600,7 +931,7 @@ export class Runner {
             }
           }
         }
-        if (!route || (!decided && !Object.hasOwn(criteria, route)))
+        if (!route || (!decided && !proposeFinish && !Object.hasOwn(criteria, route)))
           throw new Error('Jev route is uncertain; paused without executing an action');
         // The worker can batch related writes. Only enter verify after it has
         // selected the validation action, so a stale readiness judgement never
@@ -618,31 +949,31 @@ export class Runner {
         if (target && route === 'replace_lines' && harnessNote) {
           try { const text = await readFile(await safePath(this.tools.root, target.path), 'utf8'); focusedTarget = { path: target.path, text, hash: hash(text), start: target.start, end: Math.min(target.end, target.start + 249), note: harnessNote }; } catch { focusedTarget = null; }
         }
-        let prompt = focusedTarget ? focusedMessages(s, route, focusedTarget) : createTarget ? await this.createMessages(s, createTarget.path, createTarget.deliverable) : messages(s, route, harnessNote, currentSource);
+        let prompt = focusedTarget ? focusedMessages(s, route, focusedTarget) : messages(s, route, harnessNote, currentSource);
         let counted = await this.bonsai.count(prompt);
         let forced = 0;
         while (counted.tokens > this.config.workingTokens) {
           if (!evictOne(s)) throw new Error('Pinned objective, instructions and ledger exceed working context; reduce them or increase workingTokens');
           forced++;
-          prompt = messages(s, route, undefined, currentSource); counted = await this.bonsai.count(prompt);
+          prompt = focusedTarget ? focusedMessages(s, route, focusedTarget) : messages(s, route, undefined, currentSource); counted = await this.bonsai.count(prompt);
         }
         if (forced) { s.lastCompact = s.step; await this.store.log('compact', { step: s.step, removed: forced, reason: 'hard-budget' }); }
         s.lastPromptTokens = counted.tokens;
         this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
         let args: Record<string, any>;
-        // When edits are withheld until a verification runs and Jev routes to bash,
-        // the required command is already known: run it, do not ask the worker to
-        // guess one (it reaches for greps, which never count as the check).
-        const autoCheck = route === 'bash' && s.editsSinceCheck >= 3 && s.lastCheckCommand;
-        if (!autoCheck) await this.logPrompt(s, route, prompt, counted.tokens, 1);
+        await this.logPrompt(s, route, prompt, counted.tokens, 1);
         try {
-          if (autoCheck) {
-            args = { command: s.lastCheckCommand, purpose: 'Required verification after edits; re-running the last check command.' };
-            this.observe({ kind: 'generated', step: s.step, route, meta: null, args });
-            await this.store.log('auto-check', { step: s.step, command: s.lastCheckCommand });
-          } else {
-          args = await this.bonsai.generate(prompt, schemas[route], .2, { step: s.step, route });
+          {
+          args = await this.bonsai.generate(prompt, focusedTarget ? focusedEditSchema : schemas[route], .2, { step: s.step, route });
           this.observe({ kind: 'generated', step: s.step, route, meta: this.bonsai.lastMeta ?? null, args });
+          // Code fills what it knows before anything is judged: a focused edit
+          // gets its decided path and current hash whatever the worker echoed,
+          // and a write meant to create a file that does not exist is a creation.
+          if (focusedTarget) args = { path: focusedTarget.path, expectedHash: focusedTarget.hash, edits: args.edits };
+          if (route === 'write' && args.expectedHash === 'new' && typeof args.path === 'string' && !(await stat(await safePath(this.tools.root, args.path, true)).then(() => true, () => false))) {
+            await this.store.log('write-as-create', { step: s.step, path: args.path });
+            route = 'create_file'; args = { path: args.path, content: String(args.newText ?? '') };
+          }
           // An action already executed in this session yields nothing new: record a
           // generation failure naming the earlier result and let Jev route again.
           // A repeat is pointless only while its result is still in evidence; once
@@ -652,7 +983,7 @@ export class Runner {
           const searchKey = (a: Record<string, any>) => `${a.mode}:${a.query} in ${a.path}`;
           // Reads and searches are keyed with the current file hashes: after an
           // edit, the same read is a new action, not a repeat.
-          const actionKey = (a: Record<string, any>) => Runner.actionKey(s, route, a);
+          const actionKey = (a: Record<string, any>) => Runner.actionKey(s, route as Route, a);
           // Rejected edits are matched on content, not on the file hash: after a
           // rollback the same bad edit must stay refused.
           const identityOf = (a: Record<string, any>) => hash(JSON.stringify({ route, args: { ...a, expectedHash: undefined, destinationHash: undefined } }));
@@ -676,28 +1007,39 @@ export class Runner {
             throw new Error(`Bonsai repeated the ${route} action from step ${earlier} (${known}); not executed. Choose different arguments or another action`);
           }
           }
-          if (target && editRoutes.includes(route) && typeof args.path === 'string' && !(args.path === target.path || args.path.endsWith(`/${target.path}`) || target.path.endsWith(`/${args.path}`)))
-            throw new Error(`The decided action is an edit of ${target.path}; the generated arguments edit ${args.path} instead. Produce the ${route} for ${target.path} only.`);
           if (route === 'move_lines' && s.ledger.length) { const why = await this.moveOutsideLedger(s, args); if (why) throw new Error(why); }
           // The worker may not hand a decision to the user that Jev judged the task does not need.
           if (route === 'ask_user' && needsUser !== null && needsUser < .5) throw new Error(`ask_user refused: the task does not need the user (judged ${needsUser.toFixed(2)}). Decide it yourself from the objective and the deliverables: ${clip(String(args.question ?? ''), 200)}`);
-          if (route === 'bash' && typeof args.command === 'string' && readOnlyCommand(args.command) && s.inspectionsSinceAction >= 4 && (s.ledger.length || Object.keys(s.readHashes).length))
-            throw new Error(`Read-only command refused: ${s.inspectionsSinceAction} inspections have run since the last action and the evidence already holds these files. Edit, run the build or tests, or finish.`);
           if (route === 'move_lines' && typeof args.destination === 'string' && args.destinationHash === 'new') {
             const anchored = await anchorPath(this.tools.root, ledgerFile(s, args.source) ?? args.source, args.destination);
             if (anchored !== args.destination) { await this.store.log('anchored-path', { step: s.step, from: args.destination, to: anchored }); args = { ...args, destination: anchored }; }
           }
           generationFailures = 0;
         } catch (e) {
-          // Two failures in a row on one route: keep the session going by taking
-          // that route off the table for the next decision, so Jev picks another
-          // way forward. Four in a row means the worker cannot act on this state.
-          if (++generationFailures >= 4) throw e;
-          if (generationFailures >= 2) s.blockedRoute = route;
+          // On the free path, two failures in a row on one route take it off the
+          // table for the next decision, so Jev picks another way forward; four
+          // in a row mean the worker cannot act on this state. A decided action
+          // never blocks a route: its failure belongs to its deliverable.
+          if (!decided) { if (++generationFailures >= 4) throw e; if (generationFailures >= 2) s.blockedRoute = route; }
+          chargeDeliverable((e as Error).message);
           this.observe({ kind: 'generation_error', step: s.step, message: (e as Error).message });
           await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${(e as Error).message}` });
           await this.store.save(s);
           continue;
+        }
+        // A creation chosen on the free path names only the file: the content is
+        // generated as code, and only once the path is known to be free.
+        if (route === 'create_file') {
+          const path = String(args.path); const purpose = String(args.purpose ?? harnessNote ?? '');
+          if (s.phase === 'inspect') s.phase = 'implement';
+          const dl: Deliverable = s.ledger.find(d => d.kind === 'create' && d.to && same(d.to, path) && d.status !== 'done') ?? { id: 'free', kind: 'create', name: path, to: path, detail: purpose || `Create ${path} as the objective requires.`, required: 1, status: 'pending' };
+          try {
+            const exists = await safePath(this.tools.root, path, true).then(p => stat(p)).then(() => true, () => false);
+            if (exists) throw new Error(`${path} already exists; edit it with replace_lines or write instead of creating it`);
+            if (typeof args.content === 'string' && args.content.trim()) await this.forced(s, 'create_file', { path, content: args.content }, 'write-as-create');
+            else await this.createFile(s, await this.createTarget(s, path, dl), 'free-create');
+          } catch (e) { if (!decided) generationFailures++; this.observe({ kind: 'generation_error', step: s.step, message: (e as Error).message }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${(e as Error).message}` }); }
+          await this.store.save(s); continue;
         }
         if (route === 'finish') {
           // The worker may take seconds to summarize. Never accept a passing
@@ -721,19 +1063,28 @@ export class Runner {
           await this.store.log('completion-diff', { step: s.step, files: diff.files.map(f => ({ ...f, hunks: f.hunks ? clip(f.hunks, 2000) : undefined })), moved: diff.moved });
           // The diff supersedes edit evidence and recent excerpts: the audit's base
           // state omits them, and the diff chunks are sized from the bytes left.
-          const base = (extra: Record<string, unknown>) => decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', editEvidence: [], evidence: [], currentSource, lastCheck: s.lastCheck && { step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors }, ...extra });
-          const baseBytes = Buffer.byteLength(JSON.stringify(base({})));
           const evidence = await completionEvidence(this.tools.root, s, diff);
           const changedFiles = diff.files.map(f => f.path);
           const implemented: Record<string, number> = {}; let outOfScope = 0; let objectiveMet: number | null = null;
-          const diffSummary = clip(diff.files.map(f => `${f.path}${f.created ? ' (created)' : ''}: +${f.declarationsAdded.length}/-${f.declarationsRemoved.length} declarations, +${f.importsAdded.length}/-${f.importsRemoved.length} imports${f.hunks ? `\n${clip(f.hunks, 700)}` : ''}`).join('\n'), 6000);
-          // Chunk by deliverable when the evidence would exceed Jev's budget; each call carries only its items' evidence.
+          let diffSummary = clip(diff.files.map(f => `${f.path}${f.created ? ' (created)' : ''}: +${f.declarationsAdded.length}/-${f.declarationsRemoved.length} declarations, +${f.importsAdded.length}/-${f.importsRemoved.length} imports${f.hunks ? `\n${clip(f.hunks, 700)}` : ''}`).join('\n'), 6000);
+          // The audit state is sized from Jev's budget: the base (diff summary,
+          // source excerpts, deliverables) shrinks in stages until the evidence
+          // has room, and the evidence is chunked by deliverable into the room
+          // that is left; an audit never pauses on size.
+          const limit = 20000; let source = currentSource;
+          const baseBytes = () => Buffer.byteLength(JSON.stringify(completionState(s, {}, changedFiles, source, diffSummary)));
+          if (baseBytes() > limit - 6000) source = source?.map(f => ({ path: f.path, hash: f.hash, facts: f.facts.slice(0, 6) }));
+          if (baseBytes() > limit - 6000) diffSummary = clip(diffSummary, 2500);
+          if (baseBytes() > limit - 6000) source = undefined;
+          if (baseBytes() > limit - 6000) diffSummary = clip(diffSummary, 800);
+          const room = Math.max(3000, limit - baseBytes());
+          for (const d of s.ledger) if (Buffer.byteLength(evidence[d.id] ?? '') + 200 > room) evidence[d.id] = clip(evidence[d.id] ?? '', room - 400);
           const groups: Deliverable[][] = []; let group: Deliverable[] = []; let bytes = 0;
-          for (const d of s.ledger) { const size = Buffer.byteLength(evidence[d.id] ?? '') + 200; if (bytes + size > 14000 && group.length) { groups.push(group); group = []; bytes = 0; } group.push(d); bytes += size; }
+          for (const d of s.ledger) { const size = Buffer.byteLength(evidence[d.id] ?? '') + 200; if (bytes + size > room && group.length) { groups.push(group); group = []; bytes = 0; } group.push(d); bytes += size; }
           if (group.length || !groups.length) groups.push(group);
           const perItem: Record<string, { supports: number; contradicts: number; saysNothing: number }> = {}; const unmet: string[] = [];
           for (const [i, items] of groups.entries()) {
-            const state = completionState(s, Object.fromEntries(items.map(d => [d.id, evidence[d.id] ?? ''])), changedFiles, currentSource, diffSummary);
+            const state = completionState(s, Object.fromEntries(items.map(d => [d.id, evidence[d.id] ?? ''])), changedFiles, source, diffSummary);
             const answers = await this.jev.decide(state, auditQuestions(items, items.length === 0 && i === 0, unaccountedFiles(s, changedFiles)), { step: s.step, phase: 'completion-check' });
             const verdict = auditVerdict(answers, items, this.config);
             Object.assign(perItem, verdict.perItem); unmet.push(...verdict.unmet); outOfScope = Math.max(outOfScope, verdict.scopeCreep); if (verdict.objectiveMet !== null) objectiveMet = verdict.objectiveMet;
@@ -746,7 +1097,7 @@ export class Runner {
             const unmetItems = s.ledger.filter(d => unmet.includes(d.id));
             const feedback = `Completion rejected (${objectiveMet !== null ? `objective met=${objectiveMet.toFixed(2)}, ` : ''}out-of-scope changes=${outOfScope.toFixed(2)}). ${unmetItems.length ? `Deliverables the evidence does not show as done: ${unmetItems.map(d => `${d.id} ${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} [${d.status}${d.note ? `: ${d.note}` : ''}; supports ${(perItem[d.id]?.supports ?? 0).toFixed(2)}, contradicts ${(perItem[d.id]?.contradicts ?? 0).toFixed(2)}]`).join('; ')}. ` : ''}${outOfScope >= threshold ? 'The diff contains changes the objective did not ask for; revert them. ' : ''}Continue the implementation; the harness re-proposes completion after the next passing check.`;
             await this.evidence(s, 'finish_rejected', { ok: false, text: feedback });
-            s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true };
+            s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true, unmet: [...unmet] };
             if (s.lastCheck) s.finishTriedAtCheck = s.lastCheck.step;
             s.phase = 'implement'; s.inspectionsSinceAction = 0;
             s.lastRoute = 'finish'; s.lastResultOk = false;
@@ -783,13 +1134,15 @@ export class Runner {
         } catch (e) { result = { ok: false, text: `Tool error: ${(e as Error).message}`, stale: e instanceof StaleWriteError }; }
         s.lastRoute = route; s.lastResultOk = result.ok; s.lastWriteStale = editRoutes.includes(route) && result.stale === true;
         if (s.lastWriteStale) s.inspectionsSinceAction = 0; // the recovery read must stay available
+        if (!result.ok && !result.stale) chargeDeliverable(result.text);
         // A blocked route stays off the table until some other action succeeds.
         if (result.ok && route !== s.blockedRoute) s.blockedRoute = null;
-        // The same tool error twice in a row on an edit route means the worker is
-        // not reading the refusal: take the route away until another action lands.
+        // On the free path, the same tool error twice in a row on an edit route
+        // means the worker is not reading the refusal: take the route away until
+        // another action lands. A decided action's failure belongs to its deliverable.
         if (!result.ok && editRoutes.includes(route)) {
           const message = result.text.slice(0, 120);
-          if (s.lastToolError && s.lastToolError.route === route && s.lastToolError.message === message && s.lastToolError.step === s.step - 1) {
+          if (!decided && s.lastToolError && s.lastToolError.route === route && s.lastToolError.message === message && s.lastToolError.step === s.step - 1) {
             s.blockedRoute = route; await this.store.log('blocked-route', { step: s.step, route, reason: 'the same refusal twice in a row', message });
           }
           s.lastToolError = { route, message, step: s.step };
@@ -818,8 +1171,8 @@ export class Runner {
         const repeats = s.repetitions[signature] = (s.repetitions[signature] ?? 0) + 1;
         if (repeats >= 5) throw new Error(`The ${route} action produced an identical result five times; paused to prevent a loop`);
         // Surface the first repetition to both models; at three, take the route
-        // off the table until another action succeeds, as for generation failures.
-        if (repeats === 3) s.blockedRoute = route;
+        // off the free path's table until another action succeeds.
+        if (repeats === 3 && !decided) s.blockedRoute = route;
         if (repeats >= 2) s.lastError = [`Step ${s.step} repeated an identical ${route} action with an identical result${repeats >= 3 ? `; ${route} is withheld until another action succeeds` : ''}. Choose a different action or arguments that can produce new information.`,
           s.lastError].filter(Boolean).join(' Last error: ');
         s.stopReason = '';

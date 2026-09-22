@@ -77,12 +77,12 @@ export class Display {
       case 'context': { this.contextFill = e.tokens / e.workingTokens; this.promptTokens += e.tokens;
         const top = Object.entries(e.breakdown).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, v]) => `${n} ${k(v)}`).join(' | ');
         this.context = `${k(e.tokens)} / ${k(e.workingTokens)} working (${Math.round(100 * this.contextFill)}%) | window ${k(e.contextWindow)} (${Math.round(100 * e.tokens / e.contextWindow)}%) | ${e.entries} entries | ${top}`; break; }
-      case 'generating': this.now = `Bonsai generating ${e.route} arguments${e.attempt > 1 ? ' (retry, hotter)' : ''}`; break;
+      case 'generating': this.now = e.route === 'create_file' ? 'Bonsai writing the file as code' : `Bonsai generating ${e.route} arguments${e.attempt > 1 ? ' (retry)' : ''}`; break;
       case 'generated': { const s = generationSpeed(e.meta); if (s.perSecond) this.tps.push(s.perSecond); if (s.generated) this.generatedTokens += s.generated;
         this.bonsai = `${e.meta ? secs(e.meta.ms) : '-'} | ${s.generated ?? '?'} tokens${s.perSecond ? ` @ ${s.perSecond.toFixed(1)} tok/s` : ''}${s.promptPerSecond ? ` | prompt @ ${s.promptPerSecond.toFixed(0)} tok/s` : ''}${s.cached ? ` | ${s.cached} cached` : ''} | ${clip(JSON.stringify(e.args), 90)}`;
         this.now = `running ${e.route}`; break; }
       case 'generation_error': this.failures++; this.last = `[${e.step}] no action: ${e.message}`; this.now = 'asking Jev for the next action'; break;
-      case 'result': { if (['write', 'replace_lines', 'move_lines'].includes(e.route) && e.ok) this.edits++; if (e.route === 'bash') this.checks++; if (!e.ok) this.failures++;
+      case 'result': { if (['create_file', 'write', 'replace_lines', 'move_lines'].includes(e.route) && e.ok) this.edits++; if (e.route === 'bash') this.checks++; if (!e.ok) this.failures++;
         this.last = `[${e.step}] ${e.route} ${e.ok ? 'ok' : 'FAILED'} ${secs(e.ms)} -> ${k(e.chars)} chars: ${e.text.replace(/\s+/g, ' ')}`; this.now = 'asking Jev for the next action'; break; }
       case 'undo': this.undos++; this.last = `[${e.step}] undo: reverted ${e.files.join(', ')}`; break;
       case 'stop': this.status = `${e.status.toUpperCase()}: ${e.reason}`; this.now = 'stopped'; break;

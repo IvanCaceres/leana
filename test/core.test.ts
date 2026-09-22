@@ -7,18 +7,18 @@ import { createServer } from 'node:http';
 import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults, ledger: false };
-import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
-import { focusedCreateMessages, focusedMessages, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
+import { Bonsai, Jev, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
+import { createFileMessages, fenceFor, SYSTEM, focusedMessages, rewriteRegionMessages, trimContext, pinnedBlock, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { referenceContext, rememberReferences, scopes } from '../src/references.js';
-import { unaccountedFiles, auditQuestions, auditVerdict, candidates, completionEvidence, decideStep, stepQuestions, taskRecord } from '../src/decide.js';
-import { designFrom, anchorPath, candidatesFrom, checkSchema, completionQuestions, diffChunks, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from '../src/ledger.js';
+import { unaccountedFiles, auditQuestions, auditVerdict, candidates, commandLike, completionEvidence, decideStep, readyToFinish, runnableForever, stepQuestions, taskRecord } from '../src/decide.js';
+import { designFrom, anchorPath, candidatesFrom, checkCandidates, checkSchema, completionQuestions, configLike, contractsFor, creationOrder, deriveDeliverables, diffChunks, exportNames, importContracts, ledgerQuestions, ledgerSchema, missingExports, parseDesign, readyCreates, refreshLedger, structuralDiff, trialFacts, usageOf, usageSnippets } from '../src/ledger.js';
 import { dirtySessionConflict } from '../src/cli.js';
-import { samplingSchema, schemas, validate } from '../src/schema.js';
+import { extractCode, focusedEditSchema, samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { aliasImportBinding, missingDependencies, installCommand, repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { addPackagesCommand, aliasImportBinding, missingDependencies, missingPackages, installCommand, repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -148,13 +148,17 @@ test('Schemas reject unknown arguments and unbounded reads/tasks', () => {
   assert.throws(() => validate(schemas.read_files, { files: [] }));
   assert.throws(() => validate(schemas.tasks, { tasks: Array(13).fill({}) }));
 });
-test('llama grammar compatibility keeps runtime string limits intact', () => {
+test('llama grammar compatibility keeps runtime string limits intact, and content fields carry no cap', () => {
   const wire = samplingSchema(schemas.bash);
   assert.equal(wire.properties?.command?.maxLength, undefined);
   assert.equal(schemas.bash.properties?.command?.maxLength, 2000);
   assert.throws(() => validate(schemas.bash, { command: 'x'.repeat(2001), purpose: 'test' }), /string length 2001 exceeds the maximum 2000; shorten this field/);
-  validate(schemas.move_lines, { source: 'a', expectedHash: 'h', start: 1, end: 2, destination: 'b', destinationHash: 'new', replacement: '', prefix: 'import x;\n'.repeat(700) });
-  assert.throws(() => validate(schemas.move_lines, { source: 'a', expectedHash: 'h', start: 1, end: 2, destination: 'b', destinationHash: 'new', replacement: '', prefix: 'x'.repeat(16001) }), /args.prefix: string length 16001 exceeds/);
+  // Code and prose are never capped after generation: the grammar cannot enforce a length, so a cap on content is a rule that discards a finished generation.
+  validate(schemas.move_lines, { source: 'a', expectedHash: 'h', start: 1, end: 2, destination: 'b', destinationHash: 'new', replacement: '', prefix: 'x'.repeat(16001) });
+  validate(schemas.write, { path: 'a.ts', expectedHash: 'h', oldText: 'y'.repeat(700), newText: 'z'.repeat(30000) });
+  validate(schemas.replace_lines, { path: 'a.ts', expectedHash: 'h', edits: [{ start: 1, end: 1, newText: 'n'.repeat(20000), prepend: '' }] });
+  validate(schemas.finish, { summary: 's'.repeat(9000) });
+  assert.deepEqual(Object.keys(schemas.create_file.properties!), ['path', 'purpose']); assert.deepEqual(Object.keys(focusedEditSchema.properties!), ['edits']);
 });
 test('Filesystem boundary rejects traversal, secrets and escaping symlinks', async t => {
   const { root } = await fixture(t);
@@ -164,20 +168,31 @@ test('Filesystem boundary rejects traversal, secrets and escaping symlinks', asy
   await assert.rejects(safePath(root, '.env'));
   await assert.rejects(safePath(root, '.git/config'));
 });
-test('Writes enforce capability, exact hash, unique match and new-file semantics', async t => {
+test('Writes replace anchors in existing files; creation is create_file\'s alone, exclusive, validated after it lands', async t => {
   const { root, store } = await fixture(t);
   const path = join(root, 'a.ts'); await writeFile(path, 'one\ntwo\n');
   const args = { path: 'a.ts', expectedHash: hash('one\ntwo\n'), oldText: 'two', newText: 'three' };
   await assert.rejects(new ToolBox(root, store.artifacts, defaults).execute('write', args));
   const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
   assert((await tools.execute('write', args)).ok); assert.equal(await readFile(path, 'utf8'), 'one\nthree\n');
-  await assert.rejects(tools.execute('write', { ...args, expectedHash: 'new', oldText: '' }), /only valid for a new file/);
+  await assert.rejects(tools.execute('write', { ...args, expectedHash: 'new', oldText: '' }), (e: any) => e instanceof StaleWriteError && /not a hash/.test(e.message));
   await assert.rejects(tools.execute('write', { ...args, expectedHash: hash('one\nthree\n'), oldText: 'three', newText: 'three' }), /no change/);
   await assert.rejects(tools.execute('write', args), /Stale/);
   await assert.rejects(tools.execute('write', { ...args, expectedHash: hash('one\nthree\n'), oldText: '\n' }), /exactly once/);
-  await assert.rejects(tools.execute('write', { path: 'nested/', expectedHash: 'new', oldText: '', newText: 'bad' }), /regular file path/);
-  await tools.execute('write', { path: 'nested/new.ts', expectedHash: 'new', oldText: '', newText: 'new' });
-  assert.equal(await readFile(join(root, 'nested/new.ts'), 'utf8'), 'new');
+  await assert.rejects(tools.execute('write', { path: 'missing.ts', expectedHash: 'h', oldText: 'a', newText: 'b' }), (e: any) => e instanceof StaleWriteError && /create_file/.test(e.message));
+  await assert.rejects(tools.execute('create_file', { path: 'nested/', content: 'bad' }), /regular file path/);
+  await assert.rejects(tools.execute('create_file', { path: 'nested/new.ts', content: '  \n' }), /no content/);
+  const created = await tools.execute('create_file', { path: 'nested/new.ts', content: 'export const n = 1;\n' });
+  assert(created.ok); assert.equal(await readFile(join(root, 'nested/new.ts'), 'utf8'), 'export const n = 1;\n');
+  assert.deepEqual(created.snapshots, { 'nested/new.ts': '@new' }); assert.deepEqual(created.parseErrors, []); assert.deepEqual(created.imports, []);
+  await assert.rejects(tools.execute('create_file', { path: 'nested/new.ts', content: 'again' }), (e: any) => !(e instanceof StaleWriteError) && /already exists/.test(e.message));
+  // A created file is never refused for its shape: parse problems and relative imports are reported for the harness.
+  const broken = await tools.execute('create_file', { path: 'src/B.tsx', content: 'import { X } from "./x";\nimport type { T } from "../types";\nimport "./b.css";\nexport const B = () => <div>\n' });
+  assert(broken.ok); assert(broken.parseErrors!.length > 0); assert.deepEqual(broken.imports, [{ spec: './x', names: ['X'] }, { spec: '../types', names: ['T'], typeOnly: true }, { spec: './b.css', names: [] }]); assert.match(broken.text, /does not parse yet/);
+  const json = await tools.execute('create_file', { path: 'tsconfig.json', content: '{ "compilerOptions": { "lib": ["ES2020" "DOM"] } }\n' });
+  assert(json.ok); assert.match(json.parseErrors!.join(' '), /expected/);
+  const jsonc = await tools.execute('create_file', { path: 'tsconfig.base.json', content: '{\n  // comments allowed\n  "compilerOptions": { "strict": true },\n}\n' });
+  assert.deepEqual(jsonc.parseErrors, []);
 });
 test('Read ranges, artifact retrieval and literal search work without shell permission', async t => {
   const { root, store } = await fixture(t);
@@ -261,7 +276,7 @@ test('Hard prompt limit evicts evidence and never compacts the pinned objective'
   const { root, store, session } = await fixture(t);
   session.phase = 'verify'; session.lastCheckStep = 0; session.lastWriteStep = -1;
   session.entries = Array.from({ length: 5 }, (_, i) => ({ id: `e-${i}`, step: -i, kind: 'read', artifact: '', relevance: .1, text: 'x'.repeat(2000) }));
-  const c = { ...defaults, workingTokens: 2000, maxSteps: 1 };
+  const c = { ...defaults, workingTokens: 3500, maxSteps: 1 };
   const bonsai = { count: async (m: any) => ({ tokens: JSON.stringify(m).length, mode: 'test' }),
     generate: async (m: any) => { assert(JSON.stringify(m).includes(session.objective)); return { summary: 'done' }; } };
   const result = await new Runner(c, store, { decide: async (_s, q) => answersFor(q, 'finish') }, bonsai, root, () => {}).run(session);
@@ -341,7 +356,7 @@ test('A passing check in verify lets Jev return to implementation instead of rep
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }),
     generate: async () => ({ path: 'a.ts', expectedHash: hash('one\n'), oldText: 'one', newText: 'two' }) };
   const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.deepEqual(offered[0]!.sort(), ['ask_user', 'bash', 'finish', 'move_lines', 'read_files', 'replace_lines', 'write']);
+  assert.deepEqual(offered[0]!.sort(), ['ask_user', 'bash', 'create_file', 'finish', 'move_lines', 'read_files', 'replace_lines', 'write']);
   assert.equal(result.phase, 'implement'); assert.equal(result.lastResultOk, true); assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'two\n');
   assert.equal(result.lastWriteStep, 3); assert.equal(result.lastCheckStep, 2);
 });
@@ -455,9 +470,9 @@ test('An incomplete but passing implementation continues through an edit and ver
     selected = s.step === 3 ? 'read_files' : s.step === 4 ? 'write' : 'finish';
     return answersFor(q, selected);
   } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => selected === 'read_files'
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.read_files
     ? { files: [{ path: 'value.mjs', start: 1, end: 10 }] }
-    : selected === 'write' ? { path: 'value.mjs', expectedHash: s.hashes['value.mjs'], oldText: 'value = 1', newText: 'value = 2' }
+    : schema === schemas.write ? { path: 'value.mjs', expectedHash: s.hashes['value.mjs'], oldText: 'value = 1', newText: 'value = 2' }
     : { summary: s.step === 2 ? 'The syntax check passes but value is still 1.' : 'Changed value to 2 and verified syntax.' } };
   const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node --check value.mjs', maxSteps: 5 }, store, jev, bonsai, root, () => {}).run(s);
   assert.equal(result.status, 'complete', result.stopReason);
@@ -823,27 +838,6 @@ test('A read repeated after the file changed is a new action and stale search di
   assert.deepEqual(Object.keys(result.searches), ['text:zzz in other.ts']);
   assert.equal(result.editsSinceCheck, 1);
 });
-test('After three edits without a check, edit routes are withheld until a verification runs', async t => {
-  const { session: s } = await fixture(t);
-  const c = { ...defaults, allowWrite: true, allowBash: true };
-  s.phase = 'implement'; s.inspectionCount = 3; s.writes = ['a.ts']; s.editsSinceCheck = 3;
-  let route = routeQuestions(s, c).route!;
-  assert(route.type === 'choice'); assert(!('write' in route.criteria)); assert(!('replace_lines' in route.criteria)); assert(!('move_lines' in route.criteria));
-  assert.match(route.criteria.bash!, /Three edits/); assert('read_files' in route.criteria);
-  s.editsSinceCheck = 2;
-  route = routeQuestions(s, c).route!;
-  assert(route.type === 'choice'); assert('write' in route.criteria);
-  s.editsSinceCheck = 3;
-  route = routeQuestions(s, { ...c, allowBash: false }).route!;
-  assert(route.type === 'choice'); assert('write' in route.criteria);
-  const { root, store } = await fixture(t);
-  const runner = new Runner(c, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
-  s.step = 9; await runner.evidence(s, 'bash', { ok: false, verification: true, text: 'failed' });
-  assert.equal(s.editsSinceCheck, 0);
-  s.step = 10; await runner.evidence(s, 'write', { ok: true, changed: ['a.ts'], text: 'Updated' });
-  assert.equal(s.editsSinceCheck, 1);
-});
-
 test('Line-addressed edits require a read of the current version and snapshot the previous content', async t => {
   const { root, store, session } = await fixture(t);
   await writeFile(join(root, 'a.ts'), 'one\ntwo\nthree\n');
@@ -904,7 +898,7 @@ test('Check summaries count errors per file, single out syntax errors, and keep 
   const s = summarizeCheck(JSON.stringify({ command: 'lint', output, code: 1 }));
   assert.equal(s.errors, 5); assert.equal(s.syntax, 2);
   assert.deepEqual(Object.keys(s.byFile), ['src/cli.ts', 'src/cli/deps.ts', 'tests-ts/a.test.ts']);
-  assert.deepEqual(s.byFile['src/cli.ts'], { count: 2, syntax: 2, resolution: 0, lines: [3832, 3839], samples: ["src/cli.ts(3832,1): error TS1005: ':' expected.", 'src/cli.ts(3839,17): error TS1109: Expression expected.'] });
+  assert.deepEqual(s.byFile['src/cli.ts'], { count: 2, syntax: 2, resolution: 0, lines: [3832, 3839], samples: ["src/cli.ts(3832,1): error TS1005: ':' expected.", 'src/cli.ts(3839,17): error TS1109: Expression expected.'], diagnostics: ["src/cli.ts(3832,1): error TS1005: ':' expected.", 'src/cli.ts(3839,17): error TS1109: Expression expected.'] });
   assert.equal(s.byFile['src/cli/deps.ts']!.syntax, 0);
   assert.equal(summarizeCheck('all good').errors, 0);
 });
@@ -978,7 +972,7 @@ test('Reports and verbose progress expose prompts, Jev exchanges, latency, speed
   await store.log('bonsai', { requestId: 'b1', step: 1, route: 'read_files', ms: 2000, usage: { completion_tokens: 70, prompt_tokens: 3000 }, timings: { predicted_per_second: 35.5, prompt_per_second: 430 }, finishReason: 'stop' });
   const html = await renderReport(store.path);
   assert(html.includes('<title>Leana session report</title>')); assert(html.includes('"route":"read_files"')); assert(html.includes('00001-prompt.json'));
-  assert(html.includes('"predicted_per_second":35.5')); assert(html.includes('implementation worker in Leana')); assert(html.includes('"instructions":"Choose ONE valid next action'));
+  assert(html.includes('"predicted_per_second":35.5')); assert(html.includes('the worker in Leana')); assert(html.includes('"instructions":"Choose ONE valid next action'));
   assert(html.includes('README.md sha256=')); assert(!html.includes('</script>' + '</script>'));
   const steps = collectSteps((await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l)));
   assert.equal(steps.length, 1); assert.equal(steps[0]!.jev.length, 1); assert.equal(steps[0]!.jev[0]!.ms, 412); assert.equal(steps[0]!.prompts[0]!.tokens, 3000);
@@ -1058,7 +1052,7 @@ test('missingNames are pinned after a failing check and cleared by a passing one
   const runner = new Runner({ ...defaults, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
   s.step = 2; await runner.evidence(s, 'bash', { ok: false, verification: true, text: JSON.stringify({ output: "b.ts(1,1): error TS2304: Cannot find name 'z'." }) });
   assert.deepEqual(s.missingNames, [{ name: 'z', inFile: 'b.ts', importedBy: 'a.ts', importLine: 'import { z } from "./z.js";' }]);
-  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, aliasImports: {}, moveDeclarations: [], unresolved: [], total: 1 };
+  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, aliasImports: {}, respecImports: {}, moveDeclarations: [], unresolved: [], total: 1 };
   const pinned = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, total: 1 };
   assert.deepEqual((decisionState(s) as any).missingNames, grouped); assert.deepEqual(promptFields(messages(s, 'replace_lines')).missingNames, pinned);
   s.step = 3; await runner.evidence(s, 'bash', { ok: true, verification: true, check: true, text: 'passed' });
@@ -1108,7 +1102,7 @@ test('The worker prompt is one user message per pinned block and per evidence en
   assert.deepEqual(JSON.parse(prompt[2]!.content), { evidence: { id: 'e1', kind: 'read_files', artifact: '@artifact/00001.txt', text: 'a' } });
   assert.deepEqual(JSON.parse(prompt[3]!.content).evidence.id, 'e2');
   const last = Object.keys(JSON.parse(prompt[4]!.content));
-  assert.equal(last[0], 'phase'); assert.deepEqual(last.slice(-3), ['selectedAction', 'actionInstructions', 'argumentSchema']);
+  assert.equal(last[0], 'role'); assert.equal(last[1], 'phase'); assert.deepEqual(last.slice(-3), ['selectedAction', 'actionInstructions', 'argumentSchema']);
   // appending evidence leaves every earlier message byte-identical, so the server can resume from that boundary
   s.entries.push({ id: 'e3', step: 3, kind: 'bash', artifact: '', text: 'c', relevance: .5 });
   const next = messages(s, 'read_files');
@@ -1175,21 +1169,6 @@ test('Not-exported errors resolve to a ready prepend edit on the declaration lin
   assert.match(n!.note!, /replace_lines edit \{ start: 2, end: 2, newText: "", prepend: "export " \} on sdk\/src\/cli\.ts/);
 });
 
-test('When edits are withheld pending verification, bash re-runs the last check command without generation', async t => {
-  const { root, store, session } = await fixture(t);
-  await writeFile(join(root, 'check.mjs'), "console.error('a.ts(1,1): error TS2304: Cannot find name x.'); process.exit(1);\n");
-  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['a.ts']; session.editsSinceCheck = 3; session.lastCheckCommand = 'node check.mjs';
-  let generated = 0;
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => { generated++; return { command: 'grep -n x a.ts', purpose: 'look' }; } };
-  const offered: string[][] = [];
-  const jev = { decide: async (_s: unknown, q: Questions) => { offered.push(Object.keys((q.route as any).criteria)); return answersFor(q, 'bash', .1); } };
-  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.equal(generated, 0); assert(!offered[0]!.includes('replace_lines'));
-  assert.equal(result.entries[0]!.kind, 'bash'); assert.match(result.entries[0]!.text, /node check\.mjs/); assert.equal(result.editsSinceCheck, 0); assert.equal(result.lastCheck!.step, 1);
-  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
-  assert(events.some(e => e.type === 'auto-check' && e.data.command === 'node check.mjs'));
-  assert(!events.some(e => e.type === 'prompt'), 'no worker prompt was built for the automatic check');
-});
 test('The check command is remembered from the last verification', async t => {
   const { root, store, session: s } = await fixture(t);
   const runner = new Runner({ ...defaults, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
@@ -1205,7 +1184,7 @@ test('The decision state shrinks optional lists and the evidence tail before pau
   s.searches = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`text:q${i} in .`, 'z'.repeat(300)]));
   const state = decisionState(s) as any;
   assert(Buffer.byteLength(JSON.stringify(state)) <= 22000);
-  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'removeImportLines', 'aliasImports', 'moveDeclarations', 'unresolved', 'total']);
+  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'removeImportLines', 'aliasImports', 'respecImports', 'moveDeclarations', 'unresolved', 'total']);
   assert.equal(state.evidenceCount, 20); assert(state.evidence.length <= 8); assert(state.objective.includes('Fix'));
 });
 test('Panel lines are flattened to one ASCII row each', () => {
@@ -1269,18 +1248,37 @@ test('Regression rule: judged in scope, exempting structural moves, keeping net 
   assert.equal(regression(sum(100), sum(90)), 'fine'); assert.equal(regression(sum(100), sum(100)), 'fine');
   // net progress with one new syntax error is kept; no progress with a new syntax error is not
   assert.equal(regression(sum(16), sum(1, 1)), 'fine'); assert.equal(regression(sum(1), sum(1, 1)), 'worse'); assert.equal(regression(sum(696), sum(687, 6)), 'fine');
+  // Fewer syntax errors is progress whatever the total does: a file that did not parse was not checked at all.
+  assert.equal(regression(sum(1, 1), sum(4, 0)), 'fine', 'a repaired parse surfaces the errors that were always there'); assert.equal(regression(sum(2, 1), sum(2, 1)), 'fine');
   const f = (count: number, syntax = 0) => ({ count, syntax, lines: [], samples: [] });
   const before = sum(210, 0, { 'src/a.ts': f(10), 'tests/t.ts': f(200) }); const after = sum(162, 0, { 'src/a.ts': f(12), 'tests/t.ts': f(150) });
   assert.equal(regression(before, after, { files: ['sdk/src/a.ts'] }), 'worse', 'in-scope increase is a regression even when the total fell');
   assert.equal(regression(before, after), 'fine');
   assert.equal(regression(before, sum(159, 0, { 'src/a.ts': f(9), 'tests/t.ts': f(150) }), { files: ['sdk/src/a.ts'] }), 'fine');
+  // Progress in the edited file is progress whatever appears elsewhere: the
+  // check reached its next stage (the bundler after tsc) or other files.
+  assert.equal(regression(sum(1, 0, { 'src/components/Button.tsx': f(1) }), sum(2, 0, { '(other)': f(2) }), { files: ['src/components/Button.tsx'] }), 'fine', 'the fix removed its file\'s only error; the build stage\'s errors are new work');
+  assert.equal(regression(sum(2, 0, { 'src/a.ts': f(2) }), sum(4, 0, { 'src/a.ts': f(1), 'src/b.ts': f(3) }), { files: ['src/a.ts'] }), 'fine');
+  assert.equal(regression(sum(1, 0, { 'src/a.ts': f(1) }), sum(3, 0, { 'src/a.ts': f(1), '(other)': f(2) }), { files: ['src/a.ts'] }), 'worse', 'no progress in the edited file and more errors is still a regression');
+});
+test('A decided fix the check rolled back counts against the file version it came from', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'const a = 2;\n'); const before = 'const a = 1;\n';
+  const artifact = await store.snapshot(3, 'a.ts', before);
+  session.transaction = [{ key: 'k', identity: 'i', step: 3, route: 'replace_lines', paths: ['a.ts'], summary: '{}', kind: 'decided-fix' }, { key: 'k2', identity: 'i2', step: 4, route: 'replace_lines', paths: ['b.ts'], summary: '{}' }];
+  session.lastCheck = { step: 5, ok: false, text: 'x', summary: summarizeCheck('a.ts(1,1): error TS2322: bad') }; session.previousCheck = { step: 2, ok: true, text: '', summary: summarizeCheck('') };
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}) }, root, () => {});
+  await runner.undo(session, { 'a.ts': artifact }, 'worse');
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), before);
+  assert.deepEqual(session.fixAttempts, { [`a.ts@${hash(before)}`]: 1 }, 'the rolled-back decided fix counts against the restored version; the free edit does not');
 });
 
-test('Bulk duplication of existing lines is refused, small overlaps are not', async t => {
+test('Duplicate import lines are dropped from an insertion; a pasted block the file already has is refused', async t => {
   const header = Array.from({ length: 8 }, (_, i) => `import { name${i} } from "./module${i}.js";`).join('\n');
   const before = `${header}\nconst x = 1;\n`;
-  assert.throws(() => assertNoBulkDuplication(before, header.split('\n'), 'cli.ts'), /already contains the line "import \{ name0 \}/);
-  assert.throws(() => assertNoBulkDuplication(before, ['import { name0 } from "./module0.js";'], 'cli.ts'), /an import or export is never added twice/);
+  const { kept, dropped } = dropDuplicateImports(before, [...header.split('\n'), 'import { fresh } from "./fresh.js";']);
+  assert.deepEqual(kept, ['import { fresh } from "./fresh.js";']); assert.equal(dropped.length, 8);
+  assert.equal(dropDuplicateImports(before, ["import { name0 } from './module0.js'"]).dropped.length, 1, 'quote style and semicolons do not matter');
   const body = Array.from({ length: 8 }, (_, i) => `const value${i} = compute(${i});`).join('\n');
   assert.throws(() => assertNoBulkDuplication(body, body.split('\n'), 'x.ts'), /would insert a block that x\.ts already contains/);
   assertNoBulkDuplication(body, ['const value0 = compute(0);'], 'x.ts');
@@ -1289,14 +1287,18 @@ test('Bulk duplication of existing lines is refused, small overlaps are not', as
   const spread = idioms.flatMap(l => [l, '  // separate context']).join('\n');
   assertNoBulkDuplication(spread, idioms, 'y.ts');
   assert.throws(() => assertNoBulkDuplication(idioms.join('\n'), idioms, 'y.ts'), /already contains/);
-  // A move's destination is exempt from the count rule (moved code may repeat idioms) but never gains a second import.
   assertNoBulkDuplication(idioms.join('\n'), idioms, 'deps.ts', false);
-  assert.throws(() => assertNoBulkDuplication(before, ['import { name1 } from "./module1.js";'], 'deps.ts', false), /never added twice/);
   const { root, store } = await fixture(t);
   await writeFile(join(root, 'cli.ts'), before);
   const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
-  await assert.rejects(tools.execute('replace_lines', { path: 'cli.ts', expectedHash: hash(before), edits: [{ start: 1, end: 1, newText: `${header}\nimport { name0 } from "./module0.js";`, prepend: '' }] }), /already contains/);
-  assert.equal(await readFile(join(root, 'cli.ts'), 'utf8'), before);
+  // An insertion whose only new lines are imports the file already has is a no-op, named as such.
+  await assert.rejects(tools.execute('replace_lines', { path: 'cli.ts', expectedHash: hash(before), edits: [{ start: 9, end: 8, newText: 'import { name0 } from "./module0.js";', prepend: '' }] }), /only new lines were imports cli\.ts already has/);
+  // An insertion mixing a duplicate with a new import lands with the duplicate dropped: repaired, not refused.
+  const r = await tools.execute('replace_lines', { path: 'cli.ts', expectedHash: hash(before), edits: [{ start: 9, end: 8, newText: 'import { name0 } from "./module0.js";\nimport { fresh } from "./fresh.js";', prepend: '' }] });
+  assert(r.ok); assert.match(r.text, /Dropped 1 import line/); const now = await readFile(join(root, 'cli.ts'), 'utf8');
+  assert.equal(now.split('\n').filter(l => l.includes('name0')).length, 1); assert(now.includes('import { fresh } from "./fresh.js";'));
+  const w = await tools.execute('write', { path: 'cli.ts', expectedHash: hash(now), oldText: 'const x = 1;', newText: 'import { name1 } from "./module1.js";\nconst x = 2;' });
+  assert(w.ok); assert.match(w.text, /Dropped 1 import line/); assert.equal((await readFile(join(root, 'cli.ts'), 'utf8')).split('\n').filter(l => l.includes('name1')).length, 1);
 });
 test('After an edit the harness runs the check itself, rolls back an objective regression, and re-verifies', async t => {
   const { root, store, session } = await fixture(t);
@@ -1427,23 +1429,36 @@ test('Errors the check does not attribute to a file always count toward the regr
   // Path matching is segment-safe: cli.ts does not stand for deps-cli.ts.
   assert.equal(regression({ errors: 0, syntax: 0, byFile: {} }, { errors: 2, syntax: 0, byFile: { 'src/deps-cli.ts': f(2), 'src/cli.ts': f(0) } }, { files: ['cli.ts'], structural: true }), 'fine');
 });
-test('Rolling back a transaction that created a file removes the file and forgets it', async t => {
+test('A created file is never rolled back and never a rejected edit; a mixed transaction is judged on its edits; a move into a new destination is still undone whole', async t => {
   const { root, store, session: s } = await fixture(t);
-  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
-  const created = await tools.execute('write', { path: 'src/cli/deps.ts', expectedHash: 'new', oldText: '', newText: 'export const x = 1;\n' });
-  assert.equal(created.snapshots?.['src/cli/deps.ts'], '@new');
+  const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true }, (p, text) => store.snapshot(s.step, p, text));
   await writeFile(join(root, 'a.ts'), 'const a = 1;\n');
   const moved = await tools.execute('move_lines', { source: 'a.ts', expectedHash: hash('const a = 1;\n'), start: 1, end: 1, destination: 'src/cli/fresh.ts', destinationHash: 'new', prefix: '', replacement: '' });
   assert.equal(moved.snapshots?.['src/cli/fresh.ts'], '@new');
+  await writeFile(join(root, 'a.ts'), 'const a = 1;\n');
   const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
-  s.step = 2; s.writes = ['src/cli/deps.ts']; s.hashes['src/cli/deps.ts'] = 'h'; s.readHashes['src/cli/deps.ts'] = 'h'; s.coverage['src/cli/deps.ts'] = { total: 1, ranges: [[1, 1]] } as any; s.writeSteps['src/cli/deps.ts'] = 2;
-  s.transaction = [{ key: 'k', identity: 'i', step: 2, route: 'write', paths: ['src/cli/deps.ts'], summary: 'created' }];
-  s.editEvidence = [{ step: 2, route: 'write', paths: ['src/cli/deps.ts'], artifact: '', text: 'created deps.ts' }];
-  await runner.undo(s, { 'src/cli/deps.ts': '@new' }, 'worse');
-  assert.deepEqual(s.editEvidence, [], 'rolled-back changes cannot support completion');
-  await assert.rejects(readFile(join(root, 'src/cli/deps.ts'), 'utf8'), /ENOENT/);
-  assert(!('src/cli/deps.ts' in s.hashes) && !('src/cli/deps.ts' in s.readHashes) && !('src/cli/deps.ts' in s.coverage) && !s.writes.includes('src/cli/deps.ts'));
-  assert.match(s.entries.at(-1)!.text, /removed src\/cli\/deps\.ts, which those edits created/); assert.equal(s.rejectedEdits.length, 1);
+  // A failing baseline, then a created file whose own errors raise the count: committed, not rolled back.
+  s.step = 1; await runner.evidence(s, 'bash', { ok: false, verification: true, text: 'a.ts(1,1): error TS2304: x' }, { command: 'node check.mjs', purpose: 'p' });
+  s.step = 2; const created = await tools.execute('create_file', { path: 'src/cli/deps.ts', content: 'import { y } from "./y";\nexport const x = y;\n' });
+  await runner.evidence(s, 'create_file', created, { path: 'src/cli/deps.ts', content: 'x' });
+  s.transaction.push({ key: 'k', identity: 'i', step: 2, route: 'create_file', paths: ['src/cli/deps.ts'], summary: 'created' });
+  assert.deepEqual(s.editSnapshots, {}, 'a creation has nothing to restore'); assert.equal(s.baselineArtifacts['src/cli/deps.ts'], '@new', 'but the completion diff knows it was created');
+  s.step = 3; await runner.evidence(s, 'bash', { ok: false, verification: true, text: "a.ts(1,1): error TS2304: x\nsrc/cli/deps.ts(1,19): error TS2307: Cannot find module './y'" }, { command: 'node check.mjs', purpose: 'p' });
+  assert.equal(s.autoUndo, null); assert.deepEqual(s.transaction, []); assert.equal(await readFile(join(root, 'src/cli/deps.ts'), 'utf8'), 'import { y } from "./y";\nexport const x = y;\n');
+  // A mixed transaction is judged on the edited file only: the edit is reverted, the created file stays.
+  s.step = 4; const snap = await store.snapshot(4, 'a.ts', 'const a = 1;\n'); await writeFile(join(root, 'a.ts'), 'const a = BAD;\n');
+  await runner.evidence(s, 'write', { ok: true, changed: ['a.ts'], snapshots: { 'a.ts': snap }, text: 'Updated' });
+  (s.transaction as any[]).push({ key: 'k2', identity: 'i2', step: 4, route: 'write', paths: ['a.ts'], summary: 'edit' });
+  s.step = 5; const other = await tools.execute('create_file', { path: 'src/cli/more.ts', content: 'export const m = 1;\n' }); await runner.evidence(s, 'create_file', other, { path: 'src/cli/more.ts', content: 'x' });
+  (s.transaction as any[]).push({ key: 'k3', identity: 'i3', step: 5, route: 'create_file', paths: ['src/cli/more.ts'], summary: 'created' });
+  s.step = 6; await runner.evidence(s, 'bash', { ok: false, verification: true, text: "a.ts(1,1): error TS2304: x\na.ts(1,11): error TS2304: BAD\nsrc/cli/deps.ts(1,19): error TS2307: Cannot find module './y'" }, { command: 'node check.mjs', purpose: 'p' });
+  const undo = s.autoUndo as any; assert.deepEqual(Object.keys(undo?.files ?? {}), ['a.ts'], 'only the edited file is rolled back');
+  s.step = 7; await runner.undo(s, undo.files, 'worse'); s.autoUndo = null;
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'const a = 1;\n'); assert.equal(await readFile(join(root, 'src/cli/more.ts'), 'utf8'), 'export const m = 1;\n');
+  assert(s.rejectedEdits.length === 1 && s.rejectedEdits.every(r => r.route !== 'create_file'), 'a creation is never a rejected edit');
+  // The destination a move created is part of the move: undone with it.
+  s.step = 8; await runner.undo(s, moved.snapshots!, 'worse');
+  await assert.rejects(readFile(join(root, 'src/cli/fresh.ts'), 'utf8'), /ENOENT/); assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'const a = 1;\n');
 });
 test('Undo restores read state only for versions that were read, and un-flags reads the rolled-back edit made stale', async t => {
   const { root, store, session: s } = await fixture(t);
@@ -1645,7 +1660,7 @@ test('Completion reads real current declarations and imports, not lookalikes ins
   await writeFile(join(root, 'cli.ts'), `import type { Dependencies as Deps } from './deps.js';\nconst template = "export interface Fake {}";\n// export const GHOST = 1;\n`);
   await writeFile(join(root, 'deps.ts'), 'export interface Dependencies {}\nexport const DEFAULTS = {};\nconst PRIVATE = 1;\n');
   const facts = await completionSource(root, ['cli.ts', 'deps.ts'], 'Extract Dependencies as Deps with DEFAULTS PRIVATE Fake GHOST.');
-  assert.deepEqual(facts[0]!.facts, [{ line: 1, kind: 'import', name: 'Deps', imported: 'Dependencies', from: './deps.js', typeOnly: true }]);
+  assert.deepEqual(facts[0]!.facts, [{ line: 1, endLine: 1, kind: 'import', name: 'Deps', imported: 'Dependencies', from: './deps.js', typeOnly: true }]);
   assert.deepEqual(facts[1]!.facts.map(f => [f.name, f.exported]), [['Dependencies', true], ['DEFAULTS', true], ['PRIVATE', false]]);
   assert.equal(facts[1]!.hash, hash(await readFile(join(root, 'deps.ts'))));
   const missing = await completionSource(root, ['missing.ts', '../outside.ts'], 'Missing');
@@ -1789,7 +1804,7 @@ test('Unused import bindings are removed by the harness without dropping a bindi
   const { root, store, session } = await fixture(t);
   const text = 'import { existsSync, writeSync } from "node:fs";\nimport {\n  componentPlanSchema,\n  planComponents,\n} from "./component-plan.js";\nimport type { Only } from "./only.js";\nimport def from "./def.js";\nconst unusedLocal = 1;\nexport const a = existsSync("x") && componentPlanSchema && def;\n';
   await writeFile(join(root, 'a.ts'), text);
-  const check = "a.ts(1,22): error TS6133: 'writeSync' is declared but its value is never read.\na.ts(4,3): error TS6133: 'planComponents' is declared but its value is never read.\na.ts(6,15): error TS6133: 'Only' is declared but its value is never read.\na.ts(8,7): error TS6133: 'unusedLocal' is declared but its value is never read.";
+  const check = "a.ts(1,22): error TS6133: 'writeSync' is declared but its value is never read.\na.ts(4,3): error TS6133: 'planComponents' is declared but its value is never read.\na.ts(6,15): error TS6196: 'Only' is declared but never used.\na.ts(8,7): error TS6133: 'unusedLocal' is declared but its value is never read.";
   const names = await resolveMissingNames(root, check, ['a.ts']);
   assert.deepEqual(names.map(n => [n.name, n.kind, n.line]), [['writeSync', 'unused', 1], ['planComponents', 'unused', 4], ['Only', 'unused', 6]], 'a local const is not an import');
   const edits = await removeImportBindings('a.ts', text, ['writeSync', 'planComponents', 'Only']);
@@ -1833,7 +1848,7 @@ test('A passing check after edits proposes finish once without asking Jev to rou
   const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
   // step 4: baseline check passes (after the edit at 3) -> step 5: harness proposes finish, audited, accepted
   assert.equal(result.status, 'complete'); assert.equal(result.stopReason, 'a.ts exports a. The check passed.');
-  assert.deepEqual(phases, ['routing-and-context', 'completion-check'], 'Jev routed once, the harness overrode it with finish, then the audit ran');
+  assert.deepEqual(phases, ['completion-check'], 'the harness proposed finish without asking Jev to route, then the audit ran');
   assert.match(result.completionFeedback?.text ?? '', /^The completion proposed at step 2 was rejected/); assert.equal(result.completionFeedback?.addressed, true);
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.some(e => e.type === 'auto-finish'));
@@ -1886,18 +1901,16 @@ test('An uncertain vote between an edit and a read goes to the edit once inspect
   assert.equal(events.find(e => e.type === 'tie-break')?.data.rule, 'edit over inspection after inspections');
 });
 
-test('A write anchor longer than six lines is refused with the line number for replace_lines', async t => {
+test('A long anchor that matches is applied; the result notes that replace_lines addresses blocks by number', async t => {
   const { root, store } = await fixture(t);
   const text = Array.from({ length: 12 }, (_, i) => `const v${i + 1} = ${i + 1};`).join('\n') + '\n';
   await writeFile(join(root, 'a.ts'), text);
   const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
   const block = text.split('\n').slice(3, 11).join('\n');
-  await assert.rejects(tools.execute('write', { path: 'a.ts', expectedHash: hash(text), oldText: block, newText: `export ${block}` }), /oldText is 8 lines; a write anchor is at most 6\. That block starts at line 4: use replace_lines/);
-  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), text);
-  const ok = await tools.execute('write', { path: 'a.ts', expectedHash: hash(text), oldText: 'const v4 = 4;', newText: 'export const v4 = 4;' });
-  assert(ok.ok);
+  const r = await tools.execute('write', { path: 'a.ts', expectedHash: hash(text), oldText: block, newText: `export ${block}` });
+  assert(r.ok); assert.match(r.text, /anchor was 8 lines; replace_lines addresses a block by line number/);
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), text.replace(block, `export ${block}`));
 });
-
 test('Retyping a block in place with a change is a rewrite, not a paste, and a redundant prepend keyword is refused up front', async t => {
   const { root, store } = await fixture(t);
   const block = ['type Writable = Pick<NodeJS.WriteStream, "write"> & {', '  on?(event: "error", listener: (error: Error) => void): unknown;', '  off?(event: "error", listener: (error: Error) => void): unknown;', '  once?(event: "close", listener: () => void): unknown;', '  isTTY?: boolean;', '  columns?: number;', '};'];
@@ -1979,23 +1992,21 @@ test('A deliverable the destination needs is moved by the harness, in every reso
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.some(e => e.type === 'auto-move'));
 });
-test('A large range whose new text is mostly identical is refused with the lines that differ', async t => {
+test('A large range whose new text is mostly identical is applied, with a note naming the lines that changed', async t => {
   const { root, store } = await fixture(t);
   const lines = Array.from({ length: 20 }, (_, i) => `  key${i}: (signal?: AbortSignal) => run${i}(signal),`);
   const text = ['const deps = {', ...lines, '};', ''].join('\n');
   await writeFile(join(root, 'a.ts'), text);
   const tools = new ToolBox(root, store.artifacts, { ...defaults, allowWrite: true });
   const retyped = lines.map((l, i) => i === 4 ? '  key4: (signal: AbortSignal) => run4(signal),' : l).join('\n');
-  await assert.rejects(tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(text), edits: [{ start: 2, end: 21, newText: retyped, prepend: '' }] }), /rewrites 20 lines of which only 1 change \(line 6\); edit only those lines/);
-  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), text);
-  const ok = await tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(text), edits: [{ start: 6, end: 6, newText: '  key4: (signal: AbortSignal) => run4(signal),', prepend: '' }] });
-  assert(ok.ok);
-  // A genuine rewrite (most lines change) is not a retype.
+  const r = await tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(text), edits: [{ start: 2, end: 21, newText: retyped, prepend: '' }] });
+  assert(r.ok); assert.match(r.text, /rewrote 20 lines of which only 1 changed \(line 6\)/);
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), ['const deps = {', ...retyped.split('\n'), '};', ''].join('\n'));
   const now = await readFile(join(root, 'a.ts'), 'utf8');
   const rewritten = lines.map((_, i) => `  key${i}: () => ${i},`).join('\n');
-  assert((await tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(now), edits: [{ start: 2, end: 21, newText: rewritten, prepend: '' }] })).ok);
+  const g = await tools.execute('replace_lines', { path: 'a.ts', expectedHash: hash(now), edits: [{ start: 2, end: 21, newText: rewritten, prepend: '' }] });
+  assert(g.ok); assert(!/rewrote/.test(g.text), 'a genuine rewrite carries no note');
 });
-
 test('The source still using a moved name is detected by the parser even after an unbalanced quote earlier in the file', async () => {
   const text = ["const re = /'/; // an apostrophe that a literal stripper mistakes for an open string", 'const other = 1;', 'function invokedAsMain(): boolean {', '  return true;', '}', 'if (invokedAsMain()) {', '  other;', '}', ''].join('\n');
   const plan = await movePlan('src/cli.ts', text, 3, 5, 'src/cli/deps.ts', '');
@@ -2249,6 +2260,27 @@ test('The completion audit state stays under the Jev budget with a large diff an
   assert.equal(result.status, 'complete', result.stopReason); assert(sizes.every(n => n <= 22000), `state sizes ${sizes.join(',')}`);
 });
 
+test('The completion audit of a designed application with many created files stays under the Jev budget by shrinking its base and chunking the evidence', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  const paths = Array.from({ length: 20 }, (_, i) => `src/components/C${i}.tsx`);
+  const design = { summary: 'A landing page with twenty components. '.repeat(20), conventions: 'React 19, TypeScript, Tailwind; named exports; '.repeat(10), deliverables: paths.map(p => ({ kind: 'create', name: p, from: '', to: p, detail: `Create ${p}: a substantial, accessible, responsive component with several props and a documented contract.`, contents: ['a heading', 'a paragraph', 'a call to action', 'responsive layout', 'accessible markup'], exports: [`export function ${p.slice(15, -4)}(props: Props): JSX.Element`], dependsOn: [] })) };
+  for (const p of paths) await writeFile(join(root, p), `import type { ReactNode } from "react";\nexport type Props = { title: string; children?: ReactNode; className?: string };\n${Array.from({ length: 12 }, (_, i) => `export const helper${i} = (x: number) => x * ${i};`).join('\n')}\nexport function ${p.slice(15, -4)}(props: Props) {\n  return <section className={props.className}><h2>{props.title}</h2>{props.children}</section>;\n}\n`);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  s.objective = 'Bootstrap an advanced react application with a landing page and components.'; s.phase = 'implement'; s.step = 40; s.lastWriteStep = 39; s.inspectionCount = 3;
+  s.writes = paths; s.baselineArtifacts = Object.fromEntries(paths.map(p => [p, '@new'])); s.knownFiles.push(...paths);
+  s.design = designFrom(design); s.ledger = candidatesFrom(design); s.ledgerBuilt = true; await refreshLedger(root, s);
+  assert(s.ledger.every(d => d.status === 'done'));
+  const sizes: number[] = []; const phases: string[] = [];
+  const jev = { decide: async (state: unknown, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); const n = Buffer.byteLength(JSON.stringify(state)); sizes.push(n); if (n > 22000) throw new Error('Jev decision state exceeds its configured byte budget'); return answersFor(q, 'finish', .9); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'done' }) };
+  const runner = new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {});
+  await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'passed' }, { command: 'node check.mjs' });
+  const result = await runner.run(s);
+  assert.equal(result.status, 'complete', result.stopReason);
+  assert(sizes.every(n => n <= 22000), `state sizes ${sizes.join(',')}`);
+  assert(phases.filter(p => p === 'completion-check').length >= 2, `the evidence of twenty items is chunked across calls: ${phases.join(',')}`);
+});
 test('A configured check that cannot run in this repository is dropped, and the worker\'s own build then counts as verification', async t => {
   const { root, store, session } = await fixture(t);
   await writeFile(join(root, 'a.mjs'), 'export const a = 1;\n');
@@ -2266,25 +2298,50 @@ test('A configured check that cannot run in this repository is dropped, and the 
   assert.equal(result.entries[0]!.kind, 'bash'); assert.equal(result.lastCheck?.ok, true, 'the worker\'s node --check counted as the verification');
   assert.equal(result.status, 'complete', result.stopReason);
 });
-test('With no check configured, the worker proposes one from the repository, Jev classifies it, and the harness runs it before proposing finish', async t => {
+test('With no check configured, code enumerates the repository\'s verification candidates and tries them; a lone candidate that ran is selected without asking', async t => {
   const { root, store, session } = await fixture(t);
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts: { build: 'node check.mjs' } })); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts: { build: 'node check.mjs', dev: 'vite', format: 'prettier --write .' } })); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
   await writeFile(join(root, 'src.mjs'), 'export const hello = "Hello World";\n');
   session.objective = 'Make src.mjs say Hello World and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src.mjs']; session.step = 2; session.lastWriteStep = 2;
   session.editEvidence = [{ step: 2, route: 'write', paths: ['src.mjs'], artifact: '', text: 'edited' } as any];
-  const phases: string[] = []; let candidate: any = null;
-  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); if (ctx!.phase === 'check-inference') { candidate = state.candidateCheck; assert.deepEqual(Object.keys(state.repository.scripts), ['build']); return { valid: { type: 'noul', noul: .92 } } as Answers; } return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
-    if (schema === checkSchema) { assert.match(m[1].content, /"build":"node check\.mjs"/, 'the package scripts reach the worker'); return { command: 'npm run build', rationale: 'the package build script' }; }
+  const phases: string[] = [];
+  const jev = { decide: async (_state: any, q: Questions, ctx?: { phase: string }) => { phases.push(ctx!.phase); assert.notEqual(ctx!.phase, 'check-selection', 'a single candidate that ran needs no judgment'); return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: any, schema: unknown) => {
+    assert.notEqual(schema, checkSchema, 'the worker is not asked when candidates are enumerable');
     if (schema === schemas.finish) return { summary: 'done' };
     return { files: [{ path: 'src.mjs', start: 1, end: 1 }] };
   } };
   const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
-  const trail = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(e => !['prompt', 'bonsai-request', 'bonsai', 'jev-request', 'jev', 'compact'].includes(e.type)).map(e => `${e.data?.step ?? ''}:${e.type}${e.type === 'check-inferred' ? JSON.stringify(e.data) : ''}`);
-  assert.equal(candidate?.command, 'npm run build', trail.join(' | '));
-  assert.deepEqual(result.entries.map(e => e.kind), ['bash'], `the inferred check is the only action before completion; steps: ${result.entries.map(e => e.kind).join(',')}`);
+  assert.deepEqual(result.entries.map(e => e.kind), ['bash'], `the selected check is the only action before completion; steps: ${result.entries.map(e => e.kind).join(',')}`);
   assert.equal(result.lastCheckCommand, 'npm run build'); assert.equal(result.lastCheck?.ok, true); assert.equal(result.status, 'complete', result.stopReason);
-  assert(phases.includes('check-inference'));
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const inferred = events.find(e => e.type === 'check-inferred');
+  assert.deepEqual(inferred.data.candidates.map((c: any) => c.command), ['npm run build'], 'servers and formatters are never candidates'); assert.equal(inferred.data.candidates[0].trial.outcome, 'ran and passed'); assert.equal(inferred.data.accepted, true);
+});
+test('Check selection: two candidates that ran go to Jev as one Choice with a none option; startup failures never do', async t => {
+  const status = { git: false, changed: [], changedCount: 0, scripts: { typecheck: 'node tc.mjs', test: 'node test.mjs', dev: 'vite', start: 'node server.js', 'lint:fix': 'eslint --fix .', watch: 'tsc --watch' }, topLevel: [], packages: [] };
+  const { root, store, session } = await fixture(t);
+  assert.deepEqual((await checkCandidates(root, status)).map(c => c.command), ['npm run typecheck', 'npm run test']);
+  const f = trialFacts({ code: 1, timedOut: false, output: 'sh: line 1: tsc: command not found' })!; assert.equal(f.ran, false); assert.equal(f.startupFailure, true); assert.equal(f.outcome, 'failed to start');
+  const g = trialFacts({ code: 2, timedOut: false, output: 'src/a.ts(1,1): error TS2304: x\nsrc/a.ts(2,1): error TS2304: y' })!; assert.equal(g.ran, true); assert.equal(g.errorsListed, 2); assert.equal(g.outcome, 'ran and reported errors in the code');
+  assert.equal(trialFacts({ code: 0, timedOut: false, output: 'ok' })!.outcome, 'ran and passed'); assert.equal(trialFacts({ code: null, timedOut: true, output: '' })!.outcome, 'did not terminate');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts: { typecheck: 'node tc.mjs', test: 'node test.mjs' } }));
+  await writeFile(join(root, 'tc.mjs'), 'console.error("src.mjs(1,1): error TS2304: x"); process.exit(2);\n'); await writeFile(join(root, 'test.mjs'), 'process.exit(0);\n'); await writeFile(join(root, 'src.mjs'), 'export const a = 1;\n');
+  session.objective = 'Change src.mjs and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src.mjs']; session.step = 2; session.lastWriteStep = 2;
+  session.editEvidence = [{ step: 2, route: 'write', paths: ['src.mjs'], artifact: '', text: 'edited' } as any];
+  let seen: any = null; let answer = 'none';
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'check-selection') { seen = { state, q }; const keys = Object.keys((q.check as any).criteria); return { check: { type: 'choice', choice: answer, confidence: .9, probabilities: Object.fromEntries(keys.map(k => [k, k === answer ? .9 : .1 / (keys.length - 1)])) } } as Answers; }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src.mjs', start: 1, end: 1 }] } };
+  let result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(Object.keys((seen.q.check as any).criteria), ['npm run typecheck', 'npm run test', 'none'], 'options are the commands themselves plus none');
+  assert.equal(seen.state.candidates['npm run typecheck'].outcome, 'ran and reported errors in the code'); assert.equal(seen.state.candidates['npm run test'].outcome, 'ran and passed'); assert(Buffer.byteLength(JSON.stringify(seen.state)) < 3000, 'a small, literal state');
+  assert.equal(result.lastCheckCommand, null, 'none selected: no verification yet');
+  answer = 'npm run test'; session.checkTrialKey = undefined; session.checkInferences = 0;
+  result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.lastCheckCommand, 'npm run test'); assert.equal(result.status, 'complete', result.stopReason);
 });
 test('The completion diff takes the repository\'s view of change from git, including files a scaffold created', async t => {
   const { root, store, session: s } = await fixture(t);
@@ -2306,7 +2363,7 @@ test('The completion diff takes the repository\'s view of change from git, inclu
   s.writes = ['src/App.jsx'];
   assert(( await structuralDiff(root, s, store.artifacts)).files.some(f => f.path === 'src/App.jsx'), 'unless the session wrote it');
 });
-test('Read-only shell commands are inspections: they count toward the cap and are refused once it applies', async t => {
+test('Read-only shell commands are inspections: they run and count toward the inspection cap', async t => {
   assert(readOnlyCommand('ls -la && cat src/App.jsx && cat package.json')); assert(readOnlyCommand('node -e "require(\'fs\').readFileSync(\'src/App.jsx\',\'utf8\')" && echo OK'));
   assert(!readOnlyCommand('npm run build 2>&1 | tail -20')); assert(!readOnlyCommand('ls && rm -rf dist'));
   const { root, store, session } = await fixture(t);
@@ -2315,27 +2372,23 @@ test('Read-only shell commands are inspections: they count toward the cap and ar
   const jev = { decide: async (_s: unknown, q: Questions) => answersFor(q, 'bash', .1) };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ command: 'ls -la && cat a.ts', purpose: 'look' }) };
   const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.equal(result.entries[0]!.kind, 'generation_error'); assert.match(result.entries[0]!.text, /Read-only command refused: 4 inspections/);
+  assert.equal(result.entries[0]!.kind, 'bash'); assert.match(result.entries[0]!.text, /const a = 1/); assert.equal(result.inspectionsSinceAction, 5, 'a generated command is executed, never discarded by a count');
 });
-
-test('Repository status lists nested packages, and an inferred check is tried once so Jev judges its real behaviour', async t => {
+test('Repository status lists nested packages, and a package script is enumerated, tried once and selected', async t => {
   const { root, store, session } = await fixture(t);
   await mkdir(join(root, 'sdk', 'typescript', 'src'), { recursive: true });
   await writeFile(join(root, 'sdk', 'typescript', 'package.json'), JSON.stringify({ scripts: { lint: 'node check.mjs' } })); await writeFile(join(root, 'sdk', 'typescript', 'tsconfig.json'), '{}');
   await writeFile(join(root, 'sdk', 'typescript', 'check.mjs'), 'console.log("ok"); process.exit(0);\n'); await writeFile(join(root, 'sdk', 'typescript', 'src', 'a.ts'), 'export const a = 1;\n');
   const status = await repositoryStatus(root);
   assert.deepEqual(status.packages, [{ dir: 'sdk/typescript', scripts: { lint: 'node check.mjs' }, tools: ['package.json', 'tsconfig.json'] }]);
+  assert.deepEqual((await checkCandidates(root, status)).map(c => c.command), ['cd sdk/typescript && npm run lint']);
   session.objective = 'Change a in sdk/typescript/src/a.ts and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['sdk/typescript/src/a.ts']; session.step = 2; session.lastWriteStep = 2;
   session.editEvidence = [{ step: 2, route: 'write', paths: ['sdk/typescript/src/a.ts'], artifact: '', text: 'edited' } as any];
-  let seen: any = null;
-  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'check-inference') { seen = state.candidateCheck; return { valid: { type: 'noul', noul: state.candidateCheck.trial.code === 0 ? .9 : .2 } } as Answers; } return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
-    if (schema === checkSchema) { assert.match(m[1].content, /"packages":\[\{"dir":"sdk\/typescript"/); return { command: 'cd sdk/typescript && npm run lint', rationale: 'the package lint script' }; }
-    if (schema === schemas.finish) return { summary: 'done' };
-    return { files: [{ path: 'sdk/typescript/src/a.ts', start: 1, end: 1 }] };
-  } };
+  const jev = { decide: async (_state: any, q: Questions, ctx?: { phase: string }) => answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: any, schema: unknown) => schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'sdk/typescript/src/a.ts', start: 1, end: 1 }] } };
   const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.equal(seen?.trial?.code, 0); assert.match(seen?.trial?.output ?? '', /ok/);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const inferred = events.filter(e => e.type === 'check-inferred'); assert.equal(inferred.length, 1, 'tried once'); assert.equal(inferred[0].data.candidates[0].trial.exitCode, 0); assert.match(inferred[0].data.candidates[0].trial.outputHead, /ok/);
   assert.equal(result.lastCheckCommand, 'cd sdk/typescript && npm run lint'); assert.equal(result.status, 'complete', result.stopReason);
 });
 test('With no check at all, the harness still performs the ledger\'s moves and refreshes the ledger after each edit', async t => {
@@ -2371,12 +2424,12 @@ test('The task record Jev decides on is small and made of facts, and the candida
   const c = candidates(s, { ...defaults, allowWrite: true }, false);
   const ids = c.map(x => x.id);
   assert(ids.includes('implement:d2'), 'the modify deliverable is the worker\'s'); assert(!ids.includes('implement:d1') || !s.pendingMoves.length, 'a move the harness performs is never offered');
-  assert(ids.includes('fix:src/cli.ts')); assert(ids.includes('inspect:src/cli.ts'), 'the edited file is not readable at its current version'); assert(ids.includes('ask') && ids.includes('free'));
+  assert(ids.includes('fix:src/cli.ts')); assert(!ids.includes('inspect:src/cli.ts'), 'a file this session wrote is never offered as a read: code holds it'); assert(ids.includes('inspect:src/cli/deps.ts')); assert(ids.includes('ask') && ids.includes('free'));
   assert(!ids.includes('implement:d3'), 'verification is code\'s own');
   const q = stepQuestions(c); assert.deepEqual(Object.keys(q), ['next', 'stuck', 'scope_drift', 'needs_user']);
-  const d = decideStep({ next: { type: 'choice', choice: 'inspect:src/cli.ts', confidence: .4, probabilities: { 'inspect:src/cli.ts': .45, 'fix:src/cli.ts': .3, free: .25 } }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } }, c, defaults);
+  const d = decideStep({ next: { type: 'choice', choice: 'inspect:src/cli/deps.ts', confidence: .4, probabilities: { 'inspect:src/cli/deps.ts': .45, 'fix:src/cli.ts': .3, free: .25 } }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } }, c, defaults);
   assert.equal(d.tier, 'cautious'); assert.equal(d.candidate.kind, 'inspect', 'a cheap inspection proceeds on a middling read');
-  const e = decideStep({ next: { type: 'choice', choice: 'fix:src/cli.ts', confidence: .3, probabilities: { 'fix:src/cli.ts': .35, 'inspect:src/cli.ts': .33, free: .32 } } }, c, defaults);
+  const e = decideStep({ next: { type: 'choice', choice: 'fix:src/cli.ts', confidence: .3, probabilities: { 'fix:src/cli.ts': .35, 'inspect:src/cli/deps.ts': .33, free: .32 } } }, c, defaults);
   assert.equal(e.tier, 'escalate'); assert.equal(e.candidate.kind, 'free', 'an uncertain edit choice escalates to the worker');
   const f = decideStep({ next: { type: 'choice', choice: 'fix:src/cli.ts', confidence: .9, probabilities: { 'fix:src/cli.ts': .9 } }, needs_user: { type: 'noul', noul: .9 } }, c, defaults);
   assert.equal(f.candidate.kind, 'ask', 'a confident need for the user overrides');
@@ -2401,7 +2454,7 @@ test('Jev\'s step decision drives the loop: code executes inspections, the worke
   } };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
     const last = JSON.parse(m[m.length - 1].content); const note = last.task ?? promptFields(m).harnessNote; if (note) notes.push(note);
-    if (schema === schemas.replace_lines) return { path: 'src/a.ts', expectedHash: session.hashes['src/a.ts'], edits: [{ start: 1, end: 1, newText: 'export const greeting = "Hello World";', prepend: '' }] };
+    if (schema === focusedEditSchema) return { edits: [{ start: 1, end: 1, newText: 'export const greeting = "Hello World";', prepend: '' }] };
     if (schema === schemas.finish) return { summary: 'greeting says Hello World.' };
     return { files: [{ path: 'src/a.ts', start: 1, end: 1 }] };
   } };
@@ -2410,10 +2463,11 @@ test('Jev\'s step decision drives the loop: code executes inspections, the worke
   assert.equal(kinds[0], 'read_files', `code executed the inspection; steps: ${kinds.join(',')}`);
   assert.equal(kinds[1], 'replace_lines', 'the deliverable went to the worker as an edit'); assert.match(notes[0] ?? '', /^Work on deliverable d1 only: modify greeting/);
   assert.equal(await readFile(join(root, 'src', 'a.ts'), 'utf8'), 'export const greeting = "Hello World";\n');
-  assert(phases.includes('routing-and-context'), 'the escalated step fell back to the worker\'s own routing');
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   const decisions = events.filter(e => e.type === 'decision').map(e => [e.data.chosen, e.data.tier]);
   assert.deepEqual(decisions.slice(0, 2).map(d => d[1]), ['act', 'act']); assert.equal(decisions[2]?.[1], 'escalate');
+  assert(phases.includes('completion-check') && !phases.includes('routing-and-context'), 'after the passing check the harness proposed finish itself instead of routing');
+  assert.equal(result.status, 'complete', result.stopReason);
   assert(events.every(e => e.type !== 'jev-request' || e.data.phase !== 'step' || Buffer.byteLength(JSON.stringify(e.data.state)) < 4000), 'every step state is small');
 });
 test('Completion is a set of citation checks: bounded evidence per deliverable, three-way judgments, and a contradiction rejects', async t => {
@@ -2444,9 +2498,9 @@ test('A decided edit is executed in the inspect phase: Jev\'s decision is not re
     if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); return { next: { type: 'choice', choice: 'implement:d1', confidence: .98, probabilities: Object.fromEntries(ids.map(i => [i, i === 'implement:d1' ? .98 : .02 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .05 }, scope_drift: { type: 'noul', noul: .05 }, needs_user: { type: 'noul', noul: .02 } } as Answers; }
     return answersFor(q, 'read_files', .9);
   } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.write ? { path: 'package.json', expectedHash: 'new', oldText: '', newText: '{ "name": "demo" }\n' } : { files: [{ path: 'package.json', start: 1, end: 1 }] } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: any) => schema?.properties?.content ? { content: '```json\n{ "name": "demo" }\n```' } : { files: [{ path: 'package.json', start: 1, end: 1 }] } };
   const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.equal(result.entries[0]?.kind, 'write', result.stopReason); assert.equal(await readFile(join(root, 'package.json'), 'utf8'), '{ "name": "demo" }\n');
+  assert.equal(result.entries[0]?.kind, 'create_file', result.stopReason); assert.equal(await readFile(join(root, 'package.json'), 'utf8'), '{ "name": "demo" }\n');
   assert.deepEqual(phases, ['step'], 'no routing question after a decision'); assert.equal(result.phase, 'implement');
 });
 
@@ -2490,15 +2544,14 @@ test('A check trial that fails for missing dependencies triggers one code-owned 
   const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath}`; t.after(() => { process.env.PATH = oldPath; });
   session.objective = 'Make src.mjs export a and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src.mjs']; session.step = 2; session.lastWriteStep = 2;
   session.editEvidence = [{ step: 2, route: 'write', paths: ['src.mjs'], artifact: '', text: 'edited' } as any];
-  const trials: any[] = [];
-  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'check-inference') { trials.push(state.candidateCheck.trial); return { valid: { type: 'noul', noul: state.candidateCheck.trial.code === 0 ? .9 : .1 } } as Answers; } return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === checkSchema ? { command: 'npm run typecheck', rationale: 'typecheck script' } : schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src.mjs', start: 1, end: 1 }] } };
+  const jev = { decide: async (_state: any, q: Questions, ctx?: { phase: string }) => { assert.notEqual(ctx!.phase, 'check-selection'); return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src.mjs', start: 1, end: 1 }] } };
   const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
-  assert.equal(trials.length, 1); assert.equal(trials[0].code, 0, 'the trial Jev saw ran after the install');
   assert.equal(await readFile(join(root, '.installed'), 'utf8'), 'installed\n'); assert.equal(result.setupDone, true);
   assert.equal(result.lastCheckCommand, 'npm run typecheck'); assert.equal(result.status, 'complete', result.stopReason);
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert.equal(events.find(e => e.type === 'setup')?.data.command, 'npm install --no-audit --no-fund');
+  const inferred = events.find(e => e.type === 'check-inferred'); assert.equal(inferred.data.candidates[0].trial.outcome, 'ran and passed', 'the trial Jev would see ran after the install');
 });
 test('A worker-proposed ask_user is refused when Jev judged the task does not need the user', async t => {
   const { root, store, session } = await fixture(t);
@@ -2515,14 +2568,43 @@ test('A worker-proposed ask_user is refused when Jev judged the task does not ne
   assert.equal(result.entries[0]?.kind, 'generation_error'); assert.match(result.entries[0]!.text, /ask_user refused: the task does not need the user \(judged 0\.12\)/);
 });
 
-test('A transaction that creates a file is judged on the total: a sibling not yet written is not a regression', () => {
+test('The regression verdict judges only the files that existed: a created file\'s own errors never count against it', () => {
   const f = (count: number, lines: number[] = [1]) => ({ count, syntax: 0, resolution: count, lines, samples: [] as string[] });
   const before = { errors: 12, syntax: 0, resolution: 12, byFile: { 'src/App.tsx': f(12) } };
   const after = { errors: 11, syntax: 0, resolution: 11, byFile: { 'src/App.tsx': f(10), 'src/components/FeaturesSection.tsx': f(1) } };
-  assert.equal(regression(before, after, { files: ['src/components/FeaturesSection.tsx'] }), 'worse', 'judged in scope, the new file only added an error');
-  assert.equal(regression(before, after, { files: ['src/components/FeaturesSection.tsx'], created: true }), 'fine', 'created: the falling total is the progress');
-  const worse = { errors: 13, syntax: 0, resolution: 13, byFile: { 'src/App.tsx': f(12), 'src/components/FeaturesSection.tsx': f(1) } };
-  assert.equal(regression(before, worse, { files: ['src/components/FeaturesSection.tsx'], created: true }), 'worse', 'a rising total still rolls back');
+  assert.equal(regression(before, after, { files: ['src/components/FeaturesSection.tsx'] }), 'worse', 'judged in scope, an edited file that only added an error');
+  assert.equal(regression(before, after, { files: ['src/App.tsx'] }), 'fine', 'the created sibling is outside the scope the runner passes');
+});
+test('A relative module that resolves nowhere is re-pointed at the one file of that name, mechanically', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true }); await writeFile(join(root, 'src', 'types.ts'), 'export type BadgeProps = { children: string };\n');
+  const badge = "import type { BadgeProps } from './types'\nimport type { ReactNode } from 'react'\nexport function Badge(p: BadgeProps): ReactNode { return p.children }\n";
+  await writeFile(join(root, 'src', 'components', 'Badge.tsx'), badge);
+  const names = await resolveMissingNames(root, "src/components/Badge.tsx(1,33): error TS2307: Cannot find module './types' or its corresponding type declarations.", ['src/components/Badge.tsx']);
+  assert.deepEqual(names.map(n => [n.name, n.kind, n.importLine, n.line]), [["./types", 'respec', '../types', 1]]);
+  const fixes = compactNames({ missingNames: names } as any, 40);
+  assert.deepEqual(fixes.respecImports, { 'src/components/Badge.tsx': [{ from: './types', to: '../types', line: 1 }] });
+  // A module nobody has is not re-pointed; an ambiguous one is not guessed.
+  assert.deepEqual(await resolveMissingNames(root, "src/components/Badge.tsx(1,33): error TS2307: Cannot find module './nothing'.", ['src/components/Badge.tsx']), []);
+  await writeFile(join(root, 'src', 'components', 'types.tsx'), 'export type BadgeProps = {};\n');
+  assert.deepEqual(await resolveMissingNames(root, "src/components/Badge.tsx(1,33): error TS2307: Cannot find module '../lib/types'.", ['src/components/Badge.tsx']), []);
+  await rm(join(root, 'src', 'components', 'types.tsx'));
+  // End to end: the harness applies the rewrite itself after the failing check, then verifies.
+  await writeFile(join(root, 'check.mjs'), "import { readFileSync } from 'node:fs'; const t = readFileSync('src/components/Badge.tsx', 'utf8'); if (t.includes(\"from './types'\")) { console.error(\"src/components/Badge.tsx(1,33): error TS2307: Cannot find module './types' or its corresponding type declarations.\"); process.exit(1); } process.exit(0);\n");
+  s.phase = 'implement'; s.inspectionCount = 3; s.writes = ['src/components/Badge.tsx']; s.hashes['src/components/Badge.tsx'] = hash(badge);
+  const jev = { decide: async (_st: unknown, q: Questions, ctx?: { phase: string }) => answersFor(q, ctx?.phase === 'completion-check' ? 'finish' : 'read_files', .9) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src/components/Badge.tsx', start: 1, end: 3 }] } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(s);
+  const kinds = result.entries.map(e => e.kind);
+  assert.deepEqual(kinds.slice(0, 3), ['bash', 'replace_lines', 'bash'], `steps: ${kinds.join(',')}`);
+  assert.equal(await readFile(join(root, 'src', 'components', 'Badge.tsx'), 'utf8'), badge.replace("'./types'", "'../types'")); assert.equal(result.lastCheck?.ok, true);
+});
+test('A missing JSX namespace resolves to a type import of it from react, applied by the harness', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'Badge.tsx'), 'import type { P } from "./types";\nexport default function Badge(p: P): JSX.Element { return <span />; }\n');
+  const names = await resolveMissingNames(root, "src/Badge.tsx(2,39): error TS2503: Cannot find namespace 'JSX'.", ['src/Badge.tsx']);
+  assert.deepEqual(names.map(n => [n.name, n.importLine]), [['JSX', 'import type { JSX } from "react";']]);
+  assert.deepEqual(compactNames({ missingNames: names } as any, 40).addImports, { 'src/Badge.tsx': ['import type { JSX } from "react";'] });
 });
 test('A wrong-module error with the checker\'s hint is repaired as an aliased import, usage untouched', async t => {
   const { root } = await fixture(t);
@@ -2536,7 +2618,7 @@ test('A wrong-module error with the checker\'s hint is repaired as an aliased im
   const edit = await aliasImportBinding('src/App.tsx', app, 'CTASection', 'CtaSection', 2);
   assert.deepEqual(edit, { start: 2, end: 2, newText: 'import { CtaSection as CTASection, type Props } from "./components/CTASection";', prepend: '' });
 });
-test('An edit route the worker failed on twice is not offered as a fix or implement candidate', async t => {
+test('A blocked route never hides decided work; a deliverable set aside after three failed creations is', async t => {
   const { session: s } = await fixture(t);
   s.lastCheck = { step: 5, ok: false, text: 'x', summary: summarizeCheck("src/App.tsx(6,1): error TS2724: '\"./c\"' has no exported member 'X'.") };
   s.ledger = candidatesFrom({ deliverables: [{ kind: 'modify', name: 'App', from: 'src/App.tsx', to: 'src/App.tsx', detail: 'm' }, { kind: 'create', name: 'src/new.ts', from: '', to: 'src/new.ts', detail: 'c' }] });
@@ -2545,41 +2627,49 @@ test('An edit route the worker failed on twice is not offered as a fix or implem
   assert(ids.includes('fix:src/App.tsx') && ids.includes('implement:d1') && ids.includes('implement:d2'));
   s.blockedRoute = 'replace_lines';
   ids = candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id);
-  assert(!ids.includes('fix:src/App.tsx') && !ids.includes('implement:d1'), 'replace_lines is blocked'); assert(ids.includes('implement:d2'), 'a write is still offered');
+  assert(ids.includes('fix:src/App.tsx') && ids.includes('implement:d1') && ids.includes('implement:d2'), 'a free-path route block is not a reason to withhold decided work');
+  s.ledger[1]!.attempts = 3;
+  ids = candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id);
+  assert(!ids.includes('implement:d2'), 'three failed creations set the item aside');
+  s.ledger[0]!.attempts = 3; s.hashes['src/App.tsx'] = 'h'; s.fixAttempts = { 'src/App.tsx@h': 3 };
+  ids = candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id);
+  assert(!ids.includes('implement:d1') && !ids.includes('fix:src/App.tsx'), 'three failed edits set the item aside, and three failed rewrites of one version of a file withhold its fix');
+  s.hashes['src/App.tsx'] = 'changed';
+  assert(candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id).includes('fix:src/App.tsx'), 'a changed file may be fixed again');
 });
-
-test('A decided fix reads the target first, prompts the worker with only that file, and refuses arguments that edit another file', async t => {
+test('A decided fix is a region rewrite: code picks the region, the worker returns corrected code, the harness validates it before it lands, and no read is spent', async t => {
   const { root, store, session } = await fixture(t);
   await mkdir(join(root, 'src', 'components'), { recursive: true });
-  const cta = Array.from({ length: 30 }, (_, i) => i === 9 ? 'export const CTAButton = () => <button>{missing}</button>;' : `const line${i} = ${i};`).join('\n') + '\n';
-  await writeFile(join(root, 'src', 'components', 'CTAButton.tsx'), cta); await writeFile(join(root, 'tsconfig.json'), '{}\n');
-  session.objective = 'Fix the landing page.'; session.phase = 'implement'; session.inspectionCount = 3; session.knownFiles.push('src/components/CTAButton.tsx', 'tsconfig.json');
-  session.writes = ['src/components/CTAButton.tsx']; session.hashes['src/components/CTAButton.tsx'] = hash(cta); // written, never read at this version
-  session.lastCheck = { step: 3, ok: false, text: 'src/components/CTAButton.tsx(10,44): error TS2304: Cannot find name \'missing\'.', summary: summarizeCheck("src/components/CTAButton.tsx(10,44): error TS2304: Cannot find name 'missing'.") }; session.lastCheckCommand = 'node check.mjs'; session.lastWriteStep = 2;
-  session.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/components/CTAButton.tsx', from: '', to: 'src/components/CTAButton.tsx', detail: 'button' }] }); session.ledgerBuilt = true;
-  let gen = 0; const prompts: any[] = [];
+  // A Button.tsx-shaped file: the return's closing ");" is missing before the function's brace.
+  const lines = ['import React from "react";', 'export function Button({ children }: { children: React.ReactNode }) {', '  return (', '    <button type="button">', '      {children}', '    </button>', '}', ''];
+  const cta = lines.join('\n'); await writeFile(join(root, 'src', 'components', 'Button.tsx'), cta); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  session.objective = 'Fix the landing page.'; session.phase = 'implement'; session.inspectionCount = 3; session.knownFiles.push('src/components/Button.tsx');
+  session.writes = ['src/components/Button.tsx']; session.hashes['src/components/Button.tsx'] = hash(cta); // written, never read at this version
+  session.lastCheck = { step: 3, ok: false, text: "src/components/Button.tsx(7,1): error TS1005: ')' expected.", summary: summarizeCheck("src/components/Button.tsx(7,1): error TS1005: ')' expected.") }; session.lastCheckCommand = 'node check.mjs'; session.lastWriteStep = 2;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/components/Button.tsx', from: '', to: 'src/components/Button.tsx', detail: 'button' }] }); session.ledgerBuilt = true; await refreshLedger(root, session);
+  const prompts: any[] = []; let attempt = 0;
   const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
     if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('fix:'))!; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
-    return answersFor(q, 'read_files', .9);
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
   } };
-  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
-    if (schema !== schemas.replace_lines) return { files: [{ path: 'tsconfig.json', start: 1, end: 1 }] };
-    prompts.push(m); gen++;
-    const fileHash = JSON.parse(m[2].content).file.sha256;
-    return gen === 1 ? { path: 'tsconfig.json', expectedHash: hash('{}\n'), edits: [{ start: 1, end: 1, newText: '{ "strict": false }', prepend: '' }] }
-      : { path: 'src/components/CTAButton.tsx', expectedHash: fileHash, edits: [{ start: 10, end: 10, newText: 'export const CTAButton = () => <button>Go</button>;', prepend: '' }] };
-  } };
-  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(session);
+  const stillBroken = [...lines.slice(0, 5), '  );', '}', ''].join('\n'); const truncated = 'import React from "react";\nconst helper = 1;\n'; const good = [...lines.slice(0, 6), '  );', '}', ''].join('\n');
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'fixed' } : { files: [{ path: 'src/components/Button.tsx', start: 1, end: 1 }] },
+    generateText: async (m: any) => { prompts.push(m); attempt++; return { text: attempt === 1 ? stillBroken : attempt === 2 ? truncated : good, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
   const kinds = result.entries.map(e => e.kind);
-  assert.equal(kinds[0], 'read_files', `the target was read first; steps: ${kinds.join(',')}`);
-  assert.equal(kinds[1], 'generation_error'); assert.match(result.entries[1]!.text, /decided action is an edit of src\/components\/CTAButton\.tsx; the generated arguments edit tsconfig\.json instead/);
-  assert.equal(kinds[2], 'replace_lines'); assert.match(await readFile(join(root, 'src', 'components', 'CTAButton.tsx'), 'utf8'), /<button>Go<\/button>/);
-  assert.equal(await readFile(join(root, 'tsconfig.json'), 'utf8'), '{}\n', 'the other file was never touched');
-  const focused = JSON.parse(prompts[0][2].content);
-  assert.equal(prompts[0].length, 3, 'pinned block, focused request, nothing else'); assert.equal(focused.file.path, 'src/components/CTAButton.tsx'); assert.match(focused.file.text, /^1: const line0 = 0;/); assert.match(focused.task, /^Fix the verification errors in src\/components\/CTAButton\.tsx at lines 10/);
-  assert(!('editEvidence' in focused) && !('evidence' in focused), 'no history in a focused prompt');
+  assert.equal(kinds[0], 'generation_error', `steps: ${kinds.join(',')}`); assert.match(result.entries[0]!.text, /would still not parse/);
+  assert.equal(kinds[1], 'generation_error'); assert.match(result.entries[1]!.text, /dropped the export Button, which other files import/, 'a rewrite that ends early and parses is still wrong content');
+  assert.match(JSON.parse(prompts[2][2].content).errors.join(' | '), /previous attempt: The rewrite of src\/components\/Button\.tsx dropped the export Button/, 'the next attempt is told what went wrong');
+  assert.equal(kinds[2], 'replace_lines'); assert.equal(await readFile(join(root, 'src', 'components', 'Button.tsx'), 'utf8'), good);
+  assert.equal(kinds[3], 'bash', 'the check runs after the repair as after any edit'); assert.equal(result.lastCheck?.ok, true);
+  assert.equal(result.fixAttempts?.[`src/components/Button.tsx@${hash(cta)}`], 2, 'failed rewrites count against the file version');
+  assert(!kinds.includes('read_files'), 'no read: code holds the file');
+  const req = JSON.parse(prompts[0][2].content);
+  assert.equal(prompts[0].length, 3); assert.equal(prompts[0][0].content, SYSTEM); assert.equal(req.file, 'src/components/Button.tsx'); assert.equal(req.content, cta, 'a small file is rewritten whole, with its opener in view');
+  assert.match(req.errors.join(' '), /'\)' expected/); assert(!('editEvidence' in req) && !('rejectedEdits' in req), 'no history in a repair prompt');
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(events.some(e => e.type === 'decided-fix'));
 });
-
 test('Scope creep is asked only about files no deliverable names, and not at all when every changed file is a deliverable', async t => {
   const { session: s } = await fixture(t);
   s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/App.tsx', from: '', to: 'src/App.tsx', detail: 'app', contents: [] }, { kind: 'modify', name: 'main', from: 'src/main.tsx', to: 'src/main.tsx', detail: 'm', contents: [] }] });
@@ -2590,24 +2680,527 @@ test('Scope creep is asked only about files no deliverable names, and not at all
   const v = auditVerdict({ d_d1: { type: 'choice', choice: 'supports', confidence: 1, probabilities: { supports: 1, contradicts: 0, says_nothing: 0 } }, d_d2: { type: 'choice', choice: 'supports', confidence: 1, probabilities: { supports: 1, contradicts: 0, says_nothing: 0 } } }, s.ledger, defaults);
   assert(v.accepted); assert.equal(v.scopeCreep, 0);
 });
-test('The ledger carries a design and per-file contents, and a file to create is prompted from them with its neighbours\' exports', async t => {
-  const { root, store, session } = await fixture(t);
+test('The ledger carries a design, exports and dependencies, and a file to create is prompted as code with its contracts', async t => {
+  const { root, session } = await fixture(t);
   const raw = { summary: 'A marketing landing page with a hero, three feature cards and a footer.', conventions: 'React 18 with TypeScript, Vite, CSS modules; named exports; no placeholders.',
-    deliverables: [{ kind: 'create', name: 'src/components/Hero.tsx', from: '', to: 'src/components/Hero.tsx', detail: 'the hero section', contents: ['a headline and subheadline from props', 'a primary CTAButton', 'responsive layout'] }, { kind: 'create', name: 'src/components/CTAButton.tsx', from: '', to: 'src/components/CTAButton.tsx', detail: 'the button', contents: ['label and onClick props'] }] };
+    deliverables: [{ kind: 'create', name: 'src/components/Hero.tsx', from: '', to: 'src/components/Hero.tsx', detail: 'the hero section', contents: ['a headline and subheadline from props', 'a primary CTAButton', 'responsive layout'], exports: ['export function Hero(props: HeroProps): JSX.Element'], dependsOn: ['src/components/CTAButton.tsx'] }, { kind: 'create', name: 'src/components/CTAButton.tsx', from: '', to: 'src/components/CTAButton.tsx', detail: 'the button', contents: ['label and onClick props'], exports: ['export function CTAButton(props: { label: string; onClick(): void }): JSX.Element'], dependsOn: [] }] };
   assert.deepEqual(designFrom(raw), { summary: raw.summary, conventions: raw.conventions });
-  const items = candidatesFrom(raw); assert.deepEqual(items[0]!.contents, raw.deliverables[0]!.contents);
-  await mkdir(join(root, 'src', 'components'), { recursive: true }); await writeFile(join(root, 'src', 'components', 'CTAButton.tsx'), 'export const CTAButton = () => null;\nconst internal = 1;\n');
-  session.design = designFrom(raw); session.ledger = items; session.knownFiles.push('src/components/CTAButton.tsx');
-  const m = focusedCreateMessages(session, 'src/components/Hero.tsx', items[0]!, [{ path: 'src/components/CTAButton.tsx', exports: ['CTAButton'] }]);
-  const req = JSON.parse(m[2]!.content);
-  assert.equal(m.length, 3); assert.equal(req.design.summary, raw.summary); assert.deepEqual(req.mustContain, raw.deliverables[0]!.contents); assert.deepEqual(req.canImport, [{ path: 'src/components/CTAButton.tsx', exports: ['CTAButton'] }]);
-  assert.match(req.rule, /no placeholders or TODOs/); assert.deepEqual(req.argumentSchema, schemas.write);
+  const items = candidatesFrom(raw); assert.deepEqual(items[0]!.contents, raw.deliverables[0]!.contents); assert.deepEqual(items[0]!.dependsOn, ['src/components/CTAButton.tsx']); assert.deepEqual(items[1]!.exports, raw.deliverables[1]!.exports);
+  session.design = designFrom(raw); session.ledger = items;
+  // Before the dependency exists, its contract comes from the design; Hero is not ready, CTAButton is.
+  assert.deepEqual(readyCreates(session).map(d => d.to), ['src/components/CTAButton.tsx']);
+  let c = await contractsFor(root, session, items[0]!);
+  assert.deepEqual(c.contracts, [{ path: 'src/components/CTAButton.tsx', importPath: './CTAButton', status: 'planned', exports: raw.deliverables[1]!.exports }]);
+  await mkdir(join(root, 'src', 'components'), { recursive: true }); await writeFile(join(root, 'src', 'components', 'CTAButton.tsx'), 'export interface CTAProps { label: string; onClick(): void }\nexport const CTAButton = (p: CTAProps) => null;\nconst internal = 1;\n');
+  session.knownFiles.push('src/components/CTAButton.tsx'); await refreshLedger(root, session);
+  assert.deepEqual(readyCreates(session).map(d => d.to), ['src/components/Hero.tsx'], 'once the dependency exists the dependant is ready');
+  c = await contractsFor(root, session, items[0]!);
+  assert.equal(c.contracts[0]!.status, 'exists'); assert.match(c.contracts[0]!.exports.join('\n'), /export interface CTAProps/); assert.match(c.contracts[0]!.exports.join('\n'), /export const CTAButton = \(p: CTAProps\) =>$/m); assert(!c.contracts[0]!.exports.join('\n').includes('internal'));
+  // The dependency's own prompt shows how its existing importer uses it.
+  await writeFile(join(root, 'src', 'components', 'Hero.tsx'), 'import { CTAButton } from "./CTAButton";\nexport function Hero() {\n  return <div><CTAButton\n    label="Go"\n    onClick={() => track({ id: 1 })}\n  /></div>;\n}\n');
+  const back = await contractsFor(root, session, items[1]!);
+  assert.deepEqual(back.importers, [{ path: 'src/components/Hero.tsx', expects: raw.deliverables[1]!.exports, usage: ['<CTAButton label="Go" onClick={() => track({ id: 1 })} />'] }]);
+  assert(!back.contracts.some(x => configLike(x.path)), 'a build configuration is never offered as a module to import');
+  await rm(join(root, 'src', 'components', 'Hero.tsx'));
+  const m = createFileMessages(session, { path: 'src/components/Hero.tsx', deliverable: items[0]!, contracts: c.contracts, importers: [], packages: ['react@18.2.0'] });
+  assert.equal(m.length, 4); assert.equal(m[0]!.content, SYSTEM); const pinned = JSON.parse(m[1]!.content); const design = JSON.parse(m[2]!.content); const req = JSON.parse(m[3]!.content);
+  assert.equal(pinned.objective, session.objective); assert.equal(design.design.summary, raw.summary); assert.deepEqual(design.installedPackages, ['react@18.2.0']);
+  assert.deepEqual(req.mustContain, raw.deliverables[0]!.contents); assert.deepEqual(req.mustExport, items[0]!.exports); assert.equal(req.dependencies[0].import, './CTAButton'); assert.match(req.rules.join(' '), /no placeholders, TODOs/);
   assert.equal(taskRecord(session).design?.summary, raw.summary);
-  void store;
+  assert.equal(fenceFor('src/components/Hero.tsx'), '```tsx'); assert.equal(fenceFor('README.md'), '````md');
+  assert.match(createFileMessages(session, { path: 'src/components/CTAButton.tsx', deliverable: items[1]!, contracts: [], importers: back.importers, packages: [] })[3]!.content, /declare that export to accept exactly those props or arguments/);
+  assert.deepEqual(usageSnippets('const a = <FeatureCard key={feature.id} feature={feature} />; const b = <FeatureCard {...x}>\n  child\n</FeatureCard>;', 'FeatureCard'), ['<FeatureCard key={feature.id} feature={feature} />', '<FeatureCard {...x}>']);
+  assert.deepEqual(usageSnippets('export function formatPrice(n: number) { return n; }\nconst p = formatPrice(total, { currency: "USD" }); obj.formatPrice(1);', 'formatPrice'), ['formatPrice(total, { currency: "USD" })'], 'the declaration and a member call are not usages');
+  assert.deepEqual(usageSnippets('nothing here', 'X'), []);
+});
+test('Creation names only the path; content is generated as code and never validated for length', () => {
+  validate(schemas.create_file, { path: 'src/pages/LandingPage.tsx', purpose: 'the landing page' });
+  assert.throws(() => validate(schemas.create_file, { path: 'a.tsx', purpose: 'p', content: 'x' }), /unknown property content/);
+  validate(schemas.write, { path: 'a.ts', expectedHash: 'h', oldText: 'y'.repeat(700), newText: 'z' });
+  assert.equal(extractCode('Here you go:\n```tsx\nexport const A = 1;\n```\nDone.'), 'export const A = 1;\n');
+  assert.equal(extractCode('```\nline\n'), 'line\n', 'a block cut short by the budget has no closing fence');
+  assert.equal(extractCode('plain text with no fence'), 'plain text with no fence\n');
 });
 
-test('Creating a file accepts file-sized content; the anchor limit alone guards against retyping', () => {
-  const big = 'x'.repeat(9000);
-  validate(schemas.write, { path: 'src/pages/LandingPage.tsx', expectedHash: 'new', oldText: '', newText: big });
-  assert.throws(() => validate(schemas.write, { path: 'a.ts', expectedHash: 'h', oldText: 'y'.repeat(700), newText: 'z' }), /oldText/);
+test('repetitionStart finds a looping tail and leaves honest repetition alone', () => {
+  const block = ['  <li>Item</li>', '  <li>Item</li>', '  <li>Item</li>'];
+  const looping = ['const a = 1;', ...Array.from({ length: 5 }, () => ['<div className="feature">', '  <h3>Fast</h3>', '  <p>Really fast builds.</p>', '</div>']).flat()].join('\n');
+  const at = repetitionStart(looping); assert(at >= 1 && at <= 5, `first repeat at ${at}`);
+  assert.equal(repetitionStart(['const a = 1;', ...block, 'const b = 2;'].join('\n')), -1, 'three identical lines are not a loop'); assert.equal(repetitionStart(['const a = 1;', ...Array.from({ length: 6 }, () => '  <li>Item</li>')].join('\n')), 2, 'six identical substantive lines are, from the second');
+  const honest = Array.from({ length: 30 }, (_, i) => `export const v${i} = ${i};`).join('\n');
+  assert.equal(repetitionStart(honest), -1);
+  assert.equal(repetitionStart(Array.from({ length: 12 }, () => '}').join('\n')), -1, 'closing braces are not content');
+});
+test('parseDesign reads the JSON block from a design reply and repairs one the budget cut', () => {
+  const full = 'Analysis first.\n```json\n{"summary":"An app","conventions":"TS","deliverables":[{"kind":"create","name":"a.ts","from":"","to":"a.ts","detail":"d","contents":[],"exports":[],"dependsOn":[]}]}\n```\n';
+  assert.equal(parseDesign(full)!.deliverables.length, 1);
+  const cut = '```json\n{"summary":"An app","conventions":"TS","deliverables":[{"kind":"create","name":"a.ts","from":"","to":"a.ts","detail":"d","contents":[],"exports":[],"dependsOn":[]},{"kind":"create","name":"b.ts","from":"","to":"b.ts","detail":"a \\"quoted\\" one","contents":["x"],"exports":[],"dependsOn":["a.ts"]},{"kind":"create","name":"c.ts","from":"","to":"c.ts","det';
+  const repaired = parseDesign(cut)!;
+  assert.equal(repaired.summary, 'An app'); assert.deepEqual(repaired.deliverables.map((d: any) => d.name), ['a.ts', 'b.ts'], 'complete items are kept, the cut one is dropped');
+  const early = '{"summary":"Only a summary so far","conventions":"conv';
+  assert.deepEqual(parseDesign(early), { summary: 'Only a summary so far', conventions: '', deliverables: [] });
+  assert.equal(parseDesign('no json here'), null);
+  assert.equal(parseDesign('{"summary":"s","conventions":"c","deliverables":[]}')!.summary, 's', 'bare JSON without a fence');
+});
+test('generateText continues by token ids with the fence prefilled, stops on the closing fence, cuts a loop, and repairs a broken character', async t => {
+  // A mock llama-server: tokens are character codes; /completion replies from a script and records the prompts it received.
+  const requests: any[] = []; let script: { content: string; stop_type: string; tokens?: number[] }[] = [];
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk; const b = body ? JSON.parse(body) : {};
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/apply-template') return res.end(JSON.stringify({ prompt: `<|im_start|>system\n${b.messages[0].content}<|im_end|>\n<|im_start|>assistant\n${b.chat_template_kwargs?.enable_thinking ? '' : '<think>\n\n</think>\n\n'}` }));
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    if (req.url === '/detokenize') return res.end(JSON.stringify({ content: String.fromCodePoint(...b.tokens).replace(/�/g, 'é') }));
+    if (req.url === '/completion') { requests.push(b); const r = script.shift()!; return res.end(JSON.stringify({ content: r.content, tokens: r.tokens ?? [...r.content].map(c => c.codePointAt(0)), stop_type: r.stop_type, tokens_predicted: r.tokens?.length ?? [...r.content].length, timings: { predicted_per_second: 30 } })); }
+    res.statusCode = 404; res.end('{}');
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => server.once('listening', resolve)); t.after(() => server.close());
+  const bonsai = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 }, 'local', noop);
+  // Two chunks: the first stops at the chunk size, the second at the closing fence.
+  script = [{ content: 'const a = 1;\n', stop_type: 'limit' }, { content: 'export { a };', stop_type: 'word' }];
+  const g = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', context: { step: 1, route: 'create_file' } });
+  assert.equal(g.text, 'const a = 1;\nexport { a };'); assert.equal(g.finish, 'stop'); assert.equal(g.meta.continuations, 1); assert.equal(g.meta.usage.completion_tokens, 26);
+  const rendered = '<|im_start|>system\nS<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n```ts\n';
+  assert.deepEqual(requests[0].prompt, [...rendered].map(c => c.codePointAt(0)), 'the opening fence is part of the prompt'); assert.deepEqual(requests[0].stop, ['\n```']); assert.equal(requests[0].n_predict, 64); assert.equal(requests[0].cache_prompt, true); assert(requests[0].dry_multiplier > 0);
+  assert.deepEqual(requests[1].prompt, [...requests[0].prompt, ...[...'const a = 1;\n'].map(c => c.codePointAt(0))], 'the continuation is the same ids plus the ones generated, never a re-tokenized string');
+  // A chunk that loops is cut at the first repeat and reported as such; no continuation is spent on it.
+  const loop = Array.from({ length: 6 }, () => ['<div className="feature">', '  <h3>Fast</h3>', '  <p>Really fast builds.</p>', '</div>']).flat().join('\n');
+  script = [{ content: `const b = 2;\n${loop}\n`, stop_type: 'limit' }];
+  const r = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
+  assert.equal(r.finish, 'repetition'); assert(r.text.startsWith('const b = 2;\n<div className="feature">')); assert(r.text.split('\n').length < 12, 'cut at the first repeat'); assert.equal(script.length, 0);
+  // A chunk ending in a broken character is re-derived from the token ids.
+  script = [{ content: 'caf�', stop_type: 'limit', tokens: [99, 97, 102, 233] }, { content: ' au lait', stop_type: 'eos' }];
+  const d = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null });
+  assert.equal(d.text, 'café au lait'); assert.equal(d.finish, 'stop');
+  // With thinking, the reply is rendered without the empty thought block, the thought is stripped, and an overlong thought is closed by the harness.
+  script = [{ content: '<think>plan the files', stop_type: 'limit' }, { content: 'here is the design', stop_type: 'eos' }];
+  const th = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null, thinking: true, thinkingBudget: 10, budgetTokens: 200 });
+  assert.equal(th.text, 'here is the design'); assert.equal(requests.at(-1).prompt.slice(-11).map((c: number) => String.fromCodePoint(c)).join(''), '\n</think>\n\n', 'the thought was closed before the answer was asked for');
+  // The budget ends a generation cleanly as length, not as an error.
+  script = Array.from({ length: 6 }, () => ({ content: 'x'.repeat(64), stop_type: 'limit' }));
+  const l = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null, budgetTokens: 200 });
+  assert.equal(l.finish, 'length'); assert(l.text.length >= 200 && l.text.length <= 256, `generated ${l.text.length} characters`);
+});
+test('A created file that does not parse or lacks a promised export is repaired by the harness before it is checked, from a prompt that shows the whole small file', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  session.objective = 'Bootstrap a component library.'; session.phase = 'implement'; session.inspectionCount = 3;
+  session.ledger = candidatesFrom({ summary: 's', conventions: 'c', deliverables: [{ kind: 'create', name: 'src/Button.tsx', from: '', to: 'src/Button.tsx', detail: 'the button', contents: ['a button'], exports: ['export function Button(): JSX.Element', "export type ButtonVariant = 'primary' | 'secondary'"], dependsOn: [] }] }); session.ledgerBuilt = true; session.design = { summary: 's', conventions: 'c' };
+  const broken = 'export function Button() {\n  return (\n    <button type="button">Go</button>\n}\n'; // missing ");" and the promised type
+  const fixed = "export type ButtonVariant = 'primary' | 'secondary';\nexport function Button() {\n  return (\n    <button type=\"button\">Go</button>\n  );\n}\n";
+  const prompts: any[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); return { next: { type: 'choice', choice: 'implement:d1', confidence: .95, probabilities: Object.fromEntries(ids.map(i => [i, i === 'implement:d1' ? .95 : .05 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src/Button.tsx', start: 1, end: 1 }] },
+    generateText: async (m: any) => { prompts.push(m); return { text: prompts.length === 1 ? broken : fixed, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 6 }, store, jev, bonsai, root, () => {}).run(session);
+  const kinds = result.entries.map(e => e.kind);
+  assert.deepEqual(kinds.slice(0, 4), ['bash', 'create_file', 'replace_lines', 'bash'], `baseline, creation, repair, check; steps: ${kinds.join(',')}`);
+  assert.match(result.entries[1]!.text, /does not parse yet/);
+  assert.equal(await readFile(join(root, 'src', 'Button.tsx'), 'utf8'), fixed); assert.deepEqual(result.pendingRepairs, []);
+  const createReq = JSON.parse(prompts[0][3].content); assert.equal(createReq.file, 'src/Button.tsx'); assert.deepEqual(createReq.mustExport, session.ledger[0]!.exports);
+  const repairReq = JSON.parse(prompts[1][2].content);
+  assert.equal(repairReq.content, broken, 'the whole file, opener included'); assert.match(repairReq.errors.join(' | '), /expected/); assert.match(repairReq.errors.join(' | '), /contract: src\/Button\.tsx must export ButtonVariant/);
+  assert.equal(result.status, 'complete', result.stopReason);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(events.some(e => e.type === 'repair')); assert(!events.some(e => e.type === 'undo'), 'a created file is never rolled back');
+});
+test('Unplanned relative imports become derived deliverables with usage contracts; planned modules become dependencies; dropped candidates come back with their design', async t => {
+  const { session: s } = await fixture(t);
+  s.ledger = candidatesFrom({ deliverables: [
+    { kind: 'create', name: 'src/pages/Landing.tsx', from: '', to: 'src/pages/Landing.tsx', detail: 'page', contents: [], exports: [], dependsOn: [] },
+    { kind: 'create', name: 'src/types/index.ts', from: '', to: 'src/types/index.ts', detail: 'types', contents: [], exports: ['export type Feature = { id: string }'], dependsOn: [] } ] });
+  s.droppedCandidates = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/context/ThemeContext.tsx', from: '', to: 'src/context/ThemeContext.tsx', detail: 'theme context from the design', contents: ['ThemeProvider', 'useTheme hook'], exports: ['export function ThemeProvider(props: { children: React.ReactNode }): JSX.Element'], dependsOn: [] }] });
+  const text = 'import { Feature } from "../types";\nimport { Button } from "../components/Button";\nimport { useTheme } from "../context/ThemeContext";\nimport { features } from "../data/features";\nimport "./landing.css";\nexport function Landing() { const t = useTheme(); return <Button variant="primary" size="lg">{features.map(f => f.id)}</Button>; }\n';
+  const imports = await relativeImports('src/pages/Landing.tsx', text);
+  const added = deriveDeliverables(s, 'src/pages/Landing.tsx', imports, text);
+  assert.deepEqual(s.ledger[0]!.dependsOn, ['src/types/index.ts', 'src/components/Button.tsx', 'src/context/ThemeContext.tsx', 'src/data/features.ts', 'src/pages/landing.css'], 'the importer now depends on what it imports');
+  assert.deepEqual(added.map(d => [d.to, d.derived, d.status]), [['src/components/Button.tsx', true, 'pending'], ['src/context/ThemeContext.tsx', true, 'pending'], ['src/data/features.ts', true, 'pending'], ['src/pages/landing.css', true, 'pending']]);
+  assert.equal(added[1]!.detail, 'theme context from the design', 'a dropped design candidate returns with its contents, not a stub'); assert.deepEqual(s.droppedCandidates, []);
+  assert.match(added[0]!.contents!.join(' '), /React component <Button> rendered with props variant, size/); assert.match(added[2]!.contents!.join(' '), /features/);
+  assert.deepEqual(added[0]!.exports, ['export function Button(props)']); assert.equal(added[0]!.importer, 'src/pages/Landing.tsx'); assert.equal(added[0]!.spec, '../components/Button');
+  assert.deepEqual(await missingExports('src/components/Button.tsx', 'export default function Button() { return null; }\n', added[0]!.exports!), ['Button'], 'a default export does not satisfy a named contract');
+  assert.deepEqual(await missingExports('src/components/Button.tsx', 'export function Button() { return null; }\n', added[0]!.exports!), []);
+  const typed = deriveDeliverables(s, 'src/components/Card.tsx', [{ spec: '../shapes', names: ['Shape'], typeOnly: true }], 'const s: Shape = x;');
+  assert.deepEqual(typed[0]!.exports, ['export type Shape']); assert.match(typed[0]!.contents!.join(' '), /imported with import type/);
+  assert.equal(usageOf('const x = fn(a, b);', 'fn'), 'function fn called as fn(a, b)'); assert.equal(usageOf('let v: Feature = f;', 'Feature'), 'type Feature used in a type annotation');
+  // Depth one: a derived file's own unplanned imports are its fix work, not new files; the cap holds.
+  const again = deriveDeliverables(s, 'src/components/Button.tsx', [{ spec: './styles', names: ['s'] }], '');
+  assert.deepEqual(again, []);
+  assert.deepEqual(importCandidates('src/pages/Landing.tsx', '../types'), ['src/types', 'src/types.ts', 'src/types.tsx', 'src/types.js', 'src/types.jsx', 'src/types.mjs', 'src/types.cjs', 'src/types.json', 'src/types/index.ts', 'src/types/index.tsx', 'src/types/index.js', 'src/types/index.jsx']);
+  assert.deepEqual(importCandidates('src/a.ts', './b.js'), ['src/b.js', 'src/b.ts']);
+});
+test('Creation order puts configuration first, then dependency depth; readiness offers what can be written now and falls back to the order', async t => {
+  const { session: s } = await fixture(t);
+  assert(configLike('package.json') && configLike('tsconfig.json') && configLike('vite.config.ts') && configLike('index.html') && !configLike('src/index.html') && !configLike('src/App.tsx'));
+  s.ledger = candidatesFrom({ deliverables: [
+    { kind: 'create', name: 'src/App.tsx', from: '', to: 'src/App.tsx', detail: 'app', contents: [], exports: [], dependsOn: ['src/components/Navbar.tsx', 'src/pages/Landing.tsx'] },
+    { kind: 'create', name: 'src/pages/Landing.tsx', from: '', to: 'src/pages/Landing.tsx', detail: 'page', contents: [], exports: [], dependsOn: ['src/components/Button.tsx', 'src/types/index.ts'] },
+    { kind: 'create', name: 'src/components/Button.tsx', from: '', to: 'src/components/Button.tsx', detail: 'button', contents: [], exports: [], dependsOn: ['../types'] },
+    { kind: 'create', name: 'src/components/Navbar.tsx', from: '', to: 'src/components/Navbar.tsx', detail: 'nav', contents: [], exports: [], dependsOn: [] },
+    { kind: 'create', name: 'src/types/index.ts', from: '', to: 'src/types/index.ts', detail: 'types', contents: [], exports: [], dependsOn: [] },
+    { kind: 'create', name: 'package.json', from: '', to: 'package.json', detail: 'manifest', contents: [], exports: [], dependsOn: [] },
+    { kind: 'create', name: 'src/main.tsx', from: '', to: 'src/main.tsx', detail: 'entry', contents: [], exports: [], dependsOn: ['src/App.tsx'] } ] });
+  s.ledger[3]!.optional = true; // an optional dependency of a required page never deadlocks the order
+  assert.deepEqual(creationOrder(s).map(d => d.to), ['package.json', 'src/types/index.ts', 'src/components/Button.tsx', 'src/pages/Landing.tsx', 'src/App.tsx', 'src/main.tsx', 'src/components/Navbar.tsx'], 'required before optional, configuration before source, then depth');
+  assert.deepEqual(readyCreates(s).map(d => d.to), ['package.json', 'src/types/index.ts', 'src/components/Navbar.tsx']);
+  const c = candidates(s, { ...defaults, allowWrite: true }, false);
+  assert.deepEqual(c.filter(x => x.kind === 'implement').map(x => x.id), ['implement:d6'], 'one file at a time: the head of the order');
+  assert.match(c[0]!.description, /Implement deliverable d6/);
+  s.ledger[5]!.status = 'done'; s.ledger[4]!.status = 'done';
+  const button = candidates(s, { ...defaults, allowWrite: true }, false).find(x => x.kind === 'implement')!;
+  assert.equal(button.id, 'implement:d3', 'with its types in place the button comes first, in design order'); assert.match(button.description, /imported by src\/pages\/Landing\.tsx, which cannot be created before it/);
+  s.ledger[2]!.status = 'done';
+  assert.equal(candidates(s, { ...defaults, allowWrite: true }, false).find(x => x.kind === 'implement')!.id, 'implement:d2', 'the page follows its components');
+  s.ledger[1]!.status = 'done';
+  const next = candidates(s, { ...defaults, allowWrite: true }, false).find(x => x.kind === 'implement')!;
+  assert.equal(next.id, 'implement:d4'); assert.match(next.description, /optional/);
+  // A cycle or a dependency the design left out still yields work: the order itself.
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'a.ts', from: '', to: 'a.ts', detail: 'a', contents: [], exports: [], dependsOn: ['b.ts'] }, { kind: 'create', name: 'b.ts', from: '', to: 'b.ts', detail: 'b', contents: [], exports: [], dependsOn: ['a.ts'] }] });
+  assert.deepEqual(readyCreates(s).map(d => d.to).sort(), ['a.ts', 'b.ts']);
+});
+test('Fix candidates are withheld for files whose only errors name modules a pending deliverable provides; ask falls through when the user is not needed', async t => {
+  const { session: s } = await fixture(t);
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/App.tsx', from: '', to: 'src/App.tsx', detail: 'app', contents: [], exports: [], dependsOn: [] }, { kind: 'create', name: 'src/components/Footer.tsx', from: '', to: 'src/components/Footer.tsx', detail: 'footer', contents: [], exports: [], dependsOn: [] }] });
+  s.ledger[0]!.status = 'done'; s.knownFiles.push('src/App.tsx');
+  s.lastCheck = { step: 3, ok: false, text: 'x', summary: summarizeCheck("src/App.tsx(4,20): error TS2307: Cannot find module './components/Footer' or its corresponding type declarations.") };
+  let ids = candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id);
+  assert(!ids.includes('fix:src/App.tsx'), 'the module is on its way'); assert(ids.includes('implement:d2'));
+  s.lastCheck = { step: 3, ok: false, text: 'x', summary: summarizeCheck("src/App.tsx(4,20): error TS2307: Cannot find module './components/Footer'.\nsrc/App.tsx(9,3): error TS2322: Type 'string' is not assignable to type 'number'.") };
+  ids = candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id);
+  assert(ids.includes('fix:src/App.tsx'), 'a real error in the file is fix work');
+  s.lastCheck = { step: 3, ok: false, text: 'x', summary: summarizeCheck('error: Could not resolve entry module "index.html".') };
+  const pending = candidates(s, { ...defaults, allowWrite: true }, false);
+  assert(!pending.some(x => x.id === 'fix:project'), 'a project-level error while files are still to be created is a consequence, not work');
+  const d = decideStep({ next: { type: 'choice', choice: 'ask', confidence: .9, probabilities: { ask: .6, 'implement:d2': .3, free: .1 } }, needs_user: { type: 'noul', noul: .2 }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 } }, pending, defaults);
+  assert.equal(d.candidate.id, 'implement:d2', 'asking while the user is not needed falls through to the next action instead of generating a question to refuse');
+  s.ledger[1]!.status = 'done';
+  const c = candidates(s, { ...defaults, allowWrite: true }, false); const project = c.find(x => x.id === 'fix:project')!;
+  assert.equal(project.kind, 'free'); assert.match(project.description, /not attributed to any file/);
+});
+test('With a design, each candidate is judged as part of it, extra, or out of scope; the design is generated as text and parsed leniently', async t => {
+  const { root, store, session } = await fixture(t);
+  session.objective = 'Bootstrap an advanced react application with a landing page.';
+  const design = { summary: 'A Vite React app with a landing page: hero, features and footer.', conventions: 'React 18, TypeScript, Tailwind; named exports.', deliverables: [
+    { kind: 'create', name: 'package.json', from: '', to: 'package.json', detail: 'manifest', contents: ['scripts'], exports: [], dependsOn: [] },
+    { kind: 'create', name: 'src/pages/Landing.tsx', from: '', to: 'src/pages/Landing.tsx', detail: 'the page', contents: ['hero'], exports: ['export function Landing(): JSX.Element'], dependsOn: ['src/components/Footer.tsx'] },
+    { kind: 'create', name: 'src/components/Footer.tsx', from: '', to: 'src/components/Footer.tsx', detail: 'footer', contents: ['links'], exports: ['export function Footer(): JSX.Element'], dependsOn: [] },
+    { kind: 'create', name: 'README.md', from: '', to: 'README.md', detail: 'docs', contents: ['setup'], exports: [], dependsOn: [] },
+    { kind: 'create', name: 'src/legacy/Old.tsx', from: '', to: 'src/legacy/Old.tsx', detail: 'a page for a later phase', contents: [], exports: [], dependsOn: [] } ] };
+  const text = `<think>Which files does a Vite app need?</think>\nHere is the design.\n\`\`\`json\n${JSON.stringify(design)}\n\`\`\`\n`;
+  let seen: any = null;
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'ledger') {
+      seen = { state, q };
+      const tier = (id: string) => id === 'd4' || id === 'd1' ? 'extra' : id === 'd5' ? 'out_of_scope' : 'part_of_design';
+      const a: Answers = { complete: { type: 'noul', noul: .9 } };
+      for (const id of Object.keys(state.items)) { const c = tier(id); a[`tier_${id}`] = { type: 'choice', choice: c, confidence: .9, probabilities: { part_of_design: c === 'part_of_design' ? .9 : .05, extra: c === 'extra' ? .9 : .05, out_of_scope: c === 'out_of_scope' ? .9 : .05 } }; }
+      return a;
+    }
+    return answersFor(q, 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => { throw new Error('the design is not a grammar-constrained generation'); },
+    generateText: async (_m: any, o: any) => { assert.equal(o.thinking, true, 'the architect thinks first'); assert.equal(o.fence, null); return { text, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(Object.keys(seen.q).filter(k => k.startsWith('tier_')), ['tier_d2', 'tier_d3', 'tier_d4', 'tier_d5'], 'a manifest the repository lacks is part of the design by construction: Jev is not asked');
+  assert.deepEqual(Object.keys((seen.q.tier_d2 as any).criteria), ['part_of_design', 'extra', 'out_of_scope']); assert.equal(seen.state.design.summary, design.summary); assert.deepEqual(Object.keys(seen.state), ['objective', 'design', 'items', 'allItems']); assert.equal(seen.state.allItems.length, 5); assert.match((seen.q.complete as any).instructions, /`allItems`/);
+  assert.deepEqual(result.ledger.map(d => [d.to, d.optional ?? false]), [['package.json', false], ['src/pages/Landing.tsx', false], ['src/components/Footer.tsx', false], ['README.md', true]], 'part of the design blocks completion, extra is optional, the manifest is required whatever Jev would have said');
+  assert.equal(result.ledger[0]!.required, 1);
+  assert.deepEqual(result.droppedCandidates!.map(d => d.to), ['src/legacy/Old.tsx']); assert.equal(result.design!.summary, design.summary); assert.equal(result.ledgerBuilt, true);
+  assert.deepEqual(result.ledger[1]!.dependsOn, ['src/components/Footer.tsx']); assert.deepEqual(result.ledger[2]!.exports, ['export function Footer(): JSX.Element']);
+});
+test('A write meant to create a file that does not exist is executed as a creation; one aimed at an existing file stays a stale write that forces a read', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'one\n');
+  session.phase = 'implement'; session.inspectionCount = 3;
+  let n = 0;
+  const jev = { decide: async (_s: unknown, q: Questions) => answersFor(q, 'write', .1) };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ++n === 1 ? { path: 'src/new.ts', expectedHash: 'new', oldText: '', newText: 'export const n = 1;\n' } : { path: 'a.ts', expectedHash: 'new', oldText: '', newText: 'x' } };
+  const result = await new Runner({ ...defaults, allowWrite: true, maxSteps: 2 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(result.entries.map(e => e.kind), ['create_file', 'write']); assert.equal(await readFile(join(root, 'src/new.ts'), 'utf8'), 'export const n = 1;\n');
+  assert.match(result.entries[1]!.text, /not a hash/); assert.equal(result.lastWriteStale, true);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(events.find(e => e.type === 'write-as-create')?.data.path, 'src/new.ts');
+});
+test('A focused edit takes its path and hash from the harness, whatever the worker echoed', async t => {
+  const { root, store, session } = await fixture(t); const schemas_seen: unknown[] = [];
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'a.ts'), 'export const greeting = "hi";\n'); await writeFile(join(root, 'tsconfig.json'), '{}\n'); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  session.objective = 'Make greeting say Hello World in src/a.ts.'; session.knownFiles.push('src/a.ts', 'tsconfig.json'); session.phase = 'implement'; session.inspectionCount = 3;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'modify', name: 'greeting', from: 'src/a.ts', to: 'src/a.ts', detail: 'greeting must be Hello World' }] }); session.ledgerBuilt = true; session.lastCheckCommand = 'node check.mjs';
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('inspect:')) ?? 'implement:d1'; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: any, schema: unknown) => {
+    if (schema === focusedEditSchema) { schemas_seen.push(schema); return { path: 'tsconfig.json', expectedHash: 'wrong', edits: [{ start: 1, end: 1, newText: 'export const greeting = "Hello World";', prepend: '' }] } as any; }
+    if (schema === schemas.finish) return { summary: 'done' };
+    return { files: [{ path: 'src/a.ts', start: 1, end: 1 }] };
+  } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(result.entries.map(e => e.kind).slice(0, 3), ['read_files', 'replace_lines', 'bash']);
+  assert.equal(await readFile(join(root, 'src', 'a.ts'), 'utf8'), 'export const greeting = "Hello World";\n'); assert.equal(await readFile(join(root, 'tsconfig.json'), 'utf8'), '{}\n');
+  assert.equal(schemas_seen.length, 1, 'the focused edit is generated under the edits-only schema, so prompt and grammar agree');
+});
+test('One finish policy: repairs, pending tasks, unaddressed rejections and a failing check each withhold completion', async t => {
+  const { session: s } = await fixture(t);
+  s.lastCheck = { step: 5, ok: true, text: 'ok', summary: summarizeCheck('') }; s.lastWriteStep = 4; s.editEvidence = [{ step: 4, route: 'write', paths: ['a.ts'], artifact: '', text: 'e' }];
+  assert.equal(readyToFinish(s), true);
+  s.pendingRepairs = [{ path: 'a.ts', errors: ['x'], attempts: 0 }]; assert.equal(readyToFinish(s), false); s.pendingRepairs = [];
+  s.tasks = [{ id: 't', description: 'd', status: 'pending', evidence: '' }]; assert.equal(readyToFinish(s), false); s.tasks = [];
+  s.completionFeedback = { step: 3, text: 'no', awaitingEvidence: true }; assert.equal(readyToFinish(s), false); s.completionFeedback = null;
+  s.finishTriedAtCheck = 5; assert.equal(readyToFinish(s), false); s.finishTriedAtCheck = -1;
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/b.ts', from: '', to: 'src/b.ts', detail: 'b' }] }); s.ledger[0]!.status = 'pending'; assert.equal(readyToFinish(s), false, 'a required file still to be created is a fact, not a question for the audit'); s.ledger[0]!.optional = true; assert.equal(readyToFinish(s), true); s.ledger = [];
+  s.lastCheck.ok = false; assert.equal(readyToFinish(s), false);
+});
+test('Contract helpers: export names from declaration heads, missing exports, exported signatures, statement bounds and context trimming', async t => {
+  assert.deepEqual(exportNames(['export function Button(props: ButtonProps): JSX.Element', "export type ButtonVariant = 'a' | 'b'", 'export default App', 'default: Footer', 'useTheme', 'export const features: Feature[]']), ['Button', 'ButtonVariant', 'default', 'useTheme', 'features']);
+  assert.deepEqual(exportNames(['export Hero', 'export { Button, Card as FeatureCard }', 'export * from "./x"', 'export abstract class Base']), ['Hero', 'Button', 'FeatureCard', 'Base'], 'the forms the harness and designs write are read as names, never as the word export');
+  const text = 'export interface P { a: number }\nexport function Button(p: P) { return p; }\nconst hidden = 1;\nexport { hidden as shown };\nexport default Button;\nexport const long = () => {\n  return 1;\n};\n';
+  assert.deepEqual(await missingExports('b.tsx', text, ['export function Button(p: P)', 'export type Missing = 1', 'export default Button', 'shown']), ['Missing']);
+  const sigs = await exportedSignatures('b.tsx', text);
+  assert.deepEqual(sigs, ['export interface P { a: number }', 'export function Button(p: P)', 'export { hidden as shown };', 'export default Button', 'export const long = () =>']);
+  const file = 'const a = 1;\nfunction f() {\n  return (\n    1\n  );\n}\nconst b = 2;\n';
+  assert.deepEqual(await statementBounds('f.ts', file, 3, 4), { start: 2, end: 6 }, 'expanded to the statements containing the lines');
+  const gaps = 'const a = 1;\n\n\nfunction f() {\n  return 1;\n}\n\n\nconst b = 2;\n';
+  assert.deepEqual(await statementBounds('g.ts', gaps, 2, 7), { start: 4, end: 6 }, 'bounds on blank lines move to the statement edges inside the range');
+  assert.equal(trimContext('  beforeLine2\n  region1\n  region2\n  afterLine1\n', '  beforeLine1\n  beforeLine2', '  afterLine1\n  afterLine2'), '  region1\n  region2\n');
+  assert.equal(trimContext('  region1\n', '', ''), '  region1\n');
+  assert.equal(trimContext('  if (x) {\n    y();\n  }\n', '  const a = 1;\n  {', '}\n\nexport default f;'), '  if (x) {\n    y();\n  }\n', 'a lone bracket line matching the context is the region\'s own, not repeated context');
+});
+test('A region rewrite on a large file replaces only the statements around the errors, leaves the rest byte for byte, and never mistakes a region reply for the whole file', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  // 260 lines: 50 small statements, one of them (around line 120) broken.
+  const stmts = Array.from({ length: 52 }, (_, i) => i === 23 ? [`export function f${i}() {`, `  return (`, `    ${i}`, `}`, ''] : [`export function f${i}() {`, `  return ${i};`, `}`, '', '']).flat();
+  const text = ['import { x } from "./x";', ...stmts].join('\n') + '\n'; const total = text.split('\n').length; assert(total > 200);
+  const broken = text.split('\n').findIndex(l => l === '    23') + 1;
+  await writeFile(join(root, 'src', 'big.ts'), text);
+  session.objective = 'Fix it.'; session.phase = 'implement'; session.inspectionCount = 3; session.knownFiles.push('src/big.ts'); session.writes = ['src/big.ts']; session.hashes['src/big.ts'] = hash(text);
+  session.lastCheck = { step: 3, ok: false, text: `src/big.ts(${broken + 1},1): error TS1005: ')' expected.`, summary: summarizeCheck(`src/big.ts(${broken + 1},1): error TS1005: ')' expected.`) }; session.lastCheckCommand = 'node check.mjs'; session.lastWriteStep = 2;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/big.ts', from: '', to: 'src/big.ts', detail: 'big' }] }); session.ledgerBuilt = true; await refreshLedger(root, session);
+  const prompts: any[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('fix:'))!; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'fixed' } : { files: [{ path: 'src/big.ts', start: 1, end: 1 }] },
+    generateText: async (m: any) => { prompts.push(m); const req = JSON.parse(m[2].content); const region: string = req.region.text; return { text: `${req.contextBefore.text.split('\n').slice(-2).join('\n')}\n${region.replace('    23\n}', '    23\n  );\n}')}\n`, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 2 }, store, jev, bonsai, root, () => {}).run(session);
+  const kinds = result.entries.map(e => e.kind);
+  assert.equal(kinds[0], 'replace_lines', `steps: ${kinds.join(',')}`);
+  const req = JSON.parse(prompts[0][2].content);
+  assert(req.region && req.region.firstLine > 1 && req.region.lastLine < total, `a bounded region, not the whole file: ${req.region.firstLine}..${req.region.lastLine} of ${total}`);
+  assert(req.region.firstLine <= broken - 25 + 5 && req.region.lastLine >= broken + 25 - 5, 'the region surrounds the reported line'); assert(req.contextBefore && req.contextAfter);
+  assert.match(req.rules.join(' '), /contextBefore and contextAfter are shown for orientation only/);
+  const after = await readFile(join(root, 'src', 'big.ts'), 'utf8');
+  assert.equal(after, text.replace('    23\n}', '    23\n  );\n}'), 'only the broken statement changed; the repeated context lines were trimmed; everything else is byte-identical');
+  assert.equal((await syntaxErrors('src/big.ts', after)).length, 0);
+});
+test('A markdown file that opens with a code block keeps it: only a fence at least as long as the prefilled one is unwrapped', async t => {
+  const { root, store, session } = await fixture(t);
+  session.objective = 'Document it.'; session.phase = 'implement'; session.inspectionCount = 3;
+  session.ledger = candidatesFrom({ summary: 's', conventions: 'c', deliverables: [{ kind: 'create', name: 'README.md', from: '', to: 'README.md', detail: 'docs', contents: ['install'], exports: [], dependsOn: [] }, { kind: 'create', name: 'src/a.ts', from: '', to: 'src/a.ts', detail: 'a', contents: [], exports: [], dependsOn: [] }] }); session.ledgerBuilt = true; session.design = { summary: 's', conventions: 'c' };
+  const readme = '```bash\nnpm install\n```\n\n# Title\n\nMore text.\n'; const wrapped = '```ts\nexport const a = 1;\n```\n';
+  const fences: (string | null | undefined)[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('implement:'))!; return { next: { type: 'choice', choice: pick, confidence: .95, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .95 : .05 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'README.md', start: 1, end: 1 }] }),
+    generateText: async (_m: any, o: any) => { fences.push(o.fence); return { text: o.fence === '````md' ? readme : wrapped, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, maxSteps: 2 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.deepEqual(result.entries.map(e => e.kind), ['create_file', 'create_file'], result.stopReason);
+  assert.equal(await readFile(join(root, 'README.md'), 'utf8'), readme, 'a shorter fence inside a document is content');
+  assert.equal(await readFile(join(root, 'src', 'a.ts'), 'utf8'), 'export const a = 1;\n', 'a fence the model re-emitted is unwrapped');
+  assert.deepEqual(fences, ['````md', '```ts']);
+});
+test('A repair that fails twice is given up to the check: the file stays, a fix candidate takes over, and finish is not proposed while it does not parse', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'check.mjs'), "import { readFileSync } from 'node:fs'; const t = readFileSync('src/a.ts', 'utf8'); if (t.includes('return (')) { console.error(\"src/a.ts(2,1): error TS1005: ')' expected.\"); process.exit(1); } process.exit(0);\n");
+  session.objective = 'Make a.'; session.phase = 'implement'; session.inspectionCount = 3;
+  session.ledger = candidatesFrom({ summary: 's', conventions: 'c', deliverables: [{ kind: 'create', name: 'src/a.ts', from: '', to: 'src/a.ts', detail: 'a', contents: [], exports: ['export function a(): number'], dependsOn: [] }] }); session.ledgerBuilt = true; session.design = { summary: 's', conventions: 'c' };
+  const broken = 'export function a() {\n  return (\n}\n'; let gens = 0; const kinds: string[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); kinds.push(ids.join(',')); const pick = ids.find(i => i.startsWith('implement:')) ?? ids.find(i => i.startsWith('fix:')) ?? 'free'; return { next: { type: 'choice', choice: pick, confidence: .95, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .95 : .05 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ files: [{ path: 'src/a.ts', start: 1, end: 1 }] }),
+    generateText: async () => { gens++; return { text: broken, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, checkCommand: 'node check.mjs', maxSteps: 6 }, store, jev, bonsai, root, () => {}).run(session);
+  const steps = result.entries.map(e => e.kind);
+  // baseline check, creation, two failed repairs (returned unchanged), the check, then the fix candidate takes over
+  assert.deepEqual(steps.slice(0, 5), ['bash', 'create_file', 'generation_error', 'generation_error', 'bash'], `steps: ${steps.join(',')}`);
+  assert.deepEqual(result.pendingRepairs, [], 'given up after two attempts'); assert.equal(await readFile(join(root, 'src', 'a.ts'), 'utf8'), broken, 'the file stays for the fixer');
+  assert(kinds.at(-1)!.includes('fix:src/a.ts'), 'the check\'s error makes it fix work'); assert.equal(readyToFinish(result), false); assert.notEqual(result.status, 'complete');
+  assert(gens >= 3);
+});
+test('A failed dependency install is fix work for the manifest: the harness rewrites it, installs again for the new manifest, and selects the check', async t => {
+  const { root, store, session } = await fixture(t);
+  const bin = join(root, 'bin'); await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, 'npm'), `#!/bin/bash\nif [ "$1" = "install" ]; then if grep -q bogus package.json; then echo "npm error code ETARGET"; echo "npm error notarget No matching version found for bogus-plugin@^8.0.0."; exit 1; fi; mkdir -p node_modules && exit 0; fi\nif [ "$1" = "run" ]; then [ -d node_modules ] && exec node check.mjs; echo "sh: line 1: tsc: command not found"; exit 127; fi\n`, { mode: 0o755 });
+  const bad = JSON.stringify({ name: 'demo', scripts: { typecheck: 'node check.mjs' }, devDependencies: { 'bogus-plugin': '^8.0.0' } }, null, 2) + '\n';
+  const good = JSON.stringify({ name: 'demo', scripts: { typecheck: 'node check.mjs' }, devDependencies: { 'real-plugin': '^7.0.0' } }, null, 2) + '\n';
+  await writeFile(join(root, 'package.json'), bad); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n'); await writeFile(join(root, 'src.mjs'), 'export const a = 1;\n');
+  const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath}`; t.after(() => { process.env.PATH = oldPath; });
+  session.objective = 'Bootstrap and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['package.json', 'src.mjs']; session.step = 2; session.lastWriteStep = 2; session.hashes['package.json'] = hash(bad);
+  session.ledger = candidatesFrom({ summary: 's', conventions: 'c', deliverables: [{ kind: 'create', name: 'package.json', from: '', to: 'package.json', detail: 'manifest', contents: [], exports: [], dependsOn: [] }, { kind: 'create', name: 'src.mjs', from: '', to: 'src.mjs', detail: 'src', contents: [], exports: [], dependsOn: [] }] }); session.ledgerBuilt = true; session.design = { summary: 's', conventions: 'c' };
+  await refreshLedger(root, session);
+  const prompts: any[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.includes('fix:setup') ? 'fix:setup' : ids.find(i => i.startsWith('implement:')) ?? 'free'; return { next: { type: 'choice', choice: pick, confidence: .95, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .95 : .05 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src.mjs', start: 1, end: 1 }] },
+    generateText: async (m: any) => { prompts.push(m); return { text: good, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 6 }, store, jev, bonsai, root, () => {}).run(session);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const setups = events.filter(e => e.type === 'setup'); assert.equal(setups.length, 2, `one install per manifest version; steps: ${result.entries.map(e => e.kind).join(',')}`); assert.equal(setups[0].data.code, 1); assert.equal(setups[1].data.code, 0);
+  assert.match(JSON.parse(prompts[0][2].content).errors.join(' '), /npm install failed: .*No matching version found for bogus-plugin/); assert.equal(await readFile(join(root, 'package.json'), 'utf8'), good);
+  assert.equal(result.setupError, null); assert.equal(result.lastCheckCommand, 'npm run typecheck'); assert.equal(result.lastCheck?.ok, true); assert.equal(result.status, 'complete', result.stopReason);
+});
+
+test('A check summary keeps each diagnostic whole, with the continuation lines tsc prints, beside the clipped sample the decision state shows', () => {
+  const output = ["src/components/Features.tsx(10,41): error TS2322: Type '{ key: string; feature: Feature; }' is not assignable to type 'IntrinsicAttributes & FeatureCardProps'.",
+    "  Property 'feature' does not exist on type 'IntrinsicAttributes & FeatureCardProps'.",
+    "src/components/CTA.tsx(69,13): error TS2322: Type '{ children: string; type: string; }' is not assignable to type 'IntrinsicAttributes & ButtonProps'.",
+    "  Property 'type' does not exist on type 'IntrinsicAttributes & ButtonProps'.", '', 'Found 2 errors.'].join('\n');
+  const s = summarizeCheck(JSON.stringify({ command: 'npm run typecheck', output, code: 2 }));
+  assert.equal(s.errors, 2);
+  const f = s.byFile['src/components/Features.tsx']!;
+  assert.equal(f.diagnostics!.length, 1); assert.match(f.diagnostics![0]!, /Property 'feature' does not exist on type 'IntrinsicAttributes & FeatureCardProps'\.$/);
+  assert.match(f.diagnostics![0]!, /^src\/components\/Features\.tsx\(10,41\): error TS2322: Type '\{ key: string; feature: Feature; \}' is not assignable/, 'the head is not cut in the middle');
+  assert(f.samples[0]!.length <= 140 && f.samples[0]!.includes('truncated'), 'the sample stays short for the decision state');
+  assert.match(s.byFile['src/components/CTA.tsx']!.diagnostics![0]!, /\n {2}Property 'type' does not exist/, 'a continuation line joins the diagnostic it belongs to, not the next file');
+  assert.equal(summarizeCheck('x.ts(1,1): error TS1005: expected.\n' + 'y'.repeat(2000)).byFile['x.ts']!.diagnostics![0], 'x.ts(1,1): error TS1005: expected.', 'an unindented line is not a continuation');
+});
+test('importContracts lists the exported declarations of the modules a file imports, the ones the diagnostics name first, within a size budget', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-contracts-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  await writeFile(join(root, 'src', 'components', 'FeatureCard.tsx'), 'export type FeatureCardProps = {\n  title: string;\n  description: string;\n};\nexport function FeatureCard(props: FeatureCardProps) {\n  return <article>{props.title}</article>;\n}\n');
+  await writeFile(join(root, 'src', 'components', 'Section.tsx'), 'export function Section({ id, children }: { id: string; children: React.ReactNode }) {\n  return <section id={id}>{children}</section>;\n}\n');
+  await writeFile(join(root, 'src', 'data.ts'), 'export const features = [{ id: "a", title: "A", description: "a" }];\n');
+  await writeFile(join(root, 'src', 'index.css'), 'body {}\n');
+  const text = 'import "../index.css";\nimport { Section } from "./Section";\nimport { features } from "../data";\nimport { FeatureCard } from "./FeatureCard";\nimport { missing } from "./Missing";\nexport function Features() { return <Section id="f">{features.map(f => <FeatureCard key={f.id} feature={f} />)}</Section>; }\n';
+  const contracts = await importContracts(root, 'src/components/Features.tsx', text, ["src/components/Features.tsx(6,1): error TS2322: Type '{ feature: X }' is not assignable to type 'IntrinsicAttributes & FeatureCardProps'."]);
+  assert.deepEqual(contracts.map(c => c.path), ['src/components/FeatureCard.tsx', 'src/components/Section.tsx', 'src/data.ts'], 'the module whose export the error names comes first; a stylesheet and a missing module are not contracts');
+  assert.equal(contracts[0]!.importPath, './FeatureCard');
+  assert.match(contracts[0]!.exports.join('\n'), /export type FeatureCardProps = \{\n {2}title: string;\n {2}description: string;\n\};/);
+  assert.match(contracts[0]!.exports.join('\n'), /export function FeatureCard\(props: FeatureCardProps\)/);
+  const small = await importContracts(root, 'src/components/Features.tsx', text, [], 10);
+  assert.equal(small.length, 1, 'the budget keeps at least one module and stops there');
+  assert.deepEqual(await importContracts(root, 'src/components/Features.tsx', 'export const x = 1;\n'), []);
+  const { session } = await fixture(t);
+  const req = JSON.parse(rewriteRegionMessages(session, { path: 'src/components/Features.tsx', start: 1, end: 6, totalLines: 6, region: text, before: '', after: '', errors: ['e'], note: 'fix', imports: contracts })[2]!.content);
+  assert.equal(req.imports[0].importPath, './FeatureCard'); assert.match(req.rules.join(' '), /make the call sites in this file match those declarations/);
+  assert(!('imports' in JSON.parse(rewriteRegionMessages(session, { path: 'a.ts', start: 1, end: 1, totalLines: 1, region: 'x', before: '', after: '', errors: [], note: 'n' })[2]!.content)));
+});
+test('A decided fix sees the whole diagnostic and the callee\'s contract, and a rewrite that reproduces a version the check already failed is refused without a check', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  await writeFile(join(root, 'src', 'components', 'FeatureCard.tsx'), 'export type FeatureCardProps = {\n  title: string;\n  description: string;\n};\nexport function FeatureCard(props: FeatureCardProps) {\n  return <article>{props.title}</article>;\n}\n');
+  await writeFile(join(root, 'src', 'data.ts'), 'export const features = [{ id: "a", title: "A", description: "a" }];\n');
+  const shape = (call: string) => `import { features } from "../data";\nimport { FeatureCard } from "./FeatureCard";\n\nexport function Features() {\n  return (\n    <div>\n      {features.map((feature) => (\n        ${call}\n      ))}\n    </div>\n  );\n}\n`;
+  const a = shape('<FeatureCard key={feature.id} feature={feature} />'); const b = shape('<FeatureCard key={feature.id} item={feature} />'); const good = shape('<FeatureCard key={feature.id} title={feature.title} description={feature.description} />');
+  await writeFile(join(root, 'src', 'components', 'Features.tsx'), a);
+  // A check that reports, as tsc does, the property that does not exist.
+  await writeFile(join(root, 'check.mjs'), `import { readFileSync } from "node:fs";\nconst t = readFileSync("src/components/Features.tsx", "utf8"); const m = t.match(/ (feature|item)=\\{/);\nif (m) { console.log("src/components/Features.tsx(8,9): error TS2322: Type '{ key: string; " + m[1] + ": Feature; }' is not assignable to type 'IntrinsicAttributes & FeatureCardProps'.\\n  Property '" + m[1] + "' does not exist on type 'IntrinsicAttributes & FeatureCardProps'."); process.exit(2); }\n`);
+  session.objective = 'Fix the landing page.'; session.phase = 'implement'; session.inspectionCount = 3; session.knownFiles.push('src/components/Features.tsx');
+  session.writes = ['src/components/Features.tsx']; session.hashes['src/components/Features.tsx'] = hash(a); session.lastCheckCommand = 'node check.mjs'; session.lastWriteStep = 2;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/components/Features.tsx', from: '', to: 'src/components/Features.tsx', detail: 'features' }] }); session.ledgerBuilt = true; await refreshLedger(root, session);
+  session.pendingCheck = true; // the check runs first and records the failed version
+  const prompts: any[] = []; let attempt = 0;
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('fix:'))!; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.finish ? { summary: 'fixed' } : { files: [] },
+    generateText: async (m: any) => { prompts.push(m); attempt++; return { text: attempt === 1 ? b : attempt === 2 ? a : good, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 6 }, store, jev, bonsai, root, () => {}).run(session);
+  const kinds = result.entries.map(e => e.kind);
+  assert.deepEqual(kinds.slice(0, 6), ['bash', 'replace_lines', 'bash', 'generation_error', 'replace_lines', 'bash'], `steps: ${kinds.join(',')}`);
+  assert.match(result.entries[3]!.text, /reproduces a version of the file the check already reported errors in/, 'version a failed at the first check: generating it again is refused before any check is spent');
+  assert.equal(await readFile(join(root, 'src', 'components', 'Features.tsx'), 'utf8'), good); assert.equal(result.lastCheck?.ok, true);
+  assert.deepEqual(result.failedVersions?.['src/components/Features.tsx'], [hash(a), hash(b)]);
+  const first = JSON.parse(prompts[0][2].content);
+  assert.match(first.errors[0], /\n {2}Property 'feature' does not exist on type 'IntrinsicAttributes & FeatureCardProps'\.$/, 'the repair prompt carries the diagnostic whole');
+  assert(!first.errors[0].includes('truncated'));
+  assert.equal(first.imports[0].importPath, './FeatureCard'); assert.match(first.imports[0].exports.join('\n'), /FeatureCardProps = \{\n {2}title: string;/, 'the callee\'s props are in the prompt');
+  assert.equal(first.imports[1].importPath, '../data');
+  const third = JSON.parse(prompts[2][2].content);
+  assert.match(third.errors.join(' | '), /previous attempt: The rewrite of src\/components\/Features\.tsx lines 1\.\.12 reproduces a version/);
+});
+
+test('A package a written file imports and the manifest lacks is installed by code, once, and the check runs again', async t => {
+  const output = ["src/components/Icon.tsx(1,24): error TS2307: Cannot find module 'lucide-react' or its corresponding type declarations.",
+    "src/data.ts(1,20): error TS2307: Cannot find module './missing' or its corresponding type declarations.",
+    "src/util.ts(2,1): error TS2307: Cannot find module 'node:fs/promises'.",
+    "src/other.ts(2,1): error TS2307: Cannot find module 'react-dom/client'.",
+    'error during build:', "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@tailwindcss/vite' imported from /x/node_modules/.vite-temp/vite.config.ts.mjs",
+    "Error: Cannot find package 'unused-pkg'"].join('\n');
+  const summary = summarizeCheck(JSON.stringify({ command: 'npm run build', output, code: 1 }));
+  const texts = { 'src/components/Icon.tsx': 'import { Rocket } from "lucide-react";\n', 'vite.config.ts': "import tailwindcss from '@tailwindcss/vite'\nimport react from '@vitejs/plugin-react'\n", 'src/other.ts': "import { createRoot } from 'react-dom/client';\n", 'src/util.ts': "import { readFile } from 'node:fs/promises';\n" };
+  const found = missingPackages(summary, texts, ['react@19.0.0', 'react-dom@19.0.0', 'vite@5.0.0']);
+  assert.deepEqual(found.sort((a, b) => a.name.localeCompare(b.name)), [{ name: '@tailwindcss/vite', importers: ['vite.config.ts'] }, { name: 'lucide-react', importers: ['src/components/Icon.tsx'] }], 'relative, built-in, declared and unimported names are not candidates');
+  const root = await mkdtemp(join(tmpdir(), 'leana-add-')); t.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(await addPackagesCommand(root, ['lucide-react'], false), "npm install --no-audit --no-fund 'lucide-react'");
+  assert.equal(await addPackagesCommand(root, ['@tailwindcss/vite'], true), "npm install --save-dev --no-audit --no-fund '@tailwindcss/vite'");
+  await writeFile(join(root, 'pnpm-lock.yaml'), ''); assert.equal(await addPackagesCommand(root, ['a', 'b'], true), "pnpm add -D 'a' 'b'");
+  // In the loop: the install is a forced bash step before any model is consulted, once per package, and the check is due again.
+  const { root: repo, store, session } = await fixture(t);
+  await mkdir(join(repo, 'src', 'components'), { recursive: true });
+  await writeFile(join(repo, 'package.json'), JSON.stringify({ name: 'x', scripts: { build: 'tsc' }, dependencies: { react: '^19.0.0' } }));
+  await writeFile(join(repo, 'src', 'components', 'Icon.tsx'), texts['src/components/Icon.tsx']); await writeFile(join(repo, 'vite.config.ts'), texts['vite.config.ts']);
+  session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['package.json', 'src/components/Icon.tsx', 'vite.config.ts']; session.lastCheckCommand = 'npm run build';
+  session.lastCheck = { step: 2, ok: false, text: output, summary };
+  const runner = new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 1 }, store, { decide: async (_s: unknown, q: Questions) => answersFor(q, 'read_files', .9) }, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({ files: [] }) }, repo, () => {});
+  const ran: string[] = [];
+  (runner as any).tools.execute = async (route: string, args: any) => { ran.push(`${route}: ${args.command}`); return { ok: true, text: 'added 2 packages' }; };
+  const result = await runner.run(session);
+  assert.deepEqual(ran, ["bash: npm install --no-audit --no-fund 'lucide-react' && npm install --save-dev --no-audit --no-fund '@tailwindcss/vite'"], 'runtime imports are dependencies, configuration imports are development dependencies');
+  assert.equal(result.autoFixKeys['install:lucide-react'], 'step 1'); assert.equal(result.pendingCheck, true);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(events.some(e => e.type === 'auto-install' && /lucide-react/.test(e.data.purpose)));
+  // The same names are not installed twice, whatever the next check says.
+  ran.length = 0; result.pendingCheck = false;
+  await runner.run({ ...result, step: result.step, status: 'running' } as any).catch(() => {});
+  assert(!ran.some(r => r.includes('lucide-react')), 'an install is attempted once per package');
+});
+
+test('A verify deliverable that names a command is done only when that command passed after the last edit, is run by code once the check passes, and cites its own run at the audit', async t => {
+  assert(commandLike('npm run build') && commandLike('cd web && pnpm test') && commandLike('tsc --noEmit') && !commandLike('the build succeeds') && !commandLike('Typecheck passes'));
+  assert(runnableForever('npm run dev') && runnableForever('vite preview') && runnableForever('tsc --watch') && !runnableForever('npm run build'));
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'export const a = 1;\n'); await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', scripts: { typecheck: 'node -e 0', build: 'node -e 0' } }));
+  s.objective = 'Build the app.'; s.phase = 'implement'; s.inspectionCount = 3; s.step = 6; s.writes = ['a.ts']; s.lastWriteStep = 5; s.editEvidence = [{ step: 5, route: 'create_file', paths: ['a.ts'], artifact: '', text: 'created' } as any];
+  s.ledger = candidatesFrom({ deliverables: [
+    { kind: 'create', name: 'a.ts', from: '', to: 'a.ts', detail: 'a' },
+    { kind: 'verify', name: 'npm run typecheck', from: '', to: '', detail: 'types pass' },
+    { kind: 'verify', name: 'npm run build', from: '', to: '', detail: 'the production build completes' },
+    { kind: 'verify', name: 'the app renders', from: '', to: '', detail: 'described, not a command' } ] }); s.ledgerBuilt = true;
+  s.lastCheckCommand = 'npm run typecheck'; s.commandRuns = { 'npm run typecheck': { step: 6, ok: true }, 'npm run build': { step: 3, ok: true } };
+  s.lastCheck = { step: 6, ok: true, text: 'ok', summary: summarizeCheck('') };
+  await refreshLedger(root, s);
+  const status = Object.fromEntries(s.ledger.map(d => [d.name, `${d.status}: ${d.note}`]));
+  assert.equal(status['npm run typecheck'], 'done: npm run typecheck at step 6 passed');
+  assert.equal(status['npm run build'], 'pending: npm run build at step 3 passed (before later edits)', 'a passing check is not this command\'s run');
+  assert.equal(status['the app renders'], 'done: last check at step 6 passed', 'a described verification follows the check');
+  const offered = candidates(s, { ...defaults, allowWrite: true, allowBash: true }, readyToFinish(s));
+  assert.deepEqual(offered.filter(c => c.kind === 'verify').map(c => [c.id, c.target?.name]), [['verify:d3', 'npm run build']], 'the command not run since the last edit is offered; the one that ran is not');
+  assert(!offered.some(c => c.id === 'finish'), 'finish is not proposed while a required verification is pending');
+  const evidence = await completionEvidence(root, s, { files: [], moved: [] } as any);
+  assert.equal(evidence['d3'], 'npm run build at step 3: passed (before later edits)'); assert.equal(evidence['d2'], 'npm run typecheck at step 6: passed (after the last edit)');
+  // Decided: the harness runs the command itself, records the run, and the item is done.
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('verify:'))!; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; } return answersFor(q, 'read_files', .9); } };
+  const runner = new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, { count: async () => ({ tokens: 1, mode: 'test' }), generate: async () => ({}) }, root, () => {});
+  const ran: string[] = []; (runner as any).tools.execute = async (route: string, args: any) => { ran.push(`${route}: ${args.command}`); return { ok: true, text: JSON.stringify({ command: args.command, output: 'built', code: 0 }), verification: true, check: true }; };
+  s.completionFeedback = { step: 4, text: 'Completion rejected: d3 not shown as done', awaitingEvidence: true, unmet: ['d3'] };
+  const result = await runner.run(s);
+  assert.deepEqual(ran, ['bash: npm run build']);
+  assert.equal(result.completionFeedback!.addressed, true); assert.equal(result.completionFeedback!.awaitingEvidence, false, 'the verification the rejection named has run: no read or edit is needed before the next proposal');
+  assert.equal(result.commandRuns!['npm run build']!.ok, true); assert.equal(result.ledger.find(d => d.name === 'npm run build')!.status, 'done');
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert(events.some(e => e.type === 'decided-verify' && e.data.command === 'npm run build'));
 });

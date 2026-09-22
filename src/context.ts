@@ -1,4 +1,4 @@
-import type { Answers, Config, Coverage, Entry, Message, NameOrigin, Questions, Route, Session, SourceEvidence } from './types.js';
+import type { Deliverable, Answers, Config, Coverage, Entry, Message, NameOrigin, Questions, Route, Session, SourceEvidence } from './types.js';
 import { editRoutes } from './types.js';
 import { schemas } from './schema.js';
 import { referenceContext } from './references.js';
@@ -199,19 +199,20 @@ export function focus(s: Session, files = 5): Record<string, { lines: number[]; 
 // Grouped by the edit that fixes them: import lines to add per file, line
 // numbers to export per file (one replace_lines call with prepend "export "
 // per line), and names nothing resolved. Far smaller than one row per name.
-export interface NameFixes { addImports: Record<string, string[]>; addExportAtLines: Record<string, number[]>; removeImports: Record<string, string[]>; removeImportLines: Record<string, Record<string, number>>; moveDeclarations: { name: string; source: string; start: number; end: number; into: string }[]; unresolved: string[]; total: number }
+export interface NameFixes { addImports: Record<string, string[]>; addExportAtLines: Record<string, number[]>; removeImports: Record<string, string[]>; removeImportLines: Record<string, Record<string, number>>; aliasImports: Record<string, { name: string; actual: string; line: number }[]>; moveDeclarations: { name: string; source: string; start: number; end: number; into: string }[]; unresolved: string[]; total: number }
 // Empty collections are noise in every prompt: only fixes that exist are pinned.
 export function compactFixes(f: NameFixes): Partial<NameFixes> {
   return Object.fromEntries(Object.entries(f).filter(([, v]) => Array.isArray(v) ? v.length > 0 : typeof v === 'object' && v !== null ? Object.keys(v).length > 0 : v !== 0)) as Partial<NameFixes>;
 }
 export function compactNames(s: Session, limit: number, names: NameOrigin[] = s.missingNames): NameFixes {
-  const out: NameFixes = { addImports: {}, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, moveDeclarations: [], unresolved: [], total: names.length };
+  const out: NameFixes = { addImports: {}, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, aliasImports: {}, moveDeclarations: [], unresolved: [], total: names.length };
   for (const n of names.slice(0, limit)) {
     if (n.kind === 'move') {
       if (n.move && !out.moveDeclarations.some(m => m.source === n.move!.source && m.start === n.move!.start)) out.moveDeclarations.push({ name: n.name, source: n.move.source, start: n.move.start, end: n.move.end, into: n.inFile });
       else if (!n.move) out.unresolved.push(`${n.name}: ${clip(n.note ?? 'unresolved', 240)}`);
       continue;
     }
+    if (n.kind === 'alias' && n.importLine && n.line) { (out.aliasImports[n.inFile] ??= []).push({ name: n.name, actual: n.importLine, line: n.line }); continue; }
     if (n.kind === 'unused') { (out.removeImports[n.inFile] ??= []).push(n.name); if (n.line && /twice|conflicts|declared locally/.test(n.note ?? '')) (out.removeImportLines[n.inFile] ??= {})[n.name] = n.line; continue; }
     if (n.importLine) { const lines = out.addImports[n.inFile] ??= []; if (!lines.includes(n.importLine)) lines.push(n.importLine); }
     if (n.declaredIn && n.exported === false) {
@@ -314,6 +315,47 @@ const details: Record<Route, string> = {
 // end of the prompt). With one message per pinned block and per evidence entry,
 // a change late in the prompt reprocesses only what follows the last unchanged
 // boundary; with one giant message, any change reprocessed everything.
+// A targeted edit needs only its target: the pinned block (cached), the file's
+// current text with its hash, what is wrong or wanted, and the action's schema.
+export function focusedMessages(s: Session, route: Route, target: { path: string; text: string; hash: string; start: number; end: number; note: string }): Message[] {
+  const pinned = { objective: s.objective, repositoryInstructions: s.instructions,
+    directories: repoOverview(s, 30), fileCount: s.knownFiles.length, files: relevantFiles(s, 40) };
+  const lines = target.text.split('\n');
+  const excerpt = lines.slice(target.start - 1, target.end).map((l, i) => `${target.start + i}: ${l}`).join('\n');
+  const request = { task: target.note, file: { path: target.path, sha256: target.hash, totalLines: lines.length, shown: `${target.start}..${Math.min(target.end, lines.length)}`, text: excerpt },
+    ...(s.lastCheck && !s.lastCheck.ok ? { lastCheck: { step: s.lastCheck.step, ok: false, errors: s.lastCheck.summary.errors, text: clip(s.lastCheck.text, 900) } } : {}),
+    ...(s.referenceEvidence.length ? { referenceEvidence: referenceContext(s, 2500) } : {}),
+    rejectedEdits: compactRejected(s, 2), lastError: s.lastError && clip(s.lastError, 400),
+    selectedAction: route, actionInstructions: details[route], argumentSchema: schemas[route],
+    rule: `Edit only ${target.path}; expectedHash is ${target.hash}. Line numbers are those shown.` };
+  return [
+    { role: 'system', content: 'You are Bonsai, the implementation worker in Leana. The harness has decided the action and the file; produce only the arguments for that action on that file, from the text shown. Output only the JSON object.' },
+    { role: 'user', content: JSON.stringify(pinned) },
+    { role: 'user', content: JSON.stringify(request) },
+  ];
+}
+// A file to create is generated from the design, not from a label: the whole,
+// the conventions, this file's required contents, and what it can import.
+export function focusedCreateMessages(s: Session, path: string, d: Deliverable, related: { path: string; exports: string[] }[]): Message[] {
+  const pinned = { objective: s.objective, repositoryInstructions: s.instructions,
+    directories: repoOverview(s, 30), fileCount: s.knownFiles.length, files: relevantFiles(s, 40) };
+  const request = {
+    task: `Create ${path}: ${d.detail}`,
+    ...(s.design ? { design: s.design } : {}),
+    mustContain: d.contents ?? [],
+    otherDeliverables: s.ledger.filter(x => x.id !== d.id).slice(0, 20).map(x => `${x.kind} ${x.name ?? ''}${x.to ? ` (${x.to})` : ''}: ${clip(x.detail, 100)}`),
+    canImport: related,
+    ...(s.referenceEvidence.length ? { referenceEvidence: referenceContext(s, 2500) } : {}),
+    rejectedEdits: compactRejected(s, 2), lastError: s.lastError && clip(s.lastError, 400),
+    selectedAction: 'write', actionInstructions: details.write, argumentSchema: schemas.write,
+    rule: `Create ${path} with expectedHash "new" and oldText "". Write the complete file: every item in mustContain, following design.conventions, importing only from canImport or installed packages. Substantive, working code; no placeholders or TODOs.`,
+  };
+  return [
+    { role: 'system', content: 'You are Bonsai, the implementation worker in Leana. The harness has decided the action and the file; produce the complete file as the write action\'s arguments. Output only the JSON object.' },
+    { role: 'user', content: JSON.stringify(pinned) },
+    { role: 'user', content: JSON.stringify(request) },
+  ];
+}
 export function messages(s: Session, route: Route, harnessNote?: string, currentSource?: SourceEvidence[]): Message[] {
   // The pinned block never changes within a session, so the prefix stays cached.
   const pinned = { objective: s.objective, repositoryInstructions: s.instructions,
@@ -324,7 +366,7 @@ export function messages(s: Session, route: Route, harnessNote?: string, current
     ...(s.completionFeedback ? { completionFeedback: s.completionFeedback } : {}),
     ...(s.ledger.length ? { deliverables: s.ledger.map(d => `${d.id} ${d.kind} ${d.name ?? ''}${d.from ? ` from ${d.from}` : ''}${d.to ? ` to ${d.to}` : ''}: ${d.status}${d.note ? ` (${clip(d.note, 120)})` : ''}`) } : {}),
     ...(currentSource ? { currentSource } : {}),
-    editEvidence: s.editEvidence,
+    editEvidence: s.editEvidence.slice(-4).map(e => ({ ...e, applied: e.applied ? clip(e.applied, 200) : undefined })),
     readCoverage: coverageSummary(s, 12), searched: compactSearched(s, 10), fileHashes: Object.fromEntries(Object.entries(s.hashes).slice(-12)),
     lastCheck: s.lastCheck && { step: s.lastCheck.step, ok: s.lastCheck.ok, text: clip(s.lastCheck.text, 900), staleFor: staleFor(s), errors: s.lastCheck.summary.errors, syntaxErrors: s.lastCheck.summary.syntax },
     focus: focus(s), missingNames: compactFixes(compactNames(s, 60)),

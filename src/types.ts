@@ -5,8 +5,8 @@ export interface CheckSummary { errors: number; syntax: number; resolution?: num
 export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string> }
 export interface SourceEvidence { path: string; hash?: string; facts: Record<string, unknown>[]; excerpt?: string; error?: string; omitted?: number }
 export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export' | 'import' | 'verify' | 'other';
-export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean }
-export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move' | 'reexport'; line?: number; move?: { source: string; start: number; end: number } }
+export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[] }
+export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move' | 'reexport' | 'alias'; line?: number; move?: { source: string; start: number; end: number } }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
   { type: 'choice'; instructions: string; criteria: Record<string, string> };
@@ -60,8 +60,12 @@ export interface Session {
   pendingMoves: { name: string; source: string; start: number; end: number; destination: string }[];
   // The harness's own deliverable list, classified by Jev; statuses come from source facts.
   ledger: Deliverable[]; ledgerAttempts: number; ledgerBuilt: boolean; ledgerComplete: number;
+  // The worker's design for an open-ended objective: what the whole should be and the conventions every file follows.
+  design: { summary: string; conventions: string } | null;
   // Verification inferred from the repository when none is configured: attempts, and the change count at the last one.
   checkInferences: number; checkInferredFor: number;
+  // Dependencies installed by the harness once, when a check trial showed them missing.
+  setupDone: boolean;
   // Git's view of the tree when the session began: changes already present are not the session's.
   baselineStatus: string[] | null;
   // The first pre-edit snapshot of each changed file, for the completion diff ('@new' for created files).

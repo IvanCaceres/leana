@@ -11,8 +11,12 @@ export class StaleWriteError extends Error {}
 // Did a check get worse after edits? Any in-scope increase, or new in-scope syntax
 // errors without a net decrease, is a regression and is rolled back with no vote;
 // a structural move is judged on syntax only. Anything else is committed.
-export function regression(before: CheckSummary | null, after: CheckSummary, scope: { files?: string[]; structural?: boolean } = {}): 'worse' | 'fine' {
+export function regression(before: CheckSummary | null, after: CheckSummary, scope: { files?: string[]; structural?: boolean; created?: boolean } = {}): 'worse' | 'fine' {
   if (!before) return 'fine';
+  // A transaction that created a file is judged on the whole: the new file's own
+  // errors are new by definition (a sibling it imports may not exist yet), and a
+  // falling total is the progress that matters. A rising total still rolls back.
+  if (scope.created && !(after.syntax > before.syntax && after.errors >= before.errors)) return after.errors <= before.errors ? 'fine' : 'worse';
   // Judge the files this transaction touched, not the whole repository: errors
   // cascading into test files must not blunt the signal, and pre-existing errors
   // elsewhere are not this edit's doing. Errors the check does not attribute to a
@@ -291,6 +295,21 @@ export async function repositoryStatus(root: string): Promise<{ git: boolean; ch
   await walk('.', 0);
   return { git, changed: all.slice(0, 40), changedCount: all.length, scripts, topLevel, packages };
 }
+// A trial that failed for want of dependencies, and the install the manifest implies.
+export function missingDependencies(output: string): boolean {
+  return /command not found|Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|ModuleNotFoundError|No module named|is not recognized as|not found: /i.test(output);
+}
+export async function installCommand(root: string, dir = '.'): Promise<string | null> {
+  const has = async (p: string) => { try { await stat(resolve(root, dir, p)); return true; } catch { return false; } };
+  if (await has('package.json')) {
+    if (await has('node_modules')) return null;
+    const cmd = await has('pnpm-lock.yaml') ? 'pnpm install --frozen-lockfile' : await has('yarn.lock') ? 'yarn install --frozen-lockfile' : await has('bun.lockb') ? 'bun install' : await has('package-lock.json') ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund';
+    return dir === '.' ? cmd : `cd ${dir} && ${cmd}`;
+  }
+  if (await has('requirements.txt')) return `${dir === '.' ? '' : `cd ${dir} && `}python3 -m pip install -r requirements.txt`;
+  if (await has('pyproject.toml')) return `${dir === '.' ? '' : `cd ${dir} && `}python3 -m pip install -e .`;
+  return null;
+}
 // A shell command that only reads is an inspection, not an action.
 export function readOnlyCommand(command: string): boolean {
   const parts = command.split(/\s*(?:&&|\|\||;|\|)\s*/).map(p => p.trim()).filter(Boolean);
@@ -309,6 +328,21 @@ export async function checkAdvice(root: string, command: string): Promise<string
       const text = await readFile(resolve(root, dir, name), 'utf8');
       if (/"incremental"\s*:\s*true/.test(text) || /"composite"\s*:\s*true/.test(text)) return `${command} runs tsc with incremental mode (${dir}/${name}); its error list depends on the previous run's cache, so rollbacks would be judged on stale results. Use a non-incremental check, for example: pnpm --dir ${dir === '.' ? '.' : dir} exec tsc --noEmit --incremental false`;
     } catch { /* absent */ }
+  }
+  return null;
+}
+// Rewrite `name` in the import declaration spanning `line` as `actual as name`.
+export async function aliasImportBinding(path: string, text: string, name: string, actual: string, line: number): Promise<{ start: number; end: number; newText: string; prepend: string } | null> {
+  if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
+  if (!tsModule || !parseable.test(path)) return null;
+  const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  for (const st of sf.statements) {
+    if (!ts.isImportDeclaration(st) || !st.importClause?.namedBindings || !ts.isNamedImports(st.importClause.namedBindings)) continue;
+    const start = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1; const end = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
+    if (line < start || line > end) continue;
+    const c = st.importClause; const parts = c.namedBindings.elements.map((b: any) => b.name.text === name && !b.propertyName ? `${b.isTypeOnly ? 'type ' : ''}${actual} as ${name}` : `${b.isTypeOnly ? 'type ' : ''}${b.propertyName ? `${b.propertyName.text} as ` : ''}${b.name.text}`);
+    if (!c.namedBindings.elements.some((b: any) => b.name.text === name && !b.propertyName)) return null;
+    return { start, end, newText: `import ${c.isTypeOnly ? 'type ' : ''}${c.name ? `${c.name.text}, ` : ''}{ ${parts.join(', ')} } from ${st.moduleSpecifier.getText(sf)};`, prepend: '' };
   }
   return null;
 }
@@ -562,14 +596,18 @@ export function namedIdentifiers(text: string): Set<string> {
 }
 export async function resolveMissingNames(root: string, checkOutput: string, editedFiles: string[], limit = 40, deliverables: Set<string> = new Set(), direction: { source: string; destination: string } | null = null): Promise<NameOrigin[]> {
   // name -> { file it is missing in, kind, module named by the error (if any) }
+  const results: NameOrigin[] = [];
   const wanted = new Map<string, Map<string, { kind: 'missing' | 'not-exported' | 'wrong-module'; module?: string }>>();
   const add = (file: string, name: string, kind: 'missing' | 'not-exported' | 'wrong-module', module?: string) => {
     if (!wanted.has(file)) wanted.set(file, new Map()); if (!wanted.get(file)!.has(name)) wanted.get(file)!.set(name, { kind, module });
   };
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS(?:2304|2552): Cannot find name '([^']+)'/gm)) add(m[1]!, m[2]!, 'missing');
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS2459: Module '"([^"]+)"' declares '([^']+)' locally, but it is not exported/gm)) add(m[1]!, m[3]!, 'not-exported', m[2]!);
-  for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS(?:2305|2724): (?:Module )?'"([^"]+)"' has no exported member(?: named)? '([^']+)'/gm)) add(m[1]!, m[3]!, 'wrong-module', m[2]!);
-  const results: NameOrigin[] = [];
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS(?:2305|2724): (?:Module )?'"([^"]+)"' has no exported member(?: named)? '([^']+)'\.(?: Did you mean '([^']+)'\?)?/gm)) {
+    // The checker names the export that exists: alias the import to it, usage untouched.
+    if (m[5]) { const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (inFile) { results.push({ name: m[4]!, inFile, kind: 'alias', line: Number(m[2]), note: `${m[3]} exports ${m[5]}, not ${m[4]}; the harness imports it as ${m[5]} as ${m[4]}`, importLine: m[5] }); continue; } }
+    add(m[1]!, m[4]!, 'wrong-module', m[3]!);
+  }
   // An unused import binding is mechanical to remove, and removing the whole
   // line is the classic mistake when it also carries a used binding.
   for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS6133: '([^']+)' is declared but its value is never read/gm)) {

@@ -1,15 +1,16 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Bonsai, Jev } from './clients.js';
-import { checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
+import { focusedCreateMessages, focusedMessages, checkDelta, clip, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, rememberEdit, retireEvidence, routeQuestions, staleFor } from './context.js';
 import { schemas } from './schema.js';
-import { runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
-import { anchorPath, candidatesFrom, checkPrompt, checkQuestions, checkSchema, completionQuestions, diffChunks, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from './ledger.js';
+import { aliasImportBinding, missingDependencies, installCommand, runCommand, repositoryStatus, readOnlyCommand, checkUnusable, topLevelDeclarations, namedIdentifiers, removeImportBindings, checkAdvice, completionSource, hash, importInsertLine, listRepoFiles, regression, resolveMissingNames, safePath, sourceHashes, StaleWriteError, summarizeCheck, ToolBox } from './tools.js';
+import { unaccountedFiles, auditQuestions, auditVerdict, candidates, completionEvidence, completionState, decideStep, stepQuestions, taskRecord } from './decide.js';
+import { designFrom, anchorPath, candidatesFrom, checkPrompt, checkQuestions, checkSchema, completionQuestions, diffChunks, ledgerFile, ledgerPrompt, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from './ledger.js';
 const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
 import { Store } from './store.js';
 import { referenceContext, rememberReferences } from './references.js';
 import { editRoutes } from './types.js';
-import type { Config, GenerationMeta, Message, Phase, Route, Session, Task, ToolResult } from './types.js';
+import type { Answers, Deliverable, Config, GenerationMeta, Message, Phase, Route, Session, Task, ToolResult } from './types.js';
 import { lineObserver, type ProgressEvent } from './display.js';
 
 export async function newSession(root: string, objective: string): Promise<Session> {
@@ -19,7 +20,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], ledgerAttempts: 0, ledgerBuilt: false, ledgerComplete: 0, baselineArtifacts: {}, checkInferences: 0, checkInferredFor: -1, baselineStatus: null,
+    phase: 'inspect', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], design: null, ledgerAttempts: 0, ledgerBuilt: false, ledgerComplete: 0, baselineArtifacts: {}, checkInferences: 0, checkInferredFor: -1, setupDone: false, baselineStatus: null,
     lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {} };
 }
 export function updateTasks(s: Session, tasks: Task[]): void {
@@ -131,7 +132,7 @@ export class Runner {
       // The edits since the previous check are now judged by this one. An
       // objective regression is rolled back deterministically; a small increase
       // is put to Jev; an improvement or a pass is committed silently.
-      const scope = { files: [...new Set([...s.transaction.flatMap(t => t.paths), ...Object.keys(s.editSnapshots)])], structural: s.transaction.some(t => t.route === 'move_lines') };
+      const scope = { files: [...new Set([...s.transaction.flatMap(t => t.paths), ...Object.keys(s.editSnapshots)])], structural: s.transaction.some(t => t.route === 'move_lines'), created: Object.values(s.editSnapshots).some(a => a === '@new') };
       const verdict = (s.transaction.length || Object.keys(s.editSnapshots).length) && !result.ok ? regression(s.previousCheck?.summary ?? null, s.lastCheck.summary, scope) : 'fine';
       s.autoUndo = verdict === 'worse' ? { files: { ...s.editSnapshots }, reason: clip(`the check went from ${s.previousCheck?.summary.errors ?? 0} errors (${s.previousCheck?.summary.syntax ?? 0} syntax) to ${s.lastCheck.summary.errors} (${s.lastCheck.summary.syntax} syntax) in scope ${scope.files.join(', ')}; first new: ${Object.entries(s.lastCheck.summary.byFile).find(([f]) => scope.files.some(p => f.endsWith(p) || p.endsWith(f)))?.[1].samples[0] ?? ''}`, 300) } : null;
       s.editSnapshots = {};
@@ -209,7 +210,7 @@ export class Runner {
   private async pendingMoves(s: Session): Promise<Session['pendingMoves']> {
     const out: Session['pendingMoves'] = [];
     for (const d of s.ledger) {
-      if (d.kind !== 'move' || d.status !== 'pending' || !d.name || !d.from || !d.to) continue;
+      if (d.kind !== 'move' || d.status !== 'pending' || !d.name || !d.from || !d.to || d.optional) continue;
       const source = ledgerFile(s, d.from)!; const destination = await anchorPath(this.tools.root, source, ledgerFile(s, d.to)!);
       if (s.moveDirection && !(same(source, s.moveDirection.source) && same(destination, s.moveDirection.destination))) continue;
       let text: string; try { text = await readFile(await safePath(this.tools.root, source), 'utf8'); } catch { continue; }
@@ -238,11 +239,18 @@ export class Runner {
     const repository = await repositoryStatus(this.tools.root).catch(() => undefined);
     try { raw = await this.bonsai.generate(ledgerPrompt(s, note, repository), ledgerSchema, .1, { step: s.step, route: 'ledger' }); }
     catch (e) { await this.store.log('ledger', { step: s.step, error: (e as Error).message }); s.ledgerBuilt = s.ledgerAttempts >= 2; return false; }
+    const design = designFrom(raw); if (design && (!s.design || design.summary.length > s.design.summary.length)) s.design = design;
     const fresh = candidatesFrom(raw).filter(c => !s.ledger.some(d => d.kind === c.kind && d.name === c.name && d.to === c.to && d.from === c.from));
     const candidates = fresh.map((c, i) => ({ ...c, id: `d${s.ledger.length + i + 1}` }));
     if (!candidates.length) { s.ledgerBuilt = true; await this.store.log('ledger', { step: s.step, candidates: [], kept: s.ledger }); return false; }
     const answers = await this.jev.decide(decisionState(s, { candidateDeliverables: candidates.map(c => ({ id: c.id, kind: c.kind, name: c.name, from: c.from, to: c.to, detail: c.detail })) }), ledgerQuestions(candidates), { step: s.step, phase: 'ledger' });
-    const kept = candidates.filter(c => { const a = answers[`required_${c.id}`]; const p = a?.type === 'noul' ? a.noul : 0; c.required = p; return p >= this.config.completeProbability; });
+    const kept = candidates.filter(c => {
+      const a = answers[`required_${c.id}`]; const p = a?.type === 'noul' ? a.noul : 0; c.required = p;
+      const f = answers[`fits_${c.id}`]; const fits = f?.type === 'noul' ? f.noul : 0;
+      if (p >= this.config.completeProbability) return true;
+      if (fits >= this.config.completeProbability) { c.optional = true; return true; }
+      return false;
+    });
     s.ledger = [...s.ledger, ...kept];
     const complete = answers.complete?.type === 'noul' ? answers.complete.noul : 0;
     s.ledgerComplete = Math.max(s.ledgerComplete, complete);
@@ -279,7 +287,22 @@ export class Runner {
     if (!command) { await this.store.log('check-inferred', { step: s.step, command: '', accepted: false }); return false; }
     const unusable = await checkUnusable(this.tools.root, command);
     // Run the candidate once: how it actually behaves is the best evidence Jev can get.
-    const trial = unusable ? null : await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', command], this.tools.root, this.config.commandTimeoutMs).then(t => ({ code: t.code, timedOut: t.timedOut, output: clip(t.output, 1200) })).catch(e => ({ code: -1, timedOut: false, output: clip(String((e as Error).message), 300) }));
+    const run = () => runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', command], this.tools.root, this.config.commandTimeoutMs).then(t => ({ code: t.code, timedOut: t.timedOut, output: clip(t.output, 1200) })).catch(e => ({ code: -1, timedOut: false, output: clip(String((e as Error).message), 300) }));
+    let trial = unusable ? null : await run();
+    // A trial that fails for want of dependencies is an environment fact, not a
+    // verdict on the command: install what the manifest implies, once, and try again.
+    if (trial && trial.code !== 0 && missingDependencies(trial.output) && !s.setupDone) {
+      const dir = command.match(/(?:--dir|-C|--prefix)\s+(\S+)/)?.[1] ?? command.match(/^\s*cd\s+(\S+)/)?.[1] ?? '.';
+      const install = await installCommand(this.tools.root, dir);
+      if (install) {
+        s.setupDone = true;
+        const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', install], this.tools.root, Math.max(this.config.commandTimeoutMs, 300000)).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
+        await this.store.log('setup', { step: s.step, command: install, code: r.code, output: clip(r.output, 800) });
+        this.observe({ kind: 'warning', step: s.step, text: `setup: ${install} (exit ${r.code})` });
+        await this.evidence(s, 'setup', { ok: r.code === 0, text: `Installed dependencies with ${install}: exit ${r.code}\n${clip(r.output, 600)}` });
+        if (r.code === 0) trial = await run();
+      }
+    }
     const answers = unusable ? null : await this.jev.decide(decisionState(s, { candidateCheck: { command, rationale: raw.rationale, trial }, repository }), checkQuestions(), { step: s.step, phase: 'check-inference' });
     const valid = answers?.valid?.type === 'noul' ? answers.valid.noul : 0;
     const accepted = !unusable && valid >= this.config.completeProbability;
@@ -289,6 +312,16 @@ export class Runner {
     // From here on this command is the verification, exactly as a configured one would be.
     s.lastCheckCommand = command; s.pendingCheck = true; this.tools.config.checkCommand = command;
     return true;
+  }
+  // A file to create is prompted from the design: what it must contain, the
+  // conventions, and the exports of the files near it that it may import.
+  private async createMessages(s: Session, path: string, d: Deliverable): Promise<Message[]> {
+    const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+    const related: { path: string; exports: string[] }[] = [];
+    for (const f of [...s.writes, ...s.knownFiles].filter(f => f !== path && /\.[cm]?[jt]sx?$/.test(f) && (dir === '' || f.startsWith(dir.split('/')[0]!))).slice(0, 12)) {
+      try { const text = await readFile(await safePath(this.tools.root, f), 'utf8'); const decls = await topLevelDeclarations(f, text); const exports = [...decls].filter(([, v]) => v.exported).map(([n]) => n).slice(0, 12); if (exports.length) related.push({ path: f, exports }); } catch { /* skip */ }
+    }
+    return focusedCreateMessages(s, path, d, related);
   }
   private async forcedMove(s: Session, mv: { name: string; source: string; start: number; end: number; destination: string }): Promise<boolean> {
     const key = hash(JSON.stringify({ m: mv }));
@@ -313,11 +346,11 @@ export class Runner {
     // first: the extraction the objective asked for, judged by the check that follows.
     for (const mv of fixes.moveDeclarations) if (await this.forcedMove(s, { ...mv, destination: mv.into })) return true;
     // One file per step, so the check runs between files and each fix is judged alone.
-    for (const file of new Set([...Object.keys(fixes.addImports), ...Object.keys(fixes.addExportAtLines), ...Object.keys(fixes.removeImports)])) {
+    for (const file of new Set([...Object.keys(fixes.addImports), ...Object.keys(fixes.addExportAtLines), ...Object.keys(fixes.removeImports), ...Object.keys(fixes.aliasImports)])) {
       // Export fixes land in the declaring file, which may be one the session never
       // touched; those stay listed for the worker but are not applied unasked.
       if (!s.writes.some(w => w === file || w.endsWith(`/${file}`) || file.endsWith(`/${w}`))) continue;
-      const key = hash(JSON.stringify({ i: fixes.addImports[file] ?? [], e: fixes.addExportAtLines[file] ?? [], r: fixes.removeImports[file] ?? [] }));
+      const key = hash(JSON.stringify({ i: fixes.addImports[file] ?? [], e: fixes.addExportAtLines[file] ?? [], r: fixes.removeImports[file] ?? [], a: fixes.aliasImports[file] ?? [] }));
       if (s.autoFixKeys[file] === key) continue;
       s.autoFixKeys[file] = key;
       let text: string;
@@ -336,6 +369,7 @@ export class Runner {
         edits.push({ start, end: start - 1, newText: wanted.join('\n'), prepend: '' });
       }
       if (fixes.removeImports[file]?.length) edits.push(...await removeImportBindings(file, text, fixes.removeImports[file]!, fixes.removeImportLines[file] ?? {}));
+      for (const al of fixes.aliasImports[file] ?? []) { const e = await aliasImportBinding(file, text, al.name, al.actual, al.line); if (e && !edits.some(x => x.start === e.start)) edits.push(e); }
       if (!edits.length) continue;
       // An identical fix already rolled back is not tried again.
       const identity = hash(JSON.stringify({ route: 'replace_lines', args: { path: file, edits, expectedHash: undefined, destinationHash: undefined } }));
@@ -442,7 +476,8 @@ export class Runner {
           continue;
         }
         // Resolved fixes after a failing check; the plan's remaining targets after any check.
-        if (!s.lastCheckCommand && this.config.allowBash && s.writes.length && s.checkInferences < 3 && s.checkInferredFor !== s.writes.length && await this.inferCheck(s)) { await this.store.save(s); continue; }
+        // Verification is inferred after edits; later attempts wait for the change set to grow.
+        if (!s.lastCheckCommand && this.config.allowBash && s.writes.length && s.checkInferences < 6 && (s.checkInferredFor < 0 || s.writes.length - s.checkInferredFor >= (s.checkInferences < 2 ? 1 : 3)) && await this.inferCheck(s)) { await this.store.save(s); continue; }
         if ((s.pendingMoves.length || (s.lastCheck && !s.lastCheck.ok)) && this.config.allowWrite && await this.autoFix(s)) { await this.store.save(s); continue; }
         if (s.lastCheck && !s.lastCheck.ok && s.focusReadAt !== s.lastCheck.step) {
           s.focusReadAt = s.lastCheck.step;
@@ -463,6 +498,54 @@ export class Runner {
           }
         }
         if (this.config.ledger && !s.ledgerBuilt && await this.buildLedger(s)) { await this.store.save(s); continue; }
+        // Jev decides the step from a small task record and code-enumerated actions.
+        // Verification, rollback, resolved fixes and ledger moves never reach it: code owns those.
+        const readyNow = Boolean(s.lastCheck?.ok && s.editEvidence.length && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && !s.autoUndo
+          && staleFor(s).length === 0 && !s.missingNames.length && !s.pendingMoves.length && !s.ledger.some(d => d.status === 'pending' && d.kind === 'move' && !d.optional) && s.finishTriedAtCheck !== s.lastCheck.step);
+        let route: Route | null = null; let harnessNote: string | undefined; let needsUser: number | null = null;
+        let target: { path: string; start: number; end: number } | null = null; let createTarget: { path: string; deliverable: Deliverable } | null = null;
+        const cands = this.config.ledger ? candidates(s, this.config, readyNow) : [];
+        if (cands.length > 2) {
+          const record = taskRecord(s); const stepQ = stepQuestions(cands);
+          const t0 = performance.now();
+          const stepAnswers = await this.jev.decide(record, stepQ, { step: s.step, phase: 'step' });
+          const decision = decideStep(stepAnswers, cands, this.config); needsUser = decision.needsUser;
+          this.observe({ kind: 'jev', step: s.step, ms: performance.now() - t0, questions: Object.keys(stepQ).length, stateBytes: Buffer.byteLength(JSON.stringify(record)),
+            route: stepAnswers.next?.type === 'choice' ? Object.entries(stepAnswers.next.probabilities).sort((a, b) => b[1] - a[1]).slice(0, 5) : [], nouls: { stuck: decision.stuck, scope_drift: decision.scopeDrift, needs_user: decision.needsUser } });
+          await this.store.log('decision', { step: s.step, chosen: decision.candidate.id, tier: decision.tier, confidence: decision.confidence, probability: decision.probability, stuck: decision.stuck, scopeDrift: decision.scopeDrift, needsUser: decision.needsUser, candidates: cands.map(c => c.id) });
+          const d = decision.candidate;
+          if (d.kind === 'inspect' && d.target?.path) {
+            // Code reads: the range is the whole file when small, else the region the errors or the deliverable name.
+            const path = d.target.path; let start = 1; let end = 250;
+            const errs = s.lastCheck && !s.lastCheck.ok ? Object.entries(s.lastCheck.summary.byFile).find(([f]) => path.endsWith(f) || f.endsWith(path))?.[1].lines ?? [] : [];
+            if (errs.length) { start = Math.max(1, Math.min(...errs) - 20); end = Math.max(...errs) + 30; }
+            await this.forced(s, 'read_files', { files: [{ path, start, end }] }, 'decided-read');
+            await this.store.save(s); continue;
+          }
+          if (d.kind === 'search' && d.target?.name) { await this.forced(s, 'search_codebase', { query: d.target.name, path: '.', mode: 'text' }, 'decided-search'); await this.store.save(s); continue; }
+          if (d.kind === 'finish') route = 'finish';
+          else if (d.kind === 'ask') route = 'ask_user';
+          else if (d.kind === 'implement' && d.target?.deliverable) {
+            const dl = d.target.deliverable;
+            route = dl.kind === 'move' ? 'move_lines' : dl.kind === 'create' ? 'write' : 'replace_lines';
+            harnessNote = `Work on deliverable ${dl.id} only: ${dl.kind} ${dl.name ?? ''}${dl.from ? ` from ${dl.from}` : ''}${dl.to ? ` to ${dl.to}` : ''}. ${dl.detail}${dl.note ? ` Current status: ${dl.note}.` : ''} Produce the single ${route} action that advances it.`;
+            const p = route === 'replace_lines' ? (ledgerFile(s, dl.to ?? dl.from) ?? null) : null;
+            if (p && s.knownFiles.includes(p)) target = { path: p, start: 1, end: 250 };
+            if (route === 'write' && dl.kind === 'create') { const path = dl.to ?? dl.name ?? ''; if (path) { createTarget = { path, deliverable: dl }; target = { path, start: 1, end: 1 }; } }
+          } else if (d.kind === 'fix' && d.target?.path) {
+            route = 'replace_lines';
+            const v = s.lastCheck ? Object.entries(s.lastCheck.summary.byFile).find(([f]) => d.target!.path!.endsWith(f) || f.endsWith(d.target!.path!))?.[1] : undefined;
+            harnessNote = `Fix the verification errors in ${d.target.path} at lines ${(v?.lines ?? []).join(', ')}: ${(v?.samples ?? []).join(' | ')}. Edit only those lines.`;
+            const lines = v?.lines ?? []; target = { path: d.target.path, start: lines.length ? Math.max(1, Math.min(...lines) - 25) : 1, end: lines.length ? Math.max(...lines) + 40 : 250 };
+          }
+          // A line edit needs the file as it is now: read it first, and re-decide next step.
+          if (target && route === 'replace_lines' && s.readHashes[target.path] !== s.hashes[target.path]) {
+            await this.forced(s, 'read_files', { files: [{ path: target.path, start: target.start, end: target.end }] }, 'decided-read');
+            await this.store.save(s); continue;
+          }
+          if (decision.stuck >= .8 && route && editRoutes.includes(route)) harnessNote = `${harnessNote ?? ''} The last attempts did not work; take a different approach than before.`.trim();
+          if (route && (editRoutes.includes(route) || route === 'finish') && s.phase === 'inspect') s.phase = 'implement';
+        }
         const questions = routeQuestions(s, this.config);
         // A passing check after edits, with nothing pending, is the moment to propose
         // completion: the audit judges the proposal, so the harness makes it once per
@@ -470,19 +553,20 @@ export class Runner {
         const readyToFinish = Boolean(s.lastCheck?.ok && s.editEvidence.length && s.lastCheck.step > s.lastWriteStep && !s.pendingCheck && !s.autoUndo
           && staleFor(s).length === 0 && !s.missingNames.length && !s.pendingMoves.length && !s.ledger.some(d => d.status === 'pending' && d.kind === 'move') && s.finishTriedAtCheck !== s.lastCheck.step && 'finish' in (questions.route as { criteria: Record<string, string> }).criteria);
         if (readyToFinish) s.finishTriedAtCheck = s.lastCheck!.step;
+        const decided = route !== null;
         const jevStarted = performance.now();
-        const state = decisionState(s);
-        const answers = await this.jev.decide(state, questions, { step: s.step, phase: 'routing-and-context' });
+        const state = decided ? null : decisionState(s);
+        const answers: Answers = decided ? { route: { type: 'choice', choice: route!, confidence: 1, probabilities: { [route!]: 1 } } } : await this.jev.decide(state, questions, { step: s.step, phase: 'routing-and-context' });
         if (readyToFinish) { answers.route = { type: 'choice', choice: 'finish', confidence: 1, probabilities: { finish: 1 } }; await this.store.log('auto-finish', { step: s.step, check: s.lastCheck!.step }); }
-        this.observe({ kind: 'jev', step: s.step, ms: performance.now() - jevStarted, questions: Object.keys(questions).length, stateBytes: Buffer.byteLength(JSON.stringify(state)),
+        if (!decided) this.observe({ kind: 'jev', step: s.step, ms: performance.now() - jevStarted, questions: Object.keys(questions).length, stateBytes: Buffer.byteLength(JSON.stringify(state)),
           route: answers.route?.type === 'choice' ? Object.entries(answers.route.probabilities).sort((a, b) => b[1] - a[1]) : [],
           nouls: Object.fromEntries(Object.entries(answers).filter(([, a]) => a.type === 'noul').map(([k, a]) => [k, (a as { noul: number }).noul])) });
         const criteria = (questions.route as { criteria: Record<string, string> }).criteria;
         const routeAnswer = answers.route;
-        let route = confidentChoice(routeAnswer, this.config) as Route | null;
+        if (!route) route = confidentChoice(routeAnswer, this.config) as Route | null;
         // finish proposes a summary, not completion. Audit that concrete proposal
         // below instead of redirecting a finish vote into unrelated inspections.
-        if ((!route || !Object.hasOwn(criteria, route)) && routeAnswer?.type === 'choice') {
+        if (!decided && (!route || !Object.hasOwn(criteria, route)) && routeAnswer?.type === 'choice') {
           // Probability spread thinly over many options is not the same as not
           // knowing. Re-ask among the leading candidates before pausing.
           const leading = Object.entries(routeAnswer.probabilities).sort((a, b) => b[1] - a[1]).map(([k]) => k).filter(k => Object.hasOwn(criteria, k)).slice(0, 2);
@@ -516,7 +600,7 @@ export class Runner {
             }
           }
         }
-        if (!route || !Object.hasOwn(criteria, route))
+        if (!route || (!decided && !Object.hasOwn(criteria, route)))
           throw new Error('Jev route is uncertain; paused without executing an action');
         // The worker can batch related writes. Only enter verify after it has
         // selected the validation action, so a stale readiness judgement never
@@ -530,7 +614,11 @@ export class Runner {
           [...new Set([...s.writes, ...Object.keys(s.readHashes).filter(p => /\.[cm]?[jt]sx?$/.test(p))])],
           [s.objective, ...referenceContext(s).map(e => e.text)].join('\n')) : undefined;
         if (currentSource) await this.store.log('completion-source', { step: s.step, files: currentSource });
-        let prompt = messages(s, route, undefined, currentSource);
+        let focusedTarget: { path: string; text: string; hash: string; start: number; end: number; note: string } | null = null;
+        if (target && route === 'replace_lines' && harnessNote) {
+          try { const text = await readFile(await safePath(this.tools.root, target.path), 'utf8'); focusedTarget = { path: target.path, text, hash: hash(text), start: target.start, end: Math.min(target.end, target.start + 249), note: harnessNote }; } catch { focusedTarget = null; }
+        }
+        let prompt = focusedTarget ? focusedMessages(s, route, focusedTarget) : createTarget ? await this.createMessages(s, createTarget.path, createTarget.deliverable) : messages(s, route, harnessNote, currentSource);
         let counted = await this.bonsai.count(prompt);
         let forced = 0;
         while (counted.tokens > this.config.workingTokens) {
@@ -588,7 +676,11 @@ export class Runner {
             throw new Error(`Bonsai repeated the ${route} action from step ${earlier} (${known}); not executed. Choose different arguments or another action`);
           }
           }
+          if (target && editRoutes.includes(route) && typeof args.path === 'string' && !(args.path === target.path || args.path.endsWith(`/${target.path}`) || target.path.endsWith(`/${args.path}`)))
+            throw new Error(`The decided action is an edit of ${target.path}; the generated arguments edit ${args.path} instead. Produce the ${route} for ${target.path} only.`);
           if (route === 'move_lines' && s.ledger.length) { const why = await this.moveOutsideLedger(s, args); if (why) throw new Error(why); }
+          // The worker may not hand a decision to the user that Jev judged the task does not need.
+          if (route === 'ask_user' && needsUser !== null && needsUser < .5) throw new Error(`ask_user refused: the task does not need the user (judged ${needsUser.toFixed(2)}). Decide it yourself from the objective and the deliverables: ${clip(String(args.question ?? ''), 200)}`);
           if (route === 'bash' && typeof args.command === 'string' && readOnlyCommand(args.command) && s.inspectionsSinceAction >= 4 && (s.ledger.length || Object.keys(s.readHashes).length))
             throw new Error(`Read-only command refused: ${s.inspectionsSinceAction} inspections have run since the last action and the evidence already holds these files. Edit, run the build or tests, or finish.`);
           if (route === 'move_lines' && typeof args.destination === 'string' && args.destinationHash === 'new') {
@@ -631,27 +723,28 @@ export class Runner {
           // state omits them, and the diff chunks are sized from the bytes left.
           const base = (extra: Record<string, unknown>) => decisionState(s, { tasks: 'omitted: task entries are worker claims, not evidence', editEvidence: [], evidence: [], currentSource, lastCheck: s.lastCheck && { step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors }, ...extra });
           const baseBytes = Buffer.byteLength(JSON.stringify(base({})));
-          const chunks = diffChunks(diff, s.ledger, Math.max(2500, 21000 - baseBytes));
-          const implemented: Record<string, number> = {}; let outOfScope = 0; let objectiveMet = 0;
-          for (const [i, chunk] of chunks.entries()) {
-            const state = base({ diff: { files: chunk.files, moved: chunk.moved }, ...(chunks.length > 1 ? { chunk: `${i + 1} of ${chunks.length} (by file)` } : {}) });
-            const answers = await this.jev.decide(state, completionQuestions(chunk.items, i === 0), { step: s.step, phase: 'completion-check' });
-            for (const it of chunk.items) { const a = answers[`implemented_${it.id}`]; const p = a?.type === 'noul' ? a.noul : 0; implemented[it.id] = Math.max(implemented[it.id] ?? 0, p); }
-            if (answers.out_of_scope?.type === 'noul') outOfScope = Math.max(outOfScope, answers.out_of_scope.noul);
-            if (answers.objective_met?.type === 'noul') objectiveMet = answers.objective_met.noul;
+          const evidence = await completionEvidence(this.tools.root, s, diff);
+          const changedFiles = diff.files.map(f => f.path);
+          const implemented: Record<string, number> = {}; let outOfScope = 0; let objectiveMet: number | null = null;
+          const diffSummary = clip(diff.files.map(f => `${f.path}${f.created ? ' (created)' : ''}: +${f.declarationsAdded.length}/-${f.declarationsRemoved.length} declarations, +${f.importsAdded.length}/-${f.importsRemoved.length} imports${f.hunks ? `\n${clip(f.hunks, 700)}` : ''}`).join('\n'), 6000);
+          // Chunk by deliverable when the evidence would exceed Jev's budget; each call carries only its items' evidence.
+          const groups: Deliverable[][] = []; let group: Deliverable[] = []; let bytes = 0;
+          for (const d of s.ledger) { const size = Buffer.byteLength(evidence[d.id] ?? '') + 200; if (bytes + size > 14000 && group.length) { groups.push(group); group = []; bytes = 0; } group.push(d); bytes += size; }
+          if (group.length || !groups.length) groups.push(group);
+          const perItem: Record<string, { supports: number; contradicts: number; saysNothing: number }> = {}; const unmet: string[] = [];
+          for (const [i, items] of groups.entries()) {
+            const state = completionState(s, Object.fromEntries(items.map(d => [d.id, evidence[d.id] ?? ''])), changedFiles, currentSource, diffSummary);
+            const answers = await this.jev.decide(state, auditQuestions(items, items.length === 0 && i === 0, unaccountedFiles(s, changedFiles)), { step: s.step, phase: 'completion-check' });
+            const verdict = auditVerdict(answers, items, this.config);
+            Object.assign(perItem, verdict.perItem); unmet.push(...verdict.unmet); outOfScope = Math.max(outOfScope, verdict.scopeCreep); if (verdict.objectiveMet !== null) objectiveMet = verdict.objectiveMet;
+            for (const d of items) implemented[d.id] = verdict.perItem[d.id]?.supports ?? 0;
           }
           const threshold = this.config.completeProbability;
-          const unmet = s.ledger.filter(d => !d.unresolvable && d.status !== 'done' && (implemented[d.id] ?? 0) < threshold);
-          // Out-of-scope rejects only with confidence: mechanical consequences of a
-          // move (imports copied, exports added) read as noise to a classifier.
-          // With a ledger Jev classified as complete, every resolvable item done or
-          // implemented is the objective; the whole-diff question is then advisory.
-          const resolvable = s.ledger.filter(d => !d.unresolvable);
-          const objectiveGate = objectiveMet >= threshold || (s.ledgerComplete >= threshold && resolvable.length > 0 && !unmet.length);
-          const accepted = !unmet.length && objectiveGate && outOfScope < threshold;
-          await this.store.log('action', { step: s.step, route, args, rejected: !accepted, implemented, objectiveMet, outOfScope, unmet: unmet.map(d => d.id) });
+          const accepted = !unmet.length && outOfScope < threshold && (objectiveMet === null || objectiveMet >= threshold);
+          await this.store.log('action', { step: s.step, route, args, rejected: !accepted, perItem, outOfScope, objectiveMet, unmet });
           if (!accepted) {
-            const feedback = `Completion rejected (objective met=${objectiveMet.toFixed(2)}, out-of-scope changes=${outOfScope.toFixed(2)}). ${unmet.length ? `Deliverables not implemented: ${unmet.map(d => `${d.id} ${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} [${d.status}${d.note ? `: ${d.note}` : ''}]`).join('; ')}. ` : ''}${outOfScope >= threshold ? 'The diff contains changes the objective did not ask for; revert them. ' : ''}${!unmet.length && objectiveMet < threshold ? 'The diff does not accomplish the objective as requested; compare the deliverables with current source and continue. ' : ''}Continue the implementation; the harness re-proposes completion after the next passing check.`;
+            const unmetItems = s.ledger.filter(d => unmet.includes(d.id));
+            const feedback = `Completion rejected (${objectiveMet !== null ? `objective met=${objectiveMet.toFixed(2)}, ` : ''}out-of-scope changes=${outOfScope.toFixed(2)}). ${unmetItems.length ? `Deliverables the evidence does not show as done: ${unmetItems.map(d => `${d.id} ${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} [${d.status}${d.note ? `: ${d.note}` : ''}; supports ${(perItem[d.id]?.supports ?? 0).toFixed(2)}, contradicts ${(perItem[d.id]?.contradicts ?? 0).toFixed(2)}]`).join('; ')}. ` : ''}${outOfScope >= threshold ? 'The diff contains changes the objective did not ask for; revert them. ' : ''}Continue the implementation; the harness re-proposes completion after the next passing check.`;
             await this.evidence(s, 'finish_rejected', { ok: false, text: feedback });
             s.completionFeedback = { step: s.step, text: clip(feedback, 1500), awaitingEvidence: true };
             if (s.lastCheck) s.finishTriedAtCheck = s.lastCheck.step;
@@ -660,7 +753,7 @@ export class Runner {
             await this.store.save(s);
             continue;
           }
-          if (s.ledger.length) args = { ...args, summary: `${args.summary} Deliverables: ${s.ledger.map(d => `${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} (${d.status === 'done' ? 'done' : `implemented ${(implemented[d.id] ?? 0).toFixed(2)}`})`).join('; ')}.` };
+          if (s.ledger.length) args = { ...args, summary: `${args.summary} Deliverables: ${s.ledger.map(d => `${d.kind} ${d.name ?? ''}${d.to ? ` to ${d.to}` : ''} (${d.status === 'done' ? 'done' : `supported ${(implemented[d.id] ?? 0).toFixed(2)}`})`).join('; ')}.` };
         }
         await this.store.log('action', { step: s.step, route, args });
         // Save an intent marker before effects; recovery never blindly replays an action.

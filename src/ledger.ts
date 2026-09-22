@@ -16,10 +16,10 @@ const clip = (text: string, max: number) => text.length <= max ? text : `${text.
 const str = (max: number): JsonSchema => ({ type: 'string', maxLength: max });
 export const kinds = ['move', 'create', 'modify', 'delete', 'export', 'import', 'verify', 'other'] as const;
 export const ledgerSchema: JsonSchema = {
-  type: 'object', additionalProperties: false, required: ['deliverables'],
-  properties: { deliverables: { type: 'array', minItems: 0, maxItems: 24, items: {
-    type: 'object', additionalProperties: false, required: ['kind', 'name', 'from', 'to', 'detail'],
-    properties: { kind: { type: 'string', enum: [...kinds] }, name: str(120), from: str(300), to: str(300), detail: str(300) } } } },
+  type: 'object', additionalProperties: false, required: ['summary', 'conventions', 'deliverables'],
+  properties: { summary: str(700), conventions: str(600), deliverables: { type: 'array', minItems: 0, maxItems: 24, items: {
+    type: 'object', additionalProperties: false, required: ['kind', 'name', 'from', 'to', 'detail', 'contents'],
+    properties: { kind: { type: 'string', enum: [...kinds] }, name: str(120), from: str(300), to: str(300), detail: str(300), contents: { type: 'array', minItems: 0, maxItems: 6, items: str(160) } } } } },
 };
 export function ledgerPrompt(s: Session, note?: string, repository?: Awaited<ReturnType<typeof repositoryStatus>>): Message[] {
   const request = {
@@ -31,7 +31,7 @@ export function ledgerPrompt(s: Session, note?: string, repository?: Awaited<Ret
     schema: ledgerSchema,
   };
   return [
-    { role: 'system', content: 'You are Bonsai, the implementation worker in Leana. List the concrete deliverables the objective asks for, within its requested scope only, as typed items. kind: move (a declaration from one file to another), create (a file), delete (a declaration), export (add export to a declaration), import (make a file import a name from a module), modify (a change inside a declaration), verify (a command that must pass), other. name: the declaration, file or command. from: the file (or module) it is in now; to: the file it must end in; use "" when not applicable. detail: one sentence, copied or paraphrased from the requirement. Do not list work the objective does not request, and do not list names a requirement merely mentions without asking for a change to them. from and to are repository paths copied exactly from changedFiles, readFiles or relevantFiles (a plan may abbreviate a path; use the real one); name is a bare identifier without parentheses. Output only the JSON object.' },
+    { role: 'system', content: 'You are Bonsai, the implementation worker in Leana. Design the work, then list its concrete deliverables. summary: what the finished result is and does, in the terms a professional would ship it (for an application: its sections, behaviour and content; for a refactor: the resulting structure). conventions: the stack, styling, naming and quality bar every file follows. Then the deliverables the objective asks for, within its requested scope only, as typed items; each item\'s contents lists, in up to six short points, what that file or declaration must contain so that the summary holds: the components it renders, the data it holds, the exports it provides, the behaviour it implements. An objective that asks for something advanced or polished means substantive contents, not placeholders. kind: move (a declaration from one file to another), create (a file), delete (a declaration), export (add export to a declaration), import (make a file import a name from a module), modify (a change inside a declaration), verify (a command that must pass), other. name: the declaration, file or command. from: the file (or module) it is in now; to: the file it must end in; use "" when not applicable. detail: one sentence, copied or paraphrased from the requirement. Do not list work the objective does not request, and do not list names a requirement merely mentions without asking for a change to them. from and to are repository paths copied exactly from changedFiles, readFiles or relevantFiles (a plan may abbreviate a path; use the real one); name is a bare identifier without parentheses. Output only the JSON object.' },
     { role: 'user', content: JSON.stringify(request) },
   ];
 }
@@ -44,13 +44,23 @@ export function candidatesFrom(raw: Record<string, any>): Deliverable[] {
     if (it.kind === 'create' && !to && !from && /[./]/.test(name)) to = name;
     const key = `${it.kind}:${name}:${from}:${to}`;
     if (out.some(o => `${o.kind}:${o.name ?? ''}:${o.from ?? ''}:${o.to ?? ''}` === key)) continue;
-    out.push({ id: `d${out.length + 1}`, kind: it.kind, name: name || undefined, from: from || undefined, to: to || undefined, detail: clip(String(it.detail ?? ''), 300), required: 0, status: 'unknown' });
+    const contents = Array.isArray(it.contents) ? it.contents.filter((x: unknown) => typeof x === 'string' && x.trim()).slice(0, 6).map((x: string) => clip(x.trim(), 160)) : [];
+    out.push({ id: `d${out.length + 1}`, kind: it.kind, name: name || undefined, from: from || undefined, to: to || undefined, detail: clip(String(it.detail ?? ''), 300), required: 0, status: 'unknown', ...(contents.length ? { contents } : {}) });
   }
   return out;
 }
+export function designFrom(raw: Record<string, any>): { summary: string; conventions: string } | null {
+  const summary = typeof raw?.summary === 'string' ? clip(raw.summary.trim(), 700) : ''; const conventions = typeof raw?.conventions === 'string' ? clip(raw.conventions.trim(), 600) : '';
+  return summary || conventions ? { summary, conventions } : null;
+}
 export function ledgerQuestions(candidates: Deliverable[]): Questions {
   const q: Questions = {};
-  for (const c of candidates) q[`required_${c.id}`] = { type: 'noul', instructions: `Does the objective, within the scope it requests (see referenceEvidence for the referenced plan), require this deliverable: ${describe(c)}? A name a requirement only mentions in passing, or work belonging to a later step, is not required.` };
+  for (const c of candidates) {
+    q[`required_${c.id}`] = { type: 'noul', instructions: `Does the objective, within the scope it requests (see referenceEvidence for the referenced plan), require this deliverable: ${describe(c)}? A name a requirement only mentions in passing, or work belonging to a later step, is not required.` };
+    // An open-ended objective leaves room for design choices: items that fit
+    // without being required become optional deliverables.
+    q[`fits_${c.id}`] = { type: 'noul', instructions: `Is this deliverable a reasonable part of fulfilling the objective as stated, even if not strictly required: ${describe(c)}? Answer no for work outside the objective's scope or belonging to a later step.` };
+  }
   q.complete = { type: 'noul', instructions: 'Do the candidate deliverables together cover everything the objective requests within its scope, so that doing all of them completes the request? Answer low if a requested change is missing from the list.' };
   return q;
 }
@@ -247,6 +257,6 @@ export function checkPrompt(s: Session, repository: Awaited<ReturnType<typeof re
   ];
 }
 export function checkQuestions(): Questions {
-  return { valid: { type: 'noul', instructions: 'Is candidateCheck.command a verification of the objective\'s deliverables in this repository: it builds, type-checks or tests them using tools, scripts or manifests the repository shows it has (repository.scripts, repository.packages, repository.topLevel), terminates on its own, and starts no server or watcher? candidateCheck.trial shows how the command actually behaved when run once: an exit code of 0, or diagnostics from the expected tool, is evidence that it works; "command not found" or a missing directory is evidence that it does not.' } };
+  return { valid: { type: 'noul', instructions: 'Is candidateCheck.command a verification of the objective\'s deliverables in this repository: it builds, type-checks or tests them using tools, scripts or manifests the repository shows it has (repository.scripts, repository.packages, repository.topLevel), terminates on its own, and starts no server or watcher? candidateCheck.trial shows how the command actually behaved when run once. An exit code of 0 means it works. A non-zero exit whose output lists type, lint or test errors also means it works: the tool ran and found problems in the code, which is what a verification is for. "command not found", a missing script or directory, or a usage error is evidence that it does not work.' } };
 }
 export { hash as ledgerHash };

@@ -8,16 +8,17 @@ import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults, ledger: false };
 import { Bonsai, Jev, postJson, validateAnswers } from '../src/clients.js';
-import { compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
+import { focusedCreateMessages, focusedMessages, compactNames, confidentChoice, decisionState, evictOne, mergeCoverage, messages, promptFields, relevantFiles, repoOverview, checkDelta, routeDescriptions, routeQuestions, staleFor } from '../src/context.js';
 import { newSession, Runner, updateTasks } from '../src/runner.js';
 import { referenceContext, rememberReferences, scopes } from '../src/references.js';
-import { anchorPath, candidatesFrom, checkSchema, completionQuestions, diffChunks, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from '../src/ledger.js';
+import { unaccountedFiles, auditQuestions, auditVerdict, candidates, completionEvidence, decideStep, stepQuestions, taskRecord } from '../src/decide.js';
+import { designFrom, anchorPath, candidatesFrom, checkSchema, completionQuestions, diffChunks, ledgerQuestions, ledgerSchema, refreshLedger, structuralDiff } from '../src/ledger.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
+import { aliasImportBinding, missingDependencies, installCommand, repositoryStatus, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -30,6 +31,7 @@ async function fixture(t: any) {
 function answersFor(q: Questions, route = 'read_files', complete = .99): Answers {
   return Object.fromEntries(Object.entries(q).map(([id, question]) => [id, question.type === 'noul'
     ? { type: 'noul', noul: id === 'complete' || id === 'objective_met' || id.startsWith('supported_') || id.startsWith('implemented_') || id.startsWith('required_') ? complete : .1 }
+    : 'supports' in question.criteria ? { type: 'choice', choice: 'supports', confidence: 1, probabilities: { supports: complete, contradicts: 1 - complete, says_nothing: 0 } }
     : { type: 'choice', choice: route, confidence: 1,
       probabilities: Object.fromEntries(Object.keys(question.criteria).map(k => [k, k === route ? 1 : 0])) }])) as Answers;
 }
@@ -383,7 +385,7 @@ test('A finish vote goes to a concrete completion audit instead of being redirec
   const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
     calls.push({ phase: ctx!.phase, state });
     if (ctx!.phase === 'routing-and-context') assert(!q.objective_met, 'completion is evaluated on the diff, not during routing');
-    else { assert(q.objective_met); assert(q.out_of_scope); }
+    else { assert(q.objective_met, 'no deliverables listed: the objective as a whole is judged'); assert(q.scope_creep); }
     return answersFor(q, 'finish');
   } };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => {
@@ -391,7 +393,7 @@ test('A finish vote goes to a concrete completion audit instead of being redirec
   } };
   const result = await new Runner({ ...defaults, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
   assert.deepEqual(calls.map(c => c.phase), ['routing-and-context', 'completion-check']);
-  assert(calls[1]!.state.diff, 'the audit sees the structural diff');
+  assert(calls[1]!.state.evidence !== undefined, 'the audit sees per-deliverable evidence');
   assert.equal(result.status, 'complete'); assert.equal(result.entries.length, 0);
 });
 
@@ -1056,7 +1058,7 @@ test('missingNames are pinned after a failing check and cleared by a passing one
   const runner = new Runner({ ...defaults, allowBash: true }, store, { decide: async () => ({}) }, { count: async () => ({ tokens: 1, mode: 't' }), generate: async () => ({}) }, root, () => {});
   s.step = 2; await runner.evidence(s, 'bash', { ok: false, verification: true, text: JSON.stringify({ output: "b.ts(1,1): error TS2304: Cannot find name 'z'." }) });
   assert.deepEqual(s.missingNames, [{ name: 'z', inFile: 'b.ts', importedBy: 'a.ts', importLine: 'import { z } from "./z.js";' }]);
-  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, moveDeclarations: [], unresolved: [], total: 1 };
+  const grouped = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, aliasImports: {}, moveDeclarations: [], unresolved: [], total: 1 };
   const pinned = { addImports: { 'b.ts': ['import { z } from "./z.js";'] }, total: 1 };
   assert.deepEqual((decisionState(s) as any).missingNames, grouped); assert.deepEqual(promptFields(messages(s, 'replace_lines')).missingNames, pinned);
   s.step = 3; await runner.evidence(s, 'bash', { ok: true, verification: true, check: true, text: 'passed' });
@@ -1203,7 +1205,7 @@ test('The decision state shrinks optional lists and the evidence tail before pau
   s.searches = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`text:q${i} in .`, 'z'.repeat(300)]));
   const state = decisionState(s) as any;
   assert(Buffer.byteLength(JSON.stringify(state)) <= 22000);
-  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'removeImportLines', 'moveDeclarations', 'unresolved', 'total']);
+  assert.equal(state.missingNames.total, 40); assert(Object.values(state.missingNames.addImports).flat().length <= 36); assert.deepEqual(Object.keys(state.missingNames), ['addImports', 'addExportAtLines', 'removeImports', 'removeImportLines', 'aliasImports', 'moveDeclarations', 'unresolved', 'total']);
   assert.equal(state.evidenceCount, 20); assert(state.evidence.length <= 8); assert(state.objective.includes('Fix'));
 });
 test('Panel lines are flattened to one ASCII row each', () => {
@@ -2116,7 +2118,7 @@ test('A finish is rejected on the diff when a deliverable is unmet, and the feed
   s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'K', from: 'src/a.ts', to: 'src/b.ts', detail: 'move K' }] });
   s.moveDirection = { source: 'src/b.ts', destination: 'src/a.ts' }; // a direction that forbids the harness move, so the audit is exercised
   const jev = { decide: async (_st: unknown, q: Questions, ctx?: { phase: string }) => {
-    if (ctx?.phase === 'completion-check') { const a = answersFor(q, 'finish', .9) as Answers; a.implemented_d1 = { type: 'noul', noul: .2 }; return a; }
+    if (ctx?.phase === 'completion-check') { const a = answersFor(q, 'finish', .9) as Answers; a.d_d1 = { type: 'choice', choice: 'contradicts', confidence: .7, probabilities: { supports: .2, contradicts: .7, says_nothing: .1 } }; return a; }
     return answersFor(q, 'finish', .9);
   } };
   const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ summary: 'K was moved.' }) };
@@ -2124,7 +2126,7 @@ test('A finish is rejected on the diff when a deliverable is unmet, and the feed
   await runner.evidence(s, 'bash', { ok: true, check: true, verification: true, text: 'passed' }, { command: 'node --check src/a.ts' });
   const result = await runner.run(s);
   assert.equal(result.status, 'paused');
-  assert.match(result.entries.at(-1)!.text, /Completion rejected \(objective met=0\.90, out-of-scope changes=0\.10\)\. Deliverables not implemented: d1 move K to src\/b\.ts \[pending: still declared in src\/a\.ts lines 1-1\]/);
+  assert.match(result.entries.at(-1)!.text, /Completion rejected \(out-of-scope changes=0\.00\)\. Deliverables the evidence does not show as done: d1 move K to src\/b\.ts \[pending: still declared in src\/a\.ts lines 1-1; supports 0\.20/);
   assert.equal(result.completionFeedback?.awaitingEvidence, true);
 });
 
@@ -2351,4 +2353,261 @@ test('With no check at all, the harness still performs the ledger\'s moves and r
   assert.equal(kinds.filter(k => k === 'move_lines').length, 2, `steps: ${kinds.join(',')}`);
   assert.deepEqual(result.ledger.map(d => [d.name, d.from, d.status]), [['HIDE_CURSOR', 'src/cli.ts', 'done'], ['isJsonObject', 'src/cli.ts', 'done']], 'the second item was repaired from its sibling after the first move created the destination');
   assert.match(await readFile(join(root, 'src', 'cli', 'deps.ts'), 'utf8'), /export function isJsonObject/);
+});
+
+test('The task record Jev decides on is small and made of facts, and the candidates are enumerated by code', async t => {
+  const { root, session: s } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'const A = 1;\nexport const B = 2;\n'); await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export const X = 0;\n');
+  s.knownFiles.push('src/cli.ts', 'src/cli/deps.ts'); s.writes = ['src/cli.ts']; s.hashes['src/cli.ts'] = 'h'; s.step = 9; s.lastWriteStep = 8;
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'A', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'move A' }, { kind: 'modify', name: 'B', from: 'src/cli.ts', to: 'src/cli.ts', detail: 'double B' }, { kind: 'verify', name: 'node check.mjs', from: '', to: '', detail: 'passes' }] });
+  await refreshLedger(root, s);
+  s.lastCheck = { step: 9, ok: false, text: 'x', summary: summarizeCheck('src/cli.ts(2,14): error TS2322: bad') }; s.lastCheckCommand = 'node check.mjs';
+  s.entries = [{ id: 'e9', step: 9, kind: 'bash', artifact: '', text: 'x'.repeat(5000), relevance: .5 }];
+  const record = taskRecord(s);
+  assert(Buffer.byteLength(JSON.stringify(record)) < 3000, `record is ${Buffer.byteLength(JSON.stringify(record))} bytes`);
+  assert.deepEqual(Object.keys(record), ['objective', 'deliverables', 'verification', 'changes', 'lastAction', 'progress']);
+  assert.equal(record.verification.lastResult, 'failed'); assert.equal(record.verification.errors, 1); assert.equal(record.lastAction!.summary.length, 241);
+  const c = candidates(s, { ...defaults, allowWrite: true }, false);
+  const ids = c.map(x => x.id);
+  assert(ids.includes('implement:d2'), 'the modify deliverable is the worker\'s'); assert(!ids.includes('implement:d1') || !s.pendingMoves.length, 'a move the harness performs is never offered');
+  assert(ids.includes('fix:src/cli.ts')); assert(ids.includes('inspect:src/cli.ts'), 'the edited file is not readable at its current version'); assert(ids.includes('ask') && ids.includes('free'));
+  assert(!ids.includes('implement:d3'), 'verification is code\'s own');
+  const q = stepQuestions(c); assert.deepEqual(Object.keys(q), ['next', 'stuck', 'scope_drift', 'needs_user']);
+  const d = decideStep({ next: { type: 'choice', choice: 'inspect:src/cli.ts', confidence: .4, probabilities: { 'inspect:src/cli.ts': .45, 'fix:src/cli.ts': .3, free: .25 } }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } }, c, defaults);
+  assert.equal(d.tier, 'cautious'); assert.equal(d.candidate.kind, 'inspect', 'a cheap inspection proceeds on a middling read');
+  const e = decideStep({ next: { type: 'choice', choice: 'fix:src/cli.ts', confidence: .3, probabilities: { 'fix:src/cli.ts': .35, 'inspect:src/cli.ts': .33, free: .32 } } }, c, defaults);
+  assert.equal(e.tier, 'escalate'); assert.equal(e.candidate.kind, 'free', 'an uncertain edit choice escalates to the worker');
+  const f = decideStep({ next: { type: 'choice', choice: 'fix:src/cli.ts', confidence: .9, probabilities: { 'fix:src/cli.ts': .9 } }, needs_user: { type: 'noul', noul: .9 } }, c, defaults);
+  assert.equal(f.candidate.kind, 'ask', 'a confident need for the user overrides');
+});
+test('Jev\'s step decision drives the loop: code executes inspections, the worker gets a focused note for a deliverable, and uncertainty escalates', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'a.ts'), 'export const greeting = "hi";\n'); await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  session.objective = 'Make greeting say Hello World in src/a.ts.'; session.knownFiles.push('src/a.ts'); session.phase = 'implement'; session.inspectionCount = 3;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'modify', name: 'greeting', from: 'src/a.ts', to: 'src/a.ts', detail: 'greeting must be Hello World' }] }); session.ledgerBuilt = true; session.lastCheckCommand = 'node check.mjs';
+  const phases: string[] = []; const notes: string[] = []; let turn = 0;
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => {
+    phases.push(ctx!.phase);
+    if (ctx!.phase === 'step') {
+      turn++;
+      const ids = Object.keys((q.next as any).criteria);
+      const pick = turn === 1 ? ids.find(i => i.startsWith('inspect:'))! : turn === 2 ? 'implement:d1' : 'free';
+      const conf = turn === 3 ? .1 : .9;
+      return { next: { type: 'choice', choice: pick, confidence: conf, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? (turn === 3 ? .3 : .9) : (turn === 3 ? .7 / (ids.length - 1) : .1 / (ids.length - 1))])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers;
+    }
+    return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
+    const last = JSON.parse(m[m.length - 1].content); const note = last.task ?? promptFields(m).harnessNote; if (note) notes.push(note);
+    if (schema === schemas.replace_lines) return { path: 'src/a.ts', expectedHash: session.hashes['src/a.ts'], edits: [{ start: 1, end: 1, newText: 'export const greeting = "Hello World";', prepend: '' }] };
+    if (schema === schemas.finish) return { summary: 'greeting says Hello World.' };
+    return { files: [{ path: 'src/a.ts', start: 1, end: 1 }] };
+  } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 6 }, store, jev, bonsai, root, () => {}).run(session);
+  const kinds = result.entries.map(e => e.kind);
+  assert.equal(kinds[0], 'read_files', `code executed the inspection; steps: ${kinds.join(',')}`);
+  assert.equal(kinds[1], 'replace_lines', 'the deliverable went to the worker as an edit'); assert.match(notes[0] ?? '', /^Work on deliverable d1 only: modify greeting/);
+  assert.equal(await readFile(join(root, 'src', 'a.ts'), 'utf8'), 'export const greeting = "Hello World";\n');
+  assert(phases.includes('routing-and-context'), 'the escalated step fell back to the worker\'s own routing');
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const decisions = events.filter(e => e.type === 'decision').map(e => [e.data.chosen, e.data.tier]);
+  assert.deepEqual(decisions.slice(0, 2).map(d => d[1]), ['act', 'act']); assert.equal(decisions[2]?.[1], 'escalate');
+  assert(events.every(e => e.type !== 'jev-request' || e.data.phase !== 'step' || Buffer.byteLength(JSON.stringify(e.data.state)) < 4000), 'every step state is small');
+});
+test('Completion is a set of citation checks: bounded evidence per deliverable, three-way judgments, and a contradiction rejects', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await mkdir(join(root, 'src', 'cli'), { recursive: true });
+  await writeFile(join(root, 'src', 'cli.ts'), 'import { A } from "./cli/deps.js";\nexport const main = A;\n'); await writeFile(join(root, 'src', 'cli', 'deps.ts'), 'export const A = 1;\n');
+  s.writes = ['src/cli.ts', 'src/cli/deps.ts']; s.baselineArtifacts = { 'src/cli/deps.ts': '@new' }; s.knownFiles.push('src/cli.ts', 'src/cli/deps.ts');
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'move', name: 'A', from: 'src/cli.ts', to: 'src/cli/deps.ts', detail: 'move A' }, { kind: 'create', name: 'src/cli/deps.ts', from: '', to: 'src/cli/deps.ts', detail: 'new module' }] });
+  await refreshLedger(root, s);
+  const evidence = await completionEvidence(root, s, await structuralDiff(root, s, store.artifacts));
+  assert.match(evidence.d1!, /^src\/cli\/deps\.ts lines 1-1:\nexport const A = 1;\nsrc\/cli\.ts no longer declares A\.\nsrc\/cli\.ts imports it: import \{ A \} from "\.\/cli\/deps\.js";/);
+  assert.match(evidence.d2!, /^src\/cli\/deps\.ts exists \(2 lines\)/);
+  const q = auditQuestions(s.ledger); assert.deepEqual(Object.keys(q), ['d_d1', 'd_d2'], 'no scope question when every changed file is a deliverable'); assert.deepEqual(Object.keys((q.d_d1 as any).criteria), ['supports', 'contradicts', 'says_nothing']);
+  assert.deepEqual(Object.keys(auditQuestions(s.ledger, false, ['src/stray.ts'])), ['d_d1', 'd_d2', 'scope_creep']);
+  const yes = auditVerdict({ d_d1: { type: 'choice', choice: 'supports', confidence: .9, probabilities: { supports: .9, contradicts: .05, says_nothing: .05 } }, d_d2: { type: 'choice', choice: 'says_nothing', confidence: .5, probabilities: { supports: .3, contradicts: .1, says_nothing: .6 } }, scope_creep: { type: 'noul', noul: .1 } }, s.ledger, defaults);
+  assert(yes.accepted, 'a fact-done item that the evidence does not address still counts');
+  const no = auditVerdict({ d_d1: { type: 'choice', choice: 'contradicts', confidence: .8, probabilities: { supports: .1, contradicts: .8, says_nothing: .1 } }, d_d2: { type: 'choice', choice: 'supports', confidence: .9, probabilities: { supports: .9, contradicts: .05, says_nothing: .05 } }, scope_creep: { type: 'noul', noul: .1 } }, s.ledger, defaults);
+  assert(!no.accepted); assert.deepEqual(no.unmet, ['d1']);
+});
+
+test('A decided edit is executed in the inspect phase: Jev\'s decision is not re-validated against the phase menu', async t => {
+  const { root, store, session } = await fixture(t);
+  session.objective = 'Bootstrap a react app.'; session.phase = 'inspect'; session.inspectionCount = 0;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'package.json', from: '', to: 'package.json', detail: 'the package manifest' }, { kind: 'create', name: 'src/App.tsx', from: '', to: 'src/App.tsx', detail: 'the app' }] }); session.ledgerBuilt = true;
+  const phases: string[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    phases.push(ctx!.phase);
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); return { next: { type: 'choice', choice: 'implement:d1', confidence: .98, probabilities: Object.fromEntries(ids.map(i => [i, i === 'implement:d1' ? .98 : .02 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .05 }, scope_drift: { type: 'noul', noul: .05 }, needs_user: { type: 'noul', noul: .02 } } as Answers; }
+    return answersFor(q, 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === schemas.write ? { path: 'package.json', expectedHash: 'new', oldText: '', newText: '{ "name": "demo" }\n' } : { files: [{ path: 'package.json', start: 1, end: 1 }] } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.entries[0]?.kind, 'write', result.stopReason); assert.equal(await readFile(join(root, 'package.json'), 'utf8'), '{ "name": "demo" }\n');
+  assert.deepEqual(phases, ['step'], 'no routing question after a decision'); assert.equal(result.phase, 'implement');
+});
+
+test('Items that fit an open-ended objective without being required become optional: offered after required work, never blocking completion', async t => {
+  const { root, store, session: s } = await fixture(t);
+  await writeFile(join(root, 'index.html'), '<h1>Hello</h1>\n');
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'index.html', from: '', to: 'index.html', detail: 'the page' }, { kind: 'create', name: 'src/components/StatCounter.tsx', from: '', to: 'src/components/StatCounter.tsx', detail: 'a counter' }] });
+  s.ledger[1]!.optional = true; s.knownFiles.push('index.html');
+  await refreshLedger(root, s);
+  assert.deepEqual(s.ledger.map(d => [d.name, d.status, Boolean(d.optional)]), [['index.html', 'done', false], ['src/components/StatCounter.tsx', 'pending', true]]);
+  const c = candidates(s, { ...defaults, allowWrite: true }, false);
+  assert(c.some(x => x.id === 'implement:d2' && /Optional: a reasonable addition/.test(x.description)), 'with required work done, the optional item is offered and labelled');
+  s.ledger[0]!.status = 'pending';
+  assert(!candidates(s, { ...defaults, allowWrite: true }, false).some(x => x.id === 'implement:d2'), 'required work comes first');
+  s.ledger[0]!.status = 'done';
+  const verdict = auditVerdict({ d_d1: { type: 'choice', choice: 'supports', confidence: .9, probabilities: { supports: .9, contradicts: .05, says_nothing: .05 } }, d_d2: { type: 'choice', choice: 'contradicts', confidence: .9, probabilities: { supports: .05, contradicts: .9, says_nothing: .05 } }, scope_creep: { type: 'noul', noul: .1 } }, s.ledger, defaults);
+  assert(verdict.accepted, 'an unbuilt optional item does not block completion');
+  assert.equal(taskRecord(s).deliverables[1]!.optional, true);
+});
+
+test('Probability spread among pending deliverables is a preference, not doubt: the decision acts on the top one', () => {
+  const c: import('../src/decide.js').Candidate[] = [...['d1', 'd2', 'd3', 'd4', 'd5', 'd6'].map(id => ({ id: `implement:${id}`, kind: 'implement' as const, description: id })), { id: 'ask', kind: 'ask' as const, description: 'ask' }, { id: 'free', kind: 'free' as const, description: 'free' }];
+  const probs = { 'implement:d1': .3, 'implement:d2': .2, 'implement:d3': .15, 'implement:d4': .1, 'implement:d5': .1, 'implement:d6': .05, ask: .05, free: .05 };
+  const d = decideStep({ next: { type: 'choice', choice: 'implement:d1', confidence: .28, probabilities: probs } }, c, defaults);
+  assert.equal(d.tier, 'act'); assert.equal(d.candidate.id, 'implement:d1');
+  const spreadToFree = decideStep({ next: { type: 'choice', choice: 'free', confidence: .3, probabilities: { 'implement:d1': .3, free: .4, ask: .3 } } }, c, defaults);
+  assert.equal(spreadToFree.candidate.kind, 'free', 'a genuine lean to the worker still escalates');
+});
+test('A check trial that fails for missing dependencies triggers one code-owned install from the manifest, then the trial is repeated', async t => {
+  const { root, store, session } = await fixture(t);
+  assert(missingDependencies('sh: line 1: tsc: command not found')); assert(missingDependencies("Error: Cannot find module 'vite'")); assert(!missingDependencies('src/a.ts(1,1): error TS2304: x'));
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'demo', scripts: { typecheck: 'node check.mjs' } }));
+  assert.equal(await installCommand(root), 'npm install --no-audit --no-fund');
+  await writeFile(join(root, 'package-lock.json'), '{}'); assert.equal(await installCommand(root), 'npm ci --no-audit --no-fund');
+  await mkdir(join(root, 'node_modules'), { recursive: true }); assert.equal(await installCommand(root), null, 'already installed');
+  await rm(join(root, 'node_modules'), { recursive: true }); await rm(join(root, 'package-lock.json'));
+  // A fake npm on PATH records the install and creates node_modules; check.mjs works only once that exists.
+  const bin = join(root, 'bin'); await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, 'npm'), `#!/bin/bash\nif [ "$1" = "install" ]; then mkdir -p node_modules && echo installed > .installed; exit 0; fi\nif [ "$1" = "run" ]; then [ -d node_modules ] && exec node check.mjs; echo "sh: line 1: tsc: command not found"; exit 127; fi\n`, { mode: 0o755 });
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n'); await writeFile(join(root, 'src.mjs'), 'export const a = 1;\n');
+  const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath}`; t.after(() => { process.env.PATH = oldPath; });
+  session.objective = 'Make src.mjs export a and verify.'; session.phase = 'implement'; session.inspectionCount = 3; session.writes = ['src.mjs']; session.step = 2; session.lastWriteStep = 2;
+  session.editEvidence = [{ step: 2, route: 'write', paths: ['src.mjs'], artifact: '', text: 'edited' } as any];
+  const trials: any[] = [];
+  const jev = { decide: async (state: any, q: Questions, ctx?: { phase: string }) => { if (ctx!.phase === 'check-inference') { trials.push(state.candidateCheck.trial); return { valid: { type: 'noul', noul: state.candidateCheck.trial.code === 0 ? .9 : .1 } } as Answers; } return answersFor(q, ctx!.phase === 'completion-check' ? 'finish' : 'read_files', .9); } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (_m: unknown, schema: unknown) => schema === checkSchema ? { command: 'npm run typecheck', rationale: 'typecheck script' } : schema === schemas.finish ? { summary: 'done' } : { files: [{ path: 'src.mjs', start: 1, end: 1 }] } };
+  const result = await new Runner({ ...defaults, allowWrite: true, allowBash: true, maxSteps: 4 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(trials.length, 1); assert.equal(trials[0].code, 0, 'the trial Jev saw ran after the install');
+  assert.equal(await readFile(join(root, '.installed'), 'utf8'), 'installed\n'); assert.equal(result.setupDone, true);
+  assert.equal(result.lastCheckCommand, 'npm run typecheck'); assert.equal(result.status, 'complete', result.stopReason);
+  const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(events.find(e => e.type === 'setup')?.data.command, 'npm install --no-audit --no-fund');
+});
+test('A worker-proposed ask_user is refused when Jev judged the task does not need the user', async t => {
+  const { root, store, session } = await fixture(t);
+  await writeFile(join(root, 'a.ts'), 'const a = 1;\n');
+  session.objective = 'Change a to 2.'; session.phase = 'implement'; session.inspectionCount = 3; session.knownFiles.push('a.ts'); session.hashes['a.ts'] = hash('const a = 1;\n'); session.readHashes['a.ts'] = session.hashes['a.ts']!;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'modify', name: 'a', from: 'a.ts', to: 'a.ts', detail: 'a = 2' }] }); session.ledgerBuilt = true;
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); return { next: { type: 'choice', choice: 'free', confidence: .2, probabilities: Object.fromEntries(ids.map(i => [i, i === 'free' ? .4 : .6 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .12 } } as Answers; }
+    return answersFor(q, 'ask_user', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async () => ({ question: 'Should I set a to 2?' }) };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 1 }, store, jev, bonsai, root, () => {}).run(session);
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /step limit/);
+  assert.equal(result.entries[0]?.kind, 'generation_error'); assert.match(result.entries[0]!.text, /ask_user refused: the task does not need the user \(judged 0\.12\)/);
+});
+
+test('A transaction that creates a file is judged on the total: a sibling not yet written is not a regression', () => {
+  const f = (count: number, lines: number[] = [1]) => ({ count, syntax: 0, resolution: count, lines, samples: [] as string[] });
+  const before = { errors: 12, syntax: 0, resolution: 12, byFile: { 'src/App.tsx': f(12) } };
+  const after = { errors: 11, syntax: 0, resolution: 11, byFile: { 'src/App.tsx': f(10), 'src/components/FeaturesSection.tsx': f(1) } };
+  assert.equal(regression(before, after, { files: ['src/components/FeaturesSection.tsx'] }), 'worse', 'judged in scope, the new file only added an error');
+  assert.equal(regression(before, after, { files: ['src/components/FeaturesSection.tsx'], created: true }), 'fine', 'created: the falling total is the progress');
+  const worse = { errors: 13, syntax: 0, resolution: 13, byFile: { 'src/App.tsx': f(12), 'src/components/FeaturesSection.tsx': f(1) } };
+  assert.equal(regression(before, worse, { files: ['src/components/FeaturesSection.tsx'], created: true }), 'worse', 'a rising total still rolls back');
+});
+test('A wrong-module error with the checker\'s hint is repaired as an aliased import, usage untouched', async t => {
+  const { root } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  const app = 'import { Navbar } from "./components/Navbar";\nimport { CTASection, type Props } from "./components/CTASection";\nexport const App = () => [Navbar, CTASection];\n';
+  await writeFile(join(root, 'src', 'App.tsx'), app); await writeFile(join(root, 'src', 'components', 'CTASection.tsx'), 'export const CtaSection = 1;\nexport type Props = {};\n');
+  const names = await resolveMissingNames(root, `src/App.tsx(2,10): error TS2724: '"./components/CTASection"' has no exported member named 'CTASection'. Did you mean 'CtaSection'?`, ['src/App.tsx', 'src/components/CTASection.tsx']);
+  assert.deepEqual(names.map(n => [n.name, n.kind, n.importLine, n.line]), [['CTASection', 'alias', 'CtaSection', 2]]);
+  const fixes = compactNames({ missingNames: names } as any, 40);
+  assert.deepEqual(fixes.aliasImports, { 'src/App.tsx': [{ name: 'CTASection', actual: 'CtaSection', line: 2 }] });
+  const edit = await aliasImportBinding('src/App.tsx', app, 'CTASection', 'CtaSection', 2);
+  assert.deepEqual(edit, { start: 2, end: 2, newText: 'import { CtaSection as CTASection, type Props } from "./components/CTASection";', prepend: '' });
+});
+test('An edit route the worker failed on twice is not offered as a fix or implement candidate', async t => {
+  const { session: s } = await fixture(t);
+  s.lastCheck = { step: 5, ok: false, text: 'x', summary: summarizeCheck("src/App.tsx(6,1): error TS2724: '\"./c\"' has no exported member 'X'.") };
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'modify', name: 'App', from: 'src/App.tsx', to: 'src/App.tsx', detail: 'm' }, { kind: 'create', name: 'src/new.ts', from: '', to: 'src/new.ts', detail: 'c' }] });
+  s.knownFiles.push('src/App.tsx');
+  let ids = candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id);
+  assert(ids.includes('fix:src/App.tsx') && ids.includes('implement:d1') && ids.includes('implement:d2'));
+  s.blockedRoute = 'replace_lines';
+  ids = candidates(s, { ...defaults, allowWrite: true }, false).map(c => c.id);
+  assert(!ids.includes('fix:src/App.tsx') && !ids.includes('implement:d1'), 'replace_lines is blocked'); assert(ids.includes('implement:d2'), 'a write is still offered');
+});
+
+test('A decided fix reads the target first, prompts the worker with only that file, and refuses arguments that edit another file', async t => {
+  const { root, store, session } = await fixture(t);
+  await mkdir(join(root, 'src', 'components'), { recursive: true });
+  const cta = Array.from({ length: 30 }, (_, i) => i === 9 ? 'export const CTAButton = () => <button>{missing}</button>;' : `const line${i} = ${i};`).join('\n') + '\n';
+  await writeFile(join(root, 'src', 'components', 'CTAButton.tsx'), cta); await writeFile(join(root, 'tsconfig.json'), '{}\n');
+  session.objective = 'Fix the landing page.'; session.phase = 'implement'; session.inspectionCount = 3; session.knownFiles.push('src/components/CTAButton.tsx', 'tsconfig.json');
+  session.writes = ['src/components/CTAButton.tsx']; session.hashes['src/components/CTAButton.tsx'] = hash(cta); // written, never read at this version
+  session.lastCheck = { step: 3, ok: false, text: 'src/components/CTAButton.tsx(10,44): error TS2304: Cannot find name \'missing\'.', summary: summarizeCheck("src/components/CTAButton.tsx(10,44): error TS2304: Cannot find name 'missing'.") }; session.lastCheckCommand = 'node check.mjs'; session.lastWriteStep = 2;
+  session.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/components/CTAButton.tsx', from: '', to: 'src/components/CTAButton.tsx', detail: 'button' }] }); session.ledgerBuilt = true;
+  let gen = 0; const prompts: any[] = [];
+  const jev = { decide: async (_s: unknown, q: Questions, ctx?: { phase: string }) => {
+    if (ctx!.phase === 'step') { const ids = Object.keys((q.next as any).criteria); const pick = ids.find(i => i.startsWith('fix:'))!; return { next: { type: 'choice', choice: pick, confidence: .9, probabilities: Object.fromEntries(ids.map(i => [i, i === pick ? .9 : .1 / (ids.length - 1)])) }, stuck: { type: 'noul', noul: .1 }, scope_drift: { type: 'noul', noul: .1 }, needs_user: { type: 'noul', noul: .05 } } as Answers; }
+    return answersFor(q, 'read_files', .9);
+  } };
+  const bonsai = { count: async () => ({ tokens: 10, mode: 'test' }), generate: async (m: any, schema: unknown) => {
+    if (schema !== schemas.replace_lines) return { files: [{ path: 'tsconfig.json', start: 1, end: 1 }] };
+    prompts.push(m); gen++;
+    const fileHash = JSON.parse(m[2].content).file.sha256;
+    return gen === 1 ? { path: 'tsconfig.json', expectedHash: hash('{}\n'), edits: [{ start: 1, end: 1, newText: '{ "strict": false }', prepend: '' }] }
+      : { path: 'src/components/CTAButton.tsx', expectedHash: fileHash, edits: [{ start: 10, end: 10, newText: 'export const CTAButton = () => <button>Go</button>;', prepend: '' }] };
+  } };
+  const result = await new Runner({ ...defaults, ledger: true, allowWrite: true, allowBash: true, maxSteps: 3 }, store, jev, bonsai, root, () => {}).run(session);
+  const kinds = result.entries.map(e => e.kind);
+  assert.equal(kinds[0], 'read_files', `the target was read first; steps: ${kinds.join(',')}`);
+  assert.equal(kinds[1], 'generation_error'); assert.match(result.entries[1]!.text, /decided action is an edit of src\/components\/CTAButton\.tsx; the generated arguments edit tsconfig\.json instead/);
+  assert.equal(kinds[2], 'replace_lines'); assert.match(await readFile(join(root, 'src', 'components', 'CTAButton.tsx'), 'utf8'), /<button>Go<\/button>/);
+  assert.equal(await readFile(join(root, 'tsconfig.json'), 'utf8'), '{}\n', 'the other file was never touched');
+  const focused = JSON.parse(prompts[0][2].content);
+  assert.equal(prompts[0].length, 3, 'pinned block, focused request, nothing else'); assert.equal(focused.file.path, 'src/components/CTAButton.tsx'); assert.match(focused.file.text, /^1: const line0 = 0;/); assert.match(focused.task, /^Fix the verification errors in src\/components\/CTAButton\.tsx at lines 10/);
+  assert(!('editEvidence' in focused) && !('evidence' in focused), 'no history in a focused prompt');
+});
+
+test('Scope creep is asked only about files no deliverable names, and not at all when every changed file is a deliverable', async t => {
+  const { session: s } = await fixture(t);
+  s.ledger = candidatesFrom({ deliverables: [{ kind: 'create', name: 'src/App.tsx', from: '', to: 'src/App.tsx', detail: 'app', contents: [] }, { kind: 'modify', name: 'main', from: 'src/main.tsx', to: 'src/main.tsx', detail: 'm', contents: [] }] });
+  assert.deepEqual(unaccountedFiles(s, ['src/App.tsx', 'src/main.tsx', 'package-lock.json']), []);
+  assert.deepEqual(unaccountedFiles(s, ['src/App.tsx', 'src/legacy.ts']), ['src/legacy.ts']);
+  assert(!('scope_creep' in auditQuestions(s.ledger, false, [])), 'nothing to ask');
+  assert.match((auditQuestions(s.ledger, false, ['src/legacy.ts']).scope_creep as any).instructions, /`unaccountedFiles`/);
+  const v = auditVerdict({ d_d1: { type: 'choice', choice: 'supports', confidence: 1, probabilities: { supports: 1, contradicts: 0, says_nothing: 0 } }, d_d2: { type: 'choice', choice: 'supports', confidence: 1, probabilities: { supports: 1, contradicts: 0, says_nothing: 0 } } }, s.ledger, defaults);
+  assert(v.accepted); assert.equal(v.scopeCreep, 0);
+});
+test('The ledger carries a design and per-file contents, and a file to create is prompted from them with its neighbours\' exports', async t => {
+  const { root, store, session } = await fixture(t);
+  const raw = { summary: 'A marketing landing page with a hero, three feature cards and a footer.', conventions: 'React 18 with TypeScript, Vite, CSS modules; named exports; no placeholders.',
+    deliverables: [{ kind: 'create', name: 'src/components/Hero.tsx', from: '', to: 'src/components/Hero.tsx', detail: 'the hero section', contents: ['a headline and subheadline from props', 'a primary CTAButton', 'responsive layout'] }, { kind: 'create', name: 'src/components/CTAButton.tsx', from: '', to: 'src/components/CTAButton.tsx', detail: 'the button', contents: ['label and onClick props'] }] };
+  assert.deepEqual(designFrom(raw), { summary: raw.summary, conventions: raw.conventions });
+  const items = candidatesFrom(raw); assert.deepEqual(items[0]!.contents, raw.deliverables[0]!.contents);
+  await mkdir(join(root, 'src', 'components'), { recursive: true }); await writeFile(join(root, 'src', 'components', 'CTAButton.tsx'), 'export const CTAButton = () => null;\nconst internal = 1;\n');
+  session.design = designFrom(raw); session.ledger = items; session.knownFiles.push('src/components/CTAButton.tsx');
+  const m = focusedCreateMessages(session, 'src/components/Hero.tsx', items[0]!, [{ path: 'src/components/CTAButton.tsx', exports: ['CTAButton'] }]);
+  const req = JSON.parse(m[2]!.content);
+  assert.equal(m.length, 3); assert.equal(req.design.summary, raw.summary); assert.deepEqual(req.mustContain, raw.deliverables[0]!.contents); assert.deepEqual(req.canImport, [{ path: 'src/components/CTAButton.tsx', exports: ['CTAButton'] }]);
+  assert.match(req.rule, /no placeholders or TODOs/); assert.deepEqual(req.argumentSchema, schemas.write);
+  assert.equal(taskRecord(session).design?.summary, raw.summary);
+  void store;
+});
+
+test('Creating a file accepts file-sized content; the anchor limit alone guards against retyping', () => {
+  const big = 'x'.repeat(9000);
+  validate(schemas.write, { path: 'src/pages/LandingPage.tsx', expectedHash: 'new', oldText: '', newText: big });
+  assert.throws(() => validate(schemas.write, { path: 'a.ts', expectedHash: 'h', oldText: 'y'.repeat(700), newText: 'z' }), /oldText/);
 });

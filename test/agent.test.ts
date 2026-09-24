@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaults } from '../src/config.js';
 import { Agent, newSession } from '../src/agent.js';
+import { evidenceTokens } from '../src/context.js';
 import { Store } from '../src/store.js';
 import { orient } from '../src/orient.js';
 import { findBrowser, renderFacts } from '../src/render.js';
@@ -282,11 +283,118 @@ test('The harness proposes completion itself: Jev reads the objective as satisfi
 
 test('Evidence is evicted in batches so the cached prompt prefix survives several steps between reprocessings', async t => {
   const { root, store } = await repo(t);
-  const steps = Array.from({ length: 16 }, (_, i) => ({ thought: `look ${i}`, action: 'bash', args: { command: `echo ${i}`, purpose: 'look', check: false } }));
-  const result = await new Agent({ ...config, maxSteps: 16 }, store, jevOf({}), bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'x'));
-  const compactions = (await events(store)).filter(e => e.type === 'compact' && e.data.reason === 'entry-cap');
-  assert.equal(result.entries.length, 12 - 0 <= 12 ? result.entries.length : 0); assert(result.entries.length >= 8 && result.entries.length <= 12);
-  assert.equal(compactions.length, 1, `one batched eviction across sixteen steps, not one per step: ${compactions.length}`); assert.equal(compactions[0].data.removed, 5);
+  // Each step prints about 2 KB, so the evidence reaches its share of the budget after a dozen steps.
+  const steps = Array.from({ length: 16 }, (_, i) => ({ thought: `look ${i}`, action: 'bash', args: { command: `node -e "console.log('${i}'.repeat(2000))"`, purpose: 'look', check: false } }));
+  const result = await new Agent({ ...config, maxSteps: 16, workingTokens: 20000 }, store, jevOf({}), bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const compactions = (await events(store)).filter(e => e.type === 'compact' && e.data.reason === 'evidence-share');
+  assert.equal(compactions.length, 1, `one batched eviction across sixteen steps, not one per step: ${compactions.length}`);
+  assert(compactions[0].data.removed >= 4, `the eviction cuts well below the trigger: ${compactions[0].data.removed}`);
+  assert(evidenceTokens(result) <= 20000 * .45);
+});
+
+test('The worker sees its own earlier turns: each is an assistant message before the results of its batch, arguments compacted, recorded before the batch runs', async t => {
+  const { root, store } = await repo(t);
+  const prompts: Message[][] = [];
+  const long = 'x'.repeat(1000);
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'first I look at the tree', action: 'plan', batch: [{ action: 'bash', args: { command: 'echo one', purpose: 'look', check: false } }, { action: 'create_file', args: { path: 'src/a.ts', purpose: long } }] },
+    { thought: 'then I look again', action: 'bash', args: { command: 'echo two', purpose: 'look', check: false } },
+  ], files: { 'src/a.ts': 'export const a = 1;\n' } });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); }, generateText: async (m: Message[], o: any) => { prompts.push(m); return bonsai.generateText(m); } };
+  await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const assistant = (m: Message[]) => m.filter(x => x.role === 'assistant').map(x => JSON.parse(x.content));
+  // The file generated inside the first batch already sees the reasoning that asked for it.
+  const file = prompts[1]!;
+  assert.deepEqual(assistant(file).map(a => a.thought), ['first I look at the tree']);
+  const second = prompts.at(-1)!;
+  const turns = assistant(second);
+  assert.deepEqual(turns.map(a => a.thought), ['first I look at the tree']);
+  assert.deepEqual(turns[0].actions.map((a: any) => a.action), ['bash', 'create_file']);
+  assert.match(turns[0].actions[1].args.purpose, /\[1000 chars\]$/, 'generated or long content is compacted, the path kept');
+  assert.equal(turns[0].actions[1].args.path, 'src/a.ts');
+  // The turn comes right before the results of its batch.
+  const at = second.findIndex(m => m.role === 'assistant');
+  assert.match(JSON.parse(second[at + 1]!.content).evidence.text, /echo one|one/);
+  assert(!('thought' in JSON.parse(file.at(-1)!.content)), 'the file request does not repeat the reasoning the prefix already holds');
+});
+
+test('A turn is evicted with the last result of its batch, never before it, and leaves one line in earlierSteps', async t => {
+  const { evictOne, turnEntry, stepMessages } = await import('../src/context.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-evict-')), 'x');
+  const result = (id: string, step: number, turn: string, text: string) => ({ id, step, kind: 'bash', text, artifact: '', relevance: .5, turn });
+  const t1 = turnEntry(1, 'look around', [{ action: 'bash', args: { command: 'ls' } }, { action: 'bash', args: { command: 'npm test' } }]);
+  t1.outcomes = ['bash ok', 'bash failed: 1 test failed'];
+  const t3 = turnEntry(3, 'fix it', [{ action: 'bash', args: { command: 'npm test' } }]);
+  s.entries = [t1, result('e1', 1, 't1', 'a'), result('e2', 2, 't1', 'b'), t3, result('e3', 3, 't3', 'c')];
+  // The turn itself is never chosen while its results remain.
+  assert.equal(evictOne(s)!.id, 'e1'); assert(s.entries.some(e => e.id === 't1'));
+  assert.equal(evictOne(s)!.id, 'e2'); assert(!s.entries.some(e => e.id === 't1'), 'the turn goes with its last result');
+  assert.deepEqual(s.trail, ['step 1: bash ls; bash npm test -> bash ok; bash failed: 1 test failed']);
+  // The freshest entry and its turn survive.
+  assert.equal(evictOne(s), undefined); assert.deepEqual(s.entries.map(e => e.id), ['t3', 'e3']);
+  const volatile = stepMessages(s, ['bash']).filter(m => m.role === 'user').map(m => JSON.parse(m.content)).find(c => 'earlierSteps' in c)!;
+  assert.deepEqual(volatile.earlierSteps, s.trail);
+});
+
+test('The prefix only grows between turns: every message of a turn\'s prompt before the volatile block starts the next turn\'s prompt when nothing was evicted', async t => {
+  const { root, store } = await repo(t);
+  const prompts: Message[][] = [];
+  const steps = Array.from({ length: 5 }, (_, i) => ({ thought: `step ${i}`, action: 'bash', args: { command: `echo ${i}`, purpose: 'look', check: false } }));
+  const bonsai = bonsaiOf({ steps });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); } };
+  await new Agent({ ...config, maxSteps: 5 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.equal((await events(store)).filter(e => e.type === 'compact').length, 0);
+  for (let k = 0; k + 1 < prompts.length; k++) {
+    const stable = prompts[k]!.slice(0, -2);
+    assert.deepEqual(prompts[k + 1]!.slice(0, stable.length), stable, `turn ${k + 1} rewrote the prefix of turn ${k}`);
+    assert.equal(prompts[k + 1]!.filter(m => m.role === 'assistant').length, k + 1);
+  }
+});
+
+test('A command that succeeded is not run again while nothing has been written or installed since; after a write it runs', async t => {
+  const { root, store } = await repo(t);
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'look', action: 'bash', args: { command: 'echo hi', purpose: 'look', check: false } },
+    { thought: 'look again', action: 'bash', args: { command: 'echo hi', purpose: 'look', check: false } },
+    { thought: 'write', action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } },
+    { thought: 'look after the write', action: 'bash', args: { command: 'echo hi', purpose: 'look', check: false } },
+  ], files: { 'src/a.ts': 'export const a = 1;\n' } });
+  const result = await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const runs = (await events(store)).filter(e => e.type === 'action' && e.data.route === 'bash');
+  assert.deepEqual(runs.map(e => e.data.step), [1, 4], 'the repeat at step 2 did not run; the one after the write did');
+  const refused = result.entries.find(e => e.step === 2 && e.kind === 'generation_error')!;
+  assert.match(refused.text, /already ran at step 1 and nothing has been written or installed since/);
+});
+
+test('A whole-file rewrite lands as generated even when it no longer parses, like a created file: reported as a rewrite, with the parse errors and the fact that the generation was complete', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'Hero.tsx'), 'export const Hero = () => <div>old</div>;\n');
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'src/Hero.tsx', start: 1, end: 1 }] } },
+    { thought: 'rewrite', action: 'rewrite_file', args: { path: 'src/Hero.tsx', purpose: 'a new hero' } },
+  ], files: { 'src/Hero.tsx': 'export const Hero = () => (\n  <div>one</div>\n  <div>two</div>\n);\n' } });
+  const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const e = result.entries.find(x => x.kind === 'write')!;
+  assert.match(e.text, /^Rewrote src\/Hero\.tsx \(5 lines\)/); assert.doesNotMatch(e.text, /anchor was|replace_lines/);
+  assert.equal(await readFile(join(root, 'src', 'Hero.tsx'), 'utf8'), 'export const Hero = () => (\n  <div>one</div>\n  <div>two</div>\n);\n', 'the generation is kept, not discarded');
+  assert.match(e.text, /does not parse/); assert.match(e.text, /ran to its end \(\d+ lines, not cut off\); the parse errors are in the written content/);
+});
+
+test('A stuck streak sets its reasoning aside and keeps its results: the turns of the no-progress steps leave the prompt, the worker is told', async t => {
+  const { root, store } = await repo(t);
+  const prompts: Message[][] = [];
+  const steps = Array.from({ length: 5 }, (_, i) => ({ thought: `same idea ${i}`, action: 'bash', args: { command: `node -e "console.log(${i}); process.exit(1)"`, purpose: 'try' } }));
+  const bonsai = bonsaiOf({ steps });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); } };
+  // The first reading is progress, so the first turn is outside the streak; it goes too, since it holds the same line of thought.
+  await new Agent({ ...config, maxSteps: 5 }, store, jevOf({ watch: n => n === 1 ? { progress: .8, stuck: .1 } : { progress: .1, stuck: .95 } }), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const reset = (await events(store)).find(e => e.type === 'reasoning-reset');
+  assert(reset.data.turns.includes('t1'), `every earlier turn is set aside: ${reset.data.turns}`);
+  assert(reset, 'the reasoning of the streak was reset');
+  const after = prompts.find(p => /set aside/.test(p.at(-1)!.content))!;
+  assert(after, 'the worker is told its reasoning was set aside');
+  assert.equal(after.filter(m => m.role === 'assistant').length, 0, 'no turn of the streak remains');
+  assert(after.filter(m => m.role === 'user' && /evidence/.test(m.content) && /process.exit\(1\)/.test(m.content)).length >= 2, 'the results of the streak remain');
 });
 
 test('The render action shows the worker what the user sees: errors, a broken image, overflow, the headings; and the gate is told when a page was never rendered', async t => {
@@ -463,8 +571,8 @@ test('Every field the prompts name is one the model receives: descriptions, inst
   s.lastCheck = { step: 2, ok: false, text: 'src/a.ts(3,1): error TS2304', summary: { code: 2, files: { 'src/a.ts': [3] } }, command: 'tsc' };
   s.referenceEvidence = [{ path: 'PLAN.md', hash: 'h', text: '1: the plan', start: 1 }];
   s.completionFeedback = { step: 1, text: 'not accepted', awaitingEvidence: true }; s.editEvidence = [{ step: 1, route: 'write', paths: ['src/a.ts'], artifact: 'a', text: 't' }];
-  s.allowedActions = [...actions];
-  const step = stepMessages(s, [...actions], 'a note'); const file = newFileMessages(s, 'src/b.ts', 'p', 't', [], [], 0, 'old');
+  s.allowedActions = [...actions]; s.trail = ['step 1: bash echo -> bash ok'];
+  const step = stepMessages(s, [...actions], 'a note'); const file = newFileMessages(s, 'src/b.ts', 'p', [], [], 0, 'old');
   const data = [...step.slice(1), ...file.slice(1)].map(m => JSON.parse(m.content));
   const known = keysOf(data);
   const pinned = data[0].actions as Record<string, { description: string; instructions: string }>;

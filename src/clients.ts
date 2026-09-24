@@ -100,6 +100,20 @@ export function repetitionStart(text: string, tail = 80): number {
   }
   return -1;
 }
+// A generation caught in a loop inside one line (a path, a data array, a
+// string that never closes): the tail is one short unit over and over. Real
+// content does not repeat a unit of 4..200 characters verbatim for 800
+// characters. Returns the index where the repeating run starts, or -1.
+export function periodicStart(text: string, span = 800): number {
+  if (text.length < span) return -1;
+  const end = text.length;
+  for (let p = 4; p <= 200; p++) {
+    let i = end - 1; while (i - p >= 0 && text[i] === text[i - p]) i--;
+    const run = end - 1 - i; // characters equal to the character p before them
+    if (run + p >= span && (run + p) / p >= 8) return i + 1;
+  }
+  return -1;
+}
 export class Bonsai {
   // Timing and usage of the latest generation, for live progress and reports.
   lastMeta: GenerationMeta | null = null;
@@ -217,6 +231,8 @@ export class Bonsai {
         const bodyStart = thinking ? text.indexOf('</think>') + 8 : 0;
         const at = thoughtClosed ? repetitionStart(text.slice(bodyStart)) : -1;
         if (at >= 0) { const kept = text.slice(bodyStart).split('\n').slice(0, at).join('\n'); text = `${text.slice(0, bodyStart)}${kept}`; finish = 'repetition'; break; }
+        const inLine = thoughtClosed ? periodicStart(text.slice(bodyStart)) : -1;
+        if (inLine >= 0) { text = text.slice(0, bodyStart + inLine); finish = 'repetition'; break; }
         if (generated >= budget) { finish = 'length'; break; }
         continuations++;
       }

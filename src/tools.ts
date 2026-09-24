@@ -578,9 +578,14 @@ export class ToolBox {
       const newText = kept.join('\n');
       const updated = original.replace(a.oldText, () => newText);
       if (updated === original) throw new Error(dropped.length ? `Write produced no change: the only new lines were imports ${a.path} already has (${dropped.map(l => l.trim()).join('; ')})` : 'Write produced no change: newText equals oldText. oldText is the exact existing anchor; newText must be the modified text that replaces it');
-      assertBalancePreserved(original, updated, a.path);
-      await assertParses(a.path, original, updated);
-      assertNoBulkDuplication(original.replace(a.oldText, ''), kept, a.path);
+      // A whole-file rewrite is a finished generation of the complete file: like a
+      // created file it lands as written and its parse state is reported, never
+      // refused. The shape guards are for anchor edits, which splice into a file.
+      if (!a.wholeFile) {
+        assertBalancePreserved(original, updated, a.path);
+        await assertParses(a.path, original, updated);
+        assertNoBulkDuplication(original.replace(a.oldText, ''), kept, a.path);
+      }
       const temp = `${path}.leana-${randomUUID()}.tmp`;
       try {
         const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
@@ -590,8 +595,8 @@ export class ToolBox {
       } finally { await unlink(temp).catch(() => {}); }
       const updatedHash = hash(updated);
       const anchorLines = String(a.oldText).split('\n').length;
-      const notes = [dropped.length ? `Dropped ${dropped.length} import line(s) the file already had.` : '', anchorLines > 6 ? `The anchor was ${anchorLines} lines; replace_lines addresses a block by line number without retyping it.` : ''].filter(Boolean).join(' ');
-      return { ok: true, changed: [a.path], hashes: { [a.path]: updatedHash }, snapshots, text: `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.` };
+      const notes = [dropped.length ? `Dropped ${dropped.length} import line(s) the file already had.` : '', anchorLines > 6 && !a.wholeFile ? `The anchor was ${anchorLines} lines; replace_lines addresses a block by line number without retyping it.` : ''].filter(Boolean).join(' ');
+      return { ok: true, changed: [a.path], hashes: { [a.path]: updatedHash }, snapshots, text: a.wholeFile ? `Rewrote ${a.path} (${updated.split('\n').length} lines); sha256=${updatedHash}.` : `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.` };
     }
     if (route === 'replace_lines') {
       if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');

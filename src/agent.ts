@@ -11,7 +11,7 @@ import { editRoutes } from './types.js';
 import type { ProgressEvent } from './display.js';
 import { Store } from './store.js';
 import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot } from './tools.js';
-import { clip, clipEnds, evictOne, fenceFor, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
+import { clip, clipEnds, evictOne, evidenceTokens, turnEntry, fenceFor, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
 import { detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
@@ -43,6 +43,8 @@ export class Agent {
   private async manifestKey(p: Project): Promise<string> {
     return hash((await Promise.all(p.eco.manifests.map(f => readFile(join(this.tools.root, p.dir, f), 'utf8').catch(() => '')))).join('\u0000'));
   }
+  // What a command's output depends on in the repository: the last write and the installed set.
+  static world(s: Session): string { return `${s.lastWriteStep}|${s.setupKey ?? ''}|${JSON.stringify(s.setupKeys ?? {})}`; }
   static actionKey(s: Session, route: Route, args: Record<string, any>): string {
     const hashes = route === 'read_files' ? (args.files as { path: string }[]).map(f => [f.path, s.hashes[f.path] ?? null]).sort() : route === 'search_codebase' ? Object.entries(s.hashes).sort() : undefined;
     return hash(JSON.stringify({ route, args: { ...args, expectedHash: undefined, destinationHash: undefined }, hashes }));
@@ -55,7 +57,7 @@ export class Agent {
     if (kind === 'read_files' && result.ok && args) {
       for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
-    s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
+    s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, ...(s.currentTurn ? { turn: s.currentTurn } : {}), text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
     if (result.ok && result.changed?.length && editRoutes.includes(kind as Route)) rememberEdit(s, s.step, kind, result.changed, artifact, result.text, args);
     if ((kind === 'read_files' || kind === 'search_codebase') && result.ok) s.inspectionCount++;
     if (kind === 'search_codebase' && result.ok && args) {
@@ -73,7 +75,7 @@ export class Agent {
     s.lastError = result.ok ? null : clip(result.text, 1500);
     for (const [path, h] of Object.entries(result.hashes ?? {})) { delete s.hashes[path]; s.hashes[path] = h; }
     for (const stale of Object.keys(s.hashes).slice(0, -20)) delete s.hashes[stale];
-    if (kind === 'bash' && typeof args?.command === 'string') (s.commandRuns ??= {})[args.command.trim()] = { step: s.step, ok: result.ok };
+    if (kind === 'bash' && typeof args?.command === 'string') (s.commandRuns ??= {})[args.command.trim()] = { step: s.step, ok: result.ok, world: Agent.world(s) };
     if (result.verification) { s.editsSinceCheck = 0; if (kind === 'bash' && args?.command) s.lastCheckCommand = args.command.trim(); }
     if (s.completionFeedback && !s.completionFeedback.addressed && result.verification && result.ok && s.lastWriteStep > s.completionFeedback.step) s.completionFeedback = { ...s.completionFeedback, addressed: true, text: `The completion proposed at step ${s.completionFeedback.step} was rejected (${clip(s.completionFeedback.text, 200)}); edits and a passing verification have followed.` };
     if (result.changed?.length) s.editsSinceCheck++;
@@ -111,9 +113,11 @@ export class Agent {
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.baselineArtifacts)) s.baselineArtifacts[path] = artifact;
     retireEvidence(s);
     // Eviction is batched: any removal invalidates the cached prefix after it, so
-    // dropping to eight at once buys four steps of a stable prefix for one reprocessing.
-    let evicted = 0; if (s.entries.length > 12) while (s.entries.length > 8) { evictOne(s); evicted++; }
-    if (evicted) await this.store.log('compact', { step: s.step, removed: evicted, reason: 'entry-cap', retained: s.entries.length });
+    // the evidence is let grow to a share of the working budget and then cut well
+    // below it at once, which buys several steps of a stable prefix for one reprocessing.
+    let evicted = 0;
+    if (evidenceTokens(s) > this.config.workingTokens * evictAt) while (evidenceTokens(s) > this.config.workingTokens * evictTo && evictOne(s)) evicted++;
+    if (evicted) await this.store.log('compact', { step: s.step, removed: evicted, reason: 'evidence-share', retained: s.entries.length, trail: s.trail?.length ?? 0 });
   }
   // Execute an action, the worker's or the harness's, with the same bookkeeping.
   private async execute(s: Session, route: Route, args: Record<string, any>, kind: string): Promise<ToolResult> {
@@ -261,7 +265,7 @@ export class Agent {
     if (current === undefined && rewrite) throw new Error(`${path} does not exist; use create_file`);
     const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
     const project = await projectFor(this.tools.root, path); const declared = project ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[]) : [];
-    const { code, finish } = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', [() => newFileMessages(s, path, purpose, thought, contracts, declared, 0, current), () => newFileMessages(s, path, purpose, thought, contracts, declared, 1, current)], this.config.createTokens, fenceFor(path));
+    const { code, finish } = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', [() => newFileMessages(s, path, purpose, contracts, declared, 0, current), () => newFileMessages(s, path, purpose, contracts, declared, 1, current)], this.config.createTokens, fenceFor(path));
     const ended = finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : finish === 'repetition' ? 'started repeating itself and was cut at the repeat' : finish === 'eos' ? 'ended before the file was complete (the model stopped without closing the code block)' : '';
     if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
     if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, '')) throw new Error(`the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}; nothing was written. Say in purpose exactly what must differ, or edit the lines that are wrong with replace_lines`);
@@ -276,6 +280,9 @@ export class Agent {
     const present = []; for (const m of manifest) if ((await readRepo(m)) !== null) present.push(m);
     if (present.length) { const missing = await undeclaredPackages(this.tools.root, path, code, readRepo).catch(() => [] as string[]); if (missing.length) facts.push(`${path} imports ${missing.join(', ')}, which ${present.join(' or ')} does not declare: declare them (the package manager chooses the version) so they can be installed`); }
     if (ended) facts.unshift(`the generated content of ${path} ${ended}; check its end before relying on it`);
+    // A file that does not parse after a generation that ran to its end: the
+    // errors are in what was written, not in a cut, so the worker is told which.
+    else if (/does not parse/.test(result.text)) facts.unshift(`the generation of ${path} ran to its end (${code.split('\n').length} lines, not cut off); the parse errors are in the written content`);
     if (facts.length) { const e = s.entries.at(-1); if (e) e.text += `\nHarness: ${facts.join(' | ')}`; s.lastError = facts.join(' | '); }
   }
 
@@ -302,7 +309,7 @@ export class Agent {
     let generationFailures = 0;
     try {
       for (; s.step < endStep;) {
-        s.step++; this.current = s.step;
+        s.step++; this.current = s.step; s.currentTurn = null;
         this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep });
         if (this.config.allowBash && await this.retrySetup(s)) { await this.store.save(s); continue; }
         // The files the objective names, pinned as read by the harness; a changed one is read and ranked again.
@@ -313,7 +320,12 @@ export class Agent {
         if (last && last.stuck >= .9 && s.watch.noProgress >= 2) {
           s.watch.escalations++;
           if (last.needsUser >= .5 || s.watch.escalations >= 2) { s.status = 'paused'; s.stopReason = `Jev reads the session as stuck (stuck ${last.stuck.toFixed(2)}, no progress for ${s.watch.noProgress} steps)${last.needsUser >= .5 ? ' and in need of the user' : ''}. Last error: ${clip(s.lastError ?? 'none', 300)}`; break; }
-          notes.push(`Jev reads no progress for ${s.watch.noProgress} steps (stuck ${last.stuck.toFixed(2)}). Do not repeat what was tried; change the approach, or ask the user if only they can decide.`);
+          // Every earlier turn is dropped, the results kept: the facts stay, the
+          // line of thought the worker would copy and anchor on goes (a turn
+          // before the streak often holds the same reasoning).
+          const dropped = s.entries.filter(e => e.kind === 'turn');
+          if (dropped.length) { s.entries = s.entries.filter(e => !dropped.includes(e)); await this.store.log('reasoning-reset', { step: s.step, turns: dropped.map(e => e.id) }); }
+          notes.push(`Jev reads no progress for ${s.watch.noProgress} steps (stuck ${last.stuck.toFixed(2)}).${dropped.length ? ' Your reasoning from those steps was set aside; their results are still shown.' : ''} Do not repeat what was tried; change the approach, or ask the user if only they can decide.`);
           s.watch.noProgress = 0;
         }
         // Scope and completion, read by Jev, stated to the worker: work beyond the objective for a run of steps, or an objective that reads as satisfied.
@@ -359,10 +371,14 @@ export class Agent {
           const why = cut ? `your reply reached the ${this.config.maxTokens}-token limit before it closed, so nothing ran: file content inside the arguments (replace_lines or write with a large newText) does not fit. Use rewrite_file or create_file for large content, which generate it as code without that limit; keep the thought short.` : (e as Error).message;
           this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); await this.store.save(s); continue;
         }
+        // The turn enters the evidence before its actions run: the prefix only grows,
+        // and a file generated inside the batch already sees the reasoning behind it.
+        const turn = turnEntry(s.step, thought, batch); s.entries.push(turn); s.currentTurn = turn.id;
         let halted = false;
         for (let i = 0; i < batch.length; i++) {
           if (i > 0) { if (s.step >= endStep) break; s.step++; this.current = s.step; this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep }); }
           const outcome = await this.perform(s, batch[i]!.action, batch[i]!.args, thought);
+          turn.outcomes!.push(`${batch[i]!.action} ${outcome}${outcome === 'failed' || outcome === 'refused' ? `: ${(s.lastError ?? '').split('\n')[0]!.slice(0, 90)}` : ''}`);
           // A refused action (repeated, blocked, malformed) counts toward the four
           // in a row that end the attempt; a command that ran and failed is a result.
           if (outcome === 'ok' || outcome === 'failed') generationFailures = 0;
@@ -370,6 +386,7 @@ export class Agent {
           if (outcome === 'stop') { halted = true; break; }
           if ((outcome === 'failed' || outcome === 'refused') && i < batch.length - 1) { const e = s.entries.at(-1); if (e) e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch.slice(i + 1).map(b => b.action).join(', ')}); reason about the result first.`; break; }
         }
+        s.currentTurn = null;
         if (halted) break;
         s.readOnlyTurns = batch.every(b => b.action === 'read_files' || b.action === 'search_codebase') ? (s.readOnlyTurns ?? 0) + 1 : 0;
         await this.watch(s); await this.store.save(s);
@@ -394,6 +411,9 @@ export class Agent {
     if (s.blockedActions!.includes(key)) return refuse('this exact action already failed the same way and Jev read the failure as unchanged; it is not run again. Change the approach.');
     const earlier = s.actions[key];
     if (earlier !== undefined && s.entries.some(e => e.step === earlier) && !(route === 'read_files' && (args.files as { path: string }[]).some(f => (s.writeSteps[f.path] ?? -1) > earlier)) && route !== 'bash' && route !== 'plan' && route !== 'render') return refuse(`this ${route} was already done at step ${earlier} and its result is in the evidence; act on it or choose another action`);
+    // A command that succeeded, run again with nothing written or installed since
+    // and its output still shown, prints the same thing: it is not run again.
+    if (route === 'bash') { const prior = s.commandRuns?.[String(args.command ?? '').trim()]; if (prior?.ok && prior.world === Agent.world(s) && s.entries.some(e => e.step === prior.step && e.kind === 'bash')) return refuse(`this exact command already ran at step ${prior.step} and nothing has been written or installed since, so it would print the same output, which is in the evidence (e${prior.step}); act on that output or run something different`); }
     s.actions[key] = s.step;
     if (route === 'plan') { s.notes = clip(String(args.notes ?? ''), 4000); await this.store.log('plan', { step: s.step, notes: s.notes }); await this.evidence(s, 'plan', { ok: true, text: `Notes updated (${s.notes.split('\n').length} lines).` }); return 'ok'; }
     if (route === 'render') {
@@ -469,5 +489,7 @@ export class Agent {
     this.observe({ kind: 'jev', step: s.step, ms: performance.now() - t0, questions: 6, stateBytes: 0, route: [], nouls: { progress: reading.progress, stuck: reading.stuck, same_failure: reading.sameFailure, objective: reading.objective, needs_user: reading.needsUser, in_scope: reading.inScope } });
   }
 }
+// The evidence's share of the working budget that triggers a batched eviction, and the share it is cut to.
+const evictAt = .45; const evictTo = .3;
 const failureKindText = (k: string): string => ({ code_bug: 'the code or configuration written is wrong', wrong_assumption: 'an assumption the output disproves', bad_command: 'the command itself', environment: 'a tool or service the machine lacks', dependency: 'a package missing, unresolvable or at a version that does not exist', permission: 'permission or credentials', transient: 'a network or timing failure', insufficient_context: 'acting without reading what was needed', unknown: 'unclear' } as Record<string, string>)[k] ?? k;
 export { boundedRead };

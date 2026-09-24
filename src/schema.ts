@@ -5,7 +5,7 @@ const obj = (properties: Record<string, JsonSchema>): JsonSchema => ({
   type: 'object', properties, required: Object.keys(properties), additionalProperties: false,
 });
 // Length caps exist only where exceeding them is itself a content error (a path,
-// a hash, a shell command). Code, prose and summaries are never capped: the
+// a hash) and the grammar can enforce them (1000 characters or less). Code, prose and summaries are never capped: the
 // grammar cannot enforce a string length, so a cap on generated content is by
 // construction a rule that discards a finished generation. Descriptive fields
 // are clipped where they are stored; content fields are bounded by the token
@@ -26,7 +26,7 @@ export const schemas: Record<Route, JsonSchema> = {
   // A plain cut and paste: the lines leave source and are appended to destination unchanged.
   move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),
     destination: str(500), destinationHash: str(64) }),
-  bash: obj({ command: str(2000), purpose: str(), check: { type: 'boolean' } }),
+  bash: obj({ command: str(), purpose: str(), check: { type: 'boolean' } }),
   finish: obj({ summary: str() }),
   ask_user: obj({ question: str() }),
   // The worker's own notes: its plan and what it has learned, replaced whole.

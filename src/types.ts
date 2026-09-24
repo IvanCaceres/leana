@@ -22,7 +22,11 @@ export type Answer = { type: 'noul'; noul: number } |
 export type Questions = Record<string, Question>;
 export type Answers = Record<string, Answer>;
 export interface Task { id: string; description: string; status: 'pending' | 'done'; evidence: string }
-export interface Entry { id: string; step: number; kind: string; text: string; artifact: string; relevance: number; stale?: string; verification?: boolean }
+// A turn entry (kind 'turn') is the worker's own reasoning and actions for a
+// batch, shown back to it as an assistant message; the results of that batch
+// carry its id in turn, and outcomes (never rendered) feed the trail once the
+// group is evicted.
+export interface Entry { id: string; step: number; kind: string; text: string; artifact: string; relevance: number; stale?: string; verification?: boolean; turn?: string; outcomes?: string[] }
 export interface EditEvidence { step: number; route: string; paths: string[]; artifact: string; text: string; applied?: string }
 export interface Session {
   version: 1; root: string; objective: string; instructions: string; step: number;
@@ -97,7 +101,7 @@ export interface Session {
   failedVersions?: Record<string, string[]>;
   // Every command run this session with its outcome: a verify deliverable that
   // names a command is done only when that command passed after the last edit.
-  commandRuns?: Record<string, { step: number; ok: boolean }>;
+  commandRuns?: Record<string, { step: number; ok: boolean; world?: string }>;
   // Decided fixes that landed in a file without changing its diagnostics, in a
   // row: after three, the file's fix is not offered until its errors change.
   fixStalls?: Record<string, { signature: string; count: number }>;
@@ -112,6 +116,8 @@ export interface Session {
   // last stated reasoning, the watchdog's readings, and action keys Jev found
   // repeating a failure, which are refused once.
   notes?: string; orientation?: Record<string, unknown>; lastThought?: string;
+  // The turn whose batch is running, so its results are grouped with it; one line per evicted turn, oldest first.
+  currentTurn?: string | null; trail?: string[];
   watch?: { noProgress: number; readings: { step: number; progress: number; stuck: number; sameFailure: number; objective: number; needsUser: number; inScope?: number }[]; escalations: number };
   blockedActions?: string[];
   // The last render of the running application: what the user would see, as facts.
@@ -135,7 +141,7 @@ export interface Config {
   createTokens: number;
 }
 export interface GenerationMeta { ms: number; usage?: any; timings?: any; finishReason?: string; promptTokens: number; continuations?: number }
-export interface Message { role: 'system' | 'user'; content: string }
+export interface Message { role: 'system' | 'user' | 'assistant'; content: string }
 export type JsonSchema = {
   anyOf?: JsonSchema[]; const?: string;
   type?: 'object' | 'array' | 'string' | 'integer' | 'boolean';

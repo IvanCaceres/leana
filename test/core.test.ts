@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults };
-import { Bonsai, Jev, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
+import { Bonsai, Jev, periodicStart, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
 import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds } from '../src/context.js';
 import { namedFiles, pinReferences, referenceContext } from '../src/references.js';
 import { objectiveClauses } from '../src/control.js';
@@ -82,11 +82,11 @@ test('Schemas reject unknown arguments and unbounded reads', () => {
   assert.throws(() => validate(schemas.bash, { command: 'pwd', purpose: 'check', unsafe: true }));
   assert.throws(() => validate(schemas.read_files, { files: [] }));
 });
-test('llama grammar compatibility keeps runtime string limits intact, and content fields carry no cap', () => {
-  const wire = samplingSchema(schemas.bash);
-  assert.equal(wire.properties?.command?.maxLength, undefined);
-  assert.equal(schemas.bash.properties?.command?.maxLength, 2000);
-  assert.throws(() => validate(schemas.bash, { command: 'x'.repeat(2001), purpose: 'test', check: false }), /string length 2001 exceeds the maximum 2000; shorten this field/);
+test('llama grammar compatibility: every cap validated after generation is one the grammar enforced, and content fields carry no cap', () => {
+  // A cap the sampling schema drops would discard a finished generation: none may remain in the validated schema.
+  const dropped = (s: any, w: any): string[] => [...(s.maxLength !== undefined && w.maxLength === undefined ? ['maxLength'] : []), ...Object.keys(s.properties ?? {}).flatMap(k => dropped(s.properties[k], w.properties[k])), ...(s.items ? dropped(s.items, w.items) : [])];
+  for (const [route, schema] of Object.entries(schemas)) assert.deepEqual(dropped(schema, samplingSchema(schema)), [], `${route} validates a cap the grammar does not enforce`);
+  assert.throws(() => validate(schemas.read_files, { files: [{ path: 'x'.repeat(501), start: 1, end: 2 }] }), /string length 501 exceeds the maximum 500/);
   // Code and prose are never capped after generation: the grammar cannot enforce a length, so a cap on content is a rule that discards a finished generation.
   assert.throws(() => validate(schemas.move_lines, { source: 'a', expectedHash: 'h', start: 1, end: 2, destination: 'b', destinationHash: 'new', replacement: '' }), /unknown property replacement/, 'a move is a plain cut and paste: nothing to add around it');
   validate(schemas.write, { path: 'a.ts', expectedHash: 'h', oldText: 'y'.repeat(700), newText: 'z'.repeat(30000) });
@@ -173,6 +173,21 @@ test('repetitionStart finds a looping tail and leaves honest repetition alone', 
   assert.equal(repetitionStart(honest), -1);
   assert.equal(repetitionStart(Array.from({ length: 12 }, () => '}').join('\n')), -1, 'closing braces are not content');
 });
+test('periodicStart finds a loop inside one line and leaves real content alone', async () => {
+  // The shape of a run's Footer: an SVG path whose numbers fell into a cycle for 12,000 tokens.
+  const head = 'export default function Footer() {\n  return <svg><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385';
+  const looping = head + ' 0 0.267 0 0.4 0 0.133'.repeat(60);
+  const at = periodicStart(looping); assert(at > head.length - 40 && at <= head.length + 22, `cut near the start of the cycle: ${at}`);
+  assert.equal(periodicStart(looping.slice(0, head.length + 22 * 20)), -1, 'a short run is not yet a loop');
+  // Real content: a path of varied numbers, a data array, a stylesheet, a divider comment.
+  const path = 'd="' + Array.from({ length: 300 }, (_, i) => `L${(i * 37) % 1440},${(i * 53) % 120}`).join(' ') + '"';
+  const data = '[' + Array.from({ length: 400 }, (_, i) => i * 3).join(', ') + ']';
+  const css = Array.from({ length: 60 }, (_, i) => `.card--${i} { margin: ${i}px; padding: ${i * 2}px; }`).join('\n');
+  const divider = `/* ${'='.repeat(76)} */\nconst a = 1;\n`;
+  for (const honest of [path, data, css, divider]) assert.equal(periodicStart(honest), -1, honest.slice(0, 40));
+  const { validate, schemas } = await import('../src/schema.js');
+  assert.doesNotThrow(() => validate(schemas.bash, { command: `cat > src/a.ts <<'EOF'\n${'const a = 1;\n'.repeat(400)}EOF`, purpose: 'write', check: false }), 'a long command the grammar let through is not discarded afterwards');
+});
 test('generateText continues by token ids with the fence prefilled, stops on the closing fence, cuts a loop, and repairs a broken character', async t => {
   // A mock llama-server: tokens are character codes; /completion replies from a script and records the prompts it received.
   const requests: any[] = []; let script: { content: string; stop_type: string; tokens?: number[] }[] = [];
@@ -199,6 +214,10 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   script = [{ content: `const b = 2;\n${loop}\n`, stop_type: 'limit' }];
   const r = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
   assert.equal(r.finish, 'repetition'); assert(r.text.startsWith('const b = 2;\n<div className="feature">')); assert(r.text.split('\n').length < 12, 'cut at the first repeat'); assert.equal(script.length, 0);
+  // A chunk that loops inside one line is cut where the cycle starts, reported as repetition, not continued.
+  script = [{ content: `const c = <path d="M0 0${' 0 0.267 0 0.4 0 0.133'.repeat(60)}`, stop_type: 'limit' }];
+  const p = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
+  assert.equal(p.finish, 'repetition'); assert(p.text.length < 60, p.text); assert.equal(script.length, 0);
   // A chunk ending in a broken character is re-derived from the token ids.
   script = [{ content: 'caf�', stop_type: 'limit', tokens: [99, 97, 102, 233] }, { content: ' au lait', stop_type: 'eos' }];
   const d = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null });

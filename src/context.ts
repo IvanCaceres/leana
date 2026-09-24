@@ -111,14 +111,48 @@ export function confidentChoice(a: Answers[string] | undefined, c: Config): stri
   // Compare with a tolerance: 0.41 - 0.40 must count as a 0.01 margin.
   return p >= c.routeProbability - 1e-9 && p - (ranked[1]?.[1] ?? 0) >= c.routeMargin - 1e-9 ? top : null;
 }
+// A turn and its results are one group: reasoning without its outcome
+// misleads, so a turn stays while any result of its batch remains and goes
+// with the last of them, leaving one line in the trail. The running turn and
+// the freshest entry are never evicted.
 export function evictOne(s: Session): Entry | undefined {
   retireEvidence(s);
-  // Preserve the freshest result until all older candidates have been evicted.
-  const candidates = s.entries.length > 1 ? s.entries.slice(0, -1) : s.entries;
+  const hasResults = (turn: Entry) => s.entries.some(e => e.turn === turn.id);
+  const protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]);
+  const candidates = s.entries.filter(e => (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
   // Stale entries go first, then the least relevant, then the oldest.
   const candidate = [...candidates].sort((a, b) => Number(Boolean(b.stale)) - Number(Boolean(a.stale)) || a.relevance - b.relevance || a.step - b.step)[0];
-  if (candidate) s.entries = s.entries.filter(e => e.id !== candidate.id);
+  if (!candidate) return undefined;
+  s.entries = s.entries.filter(e => e !== candidate);
+  const turn = candidate.kind === 'turn' ? candidate : s.entries.find(e => e.kind === 'turn' && e.id === candidate.turn);
+  if (turn && !hasResults(turn) && turn.id !== s.currentTurn) { s.entries = s.entries.filter(e => e !== turn); s.trail = [...(s.trail ?? []), trailLine(turn)].sort((a, b) => Number(a.match(/^step (\d+)/)?.[1]) - Number(b.match(/^step (\d+)/)?.[1])).slice(-12); }
   return candidate;
+}
+// Generated content in a turn's arguments is on disk and in the results; the
+// turn keeps what identifies the action (paths, commands, queries, ranges).
+export function compactArgs(v: unknown): unknown {
+  if (typeof v === 'string') return v.length > 240 ? `${v.slice(0, 160)}… [${v.length} chars]` : v;
+  if (Array.isArray(v)) return v.map(compactArgs);
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).filter(([k]) => k !== 'expectedHash' && k !== 'destinationHash').map(([k, x]) => [k, compactArgs(x)]));
+  return v;
+}
+// The worker's reasoning and actions for a batch, exactly in the shape it
+// generated them, recorded before the batch runs so that the prefix only grows.
+export function turnEntry(step: number, thought: string, batch: { action: string; args: Record<string, any> }[]): Entry {
+  return { id: `t${step}`, step, kind: 'turn', artifact: '', relevance: .5, outcomes: [],
+    text: JSON.stringify({ thought: cut(thought, 600), actions: batch.map(b => ({ action: b.action, args: compactArgs(b.args) })) }) };
+}
+const cut = (text: string, n: number) => text.length > n ? `${text.slice(0, n - 1)}…` : text;
+function trailLine(turn: Entry): string {
+  let actions: { action: string; args: Record<string, any> }[] = [];
+  try { actions = JSON.parse(turn.text).actions ?? []; } catch { /* not a turn */ }
+  const named = actions.map(a => { const x = a.args ?? {}; const what = x.path ?? x.command ?? x.query ?? x.url ?? x.source ?? (Array.isArray(x.files) ? x.files.map((f: any) => f.path).join(',') : ''); return `${a.action}${what ? ` ${cut(String(what), 70)}` : ''}`; });
+  return cut(`step ${turn.step}: ${named.join('; ')} -> ${turn.outcomes?.length ? turn.outcomes.join('; ') : 'no result'}`, 240);
+}
+// The evidence's share of the prompt, estimated from its rendered length; the
+// batched eviction is decided on it, the hard budget by the server's count.
+export function evidenceTokens(s: Session): number {
+  return Math.ceil(agentPrefix(s).slice(2).reduce((n, m) => n + m.content.length, 0) / 3.5);
 }
 const details: Record<Route, string> = {
   rewrite_file: 'path is an existing file; purpose says what the new version must contain and change. Never put file content in the arguments: it is generated next, as code, from the current content, your thought and purpose.',
@@ -130,7 +164,7 @@ const details: Record<Route, string> = {
   move_lines: 'Cut lines start..end (1-based, inclusive, at most 2000) from source and append them unchanged to the end of destination; take the numbers from read_files or search_codebase. expectedHash is the current source sha256 from fileHashes; destinationHash is the destination sha256 from fileHashes, or "new" only when the destination does not exist yet. Nothing else is changed in either file: whatever the moved lines need in their new place (imports, exports, references) is yours to add with an edit.',
   create_file: 'path is the repository-relative path of a file that does not exist yet (never an existing file: those are edited with write or replace_lines); purpose says in one sentence what the file must contain. The content itself is not written here: the harness asks for it as code in the next generation.',
   write: 'For a short anchor only (a few lines) in a file that exists: for a region of many lines use replace_lines, and to relocate a block use move_lines. expectedHash must be the current sha256 of the path from fileHashes (the same value the latest read_files or edit result reported). oldText is a small unique anchor (a few consecutive lines) copied exactly from that read; never paste a truncated excerpt or an entire file. newText replaces the anchor and must differ from it. Never overwrite an unread file; a new file is made with create_file.',
-  bash: 'check is true only when this command is the verification of the work (a build, a type check, a test run): from then on it is the check of record, and running that same command again is a check too; false for installs, scaffolds, inspections and everything else. The harness never runs the check by itself: run it after edits when you want them judged, and before finish, which is refused while an edit is newer than the last check. command runs with bash in the repository root (the harness already sets cwd; use repository-relative paths and do not cd into a subdirectory or to /workspace). Explain its purpose. Use it for diagnostics too. Do not start background processes or servers.',
+  bash: 'check is true only when this command is the verification of the work (a build, a type check, a test run): from then on it is the check of record, and running that same command again is a check too; false for installs, scaffolds, inspections and everything else. The harness never runs the check by itself: run it after edits when you want them judged, and before finish, which is refused while an edit is newer than the last check. command runs with bash in the repository root (the harness already sets cwd; use repository-relative paths and do not cd into a subdirectory or to /workspace). Explain its purpose. Use it for diagnostics too. A command that succeeded is not run again until something is written or installed, because its output is already in the evidence. Do not start background processes or servers.',
   finish: 'summary reports the final code structure, the verification from verification, and limitations concisely. While a check command exists and verificationAfterLastWrite is false, finish is refused: run the check first. The evidence gate reads the changed files as they are now, the diff and the last render; editEvidence holds historical actions only. Missing history proves neither that a requested procedure was followed nor that it was skipped. Do not infer a procedural violation from absent records. Report only what the evidence establishes.',
   ask_user: 'Ask one concise question that explains the missing information.',
 };
@@ -160,6 +194,7 @@ export function promptFields(prompt: Message[]): Record<string, any> {
   const out: Record<string, any> = {}; const evidence: unknown[] = [];
   for (const m of prompt.slice(1)) {
     let parsed: any; try { parsed = JSON.parse(m.content); } catch { continue; }
+    if (m.role === 'assistant') continue;
     if (parsed && typeof parsed === 'object' && 'evidence' in parsed && Object.keys(parsed).length === 1) evidence.push(parsed.evidence);
     else Object.assign(out, parsed);
   }
@@ -172,7 +207,7 @@ export function promptFields(prompt: Message[]): Record<string, any> {
 // (objective, instructions, orientation), the evidence entries one per
 // message, and a last message stating the request: reason and name an action,
 // or produce the arguments of the action just chosen, or write a file.
-export const AGENT_SYSTEM = 'You are Bonsai, a coding agent working in a repository through tools. Each step you reason briefly about the objective, what you know and what you just observed, then take exactly one action. You decide what to read, what to run (scaffolders, package managers, checks), what to write and in what order; the harness executes your action, verifies what it can, and shows you what happened. Prefer acting on facts you have over reading what is already shown. Keep your notes current with the plan action.';
+export const AGENT_SYSTEM = 'You are Bonsai, a coding agent working in a repository through tools. Each step you reason briefly about the objective, what you know and what you just observed, then name the actions to take. Your own earlier turns are the assistant messages, each followed by the results of its actions; steps whose evidence was dropped for room are summarised in earlierSteps. You decide what to read, what to run (scaffolders, package managers, checks), what to write and in what order; the harness executes your action, verifies what it can, and shows you what happened. Prefer acting on facts you have over reading what is already shown. Keep your notes current with the plan action.';
 export function orientationBlock(s: Session, allowed?: string[]): Record<string, unknown> {
   return { objective: s.objective, repositoryInstructions: s.instructions || undefined, orientation: s.orientation ?? undefined,
     ...(allowed ? { actions: Object.fromEntries(allowed.map(a => [a, { description: routeDescriptions[a as Route], instructions: details[a as Route], argumentSchema: schemas[a as Route] }])) } : {}) };
@@ -207,24 +242,24 @@ function agentPrefix(s: Session): Message[] {
   return [
     { role: 'system', content: AGENT_SYSTEM },
     { role: 'user', content: JSON.stringify(orientationBlock(s, s.allowedActions)) },
-    ...s.entries.map(e => ({ role: 'user' as const, content: JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } }) })),
+    ...s.entries.map(e => e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : { role: 'user' as const, content: JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } }) }),
   ];
 }
 function volatile(s: Session): Message[] {
-  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s) }) }];
+  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', ...(s.trail?.length ? { earlierSteps: s.trail } : {}), files: relevantFiles(s, 40), ...verificationBlock(s) }) }];
 }
 export function stepMessages(s: Session, allowed: string[], note?: string): Message[] {
   const request = { role: 'Reason, then act. Write thought: two to five sentences on where the work stands given the objective, your notes and the latest evidence, and what to do next and why. Then actions: an ordered list of one to eight actions (each an action name from allowedActions with its args under that action\'s schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and a render) and put a check or a render last; keep to one action when its result decides what comes next.',
     ...agentRequestBase(s), allowedActions: allowed, ...(note ? { harnessNote: note } : {}) };
   return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify({ ...request, verificationAfterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep) }) }];
 }
-// A new file, written as code: the worker's purpose and thought, the real
+// A new file, written as code: the worker's purpose (its reasoning is the turn in the prefix), the real
 // exported signatures of the repository modules it names, and the packages
 // the manifest declares, so nothing is invented.
-export function newFileMessages(s: Session, path: string, purpose: string, thought: string, contracts: FileContract[], declared: string[], shrink = 0, current?: string): Message[] {
+export function newFileMessages(s: Session, path: string, purpose: string, contracts: FileContract[], declared: string[], shrink = 0, current?: string): Message[] {
   const request = {
     role: current === undefined ? `Write the complete file ${path} as code. The harness has opened the code block; write only the file content and close the block.` : `Rewrite the complete file ${path} as code: its whole new content, keeping what should stay and changing what purpose asks. The harness has opened the code block; write only the file content and close the block.`,
-    file: path, purpose, thought, ...(current !== undefined ? { currentContent: shrink ? clip(current, 6000) : current } : {}),
+    file: path, purpose, ...(current !== undefined ? { currentContent: shrink ? clip(current, 6000) : current } : {}),
     modules: contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
     declaredPackages: declared.slice(0, 60),
     rules: [`Write the complete content of ${path}: working code with no placeholders, TODOs or omitted sections.`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', 'Write the file content only, then the closing fence; no explanation before or after it.'],

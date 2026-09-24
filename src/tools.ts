@@ -812,19 +812,19 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     const keepExt = /\.[cm]?[jt]sx?$/.test(spec) ? target.slice(target.lastIndexOf('.')).replace(/\.tsx?$/, '.js') : '';
     const to = (rel.startsWith('.') ? rel : `./${rel}`) + keepExt;
     if (to === spec) continue;
-    results.push({ name: spec, inFile, kind: 'respec', line: Number(m[2]), importLine: to, note: `${spec} does not resolve from ${inFile}; ${target} does, so the harness rewrites the specifier to ${to}` });
+    results.push({ name: spec, inFile, kind: 'respec', line: Number(m[2]), importLine: to, note: `${spec} does not resolve from ${inFile}; ${target} does: the specifier to use is ${to}` });
   }
   // A namespace the checker cannot find that a declared package provides (the
   // caller supplies the table from the ecosystem profile): imported mechanically.
   for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2503: Cannot find namespace '([^']+)'/gm)) {
     const line = namespaceImports[m[3]!]; if (!line) continue;
     const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (!inFile || results.some(r => r.name === m[3] && r.inFile === inFile)) continue;
-    results.push({ name: m[3]!, inFile, importLine: line, line: Number(m[2]), note: `${m[3]} is a namespace a declared package provides; the harness imports it` });
+    results.push({ name: m[3]!, inFile, importLine: line, line: Number(m[2]), note: `${m[3]} is a namespace a declared package provides` });
   }
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS2459: Module '"([^"]+)"' declares '([^']+)' locally, but it is not exported/gm)) add(m[1]!, m[3]!, 'not-exported', m[2]!);
   for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS(?:2305|2724): (?:Module )?'"([^"]+)"' has no exported member(?: named)? '([^']+)'\.(?: Did you mean '([^']+)'\?)?/gm)) {
     // The checker names the export that exists: alias the import to it, usage untouched.
-    if (m[5]) { const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (inFile) { results.push({ name: m[4]!, inFile, kind: 'alias', line: Number(m[2]), note: `${m[3]} exports ${m[5]}, not ${m[4]}; the harness imports it as ${m[5]} as ${m[4]}`, importLine: m[5] }); continue; } }
+    if (m[5]) { const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (inFile) { results.push({ name: m[4]!, inFile, kind: 'alias', line: Number(m[2]), note: `${m[3]} exports ${m[5]}, not ${m[4]}; import it as ${m[5]} as ${m[4]}`, importLine: m[5] }); continue; } }
     add(m[1]!, m[4]!, 'wrong-module', m[3]!);
   }
   // An unused import binding is mechanical to remove, and removing the whole
@@ -833,7 +833,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     const reported = m[1]!; const line = Number(m[2]); const name = m[3]!;
     const inFile = editedFiles.find(f => f.endsWith(reported) || reported.endsWith(f)); if (!inFile) continue;
     let text: string; try { text = await boundedRead(await safePath(root, inFile)); } catch { continue; }
-    if (await importBindingAt(inFile, text, line, name)) results.push({ name, inFile, kind: 'unused', line, note: 'unused import binding; the harness removes it' });
+    if (await importBindingAt(inFile, text, line, name)) results.push({ name, inFile, kind: 'unused', line, note: 'unused import binding' });
   }
   // A binding imported twice (TS2300 on import lines) keeps its first import; an
   // import that conflicts with a local declaration (TS2440) goes.
@@ -845,12 +845,12 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
   for (const d of dup.values()) {
     let text: string; try { text = await boundedRead(await safePath(root, d.inFile)); } catch { continue; }
     const importLines: number[] = []; for (const l of d.lines) if (await importBindingAt(d.inFile, text, l, d.name)) importLines.push(l);
-    if (importLines.length >= 2) for (const l of importLines.sort((a, b) => a - b).slice(1)) results.push({ name: d.name, inFile: d.inFile, kind: 'unused', line: l, note: 'imported twice; the harness removes the later binding' });
+    if (importLines.length >= 2) for (const l of importLines.sort((a, b) => a - b).slice(1)) results.push({ name: d.name, inFile: d.inFile, kind: 'unused', line: l, note: 'imported twice; the later binding is redundant' });
   }
   for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2440: Import declaration conflicts with local declaration of '([^']+)'/gm)) {
     const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (!inFile) continue;
     let text: string; try { text = await boundedRead(await safePath(root, inFile)); } catch { continue; }
-    if (await importBindingAt(inFile, text, Number(m[2]), m[3]!)) results.push({ name: m[3]!, inFile, kind: 'unused', line: Number(m[2]), note: 'imported and declared locally; the harness removes the import' });
+    if (await importBindingAt(inFile, text, Number(m[2]), m[3]!)) results.push({ name: m[3]!, inFile, kind: 'unused', line: Number(m[2]), note: 'imported and declared locally; the import conflicts with the declaration' });
   }
   const headers = new Map<string, string>();
   const header = async (rel: string): Promise<string> => {
@@ -883,7 +883,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     const same = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
     if (direction && !(same(d.file, direction.source) && same(inFile, direction.destination))) return null;
     const origin: NameOrigin = { name, inFile, kind: 'move', declaredIn: `${d.file}:${d.line}` };
-    if (d.endLine) { origin.move = { source: d.file, start: Number(d.line), end: d.endLine }; origin.note = `named by the objective as something to extract and still declared in ${d.file} at lines ${d.line}-${d.endLine}; the harness moves it into ${inFile}`; }
+    if (d.endLine) { origin.move = { source: d.file, start: Number(d.line), end: d.endLine }; origin.note = `named by the objective as something to extract and still declared in ${d.file} at lines ${d.line}-${d.endLine}: move it into ${inFile} with move_lines`; }
     else origin.note = `named by the objective as something to extract and still declared at ${origin.declaredIn}: move that declaration into ${inFile} with move_lines (read its closing line first); do not import it back`;
     return origin;
   };
@@ -917,7 +917,7 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
           const target = editedFiles.find(f => f === moduleTs || f.endsWith(`/${moduleTs}`) || moduleTs.endsWith(`/${f}`));
           if (target && target !== d.file && !d.file.endsWith(`/${target}`)) {
             if (results.some(r => r.kind === 'reexport' && r.name === name && r.inFile === target)) continue;
-            results.push({ name, inFile: target, kind: 'reexport', declaredIn: `${d.file}:${d.line}`, exported: true, importLine: `export { ${name} } from "${relPath(target, d.file).replace(/\.ts$/, '.js')}";`, note: `${inFile} imports ${name} from ${target}, which no longer declares it; the harness re-exports it from ${d.file}` });
+            results.push({ name, inFile: target, kind: 'reexport', declaredIn: `${d.file}:${d.line}`, exported: true, importLine: `export { ${name} } from "${relPath(target, d.file).replace(/\.ts$/, '.js')}";`, note: `${inFile} imports ${name} from ${target}, which no longer declares it: re-export it there from ${d.file}` });
             if (results.length >= limit) return results; continue;
           }
         }
@@ -1024,8 +1024,8 @@ export class ToolBox {
     if (route === 'create_file') {
       // Creation has one meaning: a file that does not exist gets this content.
       // The content is validated after it lands, never refused for its shape:
-      // a parse problem is reported for the harness's own repair, and the
-      // relative imports are reported so the deliverables they imply can be added.
+      // a parse problem is reported to the worker as a fact, and the
+      // relative imports are reported.
       if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
       if (typeof a.path !== 'string' || /[\\/]$/.test(a.path) || a.path === '.' || a.path === '..') throw new Error('create_file requires a regular file path; directory path rejected');
       const content = typeof a.content === 'string' ? a.content : '';
@@ -1041,7 +1041,7 @@ export class ToolBox {
       const imports = await relativeImports(a.path, content);
       const h = hash(content);
       return { ok: true, changed: [a.path], hashes: { [a.path]: h }, snapshots: { [a.path]: '@new' }, parseErrors, imports,
-        text: `Created ${a.path} (${content.split('\n').length} lines); sha256=${h}.${parseErrors.length ? ` It does not parse yet (${parseErrors.join('; ')}); the harness repairs that region next.` : ''}${imports.length ? ` Imports ${imports.map(i => i.spec).join(', ')}.` : ''}` };
+        text: `Created ${a.path} (${content.split('\n').length} lines); sha256=${h}.${parseErrors.length ? ` It does not parse yet (${parseErrors.join('; ')}); it stays as written until an edit fixes it.` : ''}${imports.length ? ` Imports ${imports.map(i => i.spec).join(', ')}.` : ''}` };
     }
     if (route === 'write') {
       // An anchor replacement in a file that exists; nothing else.
@@ -1257,8 +1257,8 @@ export class ToolBox {
         `${a.source} sha256=${hash(remaining)} totalLines=${remaining.split('\n').length}; ${a.destination} sha256=${hash(output)} totalLines=${output.split('\n').length}. ` +
         (destinationStale ? `(destinationHash was stale; the current ${a.destination} was appended to.) ` : '') +
         (plan ? `Exported ${plan.exported.length ? plan.exported.join(', ') : 'nothing new'}; copied ${plan.prefix.length} import line(s) into the destination; ${plan.replacement.length ? `${a.source} now imports ${plan.stillUsed.join(', ')} from the destination` : `${a.source} no longer referenced the moved names`}.` +
-          (plan.localDeps.length ? ` The moved code also uses ${plan.localDeps.map(d => `${d.name} (declared at ${a.source}:${d.line}, not exported)`).join(', ')}: export those in ${a.source} and import them in ${a.destination}, or move them too; the check reports them next.` : '') +
-          ' The check runs next.'
+          (plan.localDeps.length ? ` The moved code also uses ${plan.localDeps.map(d => `${d.name} (declared at ${a.source}:${d.line}, not exported)`).join(', ')}: export those in ${a.source} and import them in ${a.destination}, or move them too; the check reports them when it runs.` : '') +
+          ' Run the check to have the move judged.'
           : a.replacement ? 'Run the focused check next; its errors list any imports the moved code still needs in the destination.'
           : 'The source no longer imports the moved names; add that import with write, then run the focused check.') };
     }

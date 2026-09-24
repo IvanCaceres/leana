@@ -76,10 +76,9 @@ test('HTTP retries transient responses but never retries authentication errors',
   assert.deepEqual(await postJson(url, {}, 'test', 1000), { ok: true }); assert.equal(requests, 2);
   status = 401; requests = 0; await assert.rejects(postJson(url, {}, 'test', 1000)); assert.equal(requests, 1);
 });
-test('Schemas reject unknown arguments and unbounded reads/tasks', () => {
+test('Schemas reject unknown arguments and unbounded reads', () => {
   assert.throws(() => validate(schemas.bash, { command: 'pwd', purpose: 'check', unsafe: true }));
   assert.throws(() => validate(schemas.read_files, { files: [] }));
-  assert.throws(() => validate(schemas.tasks, { tasks: Array(13).fill({}) }));
 });
 test('llama grammar compatibility keeps runtime string limits intact, and content fields carry no cap', () => {
   const wire = samplingSchema(schemas.bash);

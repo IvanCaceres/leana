@@ -28,7 +28,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
     phase: 'implement', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], design: null, ledgerAttempts: 0, ledgerBuilt: true, ledgerComplete: 0, baselineArtifacts: {}, checkInferences: 0, checkInferredFor: -1, setupDone: false, baselineStatus: null,
-    lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, pendingCheck: false, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {}, pendingRepairs: [],
+    lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {}, pendingRepairs: [],
     notes: '', watch: { noProgress: 0, readings: [], escalations: 0 }, blockedActions: [] };
 }
 
@@ -89,7 +89,7 @@ export class Agent {
     if (kind === 'bash' && typeof args?.command === 'string') (s.commandRuns ??= {})[args.command.trim()] = { step: s.step, ok: result.ok };
     if (result.verification) { s.editsSinceCheck = 0; if (kind === 'bash' && args?.command) s.lastCheckCommand = args.command.trim(); }
     if (s.completionFeedback && !s.completionFeedback.addressed && result.verification && result.ok && s.lastWriteStep > s.completionFeedback.step) s.completionFeedback = { ...s.completionFeedback, addressed: true, text: `The completion proposed at step ${s.completionFeedback.step} was rejected (${clip(s.completionFeedback.text, 200)}); edits and a passing verification have followed.` };
-    if (result.changed?.length) { s.editsSinceCheck++; s.pendingCheck = Boolean(s.lastCheckCommand) && kind !== 'bash'; }
+    if (result.changed?.length) s.editsSinceCheck++;
     if ((kind === 'read_files' || kind === 'search_codebase' || (kind === 'bash' && typeof args?.command === 'string' && readOnlyCommand(args.command))) && result.ok) s.inspectionsSinceAction++;
     if (result.changed?.length || result.verification || kind === 'undo') s.inspectionsSinceAction = 0;
     for (const changed of result.changed ?? []) {
@@ -104,7 +104,6 @@ export class Agent {
     if (result.verification) {
       s.previousCheck = s.lastCheck;
       s.lastCheck = { step: s.step, ok: result.ok, text: clipEnds(result.text, 1500), summary: summarizeCheck(result.text, s.root), fileHashes: await sourceHashes(s.root, s.writes), ...(kind === 'bash' && typeof args?.command === 'string' ? { command: args.command.trim() } : {}) };
-      s.pendingCheck = false;
       if (!result.ok) {
         const sites: string[] = [];
         for (const [file, v] of Object.entries(s.lastCheck.summary.byFile).slice(0, 5)) {
@@ -177,7 +176,7 @@ export class Agent {
     const install = await eco.installCommand(this.tools.root, '.', s.setupDone).catch(() => null);
     if (!install) { s.setupDone = true; s.setupKey = key; return false; }
     this.observe({ kind: 'warning', step: s.step, text: s.setupDone ? 'manifest changed since the last install; installing again' : 'a manifest exists and nothing is installed; installing' });
-    if (await this.installDependencies(s, install, '.')) s.pendingCheck = Boolean(s.lastCheckCommand);
+    await this.installDependencies(s, install, '.');
     return true;
   }
 
@@ -277,7 +276,7 @@ export class Agent {
     s.watch ??= { noProgress: 0, readings: [], escalations: 0 }; s.blockedActions ??= []; s.notes ??= '';
     if (s.baselineStatus === null) s.baselineStatus = await repositoryStatus(this.tools.root).then(r => r.git ? r.changed : []).catch(() => []);
     if (!s.orientation) { s.orientation = await orient(this.tools.root) as unknown as Record<string, unknown>; await this.store.log('orientation', { step: s.step, orientation: s.orientation }); }
-    if (this.config.checkCommand && !s.lastCheckCommand) { s.lastCheckCommand = this.config.checkCommand; s.pendingCheck = true; }
+    if (this.config.checkCommand && !s.lastCheckCommand) s.lastCheckCommand = this.config.checkCommand;
     this.tools.config.checkCommand = s.lastCheckCommand ?? '';
     const endStep = s.step + this.config.maxSteps;
     let generationFailures = 0;

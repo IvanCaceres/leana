@@ -38,7 +38,7 @@ export class Store {
     s.phase ??= 'inspect'; s.knownFiles ??= []; s.inspectionCount ??= 0; s.lastError ??= null;
     s.lastRoute ??= null; s.lastResultOk ??= false; s.lastWriteStale ??= false; s.coverage ??= {}; s.hashes ??= {}; s.lastPromptTokens ??= 0; s.lastCheck ??= null; s.actions ??= {}; s.searches ??= {}; s.blockedRoute ??= null; s.editsSinceCheck ??= 0; s.readHashes ??= {}; s.writeSteps ??= {};
     s.previousCheck ??= null; s.editSnapshots ??= {}; s.missingNames ??= []; s.coverageByHash ??= {}; s.repetitionSteps ??= {}; s.focusReadAt ??= -1; s.autoFixKeys ??= {};
-    for (const t of [...s.transaction ?? [], ...s.rejectedEdits ?? []]) { (t as any).identity ??= t.key; (t as any).paths ??= []; } s.transaction ??= []; s.rejectedEdits ??= []; s.lastCheckCommand ??= null; s.pendingCheck ??= false; s.autoUndo ??= null; s.inspectionsSinceAction ??= 0;
+    for (const t of [...s.transaction ?? [], ...s.rejectedEdits ?? []]) { (t as any).identity ??= t.key; (t as any).paths ??= []; } s.transaction ??= []; s.rejectedEdits ??= []; s.lastCheckCommand ??= null; s.autoUndo ??= null; s.inspectionsSinceAction ??= 0;
     // Older checkpoints: recover the check command from the pinned bash result.
     // Superseded reads from older checkpoints: keep only their header line.
     for (const e of s.entries) if (e.text.startsWith('[superseded') && e.text.split('\n').length > 2) { const l = e.text.split('\n'); e.text = `${l[0]}\n${l.find(x => x.includes(' sha256=')) ?? ''}`; e.relevance = Math.min(e.relevance, .1); }
@@ -61,9 +61,6 @@ export class Store {
       s.phase = 'implement'; s.inspectionsSinceAction = 0;
     }
     retireEvidence(s);
-    // Old runs did not bind verification to file versions. Re-check once on
-    // resume rather than assuming edits made by another run were verified.
-    if (s.status !== 'complete' && s.lastCheck?.ok && !s.lastCheck.fileHashes && s.writes.length && s.lastCheckCommand) s.pendingCheck = true;
     if (s.lastError) s.lastError = clip(s.lastError, 1500);
     return s;
   }

@@ -1,4 +1,4 @@
-export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'tasks' | 'plan' | 'render' | 'rewrite_file' | 'finish' | 'ask_user';
+export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'plan' | 'render' | 'rewrite_file' | 'finish' | 'ask_user';
 // One tool, one meaning: create_file creates, write replaces an anchor in an
 // existing file, replace_lines edits by line number, move_lines relocates.
 export const editRoutes: readonly Route[] = ['create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines'];
@@ -59,7 +59,7 @@ export interface Session {
   lastCheckCommand: string | null;
   // Harness-owned verification cycle: a check is due after every edit transaction,
   // and an objectively worse check rolls that transaction back without a vote.
-  pendingCheck: boolean; autoUndo: { files: Record<string, string>; reason: string } | null;
+  autoUndo: { files: Record<string, string>; reason: string } | null;
   inspectionsSinceAction: number;
   rejectedEdits: { key: string; identity: string; step: number; undoneAt: number; route: string; summary: string; reason: string }[];
   actions: Record<string, number>; searches: Record<string, string>; blockedRoute: Route | null;

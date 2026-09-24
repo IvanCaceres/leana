@@ -26,9 +26,6 @@ export const schemas: Record<Route, JsonSchema> = {
   move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),
     destination: str(500), destinationHash: str(64), replacement: str(), prefix: str() }),
   bash: obj({ command: str(2000), purpose: str(), check: { type: 'boolean' } }),
-  tasks: obj({ tasks: { type: 'array', minItems: 1, maxItems: 12,
-    items: obj({ id: { ...str(40), minLength: 1 }, description: str(),
-      status: { ...str(), enum: ['pending', 'done'] }, evidence: str() }) } }),
   finish: obj({ summary: str() }),
   ask_user: obj({ question: str() }),
   // The worker's own notes: its plan and what it has learned, replaced whole.

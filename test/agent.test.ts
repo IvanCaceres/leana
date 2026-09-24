@@ -443,3 +443,52 @@ test('A generation that ends without closing its code block is reported as incom
   assert(result.entries.some(e => /rewrite of src\/Hero\.tsx reproduced its current content unchanged and ended before the file was complete/.test(e.text)), 'the no-op rewrite is named with its cause');
   const { codeSampling } = await import('../src/clients.js'); assert.equal((codeSampling as any).dry_multiplier, undefined, 'no repetition penalty on code');
 });
+
+// Every tool description is tested against the harness: a field the prose names
+// must be a field the model receives, and a behaviour it claims must happen.
+function keysOf(v: unknown, out = new Set<string>()): Set<string> {
+  if (Array.isArray(v)) for (const x of v) keysOf(x, out);
+  else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) { out.add(k); if (k === 'argumentSchema') for (const p of keysOf(x)) if (!['type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems', 'minimum', 'maximum', 'maxLength', 'minLength', 'enum'].includes(p)) out.add(p); else; else keysOf(x, out); }
+  return out;
+}
+test('Every field the prompts name is one the model receives: descriptions, instructions and requests are checked against a real prompt', async t => {
+  const { root } = await repo(t);
+  const { stepMessages, newFileMessages, AGENT_SYSTEM } = await import('../src/context.js');
+  const { actions } = await import('../src/schema.js');
+  const s = await newSession(root, 'x');
+  // Every conditional block present, so the prompt holds every field it can hold.
+  s.lastCheck = { step: 2, ok: false, text: 'src/a.ts(3,1): error TS2304', summary: { errors: 1, syntax: 0, byFile: { 'src/a.ts': { count: 1, syntax: 0, lines: [3], samples: ['TS2304'] } } }, command: 'tsc' };
+  s.missingNames = [{ name: 'greet', inFile: 'src/a.ts', importLine: 'import { greet } from "./greet.js";' }];
+  s.completionFeedback = { step: 1, text: 'not accepted', awaitingEvidence: true }; s.editEvidence = [{ step: 1, route: 'write', paths: ['src/a.ts'], artifact: 'a', text: 't' }];
+  s.allowedActions = [...actions];
+  const step = stepMessages(s, [...actions], 'a note'); const file = newFileMessages(s, 'src/b.ts', 'p', 't', [], [], 0, 'old');
+  const data = [...step.slice(1), ...file.slice(1)].map(m => JSON.parse(m.content));
+  const known = keysOf(data);
+  const pinned = data[0].actions as Record<string, { description: string; instructions: string }>;
+  assert.deepEqual(Object.keys(pinned).sort(), [...actions].sort(), 'every allowed action is described, and nothing else');
+  const prose = [AGENT_SYSTEM, ...Object.values(pinned).flatMap(a => [a.description, a.instructions]), data.at(-1)!.role, step.at(-1) && JSON.parse(step.at(-1)!.content).role, ...JSON.parse(file.at(-1)!.content).rules].join('\n');
+  // Names a tool result prints (path sha256=… totalLines=…) are fields too; they must be printed by the tools.
+  const tools = await readFile(new URL('../../src/tools.ts', import.meta.url), 'utf8');
+  const printed = (name: string) => new RegExp(`\\b${name}=`).test(tools);
+  for (const name of new Set(prose.match(/\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b/g) ?? [])) assert(known.has(name) || printed(name), `the prompts name ${name}, which the model never receives`);
+  const lookup = (key: string): any => { for (const d of data) { const hit = (function find(v: any): any { if (!v || typeof v !== 'object') return undefined; if (!Array.isArray(v) && key in v) return v[key]; for (const x of Object.values(v)) { const r = find(x); if (r !== undefined) return r; } })(d); if (hit !== undefined) return hit; } };
+  for (const path of new Set(prose.match(/(?<![/\w.-])[a-z]\w*\.[a-z]\w*\b/gi) ?? [])) { const [head, field] = path.split('.'); const obj = lookup(head!); assert(obj && typeof obj === 'object' && field! in obj, `the prompts name ${path}, which the model never receives`); }
+});
+test('The prompts claim only what the harness does: an edit is not followed by a check the worker did not run, and nothing is repaired or applied for the worker', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'write', action: 'create_file', args: { path: 'a.ts', purpose: 'a' } },
+    { thought: 'done', action: 'finish', args: { summary: 's' } },
+  ], files: { 'a.ts': 'export const a = 1;\n' } });
+  const prompts: Message[][] = [];
+  const s = await new Agent({ ...config, checkCommand: 'node check.mjs', maxSteps: 2 }, store, jevOf({}), { ...bonsai, generate: async (m: Message[], schema: any) => { prompts.push(m); return bonsai.generate(m, schema); } }, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const ran = (await events(store)).filter(e => e.type === 'action').map(e => e.route);
+  assert(!ran.includes('bash'), `no check ran that the worker did not run: ${ran}`);
+  assert(s.entries.some(e => /has not run since the last edit/.test(e.text)), 'and finish is refused until it runs');
+  const pinned = JSON.parse(prompts[0]![1]!.content).actions;
+  assert.match(pinned.bash.instructions, /never runs the check by itself/); assert.match(pinned.finish.instructions, /finish is refused/);
+  const claims = /re-?runs? the (check|verification)|check runs (next|automatically)|runs (the (check|verification)( command)?|it) (itself|automatically|after every edit)|harness (repairs|removes|imports|moves|rewrites|re-exports)|applies (itself|the fix)/i;
+  const worded = [...Object.values(pinned).flatMap((a: any) => [a.description, a.instructions]), ...(await readFile(new URL('../../src/tools.ts', import.meta.url), 'utf8')).split('\n').filter(l => !/^\s*\/\//.test(l))];
+  for (const text of worded) assert(!claims.test(text), `a prompt or tool result claims something the harness does not do: ${text.slice(0, 200)}`);
+});

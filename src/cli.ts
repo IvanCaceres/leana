@@ -6,7 +6,7 @@ import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from './config.js';
 import { Bonsai, Jev, postJson } from './clients.js';
-import { newSession, Runner } from './runner.js';
+import { newSession, Agent } from './agent.js';
 import { Store } from './store.js';
 import { runCommand } from './tools.js';
 import { renderReport } from './report.js';
@@ -46,7 +46,7 @@ async function main(): Promise<void> {
   } });
   const [command, ...rest] = positionals;
   if (v.help || !command) {
-    console.log(`Leana — Jev-directed local coding agent\n\n  leana doctor [--config file] [--key-file file]\n  leana run "objective" --repo path [--allow-write] [--allow-bash]\n  leana resume session-directory [--message "new guidance"]\n  leana report session-directory [--follow]   write report.html with prompts, Jev decisions, latency, tokens and context use\n\nOptions: --key-file PATH, --env-file PATH, --config PATH, --max-steps N, --allow-dirty, --verbose,\n         --check "command" (the verification; run as a baseline first and after every edit)\nDefault: read-only tools; shell is disabled. --allow-bash permits unsandboxed\ncommands with your user privileges, including file changes outside the repository.\nJev receives the objective, task ledger and bounded excerpts of repository evidence.\nSessions and action logs are stored under REPO/.leana/runs/.`);
+    console.log(`Leana — a local coding agent: Bonsai reasons and acts, Jev guards the loop\n\n  leana doctor [--config file] [--key-file file]\n  leana run "objective" --repo path [--allow-write] [--allow-bash]\n  leana resume session-directory [--message "new guidance"]\n  leana report session-directory [--follow]   write report.html with prompts, Jev decisions, latency, tokens and context use\n\nOptions: --key-file PATH, --env-file PATH, --config PATH, --max-steps N, --allow-dirty, --verbose,\n         --check "command" (the verification; run as a baseline first and after every edit)\nDefault: read-only tools; shell is disabled. --allow-bash permits unsandboxed\ncommands with your user privileges, including file changes outside the repository.\nJev receives the objective, task ledger and bounded excerpts of repository evidence.\nSessions and action logs are stored under REPO/.leana/runs/.`);
     return;
   }
   if (!['run', 'resume', 'doctor', 'report'].includes(command)) throw new Error(`Unknown command: ${command}`);
@@ -150,7 +150,7 @@ async function main(): Promise<void> {
     const display = new Display(process.stderr, { objective: session.objective, session: basename(store.path), verbose: config.verbose });
     let result;
     const startedAt = Date.now(); const stepsBefore = session.step;
-    try { result = await new Runner(config, store, jev, bonsai, session.root, line => display.log(line), e => display.update(e)).run(session); }
+    try { result = await new Agent(config, store, jev, bonsai, session.root, line => display.log(line), e => display.update(e)).run(session); }
     finally { display.close(); }
     // Wall-clock for this invocation and, when the session was resumed, since its first event.
     const fmt = (ms: number) => { const sec = Math.round(ms / 1000); return sec >= 60 ? `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s` : `${sec}s`; };

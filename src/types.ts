@@ -1,4 +1,4 @@
-export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'tasks' | 'finish' | 'ask_user';
+export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'tasks' | 'plan' | 'render' | 'finish' | 'ask_user';
 // One tool, one meaning: create_file creates, write replaces an anchor in an
 // existing file, replace_lines edits by line number, move_lines relocates.
 export const editRoutes: readonly Route[] = ['create_file', 'write', 'replace_lines', 'move_lines'];
@@ -13,7 +13,7 @@ export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export'
 // provides, and which other deliverables it imports, so creation can be ordered
 // and every prompt can carry the exact signatures a file may import. A derived
 // item was added by the harness for an import a generated file made.
-export interface Deliverable { id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string; setAside?: boolean; layout?: string }
+export interface Deliverable { packages?: string[]; command?: string; commandProbed?: boolean; id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string; setAside?: boolean; placement?: string }
 export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move' | 'reexport' | 'alias' | 'respec'; line?: number; move?: { source: string; start: number; end: number } }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
@@ -72,8 +72,9 @@ export interface Session {
   // The harness's own deliverable list, classified by Jev; statuses come from source facts.
   ledger: Deliverable[]; ledgerAttempts: number; ledgerBuilt: boolean; ledgerComplete: number;
   // The worker's design for an open-ended objective: what the whole should be and the conventions every file follows.
-  // pageComposition: the ordered sections and the layout rules every one follows; copy: the literal copy inventory the data file holds and components render.
-  design: { summary: string; conventions: string; pageComposition?: string; copy?: string } | null;
+  // composition: how the deliverables assemble into the whole; fixtures: the
+  // literal data the result ships with, held in one module the others read.
+  design: { summary: string; conventions: string; shared?: string; composition?: string; fixtures?: string } | null;
   // Verification selected from the repository when none is configured: attempts, the change count at the last one, and the configuration files' state at the last trial.
   checkInferences: number; checkInferredFor: number; checkTrialKey?: string;
   // Dependencies installed by the harness when a check trial showed them missing:
@@ -101,24 +102,43 @@ export interface Session {
   // Every command run this session with its outcome: a verify deliverable that
   // names a command is done only when that command passed after the last edit.
   commandRuns?: Record<string, { step: number; ok: boolean }>;
+  // Decided fixes that landed in a file without changing its diagnostics, in a
+  // row: after three, the file's fix is not offered until its errors change.
+  fixStalls?: Record<string, { signature: string; count: number }>;
+  // Decided fixes generated per file over the whole session, landed or not:
+  // a file that has had ten and still fails is set aside for the audit.
+  fixTotals?: Record<string, number>;
+  // Verification candidates whose trial could not start (their configuration
+  // did not exist yet): the check is selected again once configuration changes.
+  checkDeferred?: string[];
+  // The orient-reason-act loop: the worker's running notes (its plan, revised
+  // as it learns), the orientation facts gathered by code at the start, its
+  // last stated reasoning, the watchdog's readings, and action keys Jev found
+  // repeating a failure, which are refused once.
+  notes?: string; orientation?: Record<string, unknown>; lastThought?: string;
+  watch?: { noProgress: number; readings: { step: number; progress: number; stuck: number; sameFailure: number; objective: number; needsUser: number; inScope?: number }[]; escalations: number };
+  blockedActions?: string[];
+  // The last render of the running application: what the user would see, as facts.
+  lastRender?: { step: number; ok: boolean; url: string; text: string };
 }
 export interface Config {
   baseUrl: string; model: string; contextWindow: number; maxTokens: number;
   workingTokens: number; safetyTokens: number; jevUrl: string; jevModel: string;
   routeProbability: number; routeMargin: number; compactProbability: number;
   completeProbability: number; compactCooldown: number; maxSteps: number;
-  toolChars: number; commandTimeoutMs: number; allowWrite: boolean; allowBash: boolean; verbose: boolean; ledger: boolean;
+  toolChars: number; commandTimeoutMs: number; allowWrite: boolean; allowBash: boolean; verbose: boolean;
   // The verification command. When set, it is run as a baseline before any edit and
   // after every edit; only this command counts as verification.
   checkCommand: string;
   // Output budgets for the long generations: a file's content or a region
   // rewrite (continued across chunks) and the design, which may think first.
-  createTokens: number; designTokens: number; designThinking: boolean;
+  createTokens: number;
 }
 export interface GenerationMeta { ms: number; usage?: any; timings?: any; finishReason?: string; promptTokens: number; continuations?: number }
 export interface Message { role: 'system' | 'user'; content: string }
 export type JsonSchema = {
-  type: 'object' | 'array' | 'string' | 'integer' | 'boolean';
+  anyOf?: JsonSchema[]; const?: string;
+  type?: 'object' | 'array' | 'string' | 'integer' | 'boolean';
   properties?: Record<string, JsonSchema>; required?: string[]; additionalProperties?: false;
   items?: JsonSchema; minItems?: number; maxItems?: number; minLength?: number; maxLength?: number;
   minimum?: number; maximum?: number; enum?: string[];

@@ -3,7 +3,6 @@ import { open, readFile, realpath, rename, stat, unlink, mkdir, readdir } from '
 import { dirname, isAbsolute, posix, relative, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { builtinModules } from 'node:module';
-import { pathToFileURL } from 'node:url';
 import type { CheckSummary, Config, NameOrigin, Route, SourceEvidence, ToolResult } from './types.js';
 import { clip } from './context.js';
 export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex');
@@ -277,7 +276,7 @@ export async function exportedSignatures(path: string, text: string, limit = 14)
 // The relative imports of a file (a spec starting with . or /), with the local
 // names each binds: 'default', '*', the named bindings, or none for a
 // side-effect import such as a stylesheet.
-export async function relativeImports(path: string, text: string): Promise<{ spec: string; names: string[]; typeOnly?: boolean }[]> {
+export async function relativeImports(path: string, text: string, all = false): Promise<{ spec: string; names: string[]; typeOnly?: boolean }[]> {
   if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
   if (!tsModule || !parseable.test(path)) return [];
   const ts = tsModule; const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
@@ -293,7 +292,7 @@ export async function relativeImports(path: string, text: string): Promise<{ spe
       spec = st.moduleSpecifier.text; typeOnly = Boolean(st.isTypeOnly);
       for (const b of st.exportClause && ts.isNamedExports(st.exportClause) ? st.exportClause.elements : []) names.push(b.propertyName?.text ?? b.name.text);
     }
-    if (spec && /^\.\.?\//.test(spec)) out.push({ spec, names, ...(typeOnly ? { typeOnly: true } : {}) });
+    if (spec && (all || /^\.\.?\//.test(spec))) out.push({ spec, names, ...(typeOnly ? { typeOnly: true } : {}) });
   }
   return out;
 }
@@ -363,19 +362,11 @@ export async function importBindings(path: string, text: string): Promise<{ name
 }
 // A configured check that cannot run here: its directory is missing or its
 // executable is not installed. Such a command is dropped, not retried forever.
-export async function checkUnusable(root: string, command: string): Promise<string | null> {
+export async function checkUnusable(root: string, command: string, prefix = ''): Promise<string | null> {
   const dir = command.match(/(?:--dir|-C|--prefix)\s+(\S+)/)?.[1] ?? command.match(/^\s*cd\s+(\S+)/)?.[1];
   if (dir) { try { await stat(resolve(root, dir)); } catch { return `its directory ${dir} does not exist in this repository`; } }
   const exe = command.replace(/^\s*cd\s+\S+\s*(?:&&|;)\s*/, '').trim().split(/\s+/)[0] ?? '';
-  if (exe && !exe.includes('/')) { const r = await runCommand('bash', ['--noprofile', '--norc', '-c', `command -v -- ${JSON.stringify(exe)}`], root, 5000).catch(() => null); if (!r || r.code !== 0) return `${exe} is not installed on this machine`; }
-  // A script that is only `tsc` against a solution tsconfig checks no file.
-  let body = command;
-  const script = command.match(/^\s*(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([\w:-]+)\s*$/)?.[1];
-  if (script) { try { const pkg = JSON.parse(await boundedRead(await safePath(root, 'package.json'))); if (typeof pkg?.scripts?.[script] === 'string') body = pkg.scripts[script]; } catch { /* keep */ } }
-  if (/^\s*(?:npx\s+)?tsc\b[^&|;]*$/.test(body) && !/(?:^|\s)(?:-p|--project|-b|--build)\b/.test(body)) {
-    const refs = await solutionTsconfigReferences(root);
-    if (refs) return `it checks no source files: tsconfig.json is a solution file (references ${refs.join(', ')}, no include); use tsc -p ${refs[0]}`;
-  }
+  if (exe && !exe.includes('/')) { const r = await runCommand('bash', ['--noprofile', '--norc', '-c', `${prefix}command -v -- ${JSON.stringify(exe)}`], root, 5000).catch(() => null); if (!r || r.code !== 0) return `${exe} is not installed on this machine`; }
   return null;
 }
 // What the repository looks like right now, for inference: git status, the
@@ -414,14 +405,13 @@ export async function installedPackages(root: string): Promise<string[]> {
   return [...new Set([...names(pkg?.dependencies), ...names(pkg?.devDependencies), ...names(pkg?.peerDependencies)])];
 }
 // A trial that failed for want of dependencies, and the install the manifest implies.
-export function missingDependencies(output: string): boolean {
-  return /command not found|Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|ModuleNotFoundError|No module named|is not recognized as|not found: /i.test(output);
-}
 export async function installCommand(root: string, dir = '.', force = false): Promise<string | null> {
   const has = async (p: string) => { try { await stat(resolve(root, dir, p)); return true; } catch { return false; } };
   if (await has('package.json')) {
     if (!force && await has('node_modules')) return null;
-    const cmd = await has('pnpm-lock.yaml') ? 'pnpm install --frozen-lockfile' : await has('yarn.lock') ? 'yarn install --frozen-lockfile' : await has('bun.lockb') ? 'bun install' : await has('package-lock.json') ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund';
+    // A forced install follows a manifest change: the lockfile no longer
+    // matches it, so the frozen forms (npm ci, --frozen-lockfile) would refuse.
+    const cmd = await has('pnpm-lock.yaml') ? (force ? 'pnpm install --no-frozen-lockfile' : 'pnpm install --frozen-lockfile') : await has('yarn.lock') ? (force ? 'yarn install' : 'yarn install --frozen-lockfile') : (await has('bun.lockb') || await has('bun.lock')) ? 'bun install' : (!force && await has('package-lock.json')) ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund';
     return dir === '.' ? cmd : `cd ${dir} && ${cmd}`;
   }
   if (await has('requirements.txt')) return `${dir === '.' ? '' : `cd ${dir} && `}python3 -m pip install -r requirements.txt`;
@@ -433,33 +423,6 @@ export async function installCommand(root: string, dir = '.', force = false): Pr
 // lockfile), never a manifest edit for the worker to generate. Relative and
 // built-in specifiers, packages the manifest already declares, and names no
 // written file imports are not candidates.
-export function missingPackages(summary: CheckSummary, importers: Record<string, string>, installed: string[]): { name: string; importers: string[] }[] {
-  const have = new Set(installed.map(i => i.replace(/@[^@]*$/, '')));
-  const builtin = new Set(builtinModules);
-  const out = new Map<string, Set<string>>();
-  for (const v of Object.values(summary.byFile)) for (const d of v.diagnostics?.length ? v.diagnostics : v.samples) {
-    for (const m of d.matchAll(/Cannot find (?:package|module) '([^'\s]+)'|Failed to resolve import "([^"\s]+)"|Cannot find package "([^"\s]+)"/g)) {
-      const spec = m[1] ?? m[2] ?? m[3] ?? '';
-      if (!spec || /^[./#]/.test(spec) || spec.startsWith('node:') || builtin.has(spec)) continue;
-      const name = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0]!;
-      if (!name || have.has(name)) continue;
-      const users = Object.entries(importers).filter(([, text]) => new RegExp(`(?:from\\s*|import\\s*|require\\(\\s*)['"]${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/[^'"]*)?['"]`).test(text)).map(([p]) => p);
-      if (!users.length) continue;
-      const set = out.get(name) ?? new Set<string>(); for (const u of users) set.add(u); out.set(name, set);
-    }
-  }
-  return [...out.entries()].map(([name, users]) => ({ name, importers: [...users] }));
-}
-// The command that adds packages to the manifest and installs them, by the
-// package manager the lockfile implies.
-export async function addPackagesCommand(root: string, names: string[], dev: boolean): Promise<string> {
-  const has = async (p: string) => { try { await stat(resolve(root, p)); return true; } catch { return false; } };
-  const list = names.map(n => `'${n}'`).join(' ');
-  if (await has('pnpm-lock.yaml')) return `pnpm add ${dev ? '-D ' : ''}${list}`;
-  if (await has('yarn.lock')) return `yarn add ${dev ? '-D ' : ''}${list}`;
-  if (await has('bun.lockb') || await has('bun.lock')) return `bun add ${dev ? '-d ' : ''}${list}`;
-  return `npm install ${dev ? '--save-dev ' : ''}--no-audit --no-fund ${list}`;
-}
 // A shell command that only reads is an inspection, not an action.
 export function readOnlyCommand(command: string): boolean {
   const parts = command.split(/\s*(?:&&|\|\||;|\|)\s*/).map(p => p.trim()).filter(Boolean);
@@ -581,30 +544,58 @@ export async function sourceHashes(root: string, paths: string[]): Promise<Recor
 // that fails to parse is not semantically checked, so a broken edit can make the
 // total drop while the code is worse.
 export function summarizeCheck(text: string, root?: string): CheckSummary {
-  let output = text;
-  try { const parsed = JSON.parse(text); if (typeof parsed?.output === 'string') output = parsed.output; } catch { /* plain text */ }
+  let output = text; let failedCode = false;
+  try { const parsed = JSON.parse(text); if (typeof parsed?.output === 'string') output = parsed.output; if (typeof parsed?.code === 'number' && parsed.code !== 0) failedCode = true; } catch { /* plain text */ }
   const byFile: CheckSummary['byFile'] = {}; let errors = 0; let syntax = 0; let resolution = 0;
   // Test runners report failures without the word error: TAP 'not ok', Jest 'FAIL',
   // Node's AssertionError. Summary lines ('# fail 1') are not failures.
   // A bundler's heading ("error during build:") introduces the diagnostics that follow; it is not one.
   const isHeading = (line: string) => /^errors? (?:during|while|in) [\w -]+:$/i.test(line);
-  const isError = (line: string) => !isHeading(line) && (/\berror\b/i.test(line) || /\bAssertionError\b|\bSyntaxError\b|\bFAIL(?:ED)?\b|^not ok\b/.test(line));
+  // A tool's closing count ("Found 3 errors in 2 files", "=== 1 failed, 2 errors in 0.1s ===",
+  // "Interrupted: 2 errors during collection") is a total, not a diagnostic.
+  const isSummary = (line: string) => /^[=!_-]{3,}.*[=!_-]{3,}$/.test(line) || /^Found \d+ errors?\b/.test(line) || /^\d+ (?:failed|passed|errors?|warnings?)\b/.test(line) || /\bInterrupted: \d+ errors?\b/.test(line) || /^(?:error|errors|fail|failed): \d+$/i.test(line);
+  // An error line: the word error, an exception class (AssertionError,
+  // ModuleNotFoundError, a RuntimeException), a test runner's FAIL or TAP's not ok.
+  // A test runner's location line ("tests/test_x.py:12: AssertionError") is one too.
+  const isError = (line: string) => !isHeading(line) && !isSummary(line) && (/\berror\b/i.test(line) || /^failed\b/i.test(line) || /^(?:[\w.]+\.)?\w+(?:Error|Exception)\b\s*[:[(]|\bFAIL(?:ED)?\b|^not ok\b|^[\w@./\\-]+\.\w+:\d+: (?:[\w.]+\.)?\w+(?:Error|Exception)\b/.test(line));
   // A diagnostic is an error line with its continuation lines (indented, as tsc
   // prints the property that does not exist, or a bundler the file and line).
   // A heading introduces the line that follows it, whatever that line says; a
   // heading nothing follows is the diagnostic itself.
-  const blocks: { head: string; tail: string[] }[] = []; let current: { head: string; tail: string[] } | null = null; let heading: string | null = null;
+  const blocks: { head: string; tail: string[]; frame?: string; frameLine?: number }[] = []; let current: { head: string; tail: string[] } | null = null; let heading: string | null = null;
+  // A traceback names the file in the frames before the exception: the last
+  // frame of the repository's own code is where the error is attributed.
+  const prefix = root ? `${root.replace(/\/$/, '')}/` : null;
+  let frame: { path: string; line: number } | null = null; const recent: string[] = [];
   for (const raw of output.split('\n')) {
     const line = raw.trim();
+    const fr = line.match(/^File "([^"]+)", line (\d+)/);
+    if (fr) { let p = fr[1]!; if (p.startsWith('/')) p = prefix && p.startsWith(prefix) ? p.slice(prefix.length) : ''; if (p && !/(^|\/)(?:\.venv|site-packages|node_modules|lib\/python)/.test(p)) frame = { path: p.replace(/^\.\//, ''), line: Number(fr[2]) }; }
     if (isHeading(line)) { if (heading) blocks.push({ head: heading, tail: [] }); heading = line; current = null; continue; }
-    if (isError(line) || (heading && line)) { current = { head: line, tail: [] }; blocks.push(current); heading = null; continue; }
+    if (isError(line) || (heading && line)) {
+      // A runner's location line follows what it explains: the frames of the
+      // call chain ("path:line: in func" and their source lines), the failing
+      // statement ("> assert …") and the explanation ("E …") are its detail.
+      const context: string[] = []; let i = recent.length - 1; while (i >= 0 && !recent[i]) i--;
+      for (; i >= 0 && context.length < 16; i--) { const l = recent[i]!; if (!l.trim()) continue; if (/^(?:E\s|>\s)/.test(l) || /^\S+:\d+: in \S/.test(l) || /^\s{2,}\S/.test(l)) context.unshift(l); else break; }
+      current = { head: line, tail: context }; blocks.push({ ...current, ...(frame ? { frame: frame.path, frameLine: frame.line } : {}) }); current = blocks[blocks.length - 1]!; heading = null; recent.length = 0; continue;
+    }
     // Continuations are indented, a code frame's gutter lines ("10 |  <p>", "   |  ^^^"), or a bundler's "file: path".
-    if (current && line && (/^\s+\S/.test(raw) || /^\s*\d*\s*\|/.test(raw) || /^file:\s/.test(raw))) current.tail.push(raw.replace(/\s+$/, '')); else current = null;
+    if (current && line && (/^\s+\S/.test(raw) || /^\s*\d*\s*\|/.test(raw) || /^file:\s/.test(raw))) { current.tail.push(raw.replace(/\s+$/, '')); continue; }
+    current = null;
+    // Lines since the last diagnostic, for the context a later location line takes.
+    recent.push(raw.replace(/\s+$/, '')); if (recent.length > 24) recent.shift();
   }
   if (heading) blocks.push({ head: heading, tail: [] });
+  // A command that failed without one recognisable diagnostic still failed:
+  // its first substantive lines are the diagnostic, so that whatever file they
+  // name is attributed and the worker sees the tool's own words, not nothing.
+  if (!blocks.length && failedCode) {
+    const lines = output.split('\n').map(l => l.replace(/\s+$/, '')).filter(l => l.trim() && !isSummary(l.trim()) && !/^\s*at\s/.test(l));
+    if (lines.length) blocks.push({ head: lines[0]!.trim(), tail: lines.slice(1, 8) });
+  }
   const whole = (s: string) => s.length > 900 ? `${s.slice(0, 900)} …` : s;
-  const prefix = root ? `${root.replace(/\/$/, '')}/` : null;
-  for (const { head, tail } of blocks) {
+  for (const { head, tail, frame: framePath, frameLine } of blocks) {
     errors++;
     const isSyntax = /\bTS1\d{3}\b|SyntaxError|Unexpected token|[a-z')\]}] expected\.$/.test(head);
     if (isSyntax) syntax++;
@@ -612,17 +603,27 @@ export function summarizeCheck(text: string, root?: string): CheckSummary {
     // extraction leaves behind, and the one a correct fix removes first.
     const isResolution = !isSyntax && /\bTS(?:2304|2305|2306|2307|2459|2503|2552|2613|2614|2694|2724|7016)\b|Cannot find (?:name|module)|has no exported member|is not exported|Could not find a declaration file/.test(head);
     if (isResolution) resolution++;
-    const m = head.match(/^([\w@./\\-]+\.\w+)(?:\((\d+)|:(\d+))?/);
+    const m = head.match(/^([\w@./\\-]+\.\w+)(?:\((\d+)|:(\d+))?/) ?? head.match(/^(?:FAILED|ERROR|FAIL)\s+([\w@./\\-]+\.\w+)(?:::|\s|$)/);
     let file = m?.[1] ?? '(other)'; let at = Number(m?.[2] ?? m?.[3] ?? 0);
-    // A tool that names the file only on a later line (a bundler's "at /abs/path:10:7",
-    // "file: /abs/path", rustc's "--> path:10:7") still attributes the error, relative
-    // to the repository when the path is absolute; a path in node_modules is not the file.
+    // An exception class with no file of its own is the last frame's.
+    if (file === '(other)' && framePath && /^(?:[\w.]+\.)?\w+(?:Error|Exception)\b/.test(head)) { file = framePath; at = frameLine ?? 0; }
     if (file === '(other)') for (const t of tail) {
       const n = t.match(/^\s*(?:at\s+|file:\s+|-->\s+)((?:\/|\.{1,2}\/)?[\w@./\\-]+\.\w+)(?::(\d+)(?::\d+)?)?\s*$/);
       if (!n || n[1]!.includes('/node_modules/') || n[1]!.startsWith('file:')) continue;
       let p = n[1]!; if (p.startsWith('/')) { if (prefix && p.startsWith(prefix)) p = p.slice(prefix.length); else continue; }
       file = p.replace(/^\.\//, ''); at = Number(n[2] ?? 0); break;
     }
+    // A head line that names a repository file anywhere in it ("failed to load
+    // config from /abs/vite.config.ts", "in eslint.config.js") is that file's.
+    if (file === '(other)') for (const m of [head, ...tail].join('\n').matchAll(/(?:^|[\s"'`(:])((?:\/|\.{1,2}\/)?(?:[\w@+.-]+\/)*[\w@+.-]+\.[A-Za-z]{1,5})(?::\d+)?(?=$|[\s"'`):,])/g)) {
+      let p = m[1]!; if (/(^|\/)(?:node_modules|\.venv|dist|build|\.git)\//.test(p) || /^\d/.test(p)) continue;
+      if (p.startsWith('/')) { if (prefix && p.startsWith(prefix)) p = p.slice(prefix.length); else continue; }
+      if (!p.includes('/') && !/\.(?:json|toml|ya?ml|js|cjs|mjs|ts|cts|mts|py|rs|go|cfg|ini|html?)$/.test(p)) continue;
+      file = p.replace(/^\.\//, ''); break;
+    }
+    // A tool that names the file only on a later line (a bundler's "at /abs/path:10:7",
+    // "file: /abs/path", rustc's "--> path:10:7") still attributes the error, relative
+    // to the repository when the path is absolute; a path in node_modules is not the file.
     const f = byFile[file] ??= { count: 0, syntax: 0, resolution: 0, lines: [], samples: [] };
     f.count++; if (isSyntax) f.syntax++; if (isResolution) f.resolution = (f.resolution ?? 0) + 1;
     if (at && f.lines.length < 12 && !f.lines.includes(at)) f.lines.push(at);
@@ -727,6 +728,9 @@ export async function runCommand(command: string, args: string[], cwd: string, t
     const env: NodeJS.ProcessEnv = {};
     for (const key of ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM'])
       if (process.env[key]) env[key] = process.env[key];
+    // No terminal is attached: tools that would prompt are told so, the way
+    // continuous integration tells them, and npm's own prompts are pre-answered.
+    Object.assign(env, { CI: '1', FORCE_COLOR: '0', npm_config_yes: 'true', DEBIAN_FRONTEND: 'noninteractive' });
     const child = spawn(command, args, { cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = []; let size = 0; let truncated = false; let timedOut = false;
     const kill = () => {
@@ -782,7 +786,7 @@ export function namedIdentifiers(text: string): Set<string> {
   for (const m of text.matchAll(/\b([A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+)\b/g)) out.add(m[1]!);
   return out;
 }
-export async function resolveMissingNames(root: string, checkOutput: string, editedFiles: string[], limit = 40, deliverables: Set<string> = new Set(), direction: { source: string; destination: string } | null = null): Promise<NameOrigin[]> {
+export async function resolveMissingNames(root: string, checkOutput: string, editedFiles: string[], limit = 40, deliverables: Set<string> = new Set(), direction: { source: string; destination: string } | null = null, namespaceImports: Record<string, string> = {}): Promise<NameOrigin[]> {
   // name -> { file it is missing in, kind, module named by the error (if any) }
   const results: NameOrigin[] = [];
   const wanted = new Map<string, Map<string, { kind: 'missing' | 'not-exported' | 'wrong-module'; module?: string }>>();
@@ -810,11 +814,12 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
     if (to === spec) continue;
     results.push({ name: spec, inFile, kind: 'respec', line: Number(m[2]), importLine: to, note: `${spec} does not resolve from ${inFile}; ${target} does, so the harness rewrites the specifier to ${to}` });
   }
-  // React 19's types declare JSX under the react module, not globally: a
-  // file that names JSX.Element imports the namespace, mechanically.
-  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2503: Cannot find namespace 'JSX'/gm)) {
-    const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (!inFile || results.some(r => r.name === 'JSX' && r.inFile === inFile)) continue;
-    results.push({ name: 'JSX', inFile, importLine: 'import type { JSX } from "react";', line: Number(m[2]), note: 'JSX is a namespace of the react module; the harness imports it' });
+  // A namespace the checker cannot find that a declared package provides (the
+  // caller supplies the table from the ecosystem profile): imported mechanically.
+  for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS2503: Cannot find namespace '([^']+)'/gm)) {
+    const line = namespaceImports[m[3]!]; if (!line) continue;
+    const inFile = editedFiles.find(f => f.endsWith(m[1]!) || m[1]!.endsWith(f)); if (!inFile || results.some(r => r.name === m[3] && r.inFile === inFile)) continue;
+    results.push({ name: m[3]!, inFile, importLine: line, line: Number(m[2]), note: `${m[3]} is a namespace a declared package provides; the harness imports it` });
   }
   for (const m of checkOutput.matchAll(/^(\S+?)\(\d+,\d+\): error TS2459: Module '"([^"]+)"' declares '([^']+)' locally, but it is not exported/gm)) add(m[1]!, m[3]!, 'not-exported', m[2]!);
   for (const m of checkOutput.matchAll(/^(\S+?)\((\d+),\d+\): error TS(?:2305|2724): (?:Module )?'"([^"]+)"' has no exported member(?: named)? '([^']+)'\.(?: Did you mean '([^']+)'\?)?/gm)) {
@@ -966,6 +971,9 @@ export async function resolveMissingNames(root: string, checkOutput: string, edi
   return results;
 }
 export class ToolBox {
+  // What the repository's ecosystem prefixes every command with (its
+  // environment's tools on the path), set by the loop from the profiles.
+  commandPrefix: (() => Promise<string>) | null = null;
   constructor(readonly root: string, readonly artifacts: string, readonly config: Config,
     readonly snapshot: (path: string, text: string) => Promise<string> = async () => '') {}
   async execute(route: Route, a: Record<string, any>): Promise<ToolResult> {
@@ -1149,10 +1157,12 @@ export class ToolBox {
         await rename(temp, path);
       } finally { await unlink(temp).catch(() => {}); }
       const summary = edits.map(e => `${e.start}..${e.end}`).reverse().join(', ');
+      const newLines = updated.split('\n'); const lo = Math.max(1, Math.min(...edits.map(e => e.start)) - 3); const hi = Math.min(newLines.length, Math.max(...edits.map(e => e.end)) + delta + 3);
+      const region = hi >= lo && hi - lo < 120 ? `\nThe file now reads, lines ${lo}..${hi}:\n${newLines.slice(lo - 1, hi).map((l, i) => `${lo + i}: ${l}`).join('\n')}` : '';
       const note = [skipped.length ? ` Skipped ${skipped.length} unchanged range(s): ${skipped.map(e => `${e.start}..${e.end}`).reverse().join(', ')}.` : '',
         droppedImports.length ? ` Dropped ${droppedImports.length} import line(s) the file already had.` : '', retypes.length ? ` Note: ${retypes.join('; ')}.` : ''].join('');
       return { ok: true, changed: [a.path], hashes: { [a.path]: hash(updated) }, snapshots,
-        text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${note} Line numbers below the first edit shifted by ${delta} in total; re-read before addressing them. Run focused validation.` };
+        text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${note} Line numbers below the first edit shifted by ${delta} in total.${region} Run focused validation.` };
     }
     if (route === 'move_lines') {
       if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
@@ -1256,11 +1266,12 @@ export class ToolBox {
       if (!this.config.allowBash) throw new Error('Shell disabled; restart with --allow-bash');
       // Preserve failures hidden by commands such as `pnpm test 2>&1 | tail`.
       // Without pipefail, the tail process masks the test runner's exit code.
-      const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', a.command], this.root, this.config.commandTimeoutMs);
+      const prefix = this.commandPrefix ? await this.commandPrefix().catch(() => '') : '';
+      const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', `${prefix}${a.command}`], this.root, this.config.commandTimeoutMs);
       // With a configured check command, only that command is verification; the
-      // regex is a fallback for sessions that did not declare one.
-      const looksLikeCheck = this.config.checkCommand ? a.command.trim() === this.config.checkCommand.trim()
-        : /(?:^|[\s:&|;])(?:npm|pnpm|yarn|bun|node|python|pytest|cargo|go|mvn|gradle|tsc|eslint|prettier|ruff)(?:\s|$)|\b(?:test|build|check|lint|typecheck|tsc)\b/i.test(a.command);
+      // command words of the profiles are a fallback for sessions that did not declare one.
+      // A command is verification when the worker says so, or when it is the configured check; never by its words.
+      const looksLikeCheck = a.check === true || Boolean(this.config.checkCommand && a.command.trim() === this.config.checkCommand.trim());
       return { ok: r.code === 0 && !r.truncated && !r.timedOut, check: looksLikeCheck && r.code === 0 && !r.truncated && !r.timedOut, verification: looksLikeCheck,
         text: JSON.stringify({ command: a.command, purpose: a.purpose, ...r }) };
     }
@@ -1268,82 +1279,6 @@ export class ToolBox {
   }
 }
 
-// Tailwind v4 emits utility classes only through its Vite or PostCSS plugin: a
-// stylesheet that imports tailwindcss in a Vite project whose config does not
-// load @tailwindcss/vite builds without error and styles nothing. The wiring is
-// mechanical: the import and the plugin entry, added to the config as text.
-export function wireTailwindVite(config: string): string | null {
-  if (/@tailwindcss\/vite/.test(config)) return null;
-  const quote = /from\s+"/.test(config) ? '"' : "'"; const semi = /;\s*$/m.test(config) ? ';' : '';
-  const line = `import tailwindcss from ${quote}@tailwindcss/vite${quote}${semi}`;
-  const lines = config.split('\n'); let last = -1;
-  for (let i = 0; i < lines.length; i++) if (/^import\b/.test(lines[i]!)) last = i;
-  lines.splice(last + 1, 0, line);
-  let text = lines.join('\n');
-  if (/plugins\s*:\s*\[\s*\]/.test(text)) text = text.replace(/plugins\s*:\s*\[\s*\]/, 'plugins: [tailwindcss()]');
-  else if (/plugins\s*:\s*\[/.test(text)) text = text.replace(/plugins\s*:\s*\[/, m => `${m}tailwindcss(), `);
-  else if (/defineConfig\(\s*\{/.test(text)) text = text.replace(/defineConfig\(\s*\{/, m => `${m}\n  plugins: [tailwindcss()],`);
-  else return null;
-  return text;
-}
-// Class tokens that are never a style: an arbitrary value that closes with
-// the wrong bracket ("h-[300px)") is repaired; a negative margin measured in
-// viewport heights ("-mt-[calc(100vh-100px)]"), which pulls a section off the
-// top of the page, is removed.
-export function fixClassBrackets(text: string): { text: string; fixed: string[] } {
-  const fixed: string[] = [];
-  const out = text.replace(/(className\s*=\s*(?:"[^"]*"|'[^']*'|\{`[^`]*`\}))/g, attr => attr
-    // A token whose arbitrary value never closes its bracket and ends with one
-    // closing parenthesis too many: that parenthesis is the bracket.
-    .replace(/([-\w:/.!]+\[)([^\]\s"'`]*)\)(?=[\s"'`]|$)/g, (m, head, value) => { const opens = (value.match(/\(/g) ?? []).length; const closes = (value.match(/\)/g) ?? []).length + 1; if (closes <= opens) return m; fixed.push(m); return `${head}${value}]`; })
-    .replace(/(^|[\s"'`{])((?:[a-z]+:)*-m[tbxylrse]?-\[[^\]\s]*\d+(?:d|s|l)?vh[^\]\s]*\])(?=[\s"'`}]|$)/g, (_m, before, token) => { fixed.push(token); return before; })
-    .replace(/  +(?=[^\s"'`])/g, ' '));
-  return { text: out, fixed };
-}
-
-// Quality the checks cannot see, judged by code right after a file is written:
-// a heading or paragraph nested in its own kind (invalid HTML), and class
-// tokens the project's Tailwind cannot compile (a colour no theme defines, an
-// invented utility), asked of Tailwind's own parser loaded from the project's
-// node_modules with the project's stylesheet. Each finding is a diagnostic in
-// the checker's own form, so the repair path is the same as for any error.
-const designSystems = new Map<string, any>();
-export async function invalidTailwindClasses(root: string, path: string, text: string): Promise<string[]> {
-  try {
-    let css = '';
-    const names = await readdir(resolve(root, 'src'), { recursive: true }).catch(() => [] as string[]);
-    for (const f of names.filter(f => f.endsWith('.css'))) { const c = await boundedRead(resolve(root, 'src', f)).catch(() => ''); if (/@import\s+["']tailwindcss["']/.test(c)) css += `${c}\n`; }
-    if (!css) return [];
-    const key = `${root}@${hash(css)}`;
-    let ds = designSystems.get(key);
-    if (!ds) {
-      let mod: any = null;
-      try { mod = await import(pathToFileURL(resolve(root, 'node_modules', '@tailwindcss', 'node', 'dist', 'index.mjs')).href); } catch { return []; }
-      if (typeof mod?.__unstable__loadDesignSystem !== 'function') return [];
-      ds = await mod.__unstable__loadDesignSystem(css, { base: resolve(root, 'src') });
-      designSystems.set(key, ds);
-    }
-    const bad = new Map<string, number>();
-    for (const m of text.matchAll(/className\s*=\s*(?:"([^"]*)"|'([^']*)'|\{`([^`]*)`\})/g)) {
-      const value = (m[1] ?? m[2] ?? m[3] ?? '').replace(/\$\{[^}]*\}/g, ' ');
-      const line = text.slice(0, m.index).split('\n').length;
-      for (const token of value.split(/\s+/).filter(Boolean)) {
-        if (bad.has(token) || /^(?:group|peer)(?:[/-]|$)/.test(token) || token.includes('$')) continue;
-        const out = ds.candidatesToCss([token]);
-        if (Array.isArray(out) && out[0] === null) bad.set(token, line);
-      }
-      if (bad.size >= 12) break;
-    }
-    return [...bad.entries()].map(([token, line]) => `${path}(${line},1): error: class "${token}" is not a utility the project's Tailwind can compile (no theme or plugin defines it); use a built-in utility, a colour the theme defines, or an arbitrary value`);
-  } catch { return []; }
-}
-export async function qualityDiagnostics(root: string, path: string, text: string): Promise<string[]> {
-  if (!/\.(?:[jt]sx|html)$/.test(path)) return [];
-  const out: string[] = [];
-  for (const m of text.matchAll(/<(h[1-6]|p)\b[^>]*>\s*<\1\b/g)) { const line = text.slice(0, m.index).split('\n').length; out.push(`${path}(${line},1): error: <${m[1]}> is nested inside another <${m[1]}>, which is invalid HTML (React reports a DOM nesting error); keep one element`); }
-  out.push(...await invalidTailwindClasses(root, path, text));
-  return out;
-}
 // A package script that only runs tsc against a solution tsconfig (references
 // and no include) checks nothing: the verification of record must be a config
 // that includes the sources.

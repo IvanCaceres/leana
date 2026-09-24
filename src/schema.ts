@@ -23,13 +23,23 @@ export const schemas: Record<Route, JsonSchema> = {
     items: obj({ start: integer(1, 1000000), end: integer(1, 1000000), newText: str(), prepend: str(200) }) } }),
   move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),
     destination: str(500), destinationHash: str(64), replacement: str(), prefix: str() }),
-  bash: obj({ command: str(2000), purpose: str() }),
+  bash: obj({ command: str(2000), purpose: str(), check: { type: 'boolean' } }),
   tasks: obj({ tasks: { type: 'array', minItems: 1, maxItems: 12,
     items: obj({ id: { ...str(40), minLength: 1 }, description: str(),
       status: { ...str(), enum: ['pending', 'done'] }, evidence: str() }) } }),
   finish: obj({ summary: str() }),
   ask_user: obj({ question: str() }),
+  // The worker's own notes: its plan and what it has learned, replaced whole.
+  plan: obj({ notes: str() }),
+  // Render a page of the running application in a headless browser: serve is the
+  // command that starts the server (empty when one is already running), url the page.
+  render: obj({ serve: str(500), url: str(300) }),
 };
+// One step of the orient-reason-act loop: the worker reasons in a few
+// sentences, then names one action; the action's arguments are generated next
+// under that action's schema, with the reasoning in front of the worker.
+export const actions = ['read_files', 'search_codebase', 'bash', 'create_file', 'write', 'replace_lines', 'move_lines', 'plan', 'render', 'finish', 'ask_user'] as const;
+export const stepSchema: JsonSchema = { anyOf: actions.map(a => obj({ thought: str(), action: { type: 'string', const: a, enum: [a] }, args: schemas[a] })) };
 // A decided edit of a known file: the harness fills path and expectedHash, so
 // the worker generates only the edits it was asked for.
 export const focusedEditSchema: JsonSchema = obj({ edits: schemas.replace_lines.properties!.edits! });
@@ -40,10 +50,13 @@ export function samplingSchema(schema: JsonSchema): JsonSchema {
   if (copy.type === 'string' && (copy.maxLength ?? 0) > 1000) delete copy.maxLength;
   if (copy.properties) copy.properties = Object.fromEntries(Object.entries(copy.properties).map(([k, v]) => [k, samplingSchema(v)]));
   if (copy.items) copy.items = samplingSchema(copy.items);
+  if (copy.anyOf) copy.anyOf = copy.anyOf.map(samplingSchema);
   return copy;
 }
 export function validate(schema: JsonSchema, value: unknown, path = 'args'): void {
   const fail = (reason: string): never => { throw new Error(`${path}: ${reason}`); };
+  if (schema.anyOf) { const errors: string[] = []; for (const alt of schema.anyOf) { try { validate(alt, value, path); return; } catch (e) { errors.push((e as Error).message); } } fail(`matches no alternative (${errors.slice(0, 3).join(' / ')})`); }
+  if (schema.const !== undefined && value !== schema.const) fail(`expected ${schema.const}`);
   switch (schema.type) {
     case 'object': {
       if (!value || typeof value !== 'object' || Array.isArray(value)) fail('expected object');

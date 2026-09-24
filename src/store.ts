@@ -40,6 +40,9 @@ export class Store {
     }
     s.referenceEvidence ??= [];
     for (const e of s.entries) if (e.kind === 'read_files' && !e.stale) rememberReferences(s, e.text);
+    // Designs from before the neutral schema carried landing-page field names.
+    if (s.design) { const d = s.design as any; if (d.pageComposition && !d.composition) d.composition = d.pageComposition; if (d.copy && !d.fixtures) d.fixtures = d.copy; delete d.pageComposition; delete d.copy; }
+    for (const d of s.ledger ?? []) { const x = d as any; if (x.layout && !x.placement) x.placement = x.layout; delete x.layout; }
     s.completionFeedback ??= null; s.finishTriedAtCheck ??= -1; s.lastToolError ??= null; s.moveDirection ??= null; s.pendingMoves ??= []; s.ledger ??= []; s.design ??= null; s.ledgerAttempts ??= 0; s.ledgerBuilt ??= false; s.ledgerComplete ??= 0; s.checkInferences ??= 0; s.checkInferredFor ??= -1; s.setupDone ??= false; s.setupError ??= null; s.baselineStatus ??= null; s.baselineArtifacts ??= {}; s.pendingRepairs ??= []; s.failedVersions ??= {};
     // Older checkpoints: a create that went through write is a create_file now.
     if (s.blockedRoute === ('write' as string) && s.entries.some(e => e.kind === 'write' && /Created|expectedHash=new/.test(e.text))) s.blockedRoute = null;

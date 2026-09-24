@@ -71,12 +71,15 @@ export class Jev {
     }
   }
 }
-export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'repetition'; meta: GenerationMeta }
+export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'repetition' | 'eos'; meta: GenerationMeta }
 export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number }
 // Sampling for code. The server's defaults (top_k 20, top_p 0.95) stay; the DRY
 // sampler penalises the verbatim repetition a 1-bit model falls into without
 // penalising the legitimate repeats code is made of.
-export const codeSampling = { top_k: 20, top_p: .9, dry_multiplier: .6, dry_base: 1.75, dry_allowed_length: 4, dry_penalty_last_n: 512 };
+// No repetition penalty: code repeats itself legitimately (similar blocks, a
+// rewrite that keeps most of a file), and a penalty on repeating pushes the model
+// to end the generation mid-line. A loop is caught by repetitionStart instead.
+export const codeSampling = { top_k: 20, top_p: .9 };
 // A generation that has started repeating itself: the same block of three or
 // more lines three times in the recent tail, or one line many times. Returns
 // the line index at which the first repeat begins, or -1.
@@ -206,6 +209,8 @@ export class Bonsai {
           if (text.includes('</think>')) thoughtClosed = true;
           else if (generated >= thinkingBudget && stop === 'limit') { const close = await this.tokenize('\n</think>\n\n'); prompt = [...prompt, ...close]; text += '\n</think>\n\n'; thoughtClosed = true; continuations++; continue; }
         }
+        // Ended by the model rather than by the closing fence: the file is not complete.
+        if (stop === 'eos' && fence && thoughtClosed) { finish = 'eos'; break; }
         if (stop !== 'limit') break;
         // A tail that repeats itself is wrong content, the one case to stop
         // generating: the text is cut at the first repeat and reported as such.

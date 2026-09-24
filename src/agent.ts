@@ -14,7 +14,7 @@ import { ToolBox, boundedRead, hash, listRepoFiles, readOnlyCommand, regression,
 import { clip, clipEnds, evictOne, fenceFor, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
 import { rememberReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
-import { detectEcosystem, importSpelling, undefinedClasses, importsFor, moduleCandidates, packageImportFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type EcosystemProfile } from './profiles.js';
+import { detectEcosystem, importSpelling, importsFor, moduleCandidates, packageImportFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type EcosystemProfile } from './profiles.js';
 import { orient } from './orient.js';
 import { renderFacts } from './render.js';
 import { evidenceGate, rankExcerpts, triage, watchdog, type Jev as JevLike } from './control.js';
@@ -52,7 +52,7 @@ export class Agent {
   // ---- observation: what a tool result does to the session -----------------
   async evidence(s: Session, kind: string, result: ToolResult, args?: Record<string, any>): Promise<void> {
     const artifact = await this.store.artifact(s.step, result.text);
-    const limit = kind === 'read_files' ? this.config.toolChars : kind === 'bash' || kind === 'render' ? Math.min(this.config.toolChars, 2500) : kind === 'search_codebase' ? Math.min(this.config.toolChars, 1500) : Math.min(this.config.toolChars, 600);
+    const limit = kind === 'read_files' || kind === 'render' ? this.config.toolChars : kind === 'bash' ? Math.min(this.config.toolChars, 2500) : kind === 'search_codebase' ? Math.min(this.config.toolChars, 1500) : Math.min(this.config.toolChars, 600);
     if (kind === 'read_files' && result.ok && args) {
       for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
@@ -139,13 +139,6 @@ export class Agent {
     // A written file that does not parse is a fact the worker sees at once, by the language's own tool.
     if (result.ok && editRoutes.includes(route) && result.changed?.length) {
       const facts: string[] = [];
-      // A stylesheet written: the classes the session's markup still uses that no reachable stylesheet defines.
-      if (result.changed.some(p => /\.(?:css|scss|sass|less)$/i.test(p))) {
-        const read = async (q: string) => { try { return await readFile(await safePath(this.tools.root, q), 'utf8'); } catch { return null; } };
-        const missing: string[] = []; let reached: string[] = []; let unreached: string[] = [];
-        for (const p of s.writes.filter(w => /\.(?:[jt]sx|html?|vue|svelte)$/.test(w)).slice(-30)) { const text = await read(p); if (text === null) continue; const r = await undefinedClasses(this.tools.root, p, text, [...new Set([...s.knownFiles, ...result.changed])], read).catch(() => null); if (!r) continue; reached = r.stylesheets; unreached = r.unreached; for (const m of r.missing) if (!missing.includes(m)) missing.push(m); }
-        if (missing.length) facts.push(`${missing.length} class names used in the markup are still defined by no reachable stylesheet (${reached.join(', ') || 'none'}${unreached.length ? `; not imported: ${unreached.join(', ')}` : ''}): ${missing.slice(0, 30).join(', ')}${missing.length > 30 ? ', …' : ''}`);
-      }
       for (const p of result.changed) { const text = await readFile(await safePath(this.tools.root, p), 'utf8').catch(() => null); if (text === null) continue; const problems = await syntaxCheck(this.tools.root, p, text).catch(() => [] as string[]); if (problems.length) facts.push(`${p} does not parse: ${problems.slice(0, 4).join('; ')}`); }
       if (facts.length) result.text += `\nHarness: ${facts.join(' | ')}`;
     }
@@ -174,11 +167,16 @@ export class Agent {
     s.setupError = clip([eco.errorLines(r.output), ...facts].filter(Boolean).join('\n'), 700);
     return false;
   }
+  // Dependencies follow the manifest: installed when one appears, again when it
+  // changes, once per manifest version. Mechanics the worker should not spend
+  // turns discovering (a build that cannot find its tools).
   private async retrySetup(s: Session): Promise<boolean> {
-    if (!s.setupDone || s.setupKey === await this.manifestKey()) return false;
-    const eco = await this.ecosystem(); const install = eco ? await eco.installCommand(this.tools.root, '.', true) : null;
-    if (!install) return false;
-    this.observe({ kind: 'warning', step: s.step, text: 'manifest changed since the last install; installing again' });
+    const key = await this.manifestKey();
+    if (s.setupKey === key) return false;
+    const eco = await this.ecosystem(); if (!eco) { s.setupKey = key; return false; }
+    const install = await eco.installCommand(this.tools.root, '.', s.setupDone).catch(() => null);
+    if (!install) { s.setupDone = true; s.setupKey = key; return false; }
+    this.observe({ kind: 'warning', step: s.step, text: s.setupDone ? 'manifest changed since the last install; installing again' : 'a manifest exists and nothing is installed; installing' });
     if (await this.installDependencies(s, install, '.')) s.pendingCheck = Boolean(s.lastCheckCommand);
     return true;
   }
@@ -237,21 +235,28 @@ export class Agent {
     }
     return out;
   }
-  private async createFile(s: Session, path: string, purpose: string, thought: string): Promise<void> {
-    const exists = await safePath(this.tools.root, path, true).then(p => stat(p)).then(() => true, () => false);
-    if (exists) throw new Error(`${path} already exists; edit it with replace_lines or write instead of creating it`);
+  // A file's whole content generated as code: a new file, or an existing one
+  // rewritten with its current content in front of the worker.
+  private async createFile(s: Session, path: string, purpose: string, thought: string, rewrite = false): Promise<void> {
+    let current: string | undefined;
+    try { current = await readFile(await safePath(this.tools.root, path, true), 'utf8'); } catch { current = undefined; }
+    if (current !== undefined && !rewrite) throw new Error(`${path} already exists; use rewrite_file to replace its whole content, or replace_lines for a small edit`);
+    if (current === undefined && rewrite) throw new Error(`${path} does not exist; use create_file`);
     const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
     const eco = await this.ecosystem(); const declared = eco ? await eco.declared(this.tools.root).catch(() => [] as string[]) : [];
-    const { code, finish } = await this.generateCode(s, 'create_file', [() => newFileMessages(s, path, purpose, thought, contracts, declared), () => newFileMessages(s, path, purpose, thought, contracts, declared, 1)], this.config.createTokens, fenceFor(path));
-    if (finish !== 'stop') this.observe({ kind: 'warning', step: s.step, text: `${path}: the content ${finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : 'started repeating and was cut'}` });
-    const result = await this.execute(s, 'create_file', { path, content: code }, 'create');
+    const { code, finish } = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', [() => newFileMessages(s, path, purpose, thought, contracts, declared, 0, current), () => newFileMessages(s, path, purpose, thought, contracts, declared, 1, current)], this.config.createTokens, fenceFor(path));
+    const ended = finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : finish === 'repetition' ? 'started repeating itself and was cut at the repeat' : finish === 'eos' ? 'ended before the file was complete (the model stopped without closing the code block)' : '';
+    if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
+    if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, '')) throw new Error(`the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}; nothing was written. Say in purpose exactly what must differ, or edit the lines that are wrong with replace_lines`);
+    const result = rewrite
+      ? await this.execute(s, 'write', { path, expectedHash: hash(current!), oldText: current!, newText: code, wholeFile: true }, 'rewrite')
+      : await this.execute(s, 'create_file', { path, content: code }, 'create');
     if (!result.ok) throw new Error(result.text);
     // Contracts the file breaks are facts for the worker: names a repository module does not declare, packages the manifest does not declare.
     const readRepo = async (p: string) => { try { return await readFile(await safePath(this.tools.root, p), 'utf8'); } catch { return null; } };
     const facts = [...await unresolvedImports(path, code, readRepo).catch(() => [] as string[])];
     if (eco && (await readRepo(eco.manifest)) !== null) { const missing = await undeclaredPackages(this.tools.root, path, code, readRepo).catch(() => [] as string[]); if (missing.length) facts.push(`${path} imports ${missing.join(', ')}, which ${eco.manifest} does not declare: declare them (the package manager chooses the version) so they can be installed`); }
-    const styles = await undefinedClasses(this.tools.root, path, code, s.knownFiles, readRepo).catch(() => null);
-    if (styles && styles.missing.length) facts.push(`${path} uses classes no reachable stylesheet defines: ${styles.missing.slice(0, 20).join(', ')}${styles.missing.length > 20 ? ', …' : ''} (reachable stylesheets: ${styles.stylesheets.join(', ') || 'none'}${styles.unreached.length ? `; stylesheets nothing imports or links: ${styles.unreached.join(', ')}` : ''}); the page renders unstyled until they are defined in a stylesheet that is imported`);
+    if (ended) facts.unshift(`the generated content of ${path} ${ended}; check its end before relying on it`);
     if (facts.length) { const e = s.entries.at(-1); if (e) e.text += `\nHarness: ${facts.join(' | ')}`; s.lastError = facts.join(' | '); }
   }
 
@@ -262,10 +267,8 @@ export class Agent {
     const diffStat = [diff?.code === 0 ? diff.output.trim() : '', untracked?.code === 0 && untracked.output.trim() ? `untracked: ${untracked.output.trim().split('\n').slice(0, 40).join(', ')}` : ''].filter(Boolean).join('\n') || `changed files: ${s.writes.join(', ') || 'none'}`;
     const sources: Record<string, string> = {};
     for (const p of s.writes.slice(-12)) { const t = await readFile(await safePath(s.root, p), 'utf8').catch(() => null); if (t !== null) sources[p] = clip(t, 1200); }
-    const unstyled: Record<string, string[]> = {};
-    for (const p of s.writes.slice(-30)) { if (!/\.(?:[jt]sx|html?|vue|svelte)$/.test(p)) continue; const text = await readFile(await safePath(s.root, p), 'utf8').catch(() => null); if (text === null) continue; const r = await undefinedClasses(s.root, p, text, s.knownFiles, async q => readFile(await safePath(s.root, q), 'utf8').catch(() => null)).catch(() => null); if (r && r.missing.length) unstyled[p] = r.missing.slice(0, 12); }
     const render = s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, url: s.lastRender.url, facts: s.lastRender.text } : 'never rendered: nothing is known about what the user sees';
-    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), render, ...(Object.keys(unstyled).length ? { classesNoStylesheetDefines: unstyled } : {}), verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), errors: s.lastCheck?.summary.errors ?? 0, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
+    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), render, verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), errors: s.lastCheck?.summary.errors ?? 0, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
   }
 
   // ---- the loop ----------------------------------------------------------------
@@ -274,7 +277,6 @@ export class Agent {
     s.watch ??= { noProgress: 0, readings: [], escalations: 0 }; s.blockedActions ??= []; s.notes ??= '';
     if (s.baselineStatus === null) s.baselineStatus = await repositoryStatus(this.tools.root).then(r => r.git ? r.changed : []).catch(() => []);
     if (!s.orientation) { s.orientation = await orient(this.tools.root) as unknown as Record<string, unknown>; await this.store.log('orientation', { step: s.step, orientation: s.orientation }); }
-    if (!s.setupDone) { const eco = await this.ecosystem(); if (eco && !(await eco.installCommand(this.tools.root, '.', false))) { s.setupDone = true; s.setupKey = await this.manifestKey(); } }
     if (this.config.checkCommand && !s.lastCheckCommand) { s.lastCheckCommand = this.config.checkCommand; s.pendingCheck = true; }
     this.tools.config.checkCommand = s.lastCheckCommand ?? '';
     const endStep = s.step + this.config.maxSteps;
@@ -313,9 +315,12 @@ export class Agent {
           notes.push(`The harness proposed completion because Jev reads the objective as likely satisfied and your check passes; the evidence gate did not accept it: ${verdict.reason}. Address that, then finish.`);
         }
         if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1) && s.editsSinceCheck >= 3) notes.push(`${s.editsSinceCheck} edits have landed since your check last ran; run it when you want them judged.`);
+        const readOnly = s.readOnlyTurns ?? 0;
+        if (readOnly >= 3) notes.push(`Your last ${readOnly} turns only read or searched; nothing changed. The evidence already holds what they returned. Act on it now, or say in your thought exactly which fact is still missing.`);
         if (s.setupError) notes.push(`The dependency install failed for the current manifest: ${s.setupError}. The manifest is yours to change; the install runs again by itself after the change.`);
         if (s.completionFeedback && !s.completionFeedback.addressed) notes.push(s.completionFeedback.text);
         const allowed: Route[] = [...actions].filter(a => (this.config.allowWrite || !editRoutes.includes(a as Route)) && (this.config.allowBash || (a !== 'bash' && a !== 'render'))) as Route[];
+        s.allowedActions = allowed;
         // One reasoning per batch of actions, not per action: the worker names an
         // ordered list, the harness runs it back to back and stops at the first
         // failure, which is when reasoning is worth paying for again.
@@ -326,7 +331,12 @@ export class Agent {
           thought = String(gen.thought ?? '').trim(); batch = (gen.actions as any[]).map(a => ({ action: String(a.action) as Route, args: (a.args ?? {}) as Record<string, any> }));
           s.lastThought = thought;
           await this.store.log('thought', { step: s.step, thought: clip(thought, 2000), actions: batch.map(b => b.action) });
-        } catch (e) { if (++generationFailures >= 4) throw e; this.observe({ kind: 'generation_error', step: s.step, message: (e as Error).message }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${(e as Error).message}` }); await this.store.save(s); continue; }
+        } catch (e) {
+          if (++generationFailures >= 4) throw e;
+          const cut = /\(length\)/.test((e as Error).message);
+          const why = cut ? `your reply reached the ${this.config.maxTokens}-token limit before it closed, so nothing ran: file content inside the arguments (replace_lines or write with a large newText) does not fit. Use rewrite_file or create_file for large content, which generate it as code without that limit; keep the thought short.` : (e as Error).message;
+          this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); await this.store.save(s); continue;
+        }
         let halted = false;
         for (let i = 0; i < batch.length; i++) {
           if (i > 0) { if (s.step >= endStep) break; s.step++; this.current = s.step; this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep }); }
@@ -339,6 +349,7 @@ export class Agent {
           if ((outcome === 'failed' || outcome === 'refused') && i < batch.length - 1) { const e = s.entries.at(-1); if (e) e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch.slice(i + 1).map(b => b.action).join(', ')}); reason about the result first.`; break; }
         }
         if (halted) break;
+        s.readOnlyTurns = batch.every(b => b.action === 'read_files' || b.action === 'search_codebase') ? (s.readOnlyTurns ?? 0) + 1 : 0;
         await this.watch(s); await this.store.save(s);
       }
       if (s.status === 'running') { s.status = 'paused'; s.stopReason = `Reached the ${this.config.maxSteps}-step limit for this invocation`; }
@@ -367,8 +378,16 @@ export class Agent {
       if (!this.config.allowBash) return refuse('render needs --allow-bash (it starts the server).');
       const url = String(args.url ?? ''); const serve = String(args.serve ?? '');
       const shot = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-render.png`);
-      const r = await renderFacts(this.tools.root, url, serve || undefined, shot, this.config.commandTimeoutMs).catch(e => ({ ok: false, text: `Render failed: ${(e as Error).message}` }));
-      await this.store.log('render', { step: s.step, url, serve, ok: r.ok, text: clip(r.text, 2000) });
+      const r = await renderFacts(this.tools.root, url, serve || undefined, shot, this.config.commandTimeoutMs).catch(e => ({ ok: false, text: `Render failed: ${(e as Error).message}` }) as { ok: boolean; text: string; unmatched?: string[] });
+      if (r.unmatched?.length) {
+        // Where each unstyled class name is used, so the stylesheet can be written without re-reading every component.
+        const where: Record<string, string[]> = {};
+        const hits = await runCommand('rg', ['-l', '--color', 'never', '-F', '-g', '!node_modules/**', '-g', '!dist/**', '-g', '!build/**', ...r.unmatched.flatMap((c: string) => ['-e', c]), '.'], this.tools.root, 15000).catch(() => null);
+        for (const f of (hits?.output ?? '').split('\n').map(l => l.replace(/^\.\//, '')).filter(Boolean).slice(0, 40)) { const text = await readFile(await safePath(this.tools.root, f), 'utf8').catch(() => ''); const used = r.unmatched!.filter((c: string) => new RegExp(`(^|[^\\w-])${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(text)); if (used.length && !/\.(?:css|scss|sass|less)$/.test(f)) where[f] = used; }
+        const stylesheets = s.knownFiles.filter(f => /\.(?:css|scss|sass|less)$/.test(f) && !/(^|\/)(?:node_modules|dist|build)\//.test(f));
+        r.text += `\nUnstyled class names by the file that uses them:\n${Object.entries(where).map(([f, cs]) => `  ${f}: ${cs.join(' ')}`).join('\n') || '  (not found in the sources)'}\nStylesheets in the project: ${stylesheets.join(', ') || 'none'}.`;
+      }
+      await this.store.log('render', { step: s.step, url, serve, ok: r.ok, text: clip(r.text, 3000) });
       s.lastRender = { step: s.step, ok: r.ok, url, text: clip(r.text, 1800) };
       await this.evidence(s, 'render', { ok: r.ok, text: r.text }, args);
       this.observe({ kind: 'result', step: s.step, route, ok: r.ok, ms: 0, chars: r.text.length, text: clip(r.text, 200) });
@@ -387,8 +406,8 @@ export class Agent {
       s.completionFeedback = { step: s.step, text: `The completion proposed at step ${s.step} was not accepted: ${verdict.reason}. Address it, verify, and finish again.`, awaitingEvidence: true };
       await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text }); return 'failed';
     }
-    if (route === 'create_file') {
-      try { if (typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought); }
+    if (route === 'create_file' || route === 'rewrite_file') {
+      try { if (route === 'create_file' && typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought, route === 'rewrite_file'); }
       catch (e) { return refuse((e as Error).message); }
       return s.lastResultOk ? 'ok' : 'failed';
     }

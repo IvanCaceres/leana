@@ -385,29 +385,6 @@ export async function undeclaredPackages(root: string, path: string, text: strin
   }
   return [...out];
 }
-// Class names a markup file uses that no stylesheet of the repository
-// defines, for projects that style with their own stylesheets (a utility
-// framework such as Tailwind defines classes by generation, so those projects
-// are left to the framework's own parser). A fact for the worker: the styles
-// it meant to write are not there yet.
-export async function undefinedClasses(root: string, path: string, text: string, files: string[], read: (p: string) => Promise<string | null>): Promise<{ missing: string[]; stylesheets: string[]; unreached: string[] } | null> {
-  const lang = languageFor(path); if (!lang || (lang.kind !== 'markup' && !/\.[jt]sx$/.test(path))) return null;
-  const eco = await detectEcosystem(root); const declared = eco ? (await eco.declared(root).catch(() => [] as string[])).map(d => d.replace(/@[^@]*$/, '')) : [];
-  if (declared.some(d => /tailwind|unocss|windicss|twind/i.test(d))) return null;
-  const used = new Set<string>();
-  for (const m of text.matchAll(/class(?:Name)?\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*(?:"([^"]*)"|'([^']*)'|`([^`]*)`)\s*\})/g)) for (const tok of (m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? '').replace(/\$\{[^}]*\}/g, ' ').split(/\s+/)) if (/^[A-Za-z_][\w-]*$/.test(tok)) used.add(tok);
-  if (!used.size) return null;
-  const all = files.filter(f => /\.(?:css|scss|sass|less)$/i.test(f) && !/(^|\/)(?:node_modules|dist|build)\//.test(f)).slice(0, 40);
-  // A stylesheet counts only when something reaches it: a source file imports it, a stylesheet @imports it, or the HTML entry links it.
-  const sources = files.filter(f => sourceFile(f) && !/(^|\/)(?:node_modules|dist|build)\//.test(f)).slice(0, 200);
-  const importers = (await Promise.all(sources.map(async f => (await read(f)) ?? ''))).join('\n');
-  const stylesheets = all.filter(f => { const base = f.split('/').pop()!; return new RegExp(`(?:import\\s+(?:[^'"]*from\\s+)?|@import\\s+(?:url\\()?|href=)['"\\(]?[^'"\\)]*${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"\\)]`).test(importers); });
-  const unreached = all.filter(f => !stylesheets.includes(f));
-  const defined = new Set<string>();
-  for (const f of stylesheets) { const css = await read(f); if (css === null) continue; for (const m of css.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/\.([A-Za-z_][\w-]*)(?=[\s.,:>+~#[{)])/g)) defined.add(m[1]!); }
-  const missing = [...used].filter(c => !defined.has(c));
-  return { missing, stylesheets, unreached };
-}
 // The repository files an import specifier may denote, importer-relative for
 // relative forms and root-relative for absolute ones, first match wins.
 export function moduleCandidates(importer: string, spec: string): string[] {
@@ -470,59 +447,6 @@ export const markupFile = (path: string): boolean => /\.(?:[jt]sx|html?|vue|svel
 // the text a configuration must hold for it (ensure), and the packages it
 // needs. The loop applies them as harness edits; it never knows the stack.
 // ---------------------------------------------------------------------------
-export interface QualityLint { id: string; applies(root: string, path: string): Promise<boolean>; run(root: string, path: string, text: string): Promise<{ diagnostics: string[] }> }
-const designSystems = new Map<string, any>();
-async function tailwindDesignSystem(root: string): Promise<any | null> {
-  try {
-    let css = '';
-    const names = await readdir(resolve(root, 'src'), { recursive: true }).catch(() => [] as string[]);
-    for (const f of names.filter(f => f.endsWith('.css'))) { const c = await boundedRead(resolve(root, 'src', f)).catch(() => ''); if (/@import\s+["']tailwindcss["']/.test(c)) css += `${c}\n`; }
-    if (!css) return null;
-    const key = `${root}@${hash(css)}`;
-    if (designSystems.has(key)) return designSystems.get(key);
-    const mod: any = await import(pathToFileURL(resolve(root, 'node_modules', '@tailwindcss', 'node', 'dist', 'index.mjs')).href);
-    if (typeof mod?.__unstable__loadDesignSystem !== 'function') return null;
-    const ds = await mod.__unstable__loadDesignSystem(css, { base: resolve(root, 'src') });
-    designSystems.set(key, ds); return ds;
-  } catch { return null; }
-}
-// A class token whose arbitrary value never closes its bracket and ends with
-// one closing parenthesis too many ("h-[300px)"): that parenthesis is the bracket.
-export async function invalidTailwindClasses(root: string, path: string, text: string): Promise<string[]> {
-  const ds = await tailwindDesignSystem(root); if (!ds) return [];
-  try {
-    const bad = new Map<string, number>();
-    for (const m of text.matchAll(/className\s*=\s*(?:"([^"]*)"|'([^']*)'|\{`([^`]*)`\})/g)) {
-      const value = (m[1] ?? m[2] ?? m[3] ?? '').replace(/\$\{[^}]*\}/g, ' ');
-      const line = text.slice(0, m.index).split('\n').length;
-      for (const token of value.split(/\s+/).filter(Boolean)) {
-        if (bad.has(token) || /^(?:group|peer)(?:[/-]|$)/.test(token) || token.includes('$')) continue;
-        const out = ds.candidatesToCss([token]);
-        if (Array.isArray(out) && out[0] === null) bad.set(token, line);
-      }
-      if (bad.size >= 12) break;
-    }
-    return [...bad.entries()].map(([token, line]) => `${path}(${line},1): error: class "${token}" is not a utility the project's Tailwind can compile (no theme or plugin defines it); use a built-in utility, a colour the theme defines, or an arbitrary value`);
-  } catch { return []; }
-}
-// Diagnostics a linter prints in path:line:col form, attributed to the file.
-const lintDiagnostics = (path: string, output: string) => output.split('\n').map(l => l.trim()).filter(l => l.startsWith(path) && /:\d+:\d+:?/.test(l) && !/\bwarning\b/i.test(l)).slice(0, 12);
-export const qualityLints: QualityLint[] = [
-  // The project's own linter, when the repository declares or ships one.
-  { id: 'project-linter', applies: async (root, path) => { const eco = await detectEcosystem(root); return Boolean(eco?.lintCommand && (await eco.lintCommand(root, path))); },
-    run: async (root, path) => { const eco = await detectEcosystem(root); const command = eco?.lintCommand ? await eco.lintCommand(root, path) : null; if (!command) return { diagnostics: [] }; const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', command], root, 60000).catch(() => null); return { diagnostics: r && r.code !== 0 ? lintDiagnostics(path, r.output) : [] }; } },
-  // Classes the project's own Tailwind parser rejects, as diagnostics for the repair.
-  { id: 'tailwind-classes', applies: async (root, path) => /\.(?:[jt]sx|html?)$/.test(path) && (await tailwindDesignSystem(root)) !== null,
-    run: async (root, path, text) => ({ diagnostics: await invalidTailwindClasses(root, path, text) }) },
-];
-export async function runQualityLints(root: string, path: string, text: string): Promise<{ diagnostics: string[] }> {
-  const diagnostics: string[] = [];
-  for (const lint of qualityLints) {
-    if (!(await lint.applies(root, path).catch(() => false))) continue;
-    diagnostics.push(...(await lint.run(root, path, text).catch(() => ({ diagnostics: [] as string[] }))).diagnostics);
-  }
-  return { diagnostics };
-}
 export const builtinModuleNames = new Set(builtinModules);
 // A name the checker cannot find that a declared package exports from its
 // declarations: the import line for it. Searched in the packages the manifest

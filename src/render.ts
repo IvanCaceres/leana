@@ -19,7 +19,6 @@ const probe = `(() => {
   const headings = [...document.querySelectorAll('h1,h2,h3')].filter(vis).slice(0, 24).map(h => h.tagName.toLowerCase() + ': ' + (h.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80));
   const images = [...document.images].filter(i => i.complete && i.naturalWidth === 0).slice(0, 12).map(i => (i.getAttribute('src') || '(no src)').slice(0, 120) + (i.alt ? ' (alt "' + i.alt.slice(0, 40) + '")' : ''));
   const overflow = [...document.querySelectorAll('body *')].filter(vis).filter(e => { const r = e.getBoundingClientRect(); return r.right > vw + 2 || r.left < -2; }).slice(0, 8).map(e => { const r = e.getBoundingClientRect(); return path(e) + ' spans ' + Math.round(r.left) + '..' + Math.round(r.right) + 'px of a ' + vw + 'px viewport'; });
-  const bullets = [...document.querySelectorAll('nav ul, nav ol, header ul, footer ul, [class*="nav"] ul, [class*="menu"] ul')].filter(vis).filter(l => getComputedStyle(l).listStyleType !== 'none' && l.querySelectorAll('li').length > 1).slice(0, 6).map(path);
   const empty = [...document.querySelectorAll('section, main, article, header, footer')].filter(vis).filter(e => (e.textContent || '').trim().length < 20 && !e.querySelector('img,svg,canvas,video')).slice(0, 6).map(path);
   const rules = [...document.styleSheets].reduce((n, s) => { try { return n + s.cssRules.length; } catch { return n; } }, 0);
   // Every class name a selector mentions, walking nested rules (@media, @supports, @layer).
@@ -27,14 +26,14 @@ const probe = `(() => {
   for (const s of document.styleSheets) { try { walk(s.cssRules); } catch { /* cross-origin */ } }
   const used = new Map(); for (const e of document.querySelectorAll('body [class]')) { if (!vis(e)) continue; for (const c of e.classList) used.set(c, (used.get(c) || 0) + 1); }
   const unmatched = [...used.keys()].filter(c => !selected.has(c));
-  const classes = { used: used.size, unmatched: unmatched.length, elementsUnmatched: [...used.entries()].filter(([c]) => !selected.has(c)).reduce((n, [, k]) => n + k, 0), sample: unmatched.slice(0, 20) };
+  const classes = { used: used.size, unmatched: unmatched.length, elementsUnmatched: [...used.entries()].filter(([c]) => !selected.has(c)).reduce((n, [, k]) => n + k, 0), sample: unmatched.slice(0, 20), all: unmatched.slice(0, 300) };
   const body = getComputedStyle(document.body);
   const text = (document.body.innerText || '').replace(/\\s+/g, ' ').trim();
   const links = [...document.querySelectorAll('a[href]')].filter(vis).slice(0, 30).map(a => ((a.textContent || a.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 30) || '(no text)') + ' -> ' + (a.getAttribute('href') || '').slice(0, 60));
-  return { title: document.title, headings, images, overflow, bullets, empty, rules, classes, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
+  return { title: document.title, headings, images, overflow, empty, rules, classes, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
 })()`;
 
-interface Facts { title: string; headings: string[]; images: string[]; overflow: string[]; bullets: string[]; empty: string[]; rules: number; classes: { used: number; unmatched: number; elementsUnmatched: number; sample: string[] }; font: string; background: string; textLength: number; textHead: string; links: string[]; docHeight: number; viewport: string }
+interface Facts { title: string; headings: string[]; images: string[]; overflow: string[]; empty: string[]; rules: number; classes: { used: number; unmatched: number; elementsUnmatched: number; sample: string[]; all: string[] }; font: string; background: string; textLength: number; textHead: string; links: string[]; docHeight: number; viewport: string }
 class Cdp {
   private id = 0; private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>(); private buffer = '';
   readonly events: { method: string; params: any }[] = [];
@@ -61,7 +60,7 @@ async function waitForUrl(url: string, timeoutMs: number): Promise<boolean> {
 // Render a URL, optionally after starting a server with `serve` in `root`
 // (stopped afterwards, whatever happens). Returns facts as text and, when a
 // path is given, a PNG screenshot for the session's report.
-export async function renderFacts(root: string, url: string, serve: string | undefined, screenshotPath: string | null, timeoutMs = 60000): Promise<{ ok: boolean; text: string }> {
+export async function renderFacts(root: string, url: string, serve: string | undefined, screenshotPath: string | null, timeoutMs = 60000): Promise<{ ok: boolean; text: string; unmatched?: string[] }> {
   const browser = await findBrowser(); if (!browser) return { ok: false, text: 'No browser is installed on this machine (chromium or google-chrome); the page cannot be rendered.' };
   let server: ChildProcess | null = null; const serverLog: string[] = [];
   try {
@@ -100,7 +99,6 @@ export async function renderFacts(root: string, url: string, serve: string | und
         unstyled ? `${c.unmatched} of the ${c.used} class names on the page match no CSS rule (${c.elementsUnmatched} elements render unstyled): ${c.sample.join(', ')}${c.unmatched > c.sample.length ? ', …' : ''}` : '',
         facts.rules < 5 ? 'almost no CSS rules applied: the page renders with browser defaults' : '',
         facts.overflow.length ? `elements overflowing the viewport horizontally: ${facts.overflow.join(' | ')}` : '',
-        facts.bullets.length ? `lists in navigation still showing their bullets: ${facts.bullets.join(' | ')}` : '',
       ].filter(Boolean);
       const ok = !verdict.length;
       const lines = [
@@ -111,7 +109,7 @@ export async function renderFacts(root: string, url: string, serve: string | und
         `Links: ${facts.links.length ? facts.links.slice(0, 12).join(' | ') : 'none'}`,
         `Text begins: ${facts.textHead}`,
       ].filter(Boolean);
-      return { ok, text: lines.join('\n') };
+      return { ok, text: lines.join('\n'), ...(unstyled ? { unmatched: c.all } : {}) };
     } finally { try { child.kill('SIGKILL'); } catch { /* gone */ } }
   } finally {
     if (server?.pid) { try { process.kill(-server.pid, 'SIGTERM'); } catch { /* gone */ } setTimeout(() => { try { process.kill(-server!.pid!, 'SIGKILL'); } catch { /* gone */ } }, 2000).unref(); }

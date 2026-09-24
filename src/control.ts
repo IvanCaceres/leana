@@ -22,6 +22,7 @@ export function watchState(s: Session): unknown {
     verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors, files: Object.keys(s.lastCheck.summary.byFile).slice(0, 6), firstError: clip(Object.values(s.lastCheck.summary.byFile)[0]?.samples[0] ?? '', 200), afterLastWrite: s.lastCheck.step > s.lastWriteStep } : null,
     lastError: s.lastError ? clip(s.lastError, 300) : null,
     lastRender: s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, facts: clip(s.lastRender.text, 500) } : 'never rendered',
+    turnsOnlyReading: s.readOnlyTurns ?? 0,
     recent, previousReading: previous ? { progress: previous.progress, stuck: previous.stuck, sameFailure: previous.sameFailure } : null, noProgressSteps: s.watch?.noProgress ?? 0,
   };
 }
@@ -41,7 +42,7 @@ export async function watchdog(jev: Jev, s: Session): Promise<Reading> {
 
 // The evidence gate: code states the facts (what changed, what the check
 // said, what the worker claims); Jev judges the meaning.
-export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; render?: unknown; classesNoStylesheetDefines?: Record<string, string[]>; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; errors: number; text: string }; requirements: string[]; sources: unknown }
+export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; render?: unknown; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; errors: number; text: string }; requirements: string[]; sources: unknown }
 export const gateQuestions: Questions = {
   implementation_matches_request: { type: 'noul', instructions: 'Does the change (changedFiles, diffStat, sources, and for anything user-facing the render facts: errors, failed requests, broken images, overflow, unstyled lists, a page never rendered) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken, unstyled or invented?' },
   requirement_unaddressed: { type: 'noul', instructions: 'Does any requirement of the objective appear unaddressed by the change and the verification?' },

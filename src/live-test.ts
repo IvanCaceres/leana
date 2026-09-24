@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runsDir } from './store.js';
 import { mkdir, mkdtemp, readFile, readdir, readlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -152,8 +153,8 @@ async function main(): Promise<void> {
   console.log('\nFile changes (− before, + after):\n');
   process.stdout.write(diff || '(No fixture files changed.)\n');
   const verification = await verifyFixture(runDir);
-  const runNames = await readdir(join(repo, '.leana/runs')).catch(() => [] as string[]);
-  const sessionPath = runNames[0] ? join(repo, '.leana/runs', runNames[0]) : null;
+  const runNames = await readdir(runsDir(repo)).catch(() => [] as string[]);
+  const sessionPath = runNames[0] ? join(runsDir(repo), runNames[0]) : null;
   const events = sessionPath ? await readFile(join(sessionPath, 'events.jsonl'), 'utf8').then(s => s.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)), () => []) : [];
   const jevCalls = events.filter(e => e.type === 'jev').length;
   const bonsaiCalls = events.filter(e => e.type === 'bonsai').length;

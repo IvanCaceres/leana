@@ -1,7 +1,7 @@
-export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'tasks' | 'plan' | 'render' | 'finish' | 'ask_user';
+export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'tasks' | 'plan' | 'render' | 'rewrite_file' | 'finish' | 'ask_user';
 // One tool, one meaning: create_file creates, write replaces an anchor in an
 // existing file, replace_lines edits by line number, move_lines relocates.
-export const editRoutes: readonly Route[] = ['create_file', 'write', 'replace_lines', 'move_lines'];
+export const editRoutes: readonly Route[] = ['create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines'];
 export interface Coverage { total: number; ranges: [number, number][] }
 // samples are short heads for decision state; diagnostics are the complete
 // messages with their continuation lines, for a repair prompt.
@@ -120,6 +120,10 @@ export interface Session {
   blockedActions?: string[];
   // The last render of the running application: what the user would see, as facts.
   lastRender?: { step: number; ok: boolean; url: string; text: string };
+  // The actions this session may take, fixed at its start so the pinned block never changes.
+  allowedActions?: string[];
+  // Consecutive turns that only read or searched.
+  readOnlyTurns?: number;
 }
 export interface Config {
   baseUrl: string; model: string; contextWindow: number; maxTokens: number;

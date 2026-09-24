@@ -16,7 +16,7 @@ import { extractCode, focusedEditSchema, samplingSchema, schemas, validate } fro
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { commandWords, configFile, declaredName, lockfiles, manifestOf, shellPrefixFor, undeclaredPackages, unresolvedImports, detectEcosystem, ecosystems, importSpelling, importsFor, invalidTailwindClasses, languageFor, moduleCandidates, packageImportFor, regexDeclarations, runQualityLints, signaturesFor, sourceFile, syntaxCheck, verificationClass } from '../src/profiles.js';
+import { commandWords, configFile, declaredName, lockfiles, manifestOf, shellPrefixFor, undeclaredPackages, unresolvedImports, detectEcosystem, ecosystems, importSpelling, importsFor, languageFor, moduleCandidates, packageImportFor, regexDeclarations, signaturesFor, sourceFile, syntaxCheck, verificationClass } from '../src/profiles.js';
 import { aliasImportBinding, manifestFailures, installCommand, repositoryStatus, solutionTsconfigReferences, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
@@ -277,7 +277,7 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   const g = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', context: { step: 1, route: 'create_file' } });
   assert.equal(g.text, 'const a = 1;\nexport { a };'); assert.equal(g.finish, 'stop'); assert.equal(g.meta.continuations, 1); assert.equal(g.meta.usage.completion_tokens, 26);
   const rendered = '<|im_start|>system\nS<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n```ts\n';
-  assert.deepEqual(requests[0].prompt, [...rendered].map(c => c.codePointAt(0)), 'the opening fence is part of the prompt'); assert.deepEqual(requests[0].stop, ['\n```']); assert.equal(requests[0].n_predict, 64); assert.equal(requests[0].cache_prompt, true); assert(requests[0].dry_multiplier > 0);
+  assert.deepEqual(requests[0].prompt, [...rendered].map(c => c.codePointAt(0)), 'the opening fence is part of the prompt'); assert.deepEqual(requests[0].stop, ['\n```']); assert.equal(requests[0].n_predict, 64); assert.equal(requests[0].cache_prompt, true); assert.equal(requests[0].dry_multiplier, undefined, 'no repetition penalty on code');
   assert.deepEqual(requests[1].prompt, [...requests[0].prompt, ...[...'const a = 1;\n'].map(c => c.codePointAt(0))], 'the continuation is the same ids plus the ones generated, never a re-tokenized string');
   // A chunk that loops is cut at the first repeat and reported as such; no continuation is spent on it.
   const loop = Array.from({ length: 6 }, () => ['<div className="feature">', '  <h3>Fast</h3>', '  <p>Really fast builds.</p>', '</div>']).flat().join('\n');
@@ -381,17 +381,6 @@ test('A name nothing in the repository declares that a declared package exports 
   assert.equal(await packageImportFor(root, 'FC'), "import type { FC } from 'react';", 'a type-only export is imported as a type');
   assert.equal(await packageImportFor(root, 'nothingExportsThis'), null);
 });
-test('The project linter is a quality lint at creation: its diagnostics are queued for the file, warnings and other files are not', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'leana-lint-')); t.after(() => rm(root, { recursive: true, force: true }));
-  await writeFile(join(root, 'package.json'), '{"name":"x"}'); await writeFile(join(root, 'eslint.config.js'), 'export default [];\n');
-  await mkdir(join(root, 'node_modules', '.bin'), { recursive: true }); await mkdir(join(root, 'src'), { recursive: true });
-  await writeFile(join(root, 'node_modules', '.bin', 'eslint'), '#!/bin/sh\nf="$1"; while [ "$#" -gt 0 ]; do f="$1"; shift; done\necho "$f:2:7: x is assigned a value but never used [no-unused-vars]"\necho "$f:3:1: prefer const [prefer-const] warning"\necho "src/other.ts:1:1: unrelated"\nexit 1\n', { mode: 0o755 });
-  const r = await runQualityLints(root, 'src/a.ts', 'export const a = 1;\nlet x = 2;\n');
-  assert.deepEqual(r.diagnostics, ['src/a.ts:2:7: x is assigned a value but never used [no-unused-vars]']);
-  await rm(join(root, 'eslint.config.js'));
-  assert.deepEqual((await runQualityLints(root, 'src/a.ts', 'let x = 2;\n')).diagnostics, [], 'no configuration, no linter run: the project decides');
-});
-
 test('Lockfiles and manifests are known through the profiles: a package manager rewrite is never an unaccounted file, and the setup fix targets the manifest the repository has', () => {
   for (const l of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'poetry.lock', 'uv.lock', 'Cargo.lock']) assert(lockfiles().includes(l), `${l} is a lockfile`);
   assert(!lockfiles().includes('package.json') && !lockfiles().includes('pyproject.toml'));

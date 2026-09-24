@@ -7,7 +7,6 @@ import { defaults } from '../src/config.js';
 import { Agent, newSession } from '../src/agent.js';
 import { Store } from '../src/store.js';
 import { orient } from '../src/orient.js';
-import { undefinedClasses } from '../src/profiles.js';
 import { findBrowser, renderFacts } from '../src/render.js';
 import { createServer } from 'node:http';
 import type { Answers, Message, Questions } from '../src/types.js';
@@ -244,7 +243,7 @@ test('An edit answers with the region as it now reads, so the next edit needs no
   const pinned = JSON.parse(prompts[0][1].content); const request = JSON.parse(prompts[0].at(-1).content);
   assert(pinned.actions?.replace_lines?.argumentSchema && Array.isArray(request.allowedActions) && !request.actions, 'schemas sit in the cached pinned block; the request names the allowed actions only');
   const roles = prompts[0].map((m: Message) => Object.keys(JSON.parse(m.content.startsWith('{') ? m.content : '{}'))[0] ?? 'system');
-  assert.deepEqual(roles.slice(0, 4), ['system', 'objective', 'notes', 'files'], `stable blocks precede the evidence: ${roles}`); assert.equal(roles.at(-2), 'verification', 'the check state sits just before the request');
+  assert.deepEqual(roles.slice(0, 2), ['system', 'objective'], `the stable blocks lead: ${roles}`); assert.equal(roles.at(-2), 'notes', 'notes, files and the check state sit just before the request, after the evidence');
 });
 test('Jev reads scope: three steps of work the objective did not ask for are named to the worker, and an objective read as satisfied with a passing check invites the finish', async t => {
   const { root, store } = await repo(t);
@@ -278,21 +277,6 @@ test('The harness proposes completion itself: Jev reads the objective as satisfi
   const ev = await events(store); assert(ev.some(e => e.type === 'auto-finish')); assert.equal(ev.filter(e => e.type === 'thought').length, 2, 'the worker never had to claim it; the polish step never ran');
 });
 
-test('Markup that names classes no stylesheet defines is told so at creation and shown to the gate; utility-framework projects are left to their parser; the named root counts as the project root', async t => {
-  const { root } = await repo(t);
-  await mkdir(join(root, 'src', 'components'), { recursive: true }); await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', dependencies: { react: '^19' } }));
-  await writeFile(join(root, 'src', 'index.css'), ':root { --a: 1 }\n.hero { display: grid }\n.btn, .btn-primary:hover { color: red }\n/* .commented {} */\n');
-  const read = (p: string) => readFile(join(root, p), 'utf8').catch(() => null);
-  const r = await undefinedClasses(root, 'src/components/Hero.tsx', 'export function Hero() { return <section className="hero landing-page"><a className={`btn btn-primary ${x}`}>go</a><div className={"feature-card"} /></section>; }', ['src/index.css', 'src/components/Hero.tsx'], read);
-  assert.deepEqual(r, { missing: ['hero', 'landing-page', 'btn', 'btn-primary', 'feature-card'], stylesheets: [], unreached: ['src/index.css'] }, 'a stylesheet nothing imports reaches no page, so nothing is defined');
-  await writeFile(join(root, 'src', 'main.tsx'), "import './index.css'\n");
-  const r2 = await undefinedClasses(root, 'src/components/Hero.tsx', '<section className="hero landing-page" />', ['src/index.css', 'src/main.tsx', 'src/components/Hero.tsx'], read);
-  assert.deepEqual(r2, { missing: ['landing-page'], stylesheets: ['src/index.css'], unreached: [] });
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', dependencies: { react: '^19', tailwindcss: '^4' } }));
-  assert.equal(await undefinedClasses(root, 'src/components/Hero.tsx', '<div className="flex p-4" />', ['src/index.css'], read), null, 'a utility framework defines classes by generation');
-  const { root: empty } = await repo(t);
-  assert.match((await orient(empty)).root, /counts as empty[\s\S]*not in a subdirectory/);
-});
 
 test('Evidence is evicted in batches so the cached prompt prefix survives several steps between reprocessings', async t => {
   const { root, store } = await repo(t);
@@ -303,7 +287,7 @@ test('Evidence is evicted in batches so the cached prompt prefix survives severa
   assert.equal(compactions.length, 1, `one batched eviction across sixteen steps, not one per step: ${compactions.length}`); assert.equal(compactions[0].data.removed, 5);
 });
 
-test('The render action shows the worker what the user sees: errors, a broken image, overflow, bullets in the navigation, the headings; and the gate is told when a page was never rendered', async t => {
+test('The render action shows the worker what the user sees: errors, a broken image, overflow, the headings; and the gate is told when a page was never rendered', async t => {
   if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
   const html = '<!doctype html><html><head><title>Demo</title><style>body{margin:0;font-family:sans-serif}.wide{width:2000px;height:20px;background:red}</style></head><body><header><nav><ul><li><a href="/a">A</a></li><li><a href="/b">B</a></li></ul></nav></header><main><h1>Hello there</h1><img src="/missing.png" alt="Logo"><div class="wide"></div><section id="empty" style="height:40px"></section><script>console.error("boom"); throw new Error("kaput")</script></main></body></html>';
   const server = createServer((req, res) => { if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(html); } else { res.writeHead(404); res.end('no'); } });
@@ -312,7 +296,7 @@ test('The render action shows the worker what the user sees: errors, a broken im
   const { root } = await repo(t);
   const r = await renderFacts(root, `http://127.0.0.1:${port}/`, undefined, join(root, 'shot.png'), 30000);
   assert.equal(r.ok, false);
-  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /overflowing the viewport horizontally: [^|]*div\.wide/); assert.match(r.text, /lists in navigation still showing their bullets: [^|]*ul/); assert.match(r.text, /errors in the page: .*(kaput|boom)/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
+  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /overflowing the viewport horizontally: [^|]*div\.wide/); assert.match(r.text, /errors in the page: .*(kaput|boom)/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
   assert((await readFile(join(root, 'shot.png'))).length > 1000, 'a screenshot is kept for the report');
 });
 
@@ -367,14 +351,95 @@ test('The render measures styling in the page itself: class names no CSS rule ma
   r = await renderFacts(root, url, undefined, null, 30000);
   assert.equal(r.ok, true, r.text); assert.match(r.text, /^RENDER OK: .* 9 of 9 class names styled/);
 });
-test('Writing a stylesheet answers with the class names the markup still uses that no reachable stylesheet defines', async t => {
+
+test('Every call shares one prompt prefix: a reasoning turn and a file generation differ only after the evidence, and creating a file changes nothing before it', async t => {
+  const { root, store } = await repo(t);
+  const prompts: Message[][] = [];
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'look', action: 'bash', args: { command: 'echo one', purpose: 'look', check: false } },
+    { thought: 'write two files', action: 'plan', batch: [{ action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } }, { action: 'create_file', args: { path: 'src/b.ts', purpose: 'b' } }] },
+    { thought: 'look again', action: 'bash', args: { command: 'echo two', purpose: 'look', check: false } },
+  ], files: { 'src/a.ts': 'export const a = 1;\n', 'src/b.ts': 'export const b = 2;\n' } });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); }, generateText: async (m: Message[], o: any) => { prompts.push(m); return bonsai.generateText(m); } };
+  await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const same = (a: Message[], b: Message[]) => { let n = 0; while (n < a.length && n < b.length && a[n]!.content === b[n]!.content) n++; return n; };
+  const turn2 = prompts[1]!, file = prompts[2]!, turn3 = prompts.at(-1)!;
+  assert(same(turn2, file) >= turn2.length - 2, 'the file generation reuses the whole reasoning prefix, evidence included');
+  assert(same(turn2, turn3) >= turn2.length - 2, `created files do not disturb the cached prefix (${same(turn2, turn3)} of ${turn2.length} messages shared)`);
+});
+test('Dependencies follow the manifest: a manifest the worker creates is installed before the next turn, once per version', async t => {
+  const { root, store } = await repo(t);
+  const bin = join(root, 'bin'); await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, 'npm'), '#!/bin/bash\nif [ "$1" = "install" ] || [ "$1" = "ci" ]; then mkdir -p node_modules && echo added; exit 0; fi\nexit 0\n', { mode: 0o755 });
+  const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath}`; t.after(() => { process.env.PATH = oldPath; });
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'manifest', action: 'create_file', args: { path: 'package.json', purpose: 'manifest' } },
+    { thought: 'look', action: 'bash', args: { command: 'ls node_modules', purpose: 'look', check: false } },
+    { thought: 'look again', action: 'bash', args: { command: 'echo done', purpose: 'look', check: false } },
+  ], files: { 'package.json': '{ "name": "x", "dependencies": {} }\n' } });
+  const result = await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const setups = (await events(store)).filter(e => e.type === 'setup');
+  assert.equal(setups.length, 1, 'installed once, before the turn that needed it'); assert.equal(setups[0].data.code, 0); assert.equal(result.setupDone, true);
+});
+test('Session state lives outside the repository, so the project directory holds only the project', async () => {
+  const { stateDir, runsDir } = await import('../src/store.js');
+  const dir = stateDir('/home/u/my app'); assert(!dir.startsWith('/home/u/my app'), dir); assert.match(dir, /leana[\\/]my_app-[0-9a-f]{10}$/); assert.equal(runsDir('/home/u/my app'), join(dir, 'runs'));
+});
+
+test('rewrite_file regenerates an existing file as code with its current content in the prompt; create_file on an existing file points there', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'index.css'), ':root { --a: 1 }\n.old { color: red }\n');
+  const prompts: Message[][] = [];
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'create over it', action: 'create_file', args: { path: 'src/index.css', purpose: 'styles' } },
+    { thought: 'rewrite it', action: 'rewrite_file', args: { path: 'src/index.css', purpose: 'style every component class' } },
+  ], files: { 'src/index.css': ':root { --a: 1 }\n.hero { display: grid }\n.card { padding: 1rem }\n' } });
+  const spy = { ...bonsai, generateText: async (m: Message[], o: any) => { prompts.push(m); return bonsai.generateText(m); } };
+  const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert(result.entries.some(e => /already exists; use rewrite_file/.test(e.text)));
+  assert.equal(await readFile(join(root, 'src', 'index.css'), 'utf8'), ':root { --a: 1 }\n.hero { display: grid }\n.card { padding: 1rem }\n');
+  const req = JSON.parse(prompts.at(-1)!.at(-1)!.content); assert.equal(req.currentContent, ':root { --a: 1 }\n.old { color: red }\n'); assert.match(req.role, /^Rewrite the complete file src\/index\.css/);
+  assert(result.writes.includes('src/index.css'));
+});
+test('A turn cut off by the token limit is told why and what to use instead; three read-only turns in a row are named to the worker and to Jev', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'a.txt'), 'hello\n');
+  let n = 0; const prompts: Message[][] = [];
+  const bonsai = { count: async (m: Message[]) => ({ tokens: 100, mode: 'test' }), lastMeta: null,
+    generate: async (m: Message[]) => { prompts.push(m); n++; if (n === 1) throw new Error('Bonsai did not finish a JSON argument object (length)'); return { thought: 'look', actions: [{ action: 'search_codebase', args: { query: `hello${n}`, path: '.', mode: 'text' } }] }; },
+    generateText: async () => ({ text: '', finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }) };
+  const jev = jevOf({});
+  const result = await new Agent({ ...config, maxSteps: 5 }, store, jev, bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert(result.entries.some(e => /reached the \d+-token limit before it closed[\s\S]*rewrite_file/.test(e.text)), 'the cut-off turn names the cause and the remedy');
+  const note = JSON.parse(prompts.at(-1)!.at(-1)!.content).harnessNote ?? '';
+  assert.match(note, /last 3 turns only read or searched/, note);
+  assert.equal(jev.calls.filter(c => c.phase === 'watchdog').at(-1)!.state.turnsOnlyReading, 4, 'Jev reads the streak after the fourth read-only turn');
+});
+test('A render that finds unstyled class names lists every one by the source file that uses it, and the stylesheets that exist', async t => {
+  if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', dependencies: { react: '^19' } }));
-  await writeFile(join(root, 'src', 'main.tsx'), "import './index.css'\n");
-  const bonsai = bonsaiOf({ steps: [{ thought: 'markup then styles', action: 'plan', batch: [{ action: 'create_file', args: { path: 'src/Hero.tsx', purpose: 'hero' } }, { action: 'create_file', args: { path: 'src/index.css', purpose: 'styles' } }] }],
-    files: { 'src/Hero.tsx': 'export function Hero() { return <section className="hero"><h1 className="hero__title">x</h1><p className="hero__text">y</p></section>; }\n', 'src/index.css': '.hero { display: grid }\n' } });
-  const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
-  const css = result.entries.find(e => e.kind === 'create_file' && /index\.css/.test(e.text))!;
-  assert.match(css.text, /2 class names used in the markup are still defined by no reachable stylesheet \(src\/index\.css\): hero__title, hero__text/, css.text);
+  await writeFile(join(root, 'src', 'Hero.tsx'), 'export const Hero = () => <section className="hero"><h1 className="hero__title">Title here</h1></section>;\n');
+  await writeFile(join(root, 'src', 'Card.tsx'), 'export const Card = () => <div className="card card--wide">Card body text</div>;\n');
+  await writeFile(join(root, 'src', 'index.css'), 'body { margin: 0 }\n');
+  await writeFile(join(root, 'index.html'), '<!doctype html><html><head><title>T</title><style>body{margin:0}</style></head><body><section class="hero"><h1 class="hero__title">Title here</h1></section><div class="card card--wide">Card body text</div><p class="note">A note that is long enough</p></body></html>');
+  const port = 40000 + Math.floor(Math.random() * 20000);
+  const serve = `node -e "const h=require('http');const fs=require('fs');h.createServer((q,r)=>{r.writeHead(200,{'content-type':'text/html'});r.end(fs.readFileSync('index.html'))}).listen(${port})"`;
+  const bonsai = bonsaiOf({ steps: [{ thought: 'look', action: 'render', args: { serve, url: `http://127.0.0.1:${port}/` } }] });
+  const result = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const e = result.entries.find(x => x.kind === 'render')!;
+  assert.match(e.text, /src\/Hero\.tsx: hero hero__title/); assert.match(e.text, /src\/Card\.tsx: card card--wide/); assert.match(e.text, /Stylesheets in the project: src\/index\.css/);
+});
+
+test('A generation that ends without closing its code block is reported as incomplete; a rewrite that reproduces the file unchanged says so instead of a bare no-change', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'Hero.tsx'), 'export function Hero() {\n  return <div className="a">\n');
+  let call = 0;
+  const bonsai = { count: async () => ({ tokens: 100, mode: 'test' }), lastMeta: null,
+    generate: async () => { call++; return call === 1 ? { thought: 'new file', actions: [{ action: 'create_file', args: { path: 'src/B.tsx', purpose: 'b' } }] } : { thought: 'fix hero', actions: [{ action: 'rewrite_file', args: { path: 'src/Hero.tsx', purpose: 'close the tags' } }] }; },
+    generateText: async (m: Message[]) => { const req = JSON.parse(m.at(-1)!.content); return req.currentContent !== undefined ? { text: req.currentContent, finish: 'eos' as const, meta: { ms: 1, promptTokens: 1 } } : { text: 'export const B = () => <div className="b', finish: 'eos' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert(result.entries.some(e => /generated content of src\/B\.tsx ended before the file was complete/.test(e.text)), 'the truncated creation is named');
+  assert(result.entries.some(e => /rewrite of src\/Hero\.tsx reproduced its current content unchanged and ended before the file was complete/.test(e.text)), 'the no-op rewrite is named with its cause');
+  const { codeSampling } = await import('../src/clients.js'); assert.equal((codeSampling as any).dry_multiplier, undefined, 'no repetition penalty on code');
 });

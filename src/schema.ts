@@ -17,6 +17,8 @@ export const schemas: Record<Route, JsonSchema> = {
   // The content of a new file is generated as raw text in a second, grammar-free
   // request; the worker names only the path here.
   create_file: obj({ path: str(500), purpose: str() }),
+  // A whole existing file regenerated as code: the worker names it and what must change.
+  rewrite_file: obj({ path: str(500), purpose: str() }),
   // An anchor replacement in an existing file. Creation is create_file's alone.
   write: obj({ path: str(500), expectedHash: str(64), oldText: str(), newText: str() }),
   replace_lines: obj({ path: str(500), expectedHash: str(64), edits: { type: 'array', minItems: 1, maxItems: 40,
@@ -38,7 +40,7 @@ export const schemas: Record<Route, JsonSchema> = {
 // One step of the orient-reason-act loop: the worker reasons in a few
 // sentences, then names one action; the action's arguments are generated next
 // under that action's schema, with the reasoning in front of the worker.
-export const actions = ['read_files', 'search_codebase', 'bash', 'create_file', 'write', 'replace_lines', 'move_lines', 'plan', 'render', 'finish', 'ask_user'] as const;
+export const actions = ['read_files', 'search_codebase', 'bash', 'create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines', 'plan', 'render', 'finish', 'ask_user'] as const;
 export const stepSchema: JsonSchema = { anyOf: actions.map(a => obj({ thought: str(), action: { type: 'string', const: a, enum: [a] }, args: schemas[a] })) };
 // A decided edit of a known file: the harness fills path and expectedHash, so
 // the worker generates only the edits it was asked for.

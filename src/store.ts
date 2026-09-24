@@ -1,13 +1,23 @@
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
+import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
 import type { Session } from './types.js';
 import { decisionLog } from './decision-log.js';
 import { clip, rememberEdit, retireEvidence } from './context.js';
 import { editRoutes } from './types.js';
 import { summarizeCheck } from './tools.js';
 import { rememberReferences } from './references.js';
+// Sessions live outside the repository, in the user's state directory, so the
+// project directory holds only the project: a scaffolder or a clean-tree check
+// sees exactly what the user sees.
+export function stateDir(root: string): string {
+  const base = process.env.LEANA_STATE_DIR ?? join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'leana');
+  return join(base, `${basename(root).replace(/[^\w.-]/g, '_')}-${createHash('sha256').update(root).digest('hex').slice(0, 10)}`);
+}
+export const runsDir = (root: string): string => join(stateDir(root), 'runs');
 export class Store {
   readonly artifacts: string;
   constructor(readonly path: string) { this.artifacts = join(path, 'artifacts'); }

@@ -17,13 +17,14 @@ export function clip(text: string, limit: number): string {
   return text.slice(0, Math.ceil(room * .7)) + marker + text.slice(-Math.floor(room * .3));
 }
 export const routeDescriptions: Record<Route, string> = {
+  rewrite_file: 'Replace the whole content of an existing file: name its path and what the new content must be; the complete new content is then generated as code, with the current content in front of you. For any change larger than a few lines, and for any file you would otherwise rewrite through replace_lines.',
   plan: 'Replace your running notes: the plan, what is done, what is known, what is next.',
   render: 'See what the user will see: start the app\'s server, load a page in a headless browser, and get the facts (errors, failed requests, broken images, overflow, unstyled lists, headings, text). The build cannot tell you any of this.',
   read_files: 'Read a requirements document, an uninspected file, or an exact source range already located by search or diagnostics; retrieve a stored artifact from @artifact/name. To locate named declarations in an already-read large source file, choose search_codebase instead of rereading its beginning or paging through it.',
   search_codebase: 'Locate files, definitions, references or tests using a text query or file listing; text matches return file:line, which is the one-step way to find where a symbol is defined in a large file before reading that range. Search path @artifacts for archived evidence.',
   create_file: 'Create a file that does not exist yet: name its path and purpose here; its complete content is then generated as code in a separate step.',
   write: 'Replace one short anchor with new text in an already-read existing file; never for blocks, import lists, exports or moves, which replace_lines and move_lines do by line number without retyping, and never to create a file (create_file does that).',
-  replace_lines: 'Replace, delete or prefix up to 40 line ranges of an already-read file in one step, addressed by line numbers instead of exact anchors; the way to remove many unused-import lines at once, to export many declarations at once (prepend), or to rewrite a region.',
+  replace_lines: 'For small, local edits only: newText is part of this JSON reply and the whole reply is limited in length, so a large replacement is cut off and lost; use rewrite_file for anything larger. Replace, delete or prefix up to 40 line ranges of an already-read file in one step, addressed by line numbers instead of exact anchors; the way to remove many unused-import lines at once, to export many declarations at once (prepend), or to rewrite a region.',
   move_lines: 'Move a contiguous line range from an already-read file into another file without retyping it; the way to extract a large block into a new module.',
   bash: 'Run a shell command, including tests, builds or diagnostics, with explicit execution permission.',
   tasks: 'Create or update a concise task ledger; preserve existing unfinished work and evidence.',
@@ -172,6 +173,7 @@ export function evictOne(s: Session): Entry | undefined {
   return candidate;
 }
 const details: Record<Route, string> = {
+  rewrite_file: 'path is an existing file; purpose says what the new version must contain and change. Never put file content in the arguments: it is generated next, as code, from the current content, your thought and purpose.',
   render: 'serve is the shell command that starts the server for the page (for example a dev or preview script, with a fixed port and no browser opening); it runs in the repository root and is stopped after the render; pass "" when a server is already running. url is the page to load. Do this for every user-facing change before finishing: a build that passes says nothing about what renders.',
   plan: 'notes is the whole of your notes, replaced: a short plan with what is done, what you have learned (versions, commands that work, decisions), and what comes next. Keep it under forty lines.',
   read_files: 'When focus is present, read around the lines it names for the file being fixed rather than from line 1. Use exact regular repository-relative file paths; globs, directories, and wildcard paths are invalid. Use 1-based inclusive start/end; at most 250 lines per file (end <= start+249). For a file longer than 250 lines, locate the definition with search_codebase first and read only that range; readCoverage shows what was already read, and reading it again yields nothing new. Output is cut at line boundaries within a character budget shared across the requested files and reports the last line shown; continue from the next line in a later read. Use @artifact/NAME to retrieve prior outputs. Read before editing.',
@@ -248,31 +250,38 @@ export function agentRequestBase(s: Session): Record<string, unknown> {
 export function verificationBlock(s: Session): Record<string, unknown> {
   return { verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors, byFile: Object.fromEntries(Object.entries(s.lastCheck.summary.byFile).slice(0, 6).map(([f, v]) => [f, (v.diagnostics ?? v.samples).slice(0, 3).map(d => clip(d, 400))])) } : { command: s.lastCheckCommand, step: null, ok: null } };
 }
-function agentPrefix(s: Session, includeStale = true, allowed?: string[]): Message[] {
+// The prompt is ordered by how often each part changes, because the server
+// reuses its cache only up to the first changed message: the system message and
+// the orientation never change in a session; the evidence is append-only (an
+// entry is removed only by a batched eviction); the notes, the file list, the
+// check state and the request change every turn and come last. Every call, a
+// reasoning turn or a file generation, shares this prefix.
+export function agentAllowed(s: Session): string[] | undefined { return s.allowedActions; }
+function agentPrefix(s: Session): Message[] {
   return [
     { role: 'system', content: AGENT_SYSTEM },
-    { role: 'user', content: JSON.stringify(orientationBlock(s, allowed)) },
-    { role: 'user', content: JSON.stringify({ notes: s.notes ?? '' }) },
-    { role: 'user', content: JSON.stringify({ files: relevantFiles(s, 40) }) },
-    ...s.entries.filter(e => includeStale || !e.stale).map(e => ({ role: 'user' as const, content: JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } }) })),
-    { role: 'user', content: JSON.stringify(verificationBlock(s)) },
+    { role: 'user', content: JSON.stringify(orientationBlock(s, s.allowedActions)) },
+    ...s.entries.map(e => ({ role: 'user' as const, content: JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } }) })),
   ];
+}
+function volatile(s: Session): Message[] {
+  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s) }) }];
 }
 export function stepMessages(s: Session, allowed: string[], note?: string): Message[] {
   const request = { role: 'Reason, then act. Write thought: two to five sentences on where the work stands given the objective, your notes and the latest evidence, and what to do next and why. Then actions: an ordered list of one to eight actions (each an action name from allowedActions with its args under that action\'s schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and a render) and put a check or a render last; keep to one action when its result decides what comes next.',
     ...agentRequestBase(s), allowedActions: allowed, ...(note ? { harnessNote: note } : {}) };
-  return [...agentPrefix(s, true, allowed), { role: 'user', content: JSON.stringify({ ...request, verificationAfterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep) }) }];
+  return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify({ ...request, verificationAfterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep) }) }];
 }
 // A new file, written as code: the worker's purpose and thought, the real
 // exported signatures of the repository modules it names, and the packages
 // the manifest declares, so nothing is invented.
-export function newFileMessages(s: Session, path: string, purpose: string, thought: string, contracts: FileContract[], declared: string[], shrink = 0): Message[] {
+export function newFileMessages(s: Session, path: string, purpose: string, thought: string, contracts: FileContract[], declared: string[], shrink = 0, current?: string): Message[] {
   const request = {
-    role: `Write the complete file ${path} as code. The harness has opened the code block; write only the file content and close the block.`,
-    file: path, purpose, thought, notes: clip(s.notes ?? '', shrink ? 600 : 2000),
+    role: current === undefined ? `Write the complete file ${path} as code. The harness has opened the code block; write only the file content and close the block.` : `Rewrite the complete file ${path} as code: its whole new content, keeping what should stay and changing what purpose asks. The harness has opened the code block; write only the file content and close the block.`,
+    file: path, purpose, thought, ...(current !== undefined ? { currentContent: shrink ? clip(current, 6000) : current } : {}),
     modules: contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
     declaredPackages: declared.slice(0, 60),
     rules: [`Write the complete content of ${path}: working code with no placeholders, TODOs or omitted sections.`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', 'Write the file content only, then the closing fence; no explanation before or after it.'],
   };
-  return [...agentPrefix(s, false), { role: 'user', content: JSON.stringify(request) }];
+  return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify(request) }];
 }

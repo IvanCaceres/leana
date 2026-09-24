@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { readFile, readdir, realpath, open, unlink } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, open, unlink } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from './config.js';
 import { Bonsai, Jev, postJson } from './clients.js';
 import { newSession, Agent } from './agent.js';
-import { Store } from './store.js';
+import { Store, runsDir, stateDir } from './store.js';
 import { runCommand } from './tools.js';
 import { renderReport } from './report.js';
 import { Display } from './display.js';
@@ -26,7 +26,7 @@ export async function dirtySessionConflict(root: string): Promise<string | null>
   if (!git || git.code !== 0) return null;
   const dirty = git.output.split('\n').filter(Boolean).map(l => l.slice(3).trim());
   if (!dirty.length) return null;
-  const runs = join(root, '.leana', 'runs');
+  const runs = runsDir(root);
   const names = (await readdir(runs).catch(() => [] as string[])).sort().reverse();
   for (const name of names) {
     const path = join(runs, name);
@@ -128,12 +128,13 @@ async function main(): Promise<void> {
     const root = await realpath(resolve(v.repo ?? '.'));
     const conflict = v['allow-dirty'] ? null : await dirtySessionConflict(root);
     if (conflict) throw new Error(conflict);
-    store = new Store(join(root, '.leana', 'runs', `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`));
+    store = new Store(join(runsDir(root), `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`));
     session = await newSession(root, rest[0]!);
   }
   await store.init();
   // One active Leana invocation per repository, including different session folders.
-  const lockPath = join(session.root, '.leana', 'run.lock');
+  await mkdir(stateDir(session.root), { recursive: true });
+  const lockPath = join(stateDir(session.root), 'run.lock');
   let lock;
   try { lock = await open(lockPath, 'wx', 0o600); } catch { throw new Error(`Repository is locked. If no Leana process is running, remove ${lockPath}`); }
   try {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runsDir } from './store.js';
 import { createWriteStream } from 'node:fs';
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -42,8 +43,8 @@ async function baseline(runDir: string, repo: string): Promise<void> {
 export async function evaluateBenchmark(runDir: string, options: { label?: string; wallSeconds?: number; agentCompleted?: boolean; timedOut?: boolean; settings?: unknown; telemetry?: boolean; harnessHash?: string }) {
   const manifest = JSON.parse(await readFile(join(runDir, 'manifest.json'), 'utf8'));
   const verification = await verifyBenchmark(runDir);
-  const paths = options.telemetry ? await readdir(join(runDir, 'repo/.leana/runs')).catch(() => []) : [];
-  const sessionPath = paths[0] ? join(runDir, 'repo/.leana/runs', paths[0]) : null;
+  const paths = options.telemetry ? await readdir(runsDir(join(runDir, 'repo'))).catch(() => []) : [];
+  const sessionPath = paths[0] ? join(runsDir(join(runDir, 'repo')), paths[0]) : null;
   const events: Event[] = sessionPath ? (await readFile(join(sessionPath, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
   const metrics = events.length ? summarizeEvents(events) : null;
   const checkpoint = sessionPath ? await readFile(join(sessionPath, 'checkpoint.json'), 'utf8').then(s => JSON.parse(s), () => null) : null;

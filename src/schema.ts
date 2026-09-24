@@ -1,25 +1,48 @@
 import type { JsonSchema, Route } from './types.js';
-const str = (maxLength = 1000): JsonSchema => ({ type: 'string', maxLength });
+const str = (maxLength?: number): JsonSchema => maxLength === undefined ? { type: 'string' } : { type: 'string', maxLength };
 const integer = (minimum: number, maximum: number): JsonSchema => ({ type: 'integer', minimum, maximum });
 const obj = (properties: Record<string, JsonSchema>): JsonSchema => ({
   type: 'object', properties, required: Object.keys(properties), additionalProperties: false,
 });
+// Length caps exist only where exceeding them is itself a content error (a path,
+// a hash, a shell command). Code, prose and summaries are never capped: the
+// grammar cannot enforce a string length, so a cap on generated content is by
+// construction a rule that discards a finished generation. Descriptive fields
+// are clipped where they are stored; content fields are bounded by the token
+// budget and continued when it runs out.
 export const schemas: Record<Route, JsonSchema> = {
   read_files: obj({ files: { type: 'array', minItems: 1, maxItems: 3,
     items: obj({ path: str(500), start: integer(1, 1000000), end: integer(1, 1000000) }) } }),
   search_codebase: obj({ query: str(300), path: str(500), mode: { ...str(), enum: ['text', 'files'] } }),
-  write: obj({ path: str(500), expectedHash: str(64), oldText: str(600), newText: str(2400) }),
+  // The content of a new file is generated as raw text in a second, grammar-free
+  // request; the worker names only the path here.
+  create_file: obj({ path: str(500), purpose: str() }),
+  // A whole existing file regenerated as code: the worker names it and what must change.
+  rewrite_file: obj({ path: str(500), purpose: str() }),
+  // An anchor replacement in an existing file. Creation is create_file's alone.
+  write: obj({ path: str(500), expectedHash: str(64), oldText: str(), newText: str() }),
   replace_lines: obj({ path: str(500), expectedHash: str(64), edits: { type: 'array', minItems: 1, maxItems: 40,
-    items: obj({ start: integer(1, 1000000), end: integer(1, 1000000), newText: str(16000), prepend: str(200) }) } }),
+    items: obj({ start: integer(1, 1000000), end: integer(1, 1000000), newText: str(), prepend: str(200) }) } }),
+  // A plain cut and paste: the lines leave source and are appended to destination unchanged.
   move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),
-    destination: str(500), destinationHash: str(64), replacement: str(16000), prefix: str(16000) }),
-  bash: obj({ command: str(2000), purpose: str(500) }),
-  tasks: obj({ tasks: { type: 'array', minItems: 1, maxItems: 12,
-    items: obj({ id: { ...str(40), minLength: 1 }, description: str(300),
-      status: { ...str(), enum: ['pending', 'done'] }, evidence: str(500) }) } }),
-  finish: obj({ summary: str(4000) }),
-  ask_user: obj({ question: str(2000) }),
+    destination: str(500), destinationHash: str(64) }),
+  bash: obj({ command: str(2000), purpose: str(), check: { type: 'boolean' } }),
+  finish: obj({ summary: str() }),
+  ask_user: obj({ question: str() }),
+  // The worker's own notes: its plan and what it has learned, replaced whole.
+  plan: obj({ notes: str() }),
+  // Render a page of the running application in a headless browser: serve is the
+  // command that starts the server (empty when one is already running), url the page.
+  render: obj({ serve: str(500), url: str(300) }),
 };
+// One step of the orient-reason-act loop: the worker reasons in a few
+// sentences, then names one action; the action's arguments are generated next
+// under that action's schema, with the reasoning in front of the worker.
+export const actions = ['read_files', 'search_codebase', 'bash', 'create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines', 'plan', 'render', 'finish', 'ask_user'] as const;
+export const stepSchema: JsonSchema = { anyOf: actions.map(a => obj({ thought: str(), action: { type: 'string', const: a, enum: [a] }, args: schemas[a] })) };
+// A decided edit of a known file: the harness fills path and expectedHash, so
+// the worker generates only the edits it was asked for.
+export const focusedEditSchema: JsonSchema = obj({ edits: schemas.replace_lines.properties!.edits! });
 // llama.cpp builds can reject repetition bounds such as maxLength=2000 in GBNF.
 // Keep shape constraints during sampling and enforce all size limits locally.
 export function samplingSchema(schema: JsonSchema): JsonSchema {
@@ -27,10 +50,13 @@ export function samplingSchema(schema: JsonSchema): JsonSchema {
   if (copy.type === 'string' && (copy.maxLength ?? 0) > 1000) delete copy.maxLength;
   if (copy.properties) copy.properties = Object.fromEntries(Object.entries(copy.properties).map(([k, v]) => [k, samplingSchema(v)]));
   if (copy.items) copy.items = samplingSchema(copy.items);
+  if (copy.anyOf) copy.anyOf = copy.anyOf.map(samplingSchema);
   return copy;
 }
 export function validate(schema: JsonSchema, value: unknown, path = 'args'): void {
   const fail = (reason: string): never => { throw new Error(`${path}: ${reason}`); };
+  if (schema.anyOf) { const errors: string[] = []; for (const alt of schema.anyOf) { try { validate(alt, value, path); return; } catch (e) { errors.push((e as Error).message); } } fail(`matches no alternative (${errors.slice(0, 3).join(' / ')})`); }
+  if (schema.const !== undefined && value !== schema.const) fail(`expected ${schema.const}`);
   switch (schema.type) {
     case 'object': {
       if (!value || typeof value !== 'object' || Array.isArray(value)) fail('expected object');
@@ -56,4 +82,15 @@ export function validate(schema: JsonSchema, value: unknown, path = 'args'): voi
       if (!Number.isSafeInteger(value) || (value as number) < (schema.minimum ?? -Infinity) || (value as number) > (schema.maximum ?? Infinity)) fail('integer out of range'); break;
     case 'boolean': if (typeof value !== 'boolean') fail('expected boolean');
   }
+}
+// The body of the first fenced code block, or the whole text when the model
+// wrote none: a mechanical unwrap, never a reason to regenerate. A block cut
+// short by the token budget has no closing fence and is taken to the end.
+export function extractCode(text: string): string {
+  const open = text.match(/(^|\n)\s*```[^\n]*\n/);
+  if (!open || open.index === undefined) return text.replace(/\s+$/, '') + '\n';
+  const start = open.index + open[0].length;
+  const close = text.indexOf('\n```', start);
+  const body = close < 0 ? text.slice(start) : text.slice(start, close);
+  return body.replace(/\s+$/, '') + '\n';
 }

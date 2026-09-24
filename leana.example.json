@@ -15,6 +15,9 @@
   "maxSteps": 80,
   "toolChars": 6000,
   "commandTimeoutMs": 60000,
+  "createTokens": 12000,
+  "designTokens": 14000,
+  "designThinking": true,
   "allowWrite": false,
   "allowBash": false
 }

@@ -1,74 +1,68 @@
 import type { Session } from './types.js';
+import { boundedRead, hash, safePath } from './tools.js';
 
-// Preserve source excerpts, never model-written interpretations of the task.
-// Rank short windows by literal objective terms, including numbered sections:
-// a plan's title and table of contents alone do not explain a requested substep.
-function terms(objective: string): string[] {
-  const sections = objective.match(/\b(?:step|section|phase|part)\s+\d+(?:\.\d+)*\b/gi) ?? [];
-  const words = objective.replace(/\S+\.(?:md|txt|rst)\b/gi, '').match(/[a-zA-Z_][\w-]{3,}/g) ?? [];
-  return [...new Set([...sections, ...words.filter(w => !/^(read|perform|only|step|substep|section|phase|part|this|that|with|from|then|please)$/i.test(w))].map(w => w.toLowerCase()))];
-}
-function score(text: string, objective: string): number {
-  const lower = text.toLowerCase();
-  return terms(objective).reduce((n, term) => n + (new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(lower) ? (term.includes(' ') ? 20 : 1) : 0), 0);
-}
-// Every requested item: "step 1 substep 2", "step 1 substep 1 and substep 2",
-// "step 1 substeps 1-3", "step 1 substep 1 and 2". One scope per item.
-export function scopes(objective: string): { key: string; kind: string; section: string; item: string }[] {
-  const out: { key: string; kind: string; section: string; item: string }[] = [];
-  for (const m of objective.matchAll(/\b(step|section|phase|part)\s+(\d+(?:\.\d+)*)\s+(?:substeps?|items?)\s+(\d+(?:\s*(?:,|and|&|-|to|through)\s*(?:substeps?|items?)?\s*\d+)*)\b/gi)) {
-    const [kind, section] = [m[1]!.toLowerCase(), m[2]!];
-    const numbers = [...m[3]!.matchAll(/\d+/g)].map(x => Number(x[0]));
-    const ranged = /-|\bto\b|\bthrough\b/i.test(m[3]!) && numbers.length === 2 && numbers[1]! > numbers[0]!
-      ? Array.from({ length: numbers[1]! - numbers[0]! + 1 }, (_, i) => numbers[0]! + i) : numbers;
-    for (const n of ranged) { const key = `${kind} ${section} substep ${n}`; if (!out.some(o => o.key === key)) out.push({ key, kind, section, item: String(n) }); }
+// The files the objective names are pinned for the worker as source excerpts,
+// never as model-written interpretations of the task. The harness reads each
+// one itself (bounded), cuts it into overlapping chunks, and when the chunks do
+// not all fit, Jev ranks them against the objective; the prompt carries the
+// best-ranked ones. A file that changes is read and ranked again.
+const chunkLines = 30; const chunkStep = 20; const maxChunks = 120; const storeBytes = 12000;
+export type Rank = (query: string, chunks: string[]) => Promise<number[]>;
+
+// Path tokens of the objective that are files of the repository: as written
+// from the root, or the one known file that ends with it.
+export async function namedFiles(root: string, objective: string, known: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const m of objective.matchAll(/(?:^|[\s"'`(\[<])((?:\.\/)?(?:[\w@+.-]+\/)*[\w@+-][\w@+.-]*\.[A-Za-z]\w{0,7})(?=$|[\s"'`)\]>:;,.!?])/g)) {
+    const token = m[1]!.replace(/^\.\//, '');
+    let path: string | null = await safePath(root, token).then(() => token, () => null);
+    if (!path) { const ends = known.filter(f => f.endsWith(`/${token}`)); path = ends.length === 1 ? ends[0]! : null; }
+    if (path && !out.includes(path)) out.push(path);
   }
   return out;
 }
-export function rememberReferences(s: Session, result: string): void {
-  const blocks = result.split(/\n\n(?=\S+ sha256=)/);
-  for (const block of blocks) {
-    const header = block.match(/^(\S+\.(?:md|txt|rst)) sha256=(\w+) totalLines=\d+ shown=\d+\.\.\d+\n/i);
-    if (!header || !s.objective.includes(header[1]!)) continue;
-    const [, path, hash] = header as [string, string, string];
-    s.referenceEvidence = s.referenceEvidence.filter(e => e.path !== path || e.hash === hash);
-    const lines = block.slice(header[0].length).split('\n');
-    for (const requested of scopes(s.objective)) {
-      const plain = (line: string) => line.replace(/^\d+:\s?/, '').replace(/^[#*\s]+/, '');
-      const heading = new RegExp(`^${requested.kind}\\s+${requested.section.replace(/\./g, '\\.')}\\b`, 'i');
-      const at = lines.findIndex(l => heading.test(plain(l)));
-      if (at < 0) continue;
-      const body = lines.slice(at + 1);
-      const nextHeading = body.findIndex(l => /^(?:step|section|phase|part)\s+\d/i.test(plain(l)));
-      const section = nextHeading < 0 ? body : body.slice(0, nextHeading);
-      const item = section.findIndex(l => new RegExp(`^${requested.item}[.)]\\s`).test(plain(l)));
-      if (item < 0) continue;
-      const rest = section.slice(item + 1);
-      const next = rest.findIndex(l => /^\d+[.)]\s/.test(plain(l)));
-      const text = [lines[at], section[item], ...(next < 0 ? rest : rest.slice(0, next))].join('\n').slice(0, 2400);
-      if (!s.referenceEvidence.some(e => e.path === path && e.text === text)) s.referenceEvidence.push({ path, hash, text, scope: requested.key });
+
+// Refresh the pinned chunks of every named file whose content changed since it
+// was pinned. Returns the paths that were (re)pinned.
+export async function pinReferences(s: Session, root: string, rank: Rank | null): Promise<string[]> {
+  const pinned: string[] = []; const named = await namedFiles(root, s.objective, s.knownFiles);
+  for (const path of named) {
+    let text: string; try { text = await boundedRead(await safePath(root, path)); } catch { continue; }
+    if (text.includes('\u0000')) continue;
+    const h = hash(text);
+    if (s.referenceEvidence.some(e => e.path === path && e.hash === h)) continue;
+    const lines = text.split('\n'); const chunks: { start: number; text: string }[] = [];
+    for (let start = 0; start < lines.length && chunks.length < maxChunks; start += chunkStep) {
+      chunks.push({ start: start + 1, text: lines.slice(start, start + chunkLines).map((l, i) => `${start + i + 1}: ${l}`).join('\n').slice(0, 2400) });
+      if (start + chunkLines >= lines.length) break;
     }
-    // Overlapping windows retain headings and the following numbered items.
-    for (let start = 0; start < lines.length; start += 12) {
-      const text = lines.slice(start, start + 24).join('\n').slice(0, 2400);
-      if (!s.referenceEvidence.some(e => e.path === path && e.text === text)) s.referenceEvidence.push({ path, hash, text });
+    let ranks: (number | undefined)[] = chunks.map(() => undefined);
+    const share = Math.floor(storeBytes / named.length);
+    if (rank && chunks.reduce((n, c) => n + Buffer.byteLength(c.text), 0) > share) {
+      ranks = [];
+      for (let i = 0; i < chunks.length; i += 24) {
+        const batch = chunks.slice(i, i + 24).map(c => c.text);
+        const scores = await rank(`the parts of ${path} that the objective asks for`, batch).catch(() => batch.map(() => undefined));
+        ranks.push(...scores);
+      }
     }
+    const fresh = chunks.map((c, i) => ({ path, hash: h, text: c.text, start: c.start, ...(ranks[i] !== undefined ? { rank: ranks[i] } : {}) }))
+      .sort((a, b) => (b.rank ?? 1) - (a.rank ?? 1) || a.start - b.start);
+    let bytes = 0; const kept = fresh.filter(e => (bytes += Buffer.byteLength(e.text)) <= share || e === fresh[0]);
+    s.referenceEvidence = [...s.referenceEvidence.filter(e => e.path !== path), ...kept];
+    pinned.push(path);
   }
-  s.referenceEvidence.sort((a, b) => Number(Boolean(b.scope)) - Number(Boolean(a.scope)) || score(b.text, s.objective) - score(a.text, s.objective));
-  let bytes = 0;
-  s.referenceEvidence = s.referenceEvidence.filter(e => (bytes += Buffer.byteLength(JSON.stringify(e))) <= 12000);
+  return pinned;
 }
+
+// The best-ranked current chunks within a budget, in document order.
 export function referenceContext(s: Session, budget = 6000): Session['referenceEvidence'] {
-  const out: Session['referenceEvidence'] = [];
-  const requested = new Set(scopes(s.objective).map(r => r.key));
   const current = s.referenceEvidence.filter(e => !s.hashes[e.path] || s.hashes[e.path] === e.hash);
-  const scoped = current.filter(e => e.scope && requested.has(e.scope));
-  for (const e of scoped.length ? scoped : current) {
-    // A changed document must be read again before its requirements are reused.
-    if (s.hashes[e.path] && s.hashes[e.path] !== e.hash) continue;
+  const out: Session['referenceEvidence'] = [];
+  for (const e of [...current].sort((a, b) => (b.rank ?? 1) - (a.rank ?? 1) || (a.start ?? 0) - (b.start ?? 0))) {
     const size = Buffer.byteLength(JSON.stringify(e));
     if (size > budget) continue;
     out.push(e); budget -= size;
   }
-  return out;
+  return out.sort((a, b) => a.path.localeCompare(b.path) || (a.start ?? 0) - (b.start ?? 0));
 }

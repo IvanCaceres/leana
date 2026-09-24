@@ -10,14 +10,14 @@ import type { Answers, Config, Message, Questions, Route, Session, ToolResult } 
 import { editRoutes } from './types.js';
 import type { ProgressEvent } from './display.js';
 import { Store } from './store.js';
-import { ToolBox, boundedRead, hash, listRepoFiles, readOnlyCommand, regression, repositoryStatus, resolveMissingNames, runCommand, safePath, sourceHashes, summarizeCheck } from './tools.js';
+import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot } from './tools.js';
 import { clip, clipEnds, evictOne, fenceFor, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
-import { rememberReferences, referenceContext } from './references.js';
+import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
-import { detectEcosystem, importSpelling, importsFor, moduleCandidates, packageImportFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type EcosystemProfile } from './profiles.js';
+import { detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
 import { orient } from './orient.js';
 import { renderFacts } from './render.js';
-import { evidenceGate, rankExcerpts, triage, watchdog, type Jev as JevLike } from './control.js';
+import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
 import type { Bonsai } from './clients.js';
 
 export async function newSession(root: string, objective: string): Promise<Session> {
@@ -27,8 +27,8 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   if (Buffer.byteLength(instructions) > 12000) throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
   return { version: 1, root, objective, instructions, step: 0, tasks: [], focus: null, entries: [],
     lastCompact: -100, status: 'running', stopReason: '', writes: [], lastWriteStep: -1, lastCheckStep: -1,
-    phase: 'implement', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, moveDirection: null, pendingMoves: [], ledger: [], design: null, ledgerAttempts: 0, ledgerBuilt: true, ledgerComplete: 0, baselineArtifacts: {}, checkInferences: 0, checkInferredFor: -1, setupDone: false, baselineStatus: null,
-    lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, missingNames: [], transaction: [], rejectedEdits: [], lastCheckCommand: null, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {}, pendingRepairs: [],
+    phase: 'implement', knownFiles: await listRepoFiles(root), inspectionCount: 0, lastError: null, editEvidence: [], referenceEvidence: [], completionFeedback: null, finishTriedAtCheck: -1, lastToolError: null, ledger: [], design: null, ledgerAttempts: 0, ledgerBuilt: true, ledgerComplete: 0, baselineArtifacts: {}, checkInferences: 0, checkInferredFor: -1, setupDone: false, baselineStatus: null,
+    lastRoute: null, lastResultOk: false, lastWriteStale: false, repetitions: {}, coverage: {}, hashes: {}, lastPromptTokens: 0, lastCheck: null, previousCheck: null, editSnapshots: {}, transaction: [], rejectedEdits: [], lastCheckCommand: null, autoUndo: null, inspectionsSinceAction: 0, coverageByHash: {}, repetitionSteps: {}, focusReadAt: -1, autoFixKeys: {}, actions: {}, searches: {}, blockedRoute: null, editsSinceCheck: 0, readHashes: {}, writeSteps: {}, pendingRepairs: [],
     notes: '', watch: { noProgress: 0, readings: [], escalations: 0 }, blockedActions: [] };
 }
 
@@ -39,10 +39,9 @@ export class Agent {
     this.tools = new ToolBox(root, store.artifacts, config, (path, text) => store.snapshot(this.current, path, text));
     this.tools.commandPrefix = () => shellPrefixFor(root);
   }
-  private async ecosystem(): Promise<EcosystemProfile | null> { return detectEcosystem(this.tools.root); }
-  private async manifestKey(): Promise<string> {
-    const eco = await this.ecosystem(); const files = eco ? eco.manifests : [];
-    return hash((await Promise.all(files.map(f => readFile(join(this.tools.root, f), 'utf8').catch(() => '')))).join('\u0000'));
+  // A project's manifests' state: what its install was made from.
+  private async manifestKey(p: Project): Promise<string> {
+    return hash((await Promise.all(p.eco.manifests.map(f => readFile(join(this.tools.root, p.dir, f), 'utf8').catch(() => '')))).join('\u0000'));
   }
   static actionKey(s: Session, route: Route, args: Record<string, any>): string {
     const hashes = route === 'read_files' ? (args.files as { path: string }[]).map(f => [f.path, s.hashes[f.path] ?? null]).sort() : route === 'search_codebase' ? Object.entries(s.hashes).sort() : undefined;
@@ -57,17 +56,6 @@ export class Agent {
       for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
     s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
-    // A shell command that is not read-only may have edited files: every written or named file whose hash changed is an edit of this step.
-    if (kind === 'bash' && typeof args?.command === 'string' && !readOnlyCommand(args.command)) {
-      const named = s.knownFiles.filter(p => p.length > 3 && args.command.includes(p));
-      const baseline = (p: string) => s.hashes[p] ?? s.lastCheck?.fileHashes?.[p];
-      const watched = [...new Set([...s.writes, ...named])].filter(p => baseline(p) && baseline(p) !== 'unavailable');
-      const now = await sourceHashes(s.root, watched);
-      const changed = watched.filter(p => now[p] !== 'unavailable' && now[p] !== baseline(p));
-      if (changed.length) { result.changed = [...new Set([...(result.changed ?? []), ...changed])]; result.hashes = { ...(result.hashes ?? {}), ...Object.fromEntries(changed.map(p => [p, now[p]!])) }; await this.store.log('bash-edit', { step: s.step, files: changed, command: clip(args.command, 200) }); }
-      // A command may have created files the session did not know (a scaffolder, a generator): the tree is re-read.
-      if (!result.changed?.length || /\b(create|init|new|generate|scaffold|install)\b/.test(args.command)) s.knownFiles = await listRepoFiles(s.root).catch(() => s.knownFiles);
-    }
     if (result.ok && result.changed?.length && editRoutes.includes(kind as Route)) rememberEdit(s, s.step, kind, result.changed, artifact, result.text, args);
     if ((kind === 'read_files' || kind === 'search_codebase') && result.ok) s.inspectionCount++;
     if (kind === 'search_codebase' && result.ok && args) {
@@ -78,7 +66,6 @@ export class Agent {
       for (const old of Object.keys(s.searches).slice(0, -20)) delete s.searches[old];
     }
     if (kind === 'read_files' && result.ok) {
-      rememberReferences(s, result.text);
       for (const [path, h] of Object.entries(result.hashes ?? {})) s.readHashes[path] = h;
       for (const m of result.text.matchAll(/(?:^|\n\n)(\S+) sha256=(\w+) totalLines=(\d+) shown=(\d+)\.\.(\d+)/g)) if (Number(m[5]) >= Number(m[4])) { s.coverage[m[1]!] = mergeCoverage(s.coverage[m[1]!], Number(m[3]), Number(m[4]), Number(m[5])); s.coverageByHash[`${m[1]}@${m[2]}`] = s.coverage[m[1]!]!; }
       for (const old of Object.keys(s.coverageByHash).slice(0, -40)) delete s.coverageByHash[old];
@@ -90,7 +77,7 @@ export class Agent {
     if (result.verification) { s.editsSinceCheck = 0; if (kind === 'bash' && args?.command) s.lastCheckCommand = args.command.trim(); }
     if (s.completionFeedback && !s.completionFeedback.addressed && result.verification && result.ok && s.lastWriteStep > s.completionFeedback.step) s.completionFeedback = { ...s.completionFeedback, addressed: true, text: `The completion proposed at step ${s.completionFeedback.step} was rejected (${clip(s.completionFeedback.text, 200)}); edits and a passing verification have followed.` };
     if (result.changed?.length) s.editsSinceCheck++;
-    if ((kind === 'read_files' || kind === 'search_codebase' || (kind === 'bash' && typeof args?.command === 'string' && readOnlyCommand(args.command))) && result.ok) s.inspectionsSinceAction++;
+    if ((kind === 'read_files' || kind === 'search_codebase' || (kind === 'bash' && !result.changed?.length)) && result.ok) s.inspectionsSinceAction++;
     if (result.changed?.length || result.verification || kind === 'undo') s.inspectionsSinceAction = 0;
     for (const changed of result.changed ?? []) {
       if (!s.writes.includes(changed)) s.writes.push(changed);
@@ -103,23 +90,23 @@ export class Agent {
     if (result.check) s.lastCheckStep = s.step;
     if (result.verification) {
       s.previousCheck = s.lastCheck;
-      s.lastCheck = { step: s.step, ok: result.ok, text: clipEnds(result.text, 1500), summary: summarizeCheck(result.text, s.root), fileHashes: await sourceHashes(s.root, s.writes), ...(kind === 'bash' && typeof args?.command === 'string' ? { command: args.command.trim() } : {}) };
+      let output = result.text; try { output = String(JSON.parse(result.text).output ?? result.text); } catch { /* plain text */ }
+      s.lastCheck = { step: s.step, ok: result.ok, text: clipEnds(output, 1500), summary: await summarizeCheck(result.text, s.root, [...s.writes, ...s.knownFiles]), fileHashes: await sourceHashes(s.root, s.writes), ...(kind === 'bash' && typeof args?.command === 'string' ? { command: args.command.trim() } : {}) };
       if (!result.ok) {
         const sites: string[] = [];
-        for (const [file, v] of Object.entries(s.lastCheck.summary.byFile).slice(0, 5)) {
-          if (file === '(other)') continue; const p = [...s.writes, ...s.knownFiles].find(f => f === file || f.endsWith(`/${file}`) || file.endsWith(`/${f}`)); if (!p) continue;
+        for (const [p, named] of Object.entries(s.lastCheck.summary.files).slice(0, 5)) {
           const text = await readFile(await safePath(s.root, p), 'utf8').catch(() => null); if (text === null) continue;
           const lines = text.split('\n');
-          for (const n of v.lines.slice(0, 2)) { const a = Math.max(1, n - 4); const b = Math.min(lines.length, n + 4); sites.push(`${p} lines ${a}..${b} (error at ${n}):\n${lines.slice(a - 1, b).map((l, i) => `${a + i}: ${l}`).join('\n')}`); }
+          for (const n of named.filter(n => n <= lines.length).slice(0, 2)) { const a = Math.max(1, n - 4); const b = Math.min(lines.length, n + 4); sites.push(`${p} lines ${a}..${b} (error at ${n}):\n${lines.slice(a - 1, b).map((l, i) => `${a + i}: ${l}`).join('\n')}`); }
         }
         if (sites.length) { const e = s.entries.at(-1); if (e) e.text += `\nSource at the errors (sha256 in fileHashes):\n${clip(sites.join('\n'), 2400)}`; }
       }
       // How this run compares with the previous run of the same command: a fact for the worker, never a rollback.
-      if (s.previousCheck && s.previousCheck.command === s.lastCheck.command) { const e = s.entries.at(-1); const before = s.previousCheck.summary.errors; const after = s.lastCheck.summary.errors; if (e && before !== after) e.text += `\nCompared with the previous run at step ${s.previousCheck.step}: errors ${before} -> ${after}.`; }
-      // Names the check cannot find, resolved to import lines by code: facts for the worker, never applied for it.
-      let output = result.text; try { output = JSON.parse(result.text).output ?? result.text; } catch { /* plain text */ }
-      s.missingNames = result.ok ? [] : await resolveMissingNames(this.tools.root, output, s.writes, 40).catch(() => []);
-      for (const n of s.missingNames) if (!n.importLine && !n.declaredIn && !n.kind) { const line = await packageImportFor(this.tools.root, n.name).catch(() => null); if (line) { n.importLine = line; n.note = `${n.name} is exported by a declared package`; } }
+      if (s.previousCheck?.summary.files && s.previousCheck.command === s.lastCheck.command) {
+        const e = s.entries.at(-1); const was = s.previousCheck.summary; const now = s.lastCheck.summary;
+        const before = Object.keys(was.files); const after = Object.keys(now.files);
+        if (e && (was.code !== now.code || before.join('\n') !== after.join('\n'))) e.text += `\nCompared with the previous run at step ${s.previousCheck.step}: exit code ${was.code} -> ${now.code}; files the output names: ${before.join(', ') || 'none'} -> ${after.join(', ') || 'none'}.`;
+      }
     }
     for (const [path, artifact] of Object.entries(result.snapshots ?? {})) if (!(path in s.baselineArtifacts)) s.baselineArtifacts[path] = artifact;
     retireEvidence(s);
@@ -134,7 +121,10 @@ export class Agent {
     await this.store.log('action', { step: s.step, route, args, forced: kind.startsWith('auto') });
     const started = performance.now();
     let result: ToolResult;
+    // What a shell command changed is read from the tree, never guessed from the command.
+    const before = route === 'bash' ? await treeSnapshot(this.tools.root).catch(() => null) : null;
     try { result = await this.tools.execute(route, args); } catch (e) { result = { ok: false, text: `Tool error: ${(e as Error).message}` }; }
+    if (route === 'bash') await this.commandEffects(s, args, result, before);
     // A written file that does not parse is a fact the worker sees at once, by the language's own tool.
     if (result.ok && editRoutes.includes(route) && result.changed?.length) {
       const facts: string[] = [];
@@ -148,10 +138,30 @@ export class Agent {
     return result;
   }
 
+  // Every file a command created, modified or deleted is an edit of this step,
+  // except what the check of record writes (a build's output is not an edit it
+  // must be run again for). The file list follows the tree either way.
+  private async commandEffects(s: Session, args: Record<string, any>, result: ToolResult, before: Awaited<ReturnType<typeof treeSnapshot>>): Promise<void> {
+    const after = before ? await treeSnapshot(this.tools.root).catch(() => null) : null;
+    if (!before || !after) { s.knownFiles = await listRepoFiles(s.root).catch(() => s.knownFiles); return; }
+    const { changed, created, deleted } = await treeChanges(this.tools.root, before, after);
+    if (!changed.length) return;
+    s.knownFiles = [...s.knownFiles.filter(p => !deleted.includes(p)), ...created.filter(p => !s.knownFiles.includes(p))].sort();
+    for (const p of deleted) { delete s.hashes[p]; delete s.coverage[p]; delete s.readHashes[p]; }
+    if (args.check === true) return;
+    const present = changed.filter(p => !deleted.includes(p));
+    const now = await sourceHashes(s.root, present.slice(0, 40));
+    result.changed = [...new Set([...(result.changed ?? []), ...changed])];
+    result.hashes = { ...(result.hashes ?? {}), ...Object.fromEntries(Object.entries(now).filter(([, h]) => h !== 'unavailable')) };
+    const counts = [created.length ? `created ${created.length}` : '', present.length - created.length ? `modified ${present.length - created.length}` : '', deleted.length ? `deleted ${deleted.length}` : ''].filter(Boolean).join(', ');
+    result.text += `\nHarness: the command changed files (${counts}): ${clip(changed.slice(0, 30).join(', ') + (changed.length > 30 ? `, +${changed.length - 30} more` : ''), 900)}`;
+    await this.store.log('bash-edit', { step: s.step, files: changed.slice(0, 200), command: clip(String(args.command ?? ''), 200) });
+  }
+
   // ---- installs: mechanics the worker cannot do for itself -----------------
-  private async installDependencies(s: Session, install: string, dir: string): Promise<boolean> {
-    const eco = await this.ecosystem(); if (!eco) return false;
-    s.setupDone = true; s.setupKey = await this.manifestKey();
+  private async installDependencies(s: Session, p: Project, install: string): Promise<boolean> {
+    const eco = p.eco; const id = `${eco.id}:${p.dir}`;
+    s.setupDone = true; (s.setupKeys ??= {})[id] = await this.manifestKey(p);
     const attempt = async () => {
       const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', install], this.tools.root, Math.max(this.config.commandTimeoutMs, 300000)).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
       await this.store.log('setup', { step: s.step, command: install, code: r.code, output: clip(r.output, 800) });
@@ -159,25 +169,33 @@ export class Agent {
       await this.evidence(s, 'setup', { ok: r.code === 0, text: `Installed dependencies with ${install}: exit ${r.code}\n${clipEnds(r.output, 900)}` });
       return r;
     };
+    const errors = s.setupErrors ??= {};
     let r = await attempt();
-    if (r.code !== 0 && !s.autoFixKeys['install-retry']) { s.autoFixKeys['install-retry'] = `step ${s.step}`; r = await attempt(); }
-    if (r.code === 0) { s.setupError = null; s.setupKey = await this.manifestKey(); s.knownFiles = await listRepoFiles(s.root).catch(() => s.knownFiles); return true; }
-    const facts = eco.installFacts ? await eco.installFacts(r.output, name => eco.lookupLatest ? eco.lookupLatest(this.tools.root, name) : Promise.resolve(null)).catch(() => [] as string[]) : [];
-    s.setupError = clip([eco.errorLines(r.output), ...facts].filter(Boolean).join('\n'), 700);
-    return false;
+    if (r.code !== 0 && !s.autoFixKeys[`install-retry:${id}`]) { s.autoFixKeys[`install-retry:${id}`] = `step ${s.step}`; r = await attempt(); }
+    if (r.code === 0) { delete errors[id]; s.setupKeys![id] = await this.manifestKey(p); s.knownFiles = await listRepoFiles(s.root).catch(() => s.knownFiles); }
+    else {
+      const facts = eco.installFacts ? await eco.installFacts(r.output, name => eco.lookupLatest ? eco.lookupLatest(join(this.tools.root, p.dir), name) : Promise.resolve(null)).catch(() => [] as string[]) : [];
+      errors[id] = clip([p.dir === '.' ? '' : `in ${p.dir}:`, eco.errorLines(r.output), ...facts].filter(Boolean).join('\n'), 700);
+    }
+    s.setupError = Object.values(errors).join('\n') || null;
+    return r.code === 0;
   }
-  // Dependencies follow the manifest: installed when one appears, again when it
-  // changes, once per manifest version. Mechanics the worker should not spend
-  // turns discovering (a build that cannot find its tools).
+  // Dependencies follow the manifests: each project's installed when its
+  // manifest appears, again when it changes, once per manifest version.
+  // Mechanics the worker should not spend turns discovering (a build that
+  // cannot find its tools).
   private async retrySetup(s: Session): Promise<boolean> {
-    const key = await this.manifestKey();
-    if (s.setupKey === key) return false;
-    const eco = await this.ecosystem(); if (!eco) { s.setupKey = key; return false; }
-    const install = await eco.installCommand(this.tools.root, '.', s.setupDone).catch(() => null);
-    if (!install) { s.setupDone = true; s.setupKey = key; return false; }
-    this.observe({ kind: 'warning', step: s.step, text: s.setupDone ? 'manifest changed since the last install; installing again' : 'a manifest exists and nothing is installed; installing' });
-    await this.installDependencies(s, install, '.');
-    return true;
+    const keys = s.setupKeys ??= {}; let ran = false;
+    for (const p of await detectProjects(this.tools.root).catch(() => [] as Project[])) {
+      const id = `${p.eco.id}:${p.dir}`; const key = await this.manifestKey(p);
+      if (keys[id] === key) continue;
+      const again = id in keys;
+      const install = await p.eco.installCommand(this.tools.root, p.dir, again).catch(() => null);
+      if (!install) { keys[id] = key; continue; }
+      this.observe({ kind: 'warning', step: s.step, text: `${p.dir === '.' ? '' : `${p.dir}: `}${again ? 'manifest changed since the last install; installing again' : 'a manifest exists and nothing is installed; installing'}` });
+      await this.installDependencies(s, p, install); ran = true;
+    }
+    return ran;
   }
 
   // ---- generation --------------------------------------------------------------
@@ -242,7 +260,7 @@ export class Agent {
     if (current !== undefined && !rewrite) throw new Error(`${path} already exists; use rewrite_file to replace its whole content, or replace_lines for a small edit`);
     if (current === undefined && rewrite) throw new Error(`${path} does not exist; use create_file`);
     const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
-    const eco = await this.ecosystem(); const declared = eco ? await eco.declared(this.tools.root).catch(() => [] as string[]) : [];
+    const project = await projectFor(this.tools.root, path); const declared = project ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[]) : [];
     const { code, finish } = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', [() => newFileMessages(s, path, purpose, thought, contracts, declared, 0, current), () => newFileMessages(s, path, purpose, thought, contracts, declared, 1, current)], this.config.createTokens, fenceFor(path));
     const ended = finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : finish === 'repetition' ? 'started repeating itself and was cut at the repeat' : finish === 'eos' ? 'ended before the file was complete (the model stopped without closing the code block)' : '';
     if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
@@ -254,7 +272,9 @@ export class Agent {
     // Contracts the file breaks are facts for the worker: names a repository module does not declare, packages the manifest does not declare.
     const readRepo = async (p: string) => { try { return await readFile(await safePath(this.tools.root, p), 'utf8'); } catch { return null; } };
     const facts = [...await unresolvedImports(path, code, readRepo).catch(() => [] as string[])];
-    if (eco && (await readRepo(eco.manifest)) !== null) { const missing = await undeclaredPackages(this.tools.root, path, code, readRepo).catch(() => [] as string[]); if (missing.length) facts.push(`${path} imports ${missing.join(', ')}, which ${eco.manifest} does not declare: declare them (the package manager chooses the version) so they can be installed`); }
+    const manifest = project ? project.eco.markers.map(m => inProject(project, m)) : [];
+    const present = []; for (const m of manifest) if ((await readRepo(m)) !== null) present.push(m);
+    if (present.length) { const missing = await undeclaredPackages(this.tools.root, path, code, readRepo).catch(() => [] as string[]); if (missing.length) facts.push(`${path} imports ${missing.join(', ')}, which ${present.join(' or ')} does not declare: declare them (the package manager chooses the version) so they can be installed`); }
     if (ended) facts.unshift(`the generated content of ${path} ${ended}; check its end before relying on it`);
     if (facts.length) { const e = s.entries.at(-1); if (e) e.text += `\nHarness: ${facts.join(' | ')}`; s.lastError = facts.join(' | '); }
   }
@@ -267,7 +287,7 @@ export class Agent {
     const sources: Record<string, string> = {};
     for (const p of s.writes.slice(-12)) { const t = await readFile(await safePath(s.root, p), 'utf8').catch(() => null); if (t !== null) sources[p] = clip(t, 1200); }
     const render = s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, url: s.lastRender.url, facts: s.lastRender.text } : 'never rendered: nothing is known about what the user sees';
-    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), render, verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), errors: s.lastCheck?.summary.errors ?? 0, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
+    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), render, verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), exitCode: s.lastCheck?.summary.code ?? null, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
   }
 
   // ---- the loop ----------------------------------------------------------------
@@ -285,6 +305,9 @@ export class Agent {
         s.step++; this.current = s.step;
         this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep });
         if (this.config.allowBash && await this.retrySetup(s)) { await this.store.save(s); continue; }
+        // The files the objective names, pinned as read by the harness; a changed one is read and ranked again.
+        const pinned = await pinReferences(s, this.tools.root, (query, chunks) => relevance(this.jev, s, query, chunks, 1200)).catch(() => [] as string[]);
+        if (pinned.length) await this.store.log('references', { step: s.step, files: pinned, chunks: s.referenceEvidence.filter(e => pinned.includes(e.path)).length });
         // The watchdog's standing verdicts shape the step: a repeated failure blocks its identical retry; no progress for a run of steps ends the attempt or asks the user.
         const last = s.watch.readings.at(-1); const notes: string[] = [];
         if (last && last.stuck >= .9 && s.watch.noProgress >= 2) {
@@ -384,7 +407,7 @@ export class Agent {
         const hits = await runCommand('rg', ['-l', '--color', 'never', '-F', '-g', '!node_modules/**', '-g', '!dist/**', '-g', '!build/**', ...r.unmatched.flatMap((c: string) => ['-e', c]), '.'], this.tools.root, 15000).catch(() => null);
         for (const f of (hits?.output ?? '').split('\n').map(l => l.replace(/^\.\//, '')).filter(Boolean).slice(0, 40)) { const text = await readFile(await safePath(this.tools.root, f), 'utf8').catch(() => ''); const used = r.unmatched!.filter((c: string) => new RegExp(`(^|[^\\w-])${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(text)); if (used.length && !/\.(?:css|scss|sass|less)$/.test(f)) where[f] = used; }
         const stylesheets = s.knownFiles.filter(f => /\.(?:css|scss|sass|less)$/.test(f) && !/(^|\/)(?:node_modules|dist|build)\//.test(f));
-        r.text += `\nUnstyled class names by the file that uses them:\n${Object.entries(where).map(([f, cs]) => `  ${f}: ${cs.join(' ')}`).join('\n') || '  (not found in the sources)'}\nStylesheets in the project: ${stylesheets.join(', ') || 'none'}.`;
+        r.text += `\nClass names no CSS selector matches, by the file that uses them:\n${Object.entries(where).map(([f, cs]) => `  ${f}: ${cs.join(' ')}`).join('\n') || '  (not found in the sources)'}\nStylesheets in the project: ${stylesheets.join(', ') || 'none'}.`;
       }
       await this.store.log('render', { step: s.step, url, serve, ok: r.ok, text: clip(r.text, 3000) });
       s.lastRender = { step: s.step, ok: r.ok, url, text: clip(r.text, 1800) };

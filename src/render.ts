@@ -1,9 +1,12 @@
 // What the user will see: a page rendered in a headless browser, reported as
-// facts a text-only worker can act on. Console errors and exceptions, requests
-// that failed, images that did not load, elements that overflow the viewport,
-// list bullets left visible inside navigation, the heading outline, sections
-// without text, and whether any stylesheet applied at all. The browser is
-// driven over Chrome's debugging pipe; no library, no network port.
+// facts a text-only worker can act on. The render fails only on what is
+// unambiguous: exceptions thrown, responses with a 4xx or 5xx status, requests
+// or images that did not load. Everything else is a fact for the worker and
+// Jev to judge, never a verdict: console messages, elements that overflow the
+// viewport, the heading outline, sections without text, and how the page is
+// styled (CSS rules, class names a selector matches, inline styles, shadow
+// roots), since pages are styled in more ways than one. The browser is driven
+// over Chrome's debugging pipe; no library, no network port.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
 import { runCommand } from './tools.js';
@@ -27,13 +30,14 @@ const probe = `(() => {
   const used = new Map(); for (const e of document.querySelectorAll('body [class]')) { if (!vis(e)) continue; for (const c of e.classList) used.set(c, (used.get(c) || 0) + 1); }
   const unmatched = [...used.keys()].filter(c => !selected.has(c));
   const classes = { used: used.size, unmatched: unmatched.length, elementsUnmatched: [...used.entries()].filter(([c]) => !selected.has(c)).reduce((n, [, k]) => n + k, 0), sample: unmatched.slice(0, 20), all: unmatched.slice(0, 300) };
+  const all = document.querySelectorAll('body *'); let inline = 0; let shadow = 0; for (const e of all) { if (e.hasAttribute('style')) inline++; if (e.shadowRoot) shadow++; }
   const body = getComputedStyle(document.body);
   const text = (document.body.innerText || '').replace(/\\s+/g, ' ').trim();
   const links = [...document.querySelectorAll('a[href]')].filter(vis).slice(0, 30).map(a => ((a.textContent || a.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 30) || '(no text)') + ' -> ' + (a.getAttribute('href') || '').slice(0, 60));
-  return { title: document.title, headings, images, overflow, empty, rules, classes, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
+  return { title: document.title, headings, images, overflow, empty, rules, classes, inline, shadow, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
 })()`;
 
-interface Facts { title: string; headings: string[]; images: string[]; overflow: string[]; empty: string[]; rules: number; classes: { used: number; unmatched: number; elementsUnmatched: number; sample: string[]; all: string[] }; font: string; background: string; textLength: number; textHead: string; links: string[]; docHeight: number; viewport: string }
+interface Facts { title: string; headings: string[]; images: string[]; overflow: string[]; empty: string[]; rules: number; classes: { used: number; unmatched: number; elementsUnmatched: number; sample: string[]; all: string[] }; inline: number; shadow: number; font: string; background: string; textLength: number; textHead: string; links: string[]; docHeight: number; viewport: string }
 class Cdp {
   private id = 0; private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>(); private buffer = '';
   readonly events: { method: string; params: any }[] = [];
@@ -90,26 +94,26 @@ export async function renderFacts(root: string, url: string, serve: string | und
       const failed = cdp.events.filter(e => e.method === 'Network.responseReceived' && (e.params?.response?.status ?? 0) >= 400 && own(String(e.params.response.url))).map(e => `${e.params.response.status} ${String(e.params.response.url).slice(0, 120)}`);
       const notLoaded = cdp.events.filter(e => e.method === 'Network.loadingFailed').map(e => `failed: ${String(e.params?.errorText ?? '')} ${String(e.params?.requestId ?? '')}`.slice(0, 160));
       if (!facts) return { ok: false, text: `Rendered ${url} but the page could not be inspected (no document).` };
-      const problems = [...errors, ...consoleErrors, ...logErrors].slice(0, 12); const requests = [...new Set([...failed, ...notLoaded])].slice(0, 12);
-      const c = facts.classes; const unstyled = c.used >= 5 && c.unmatched / c.used > .3;
+      const messages = [...consoleErrors, ...logErrors].slice(0, 12); const requests = [...new Set([...failed, ...notLoaded])].slice(0, 12);
+      const c = facts.classes;
       const verdict = [
-        problems.length ? `errors in the page: ${problems.join(' | ')}` : '',
+        errors.length ? `exceptions thrown in the page: ${errors.slice(0, 12).join(' | ')}` : '',
         requests.length ? `requests that failed: ${requests.join(' | ')}` : '',
         facts.images.length ? `images that did not load: ${facts.images.join(' | ')}` : '',
-        unstyled ? `${c.unmatched} of the ${c.used} class names on the page match no CSS rule (${c.elementsUnmatched} elements render unstyled): ${c.sample.join(', ')}${c.unmatched > c.sample.length ? ', …' : ''}` : '',
-        facts.rules < 5 ? 'almost no CSS rules applied: the page renders with browser defaults' : '',
-        facts.overflow.length ? `elements overflowing the viewport horizontally: ${facts.overflow.join(' | ')}` : '',
       ].filter(Boolean);
       const ok = !verdict.length;
       const lines = [
-        ok ? `RENDER OK: ${url} rendered with no errors, every request and image loaded, ${c.used - c.unmatched} of ${c.used} class names styled.` : `RENDER FAILED for ${url}, ${verdict.length} problem(s):\n- ${verdict.join('\n- ')}`,
-        `Page: title "${facts.title}"; ${facts.viewport}, height ${facts.docHeight}px; ${facts.rules} CSS rules; body font ${facts.font}; background ${facts.background}; ${facts.textLength} characters of text.`,
+        ok ? `RENDER OK: ${url} rendered with no exception, every request and image loaded.` : `RENDER FAILED for ${url}, ${verdict.length} problem(s):\n- ${verdict.join('\n- ')}`,
+        messages.length ? `Console messages: ${messages.join(' | ')}` : '',
+        `Page: title "${facts.title}"; ${facts.viewport}, height ${facts.docHeight}px; body font ${facts.font}; background ${facts.background}; ${facts.textLength} characters of text.`,
+        `Styling: ${facts.rules} CSS rules; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS selector${c.unmatched ? ` (without one: ${c.sample.join(', ')}${c.unmatched > c.sample.length ? ', …' : ''})` : ''}; ${facts.inline} elements with a style attribute; ${facts.shadow} shadow roots.`,
+        facts.overflow.length ? `Elements overflowing the viewport horizontally: ${facts.overflow.join(' | ')}` : '',
         `Headings: ${facts.headings.length ? facts.headings.join(' | ') : 'none'}`,
         facts.empty.length ? `Visible regions with no text or media: ${facts.empty.join(' | ')}` : '',
         `Links: ${facts.links.length ? facts.links.slice(0, 12).join(' | ') : 'none'}`,
         `Text begins: ${facts.textHead}`,
       ].filter(Boolean);
-      return { ok, text: lines.join('\n'), ...(unstyled ? { unmatched: c.all } : {}) };
+      return { ok, text: lines.join('\n'), ...(c.unmatched ? { unmatched: c.all } : {}) };
     } finally { try { child.kill('SIGKILL'); } catch { /* gone */ } }
   } finally {
     if (server?.pid) { try { process.kill(-server.pid, 'SIGTERM'); } catch { /* gone */ } setTimeout(() => { try { process.kill(-server!.pid!, 'SIGKILL'); } catch { /* gone */ } }, 2000).unref(); }

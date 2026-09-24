@@ -1,4 +1,4 @@
-import type { Deliverable, Answers, Config, Coverage, Entry, Message, NameOrigin, Questions, Route, Session, SourceEvidence } from './types.js';
+import type { Deliverable, Answers, Config, Coverage, Entry, Message, Questions, Route, Session, SourceEvidence } from './types.js';
 import { editRoutes } from './types.js';
 import { focusedEditSchema, schemas } from './schema.js';
 import { referenceContext } from './references.js';
@@ -19,13 +19,13 @@ export function clip(text: string, limit: number): string {
 export const routeDescriptions: Record<Route, string> = {
   rewrite_file: 'Replace the whole content of an existing file: name its path and what the new content must be; the complete new content is then generated as code, with the current content in front of you. For any change larger than a few lines, and for any file you would otherwise rewrite through replace_lines.',
   plan: 'Replace your running notes: the plan, what is done, what is known, what is next.',
-  render: 'See what the user will see: start the app\'s server, load a page in a headless browser, and get the facts (errors, failed requests, broken images, overflow, unstyled lists, headings, text). The build cannot tell you any of this.',
+  render: 'See what the user will see: start the app\'s server, load a page in a headless browser, and get the facts (exceptions, failed requests, broken images, console messages, overflow, how the page is styled, headings, text). The build cannot tell you any of this.',
   read_files: 'Read a requirements document, an uninspected file, or an exact source range already located by search or diagnostics; retrieve a stored artifact from @artifact/name. To locate named declarations in an already-read large source file, choose search_codebase instead of rereading its beginning or paging through it.',
   search_codebase: 'Locate files, definitions, references or tests using a text query or file listing; text matches return file:line, which is the one-step way to find where a symbol is defined in a large file before reading that range. Search path @artifacts for archived evidence.',
   create_file: 'Create a file that does not exist yet: name its path and purpose here; its complete content is then generated as code in a separate step.',
-  write: 'Replace one short anchor with new text in an already-read existing file; never for blocks, import lists, exports or moves, which replace_lines and move_lines do by line number without retyping, and never to create a file (create_file does that).',
+  write: 'Replace one short anchor with new text in an already-read existing file; never for blocks or moves, which replace_lines and move_lines do by line number without retyping, and never to create a file (create_file does that).',
   replace_lines: 'For small, local edits only: newText is part of this JSON reply and the whole reply is limited in length, so a large replacement is cut off and lost; use rewrite_file for anything larger. Replace, delete or prefix up to 40 line ranges of an already-read file in one step, addressed by line numbers instead of exact anchors; the way to remove many unused-import lines at once, to export many declarations at once (prepend), or to rewrite a region.',
-  move_lines: 'Move a contiguous line range from an already-read file into another file without retyping it; the way to extract a large block into a new module.',
+  move_lines: 'Cut a contiguous line range from an already-read file and append it, unchanged, to another file (created when it does not exist), without retyping it.',
   bash: 'Run a shell command, including tests, builds or diagnostics, with explicit execution permission.',
   finish: 'Report completion when the objective is met and the supplied evidence supports completion.',
   ask_user: 'Pause because essential user information or a permission is missing; no other action fits.',
@@ -72,52 +72,9 @@ export function mergeCoverage(c: Coverage | undefined, total: number, start: num
 export function staleFor(s: Session): string[] {
   return s.lastCheck ? Object.entries(s.writeSteps).filter(([, step]) => step > s.lastCheck!.step).map(([path]) => path) : [];
 }
-// How the verification changed across the edits it judged, for the undo decision.
-export function checkDelta(s: Session): string | null {
-  if (!s.lastCheck || !s.previousCheck) return null;
-  const files = [...new Set(s.transaction.flatMap(t => t.paths))];
-  const before = s.previousCheck.summary; const after = s.lastCheck.summary;
-  const per = files.map(f => {
-    const key = (o: Record<string, unknown>) => Object.keys(o).find(k => k.endsWith(f) || f.endsWith(k));
-    const a = key(after.byFile) ? after.byFile[key(after.byFile)!]! : null; const b = key(before.byFile) ? before.byFile[key(before.byFile)!]! : null;
-    return `${f}: ${b ? `${b.count} errors (${b.syntax} syntax)` : 'no errors'} before, ${a ? `${a.count} errors (${a.syntax} syntax)` : 'no errors'} after${a?.samples.length ? `; now: ${a.samples[0]}` : ''}`;
-  });
-  return `Check at step ${s.previousCheck.step}: ${before.errors} errors (${before.syntax} syntax). Check at step ${s.lastCheck.step}${files.length ? `, after editing ${files.join(', ')}` : ''}: ${after.errors} errors (${after.syntax} syntax).${per.length ? ` ${per.join('. ')}` : ''}`;
-}
 // Bounded views of the volatile fields. Whatever the working budget, these must
 // stay small: they sit after the evidence in the prompt, change every step and
 // are therefore reprocessed by the server on every step.
-// Grouped by the edit that fixes them: import lines to add per file, line
-// numbers to export per file (one replace_lines call with prepend "export "
-// per line), and names nothing resolved. Far smaller than one row per name.
-export interface NameFixes { addImports: Record<string, string[]>; addExportAtLines: Record<string, number[]>; removeImports: Record<string, string[]>; removeImportLines: Record<string, Record<string, number>>; aliasImports: Record<string, { name: string; actual: string; line: number }[]>; respecImports: Record<string, { from: string; to: string; line: number }[]>; moveDeclarations: { name: string; source: string; start: number; end: number; into: string }[]; unresolved: string[]; total: number }
-// Empty collections are noise in every prompt: only fixes that exist are pinned.
-export function compactFixes(f: NameFixes): Partial<NameFixes> {
-  return Object.fromEntries(Object.entries(f).filter(([, v]) => Array.isArray(v) ? v.length > 0 : typeof v === 'object' && v !== null ? Object.keys(v).length > 0 : v !== 0)) as Partial<NameFixes>;
-}
-export function compactNames(s: Session, limit: number, names: NameOrigin[] = s.missingNames): NameFixes {
-  const out: NameFixes = { addImports: {}, addExportAtLines: {}, removeImports: {}, removeImportLines: {}, aliasImports: {}, respecImports: {}, moveDeclarations: [], unresolved: [], total: names.length };
-  for (const n of names.slice(0, limit)) {
-    if (n.kind === 'move') {
-      if (n.move && !out.moveDeclarations.some(m => m.source === n.move!.source && m.start === n.move!.start)) out.moveDeclarations.push({ name: n.name, source: n.move.source, start: n.move.start, end: n.move.end, into: n.inFile });
-      else if (!n.move) out.unresolved.push(`${n.name}: ${clip(n.note ?? 'unresolved', 240)}`);
-      continue;
-    }
-    if (n.kind === 'alias' && n.importLine && n.line) { (out.aliasImports[n.inFile] ??= []).push({ name: n.name, actual: n.importLine, line: n.line }); continue; }
-    if (n.kind === 'respec' && n.importLine && n.line) { (out.respecImports[n.inFile] ??= []).push({ from: n.name, to: n.importLine, line: n.line }); continue; }
-    if (n.kind === 'unused') { (out.removeImports[n.inFile] ??= []).push(n.name); if (n.line && /twice|conflicts|declared locally/.test(n.note ?? '')) (out.removeImportLines[n.inFile] ??= {})[n.name] = n.line; continue; }
-    if (n.importLine) { const lines = out.addImports[n.inFile] ??= []; if (!lines.includes(n.importLine)) lines.push(n.importLine); }
-    if (n.declaredIn && n.exported === false) {
-      const [file, line] = n.declaredIn.split(':');
-      if (file && line) (out.addExportAtLines[file] ??= []).push(Number(line));
-      else out.unresolved.push(`${n.name}: ${clip(n.note ?? 'declaration line unknown', 240)}`);
-    } else if (!n.importLine) out.unresolved.push(`${n.name}: ${clip(n.note ?? 'unresolved', 240)}`);
-  }
-  for (const k of Object.keys(out.addExportAtLines)) out.addExportAtLines[k] = [...new Set(out.addExportAtLines[k])].sort((a, b) => a - b);
-  // Names nothing resolved are the least actionable; never let them dominate the prompt.
-  if (out.unresolved.length > 8) out.unresolved = [...out.unresolved.slice(0, 8).map(u => clip(u, 70)), `+${out.unresolved.length - 8} more unresolved; re-run the check to refresh`];
-  return out;
-}
 export function compactRejected(s: Session, limit: number): { step: number; route: string; args: string; reason: string }[] {
   return s.rejectedEdits.slice(-limit).map(r => ({ step: r.step, route: r.route, args: clip(r.summary, 120), reason: clip(r.reason, 140) }));
 }
@@ -167,10 +124,10 @@ const details: Record<Route, string> = {
   rewrite_file: 'path is an existing file; purpose says what the new version must contain and change. Never put file content in the arguments: it is generated next, as code, from the current content, your thought and purpose.',
   render: 'serve is the shell command that starts the server for the page (for example a dev or preview script, with a fixed port and no browser opening); it runs in the repository root and is stopped after the render; pass "" when a server is already running. url is the page to load. Do this for every user-facing change before finishing: a build that passes says nothing about what renders.',
   plan: 'notes is the whole of your notes, replaced: a short plan with what is done, what you have learned (versions, commands that work, decisions), and what comes next. Keep it under forty lines.',
-  read_files: 'When verification.byFile reports errors in the file being fixed, read around the lines they name rather than from line 1. Use exact regular repository-relative file paths; globs, directories, and wildcard paths are invalid. Use 1-based inclusive start/end; at most 250 lines per file (end <= start+249). For a file longer than 250 lines, locate the definition with search_codebase first and read only that range; readCoverage shows what was already read, and reading it again yields nothing new. Output is cut at line boundaries within a character budget shared across the requested files and reports the last line shown; continue from the next line in a later read. Use @artifact/NAME to retrieve prior outputs. Read before editing.',
+  read_files: 'When verification.files names lines in the file being fixed, read around those lines rather than from line 1. Use exact regular repository-relative file paths; globs, directories, and wildcard paths are invalid. Use 1-based inclusive start/end; at most 250 lines per file (end <= start+249). For a file longer than 250 lines, locate the definition with search_codebase first and read only that range; readCoverage shows what was already read, and reading it again yields nothing new. Output is cut at line boundaries within a character budget shared across the requested files and reports the last line shown; continue from the next line in a later read. Use @artifact/NAME to retrieve prior outputs. Read before editing.',
   search_codebase: 'Use a narrow literal query or mode files. Text matches are returned as path:line:text, so a query such as "const DEFAULT_DEPENDENCIES" gives the exact line to read next. searched lists every query already run and what it found; never repeat one, search for the next symbol the objective still needs. The path is a repository-relative directory, usually "."; use "@artifacts" to search archived tool outputs. Do not use search results as read_files paths unless they are exact regular files.',
-  replace_lines: 'Each edit is { start, end, newText, prepend }. To insert lines without replacing any, use end = start - 1: the newText is inserted before line start (start = totalLines + 1 appends); this is how imports are added, never by retyping an existing line. With prepend non-empty (for example "export ") every line in start..end keeps its text and gets that prefix; newText must be "" and nothing is retyped. This is how declarations are exported: one edit per declaration line, all in one call. With prepend "", the range is replaced by newText ("" deletes it). missingNames lists fixes resolved by code from the last failed check (import lines to add, declaration lines to export, and the like); it is information only and nothing in it is applied for you: make each fix yourself, an import with the insert form after the last import statement, an export with prepend at the declaration line. Edits that would leave the file unparseable are refused with the parser message. An error at a line means that line needs fixing in place: a missing import is added at the top of the file, never by overwriting the line that uses the name. The file must have been read since it last changed: expectedHash must equal the sha256 of that read. edits is a list of up to 40 non-overlapping ranges {start, end, newText} (1-based, inclusive) of path, all numbered as in that read, never from a check that ran before the latest edit of the file (compare verification.step with the steps in editEvidence); the harness applies them bottom-up so they never shift each other. expectedHash comes from fileHashes. newText may be empty to delete the lines. Only new text is generated, so this is the way to remove many unused import lines in one step (one edit per reported line) or rewrite a region. After it runs, line numbers below the first edit have shifted: re-read before addressing them.',
-  move_lines: 'Cut lines start..end (1-based, inclusive, at most 2000) from source and append them to destination without retyping them; take the numbers from read_files or search_codebase. expectedHash is the current source sha256 from fileHashes. destinationHash is the destination sha256 from fileHashes, or "new" only when the destination does not exist yet. If the range is refused as incomplete, the error names the exact start or end line to retry with. The harness completes the extraction itself: it adds export to the moved top-level declarations, copies the import lines the moved code uses from the source (paths re-based), and inserts the import the source still needs from the destination; leave replacement and prefix empty unless you need something beyond that. The result names any names the moved code uses that are declared in the source without export; those need an export there or a move of their own. The check does not run by itself: run it with bash to have the move judged.',
+  replace_lines: 'Each edit is { start, end, newText, prepend }. To insert lines without replacing any, use end = start - 1: the newText is inserted before line start (start = totalLines + 1 appends); this is how imports are added, never by retyping an existing line. With prepend non-empty (for example "export ") every line in start..end keeps its text and gets that prefix; newText must be "" and nothing is retyped. This is how declarations are exported: one edit per declaration line, all in one call. With prepend "", the range is replaced by newText ("" deletes it). Edits that would leave the file unparseable are refused with the parser message. An error at a line means that line needs fixing in place: a missing import is added at the top of the file, never by overwriting the line that uses the name. The file must have been read since it last changed: expectedHash must equal the sha256 of that read. edits is a list of up to 40 non-overlapping ranges {start, end, newText} (1-based, inclusive) of path, all numbered as in that read, never from a check that ran before the latest edit of the file (compare verification.step with the steps in editEvidence); the harness applies them bottom-up so they never shift each other. expectedHash comes from fileHashes. newText may be empty to delete the lines. Only new text is generated, so this is the way to remove many unused import lines in one step (one edit per reported line) or rewrite a region. After it runs, line numbers below the first edit have shifted: re-read before addressing them.',
+  move_lines: 'Cut lines start..end (1-based, inclusive, at most 2000) from source and append them unchanged to the end of destination; take the numbers from read_files or search_codebase. expectedHash is the current source sha256 from fileHashes; destinationHash is the destination sha256 from fileHashes, or "new" only when the destination does not exist yet. Nothing else is changed in either file: whatever the moved lines need in their new place (imports, exports, references) is yours to add with an edit.',
   create_file: 'path is the repository-relative path of a file that does not exist yet (never an existing file: those are edited with write or replace_lines); purpose says in one sentence what the file must contain. The content itself is not written here: the harness asks for it as code in the next generation.',
   write: 'For a short anchor only (a few lines) in a file that exists: for a region of many lines use replace_lines, and to relocate a block use move_lines. expectedHash must be the current sha256 of the path from fileHashes (the same value the latest read_files or edit result reported). oldText is a small unique anchor (a few consecutive lines) copied exactly from that read; never paste a truncated excerpt or an entire file. newText replaces the anchor and must differ from it. Never overwrite an unread file; a new file is made with create_file.',
   bash: 'check is true only when this command is the verification of the work (a build, a type check, a test run): from then on it is the check of record, and running that same command again is a check too; false for installs, scaffolds, inspections and everything else. The harness never runs the check by itself: run it after edits when you want them judged, and before finish, which is refused while an edit is newer than the last check. command runs with bash in the repository root (the harness already sets cwd; use repository-relative paths and do not cd into a subdirectory or to /workspace). Explain its purpose. Use it for diagnostics too. Do not start background processes or servers.',
@@ -228,7 +185,6 @@ export function agentRequestBase(s: Session): Record<string, unknown> {
     ...(s.completionFeedback && !s.completionFeedback.addressed ? { completionFeedback: s.completionFeedback.text } : {}),
     editEvidence: s.editEvidence.slice(-4).map(e => ({ step: e.step, route: e.route, paths: e.paths, applied: e.applied ? clip(e.applied, 160) : undefined })),
     readCoverage: coverageSummary(s, 12), searched: compactSearched(s, 8), fileHashes: Object.fromEntries(Object.entries(s.hashes).slice(-12)),
-    ...(s.missingNames.length ? { missingNames: compactFixes(compactNames(s, 40)) } : {}),
     rejectedEdits: compactRejected(s, 3),
     lastError: s.lastError && clip(s.lastError, 700),
   };
@@ -238,7 +194,7 @@ export function agentRequestBase(s: Session): Record<string, unknown> {
 // check runs; each sits in its own message so a step re-processes only what
 // changed after the last unchanged boundary.
 export function verificationBlock(s: Session): Record<string, unknown> {
-  return { verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors, byFile: Object.fromEntries(Object.entries(s.lastCheck.summary.byFile).slice(0, 6).map(([f, v]) => [f, (v.diagnostics ?? v.samples).slice(0, 3).map(d => clip(d, 400))])) } : { command: s.lastCheckCommand, step: null, ok: null } };
+  return { verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, exitCode: s.lastCheck.summary.code, files: Object.fromEntries(Object.entries(s.lastCheck.summary.files).slice(0, 8)), output: clipEnds(s.lastCheck.text, 1200) } : { command: s.lastCheckCommand, step: null, ok: null } };
 }
 // The prompt is ordered by how often each part changes, because the server
 // reuses its cache only up to the first changed message: the system message and

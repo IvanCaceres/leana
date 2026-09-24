@@ -9,7 +9,6 @@ import { decisionLog } from './decision-log.js';
 import { clip, rememberEdit, retireEvidence } from './context.js';
 import { editRoutes } from './types.js';
 import { summarizeCheck } from './tools.js';
-import { rememberReferences } from './references.js';
 // Sessions live outside the repository, in the user's state directory, so the
 // project directory holds only the project: a scaffolder or a clean-tree check
 // sees exactly what the user sees.
@@ -37,23 +36,23 @@ export class Store {
     if (s.version !== 1 || !Array.isArray(s.entries) || !Array.isArray(s.tasks) || typeof s.root !== 'string') throw new Error('Invalid checkpoint');
     s.phase ??= 'inspect'; s.knownFiles ??= []; s.inspectionCount ??= 0; s.lastError ??= null;
     s.lastRoute ??= null; s.lastResultOk ??= false; s.lastWriteStale ??= false; s.coverage ??= {}; s.hashes ??= {}; s.lastPromptTokens ??= 0; s.lastCheck ??= null; s.actions ??= {}; s.searches ??= {}; s.blockedRoute ??= null; s.editsSinceCheck ??= 0; s.readHashes ??= {}; s.writeSteps ??= {};
-    s.previousCheck ??= null; s.editSnapshots ??= {}; s.missingNames ??= []; s.coverageByHash ??= {}; s.repetitionSteps ??= {}; s.focusReadAt ??= -1; s.autoFixKeys ??= {};
+    s.previousCheck ??= null; s.editSnapshots ??= {}; s.coverageByHash ??= {}; s.repetitionSteps ??= {}; s.focusReadAt ??= -1; s.autoFixKeys ??= {};
     for (const t of [...s.transaction ?? [], ...s.rejectedEdits ?? []]) { (t as any).identity ??= t.key; (t as any).paths ??= []; } s.transaction ??= []; s.rejectedEdits ??= []; s.lastCheckCommand ??= null; s.autoUndo ??= null; s.inspectionsSinceAction ??= 0;
     // Older checkpoints: recover the check command from the pinned bash result.
     // Superseded reads from older checkpoints: keep only their header line.
     for (const e of s.entries) if (e.text.startsWith('[superseded') && e.text.split('\n').length > 2) { const l = e.text.split('\n'); e.text = `${l[0]}\n${l.find(x => x.includes(' sha256=')) ?? ''}`; e.relevance = Math.min(e.relevance, .1); }
     if (!s.lastCheckCommand && s.lastCheck) { const m = s.lastCheck.text.match(/^\{"command":"((?:[^"\\]|\\.)*)"/); if (m) { try { s.lastCheckCommand = JSON.parse(`"${m[1]}"`); } catch { /* leave null */ } } }
-    for (const c of [s.lastCheck, s.previousCheck]) if (c && !c.summary) c.summary = summarizeCheck(c.text, s.root);
+    // Checkpoints from before the neutral summary carried per-tool error counts: re-read from the text.
+    for (const c of [s.lastCheck, s.previousCheck]) if (c && !c.summary?.files) c.summary = await summarizeCheck(c.text, s.root, s.knownFiles);
     if (!s.editEvidence) {
       s.editEvidence = [];
       await this.recoverEditEvidence(s);
     }
     s.referenceEvidence ??= [];
-    for (const e of s.entries) if (e.kind === 'read_files' && !e.stale) rememberReferences(s, e.text);
     // Designs from before the neutral schema carried landing-page field names.
     if (s.design) { const d = s.design as any; if (d.pageComposition && !d.composition) d.composition = d.pageComposition; if (d.copy && !d.fixtures) d.fixtures = d.copy; delete d.pageComposition; delete d.copy; }
     for (const d of s.ledger ?? []) { const x = d as any; if (x.layout && !x.placement) x.placement = x.layout; delete x.layout; }
-    s.completionFeedback ??= null; s.finishTriedAtCheck ??= -1; s.lastToolError ??= null; s.moveDirection ??= null; s.pendingMoves ??= []; s.ledger ??= []; s.design ??= null; s.ledgerAttempts ??= 0; s.ledgerBuilt ??= false; s.ledgerComplete ??= 0; s.checkInferences ??= 0; s.checkInferredFor ??= -1; s.setupDone ??= false; s.setupError ??= null; s.baselineStatus ??= null; s.baselineArtifacts ??= {}; s.pendingRepairs ??= []; s.failedVersions ??= {};
+    s.completionFeedback ??= null; s.finishTriedAtCheck ??= -1; s.lastToolError ??= null; s.ledger ??= []; s.design ??= null; s.ledgerAttempts ??= 0; s.ledgerBuilt ??= false; s.ledgerComplete ??= 0; s.checkInferences ??= 0; s.checkInferredFor ??= -1; s.setupDone ??= false; s.setupError ??= null; s.baselineStatus ??= null; s.baselineArtifacts ??= {}; s.pendingRepairs ??= []; s.failedVersions ??= {};
     // Older checkpoints: a create that went through write is a create_file now.
     if (s.blockedRoute === ('write' as string) && s.entries.some(e => e.kind === 'write' && /Created|expectedHash=new/.test(e.text))) s.blockedRoute = null;
     if (!s.completionFeedback && s.stopReason.startsWith('Completion was not established by tool evidence')) {

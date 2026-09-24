@@ -9,15 +9,17 @@ import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults };
 import { Bonsai, Jev, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
-import { fenceFor, trimContext, compactNames, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, checkDelta, staleFor, clipEnds } from '../src/context.js';
-import { referenceContext, rememberReferences, scopes } from '../src/references.js';
+import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds } from '../src/context.js';
+import { namedFiles, pinReferences, referenceContext } from '../src/references.js';
+import { objectiveClauses } from '../src/control.js';
+import { newSession } from '../src/agent.js';
 import { dirtySessionConflict } from '../src/cli.js';
 import { extractCode, focusedEditSchema, samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { commandWords, configFile, declaredName, lockfiles, manifestOf, shellPrefixFor, undeclaredPackages, unresolvedImports, detectEcosystem, ecosystems, importSpelling, importsFor, languageFor, moduleCandidates, packageImportFor, regexDeclarations, signaturesFor, sourceFile, syntaxCheck, verificationClass } from '../src/profiles.js';
-import { aliasImportBinding, manifestFailures, installCommand, repositoryStatus, solutionTsconfigReferences, readOnlyCommand, checkUnusable, movePlan, namedIdentifiers, removeImportBindings, checkAdvice, assertBalancePreserved, completionSource, hash, importInsertLine, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, resolveMissingNames, syntaxErrors, regression, assertNoBulkDuplication, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
+import { commandWords, configFile, declaredName, lockfiles, manifestOf, shellPrefixFor, undeclaredPackages, unresolvedImports, detectProjects, projectFor, ecosystems, importSpelling, importsFor, languageFor, moduleCandidates, regexDeclarations, signaturesFor, sourceFile, syntaxCheck, verificationClass } from '../src/profiles.js';
+import { manifestFailures, installCommand, repositoryStatus, solutionTsconfigReferences, checkUnusable, checkAdvice, assertBalancePreserved, completionSource, hash, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, syntaxErrors, assertNoBulkDuplication, treeChanges, treeSnapshot, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -86,7 +88,7 @@ test('llama grammar compatibility keeps runtime string limits intact, and conten
   assert.equal(schemas.bash.properties?.command?.maxLength, 2000);
   assert.throws(() => validate(schemas.bash, { command: 'x'.repeat(2001), purpose: 'test', check: false }), /string length 2001 exceeds the maximum 2000; shorten this field/);
   // Code and prose are never capped after generation: the grammar cannot enforce a length, so a cap on content is a rule that discards a finished generation.
-  validate(schemas.move_lines, { source: 'a', expectedHash: 'h', start: 1, end: 2, destination: 'b', destinationHash: 'new', replacement: '', prefix: 'x'.repeat(16001) });
+  assert.throws(() => validate(schemas.move_lines, { source: 'a', expectedHash: 'h', start: 1, end: 2, destination: 'b', destinationHash: 'new', replacement: '' }), /unknown property replacement/, 'a move is a plain cut and paste: nothing to add around it');
   validate(schemas.write, { path: 'a.ts', expectedHash: 'h', oldText: 'y'.repeat(700), newText: 'z'.repeat(30000) });
   validate(schemas.replace_lines, { path: 'a.ts', expectedHash: 'h', edits: [{ start: 1, end: 1, newText: 'n'.repeat(20000), prepend: '' }] });
   validate(schemas.finish, { summary: 's'.repeat(9000) });
@@ -109,17 +111,6 @@ test('Routing returns the argmax option with margin tolerance and survives a mis
   assert.equal(confidentChoice({ type: 'choice', choice: 'a', probabilities: { a: .5, b: .5 }, confidence: .5 }, c), null);
 });
 
-test('Check summaries count errors per file, single out syntax errors, and keep the lines named', () => {
-  const output = ['$ tsc --noEmit', 'src/cli.ts(3832,1): error TS1005: \':\' expected.', "src/cli.ts(3839,17): error TS1109: Expression expected.",
-    "src/cli/deps.ts(4,10): error TS6133: 'x' is declared but its value is never read.", 'src/cli/deps.ts(9,3): error TS2554: Expected 2 arguments, but got 1.',
-    'tests-ts/a.test.ts(1,1): error TS7006: implicit any', 'warning: unrelated'].join('\n');
-  const s = summarizeCheck(JSON.stringify({ command: 'lint', output, code: 1 }));
-  assert.equal(s.errors, 5); assert.equal(s.syntax, 2);
-  assert.deepEqual(Object.keys(s.byFile), ['src/cli.ts', 'src/cli/deps.ts', 'tests-ts/a.test.ts']);
-  assert.deepEqual(s.byFile['src/cli.ts'], { count: 2, syntax: 2, resolution: 0, lines: [3832, 3839], samples: ["src/cli.ts(3832,1): error TS1005: ':' expected.", 'src/cli.ts(3839,17): error TS1109: Expression expected.'], diagnostics: ["src/cli.ts(3832,1): error TS1005: ':' expected.", 'src/cli.ts(3839,17): error TS1109: Expression expected.'] });
-  assert.equal(s.byFile['src/cli/deps.ts']!.syntax, 0);
-  assert.equal(summarizeCheck('all good').errors, 0);
-});
 test('The terminal display redraws a status panel in place and falls back to lines off a terminal', () => {
   const tty: string[] = []; const plain: string[] = [];
   const d = new Display({ write: (s: string) => tty.push(s), isTTY: true, columns: 120 }, { objective: 'Move the block', session: 'run-1', verbose: false });
@@ -164,81 +155,6 @@ test('Panel lines are flattened to one ASCII row each', () => {
   for (const l of d.panel()) { assert(!l.includes('\n')); assert(l.length <= 99); assert(/^[\x20-\x7e]*$/.test(l), l); }
 });
 
-test('Regression rule: judged in scope, exempting structural moves, keeping net progress with a new syntax error', () => {
-  const sum = (errors: number, syntax = 0, byFile: Record<string, { count: number; syntax: number; lines: number[]; samples: string[] }> = {}) => ({ errors, syntax, byFile });
-  assert.equal(regression(null, sum(50)), 'fine');
-  assert.equal(regression(sum(305), sum(696)), 'worse');
-  assert.equal(regression(sum(100), sum(101)), 'worse'); assert.equal(regression(sum(100), sum(101), { structural: true }), 'fine');
-  assert.equal(regression(sum(100), sum(90)), 'fine'); assert.equal(regression(sum(100), sum(100)), 'fine');
-  // net progress with one new syntax error is kept; no progress with a new syntax error is not
-  assert.equal(regression(sum(16), sum(1, 1)), 'fine'); assert.equal(regression(sum(1), sum(1, 1)), 'worse'); assert.equal(regression(sum(696), sum(687, 6)), 'fine');
-  // Fewer syntax errors is progress whatever the total does: a file that did not parse was not checked at all.
-  assert.equal(regression(sum(1, 1), sum(4, 0)), 'fine', 'a repaired parse surfaces the errors that were always there'); assert.equal(regression(sum(2, 1), sum(2, 1)), 'fine');
-  const f = (count: number, syntax = 0) => ({ count, syntax, lines: [], samples: [] });
-  const before = sum(210, 0, { 'src/a.ts': f(10), 'tests/t.ts': f(200) }); const after = sum(162, 0, { 'src/a.ts': f(12), 'tests/t.ts': f(150) });
-  assert.equal(regression(before, after, { files: ['sdk/src/a.ts'] }), 'worse', 'in-scope increase is a regression even when the total fell');
-  assert.equal(regression(before, after), 'fine');
-  assert.equal(regression(before, sum(159, 0, { 'src/a.ts': f(9), 'tests/t.ts': f(150) }), { files: ['sdk/src/a.ts'] }), 'fine');
-  // Progress in the edited file is progress whatever appears elsewhere: the
-  // check reached its next stage (the bundler after tsc) or other files.
-  assert.equal(regression(sum(1, 0, { 'src/components/Button.tsx': f(1) }), sum(2, 0, { '(other)': f(2) }), { files: ['src/components/Button.tsx'] }), 'fine', 'the fix removed its file\'s only error; the build stage\'s errors are new work');
-  assert.equal(regression(sum(2, 0, { 'src/a.ts': f(2) }), sum(4, 0, { 'src/a.ts': f(1), 'src/b.ts': f(3) }), { files: ['src/a.ts'] }), 'fine');
-  assert.equal(regression(sum(1, 0, { 'src/a.ts': f(1) }), sum(3, 0, { 'src/a.ts': f(1), '(other)': f(2) }), { files: ['src/a.ts'] }), 'worse', 'no progress in the edited file and more errors is still a regression');
-});
-test('Errors the check does not attribute to a file always count toward the regression verdict', () => {
-  // A test runner's failure lines carry no file path; the scope filter must not drop them.
-  const before = summarizeCheck('ok');
-  const after = summarizeCheck('AssertionError [ERR_ASSERTION]: expected 1 to be 2\nnot ok 3 - prices are rounded\n# fail 1');
-  assert.equal(after.errors, 2); assert.equal(after.byFile['(other)']?.count, 2);
-  assert.equal(regression(before, after, { files: ['src/a.ts'] }), 'worse');
-  assert.equal(regression(after, after, { files: ['src/a.ts'] }), 'fine');
-  // With attribution, out-of-scope files are still ignored but the unattributed bucket is not.
-  const f = (count: number) => ({ count, syntax: 0, lines: [1], samples: [] as string[] });
-  const b = { errors: 3, syntax: 0, byFile: { 'src/a.ts': f(1), 'tests/t.ts': f(2) } };
-  const a = { errors: 4, syntax: 0, byFile: { 'src/a.ts': f(1), 'tests/t.ts': f(1), '(other)': f(2) } };
-  assert.equal(regression(b, a, { files: ['src/a.ts'] }), 'worse');
-  // Path matching is segment-safe: cli.ts does not stand for deps-cli.ts.
-  assert.equal(regression({ errors: 0, syntax: 0, byFile: {} }, { errors: 2, syntax: 0, byFile: { 'src/deps-cli.ts': f(2), 'src/cli.ts': f(0) } }, { files: ['cli.ts'], structural: true }), 'fine');
-});
-test('Import insertion uses the parser: an import-shaped line inside a string is not an import', async () => {
-  const text = "#!/usr/bin/env node\nimport { a } from './a.js';\nimport type { B } from './b.js';\nconst tpl = `\nimport { fake } from './nope.js';\n`;\nexport const x = a;\n";
-  assert.equal(await importInsertLine('src/x.ts', text), 4);
-  assert.equal(await importInsertLine('src/y.ts', "'use strict';\nconst a = 1;\n"), 2);
-  assert.equal(await importInsertLine('src/z.ts', "#!/usr/bin/env node\nconst a = 1;\n"), 2);
-  assert.equal(await importInsertLine('src/w.ts', 'const a = 1;\n'), 1);
-  assert.equal(await importInsertLine('notes.txt', "import { a } from './a.js';\ntext\n"), 2, 'non-TypeScript files fall back to the line scan');
-});
-test('Unresolved names decide before the plain count: removing one is progress even when types surface further errors', () => {
-  // Step 88 of the 31-minute run: replacing an any-typed import from a test file with the real module
-  // removed a TS7016 and revealed a TS18047; the count rose 1 -> 2 and the correct fix was rolled back.
-  const before = summarizeCheck("src/cli/deps.ts(44,26): error TS7016: Could not find a declaration file for module '../../x.mjs'.");
-  const after = summarizeCheck("src/cli/deps.ts(200,47): error TS18047: 'stdout' is possibly 'null'.\nsrc/cli/deps.ts(210,3): error TS2322: Type 'x' is not assignable.");
-  assert.equal(before.resolution, 1); assert.equal(after.resolution, 0);
-  assert.equal(regression(before, after, { files: ['sdk/typescript/src/cli/deps.ts'] }), 'fine');
-  // Deleting an import that is still used adds an unresolved name: worse when the total does not fall.
-  const flat = summarizeCheck("src/cli.ts(505,5): error TS2304: Cannot find name 'stripVTControlCharacters'.\nsrc/cli.ts(9,1): error TS6133: 'x' is declared but its value is never read.");
-  assert.equal(regression(after, flat, { files: ['sdk/typescript/src/cli.ts', 'sdk/typescript/src/cli/deps.ts'] }), 'worse');
-  // Removing fourteen unused imports and breaking one used binding is progress the resolver completes (15 -> 2 in the paused run).
-  const fifteen = summarizeCheck(Array.from({ length: 15 }, (_, i) => `src/cli.ts(${i + 1},1): error TS6133: 'n${i}' is declared but its value is never read.`).join('\n'));
-  const two = summarizeCheck("src/cli.ts(3836,17): error TS2304: Cannot find name 'componentPlanSchema'.\nsrc/cli/deps.ts(3,1): error TS6133: 'resolve' is declared but its value is never read.");
-  assert.equal(regression(fifteen, two, { files: ['sdk/typescript/src/cli.ts', 'sdk/typescript/src/cli/deps.ts'] }), 'fine');
-  // A structural move legitimately leaves unresolved names behind.
-  const many = summarizeCheck(Array.from({ length: 30 }, (_, i) => `src/cli.ts(${i + 1},1): error TS2304: Cannot find name 'CliDependencies'.`).join('\n'));
-  assert.equal(regression(summarizeCheck('ok'), many, { files: ['sdk/typescript/src/cli.ts'], structural: true }), 'fine');
-  assert.equal(regression(summarizeCheck('ok'), many, { files: ['sdk/typescript/src/cli.ts'] }), 'worse');
-});
-test('The source still using a moved name is detected by the parser even after an unbalanced quote earlier in the file', async () => {
-  const text = ["const re = /'/; // an apostrophe that a literal stripper mistakes for an open string", 'const other = 1;', 'function invokedAsMain(): boolean {', '  return true;', '}', 'if (invokedAsMain()) {', '  other;', '}', ''].join('\n');
-  const plan = await movePlan('src/cli.ts', text, 3, 5, 'src/cli/deps.ts', '');
-  assert.deepEqual(plan!.stillUsed, ['invokedAsMain']); assert.deepEqual(plan!.replacement, ['import { invokedAsMain } from "./cli/deps.js";']);
-});
-test('The regression verdict judges only the files that existed: a created file\'s own errors never count against it', () => {
-  const f = (count: number, lines: number[] = [1]) => ({ count, syntax: 0, resolution: count, lines, samples: [] as string[] });
-  const before = { errors: 12, syntax: 0, resolution: 12, byFile: { 'src/App.tsx': f(12) } };
-  const after = { errors: 11, syntax: 0, resolution: 11, byFile: { 'src/App.tsx': f(10), 'src/components/FeaturesSection.tsx': f(1) } };
-  assert.equal(regression(before, after, { files: ['src/components/FeaturesSection.tsx'] }), 'worse', 'judged in scope, an edited file that only added an error');
-  assert.equal(regression(before, after, { files: ['src/App.tsx'] }), 'fine', 'the created sibling is outside the scope the runner passes');
-});
 test('Creation names only the path; content is generated as code and never validated for length', () => {
   validate(schemas.create_file, { path: 'src/pages/LandingPage.tsx', purpose: 'the landing page' });
   assert.throws(() => validate(schemas.create_file, { path: 'a.tsx', purpose: 'p', content: 'x' }), /unknown property content/);
@@ -296,39 +212,13 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   const l = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null, budgetTokens: 200 });
   assert.equal(l.finish, 'length'); assert(l.text.length >= 200 && l.text.length <= 256, `generated ${l.text.length} characters`);
 });
-test('A check summary keeps each diagnostic whole, with the continuation lines tsc prints, beside the clipped sample the decision state shows', () => {
-  const output = ["src/components/Features.tsx(10,41): error TS2322: Type '{ key: string; feature: Feature; }' is not assignable to type 'IntrinsicAttributes & FeatureCardProps'.",
-    "  Property 'feature' does not exist on type 'IntrinsicAttributes & FeatureCardProps'.",
-    "src/components/CTA.tsx(69,13): error TS2322: Type '{ children: string; type: string; }' is not assignable to type 'IntrinsicAttributes & ButtonProps'.",
-    "  Property 'type' does not exist on type 'IntrinsicAttributes & ButtonProps'.", '', 'Found 2 errors.'].join('\n');
-  const s = summarizeCheck(JSON.stringify({ command: 'npm run typecheck', output, code: 2 }));
-  assert.equal(s.errors, 2);
-  const f = s.byFile['src/components/Features.tsx']!;
-  assert.equal(f.diagnostics!.length, 1); assert.match(f.diagnostics![0]!, /Property 'feature' does not exist on type 'IntrinsicAttributes & FeatureCardProps'\.$/);
-  assert.match(f.diagnostics![0]!, /^src\/components\/Features\.tsx\(10,41\): error TS2322: Type '\{ key: string; feature: Feature; \}' is not assignable/, 'the head is not cut in the middle');
-  assert(f.samples[0]!.length <= 140 && f.samples[0]!.includes('truncated'), 'the sample stays short for the decision state');
-  assert.match(s.byFile['src/components/CTA.tsx']!.diagnostics![0]!, /\n {2}Property 'type' does not exist/, 'a continuation line joins the diagnostic it belongs to, not the next file');
-  assert.equal(summarizeCheck('x.ts(1,1): error TS1005: expected.\n' + 'y'.repeat(2000)).byFile['x.ts']!.diagnostics![0], 'x.ts(1,1): error TS1005: expected.', 'an unindented line is not a continuation');
-});
-test('A check summary attributes a diagnostic whose file appears only on a continuation line, relative to the repository, and never to node_modules', () => {
-  const output = ['> demo@1.0.0 build', '> tsc --noEmit && vite build', '', 'vite v6.4.3 building for production...', '✗ Build failed in 21ms', 'error during build:',
-    '[vite:build-html] Unable to parse HTML; parse5 error code disallowed-content-in-noscript-in-head', ' at /home/u/repo/index.html:10:7', '8  |      <title>Demo</title>', '9  |      <noscript>', '10 |        <p>Enable JavaScript.</p>', '   |        ^^^', 'file: /home/u/repo/index.html',
-    '    at handleParseError (file:///home/u/repo/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:36308:9)', '    at Parser.onParseError (file:///home/u/repo/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:36221:7)'].join('\n');
-  const s = summarizeCheck(JSON.stringify({ command: 'npm run build', output, code: 1 }), '/home/u/repo');
-  assert.equal(s.errors, 1, 'the bundler\'s "error during build:" heading is not a diagnostic');
-  assert.deepEqual(s.byFile['index.html']?.lines, [10]); assert.equal(s.byFile['index.html']?.count, 1); assert.match(s.byFile['index.html']!.diagnostics![0]!, /^\[vite:build-html\] Unable to parse HTML/);
-  assert.match(s.byFile['index.html']!.diagnostics![0]!, /\n at \/home\/u\/repo\/index\.html:10:7\n8 {2}\|/, 'the code frame stays in the diagnostic');
-  assert.equal(s.byFile['(other)'], undefined);
-  assert.equal(summarizeCheck(JSON.stringify({ command: 'x', output: 'error: something\n at /elsewhere/other.ts:3:1' }), '/home/u/repo').byFile['(other)']?.count, 1, 'a path outside the repository is not attributed');
-  const rust = summarizeCheck('error[E0425]: cannot find value `x` in this scope\n --> src/main.rs:4:13\n  |\n4 |     let y = x;');
-  assert.deepEqual(rust.byFile['src/main.rs'], { count: 1, syntax: 0, resolution: 0, lines: [4], samples: ['error[E0425]: cannot find value `x` in this scope'], diagnostics: ['error[E0425]: cannot find value `x` in this scope\n --> src/main.rs:4:13\n  |\n4 |     let y = x;'] });
-});
 test('Profiles carry the ecosystem, language and stack knowledge: detected from the repository, never named by the loop', async t => {
   const root = await mkdtemp(join(tmpdir(), 'leana-profiles-')); t.after(() => rm(root, { recursive: true, force: true }));
-  assert.equal(await detectEcosystem(root), null, 'no manifest, no ecosystem');
-  await writeFile(join(root, 'pyproject.toml'), '[project]\nname = "x"\n'); assert.equal((await detectEcosystem(root))!.id, 'python');
-  await writeFile(join(root, 'Cargo.toml'), '[package]\nname = "x"\n[dependencies]\nserde = "1"\n'); assert.equal((await detectEcosystem(root))!.id, 'python', 'the first manifest found wins, in the profile order');
-  await writeFile(join(root, 'package.json'), '{"name":"x"}'); assert.equal((await detectEcosystem(root))!.id, 'node');
+  const ids = async () => (await detectProjects(root)).map(p => `${p.eco.id}:${p.dir}`);
+  assert.deepEqual(await ids(), [], 'no manifest, no project');
+  await writeFile(join(root, 'pyproject.toml'), '[project]\nname = "x"\n'); assert.deepEqual(await ids(), ['python:.']);
+  await writeFile(join(root, 'Cargo.toml'), '[package]\nname = "x"\n[dependencies]\nserde = "1"\n'); assert.deepEqual(await ids(), ['python:.', 'rust:.'], 'every ecosystem present is a project, not the first found');
+  await writeFile(join(root, 'package.json'), '{"name":"x"}'); assert.deepEqual(await ids(), ['node:.', 'python:.', 'rust:.']);
   const py = ecosystems.find(e => e.id === 'python')!; const rs = ecosystems.find(e => e.id === 'rust')!; const go = ecosystems.find(e => e.id === 'go')!;
   // System pip refuses installs on managed machines (PEP 668): the profile keeps a project venv. The install is staged: the
   // declared dependencies as soon as the manifest exists (the project has no sources yet), the project itself once it has.
@@ -368,18 +258,6 @@ test('Syntax gates by language: the interpreter judges a Python file when the ma
   assert.deepEqual(await syntaxCheck(root, 'x.ts', 'const a: = 1;').then(d => d.length), 1, 'TypeScript keeps the in-process parser');
   assert.deepEqual(await syntaxCheck(root, 'Main.java', 'this is not java'), [], 'no tool for the language: no verdict, never a false rejection');
 });
-test('A name nothing in the repository declares that a declared package exports is imported from it: test-runner globals, framework hooks', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'leana-pkg-')); t.after(() => rm(root, { recursive: true, force: true }));
-  await writeFile(join(root, 'package.json'), JSON.stringify({ dependencies: { react: '^19' }, devDependencies: { vitest: '^3' } }));
-  await mkdir(join(root, 'node_modules', 'vitest', 'dist'), { recursive: true }); await mkdir(join(root, 'node_modules', 'react'), { recursive: true });
-  await writeFile(join(root, 'node_modules', 'vitest', 'index.d.ts'), "export { describe, it, expect } from './dist/index.js';\nexport type { TestContext } from './dist/index.js';\nexport declare function vi(): void;\n");
-  await writeFile(join(root, 'node_modules', 'react', 'index.d.ts'), 'export declare function useState<T>(init: T): [T, (v: T) => void];\nexport interface FC<P = {}> { (props: P): null }\n');
-  assert.equal(await packageImportFor(root, 'describe'), "import { describe } from 'vitest';");
-  assert.equal(await packageImportFor(root, 'vi'), "import { vi } from 'vitest';");
-  assert.equal(await packageImportFor(root, 'useState'), "import { useState } from 'react';");
-  assert.equal(await packageImportFor(root, 'FC'), "import type { FC } from 'react';", 'a type-only export is imported as a type');
-  assert.equal(await packageImportFor(root, 'nothingExportsThis'), null);
-});
 test('Lockfiles and manifests are known through the profiles: a package manager rewrite is never an unaccounted file, and the setup fix targets the manifest the repository has', () => {
   for (const l of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'poetry.lock', 'uv.lock', 'Cargo.lock']) assert(lockfiles().includes(l), `${l} is a lockfile`);
   assert(!lockfiles().includes('package.json') && !lockfiles().includes('pyproject.toml'));
@@ -387,21 +265,13 @@ test('Lockfiles and manifests are known through the profiles: a package manager 
   assert.equal(manifestOf(['src/a.rs', 'Cargo.toml']), 'Cargo.toml'); assert.equal(manifestOf(['src/a.ts']), null);
 });
 
-test('A type\'s contract carries its members in any language, and a test failure carries its call chain so the fixer sees the caller', async () => {
+test('A type\'s contract carries its members in any language', async () => {
   const py = await signaturesFor('app/models.py', 'from dataclasses import dataclass, field\n\n@dataclass\nclass Task:\n    """A task."""\n    id: str\n    title: str\n    created_at: str = field(default_factory=now)\n    _cache: dict = field(default_factory=dict)\n\n    def __post_init__(self) -> None:\n        datetime.fromisoformat(self.created_at)\n\n    def mark_done(self) -> "Task":\n        return self\n\n    def _hidden(self):\n        pass\n\nclass _Private:\n    x: int\n\ndef helper() -> None:\n    pass\n');
   assert.deepEqual(py, ['class Task\n    id: str\n    title: str\n    created_at: str\n    def __post_init__(self) -> None\n    def mark_done(self) -> "Task"', 'def helper() -> None'], `fields and public methods, dunder kept, private dropped: ${JSON.stringify(py)}`);
   const rs = await signaturesFor('src/config.rs', 'pub struct Config {\n    pub name: String,\n    port: u16,\n}\n\nimpl Config {\n    pub fn load() -> Config { todo!() }\n}\n\npub enum Mode { Fast, Safe }\n');
   assert.deepEqual(rs, ['pub struct Config\n    pub name: String,\n    port: u16,', 'pub enum Mode'], `rust fields: ${JSON.stringify(rs)}`);
   const go = await signaturesFor('pkg/s.go', 'type Server struct {\n\tPort int\n\thost string\n}\n\nfunc (s *Server) Start() error { return nil }\n');
   assert.deepEqual(go, ['type Server struct\n    Port int\n    host string', 'func (s *Server) Start() error']);
-  const out = "=================================== FAILURES ===================================\n__________________ test_save_writes_valid_json_array_to_disk ___________________\n\ntests/test_repository.py:45: in test_save_writes_valid_json_array_to_disk\n    task = _make_task()\n           ^^^^^^^^^^^^\ntests/test_repository.py:29: in _make_task\n    return Task(\n<string>:9: in __init__\n    ???\nsrc/taskmanager/models.py:45: in __post_init__\n    datetime.fromisoformat(self.created_at)\nE   TypeError: fromisoformat: argument must be str\n\nsrc/taskmanager/models.py:45: TypeError\n=========================== short test summary info ============================\nFAILED tests/test_repository.py::test_save_writes_valid_json_array_to_disk - TypeError: fromisoformat: argument must be str\n1 failed, 1 passed in 0.02s";
-  const s = summarizeCheck(out);
-  assert.deepEqual(Object.keys(s.byFile).sort(), ['src/taskmanager/models.py', 'tests/test_repository.py']);
-  const d = s.byFile['src/taskmanager/models.py']!.diagnostics![0]!;
-  assert(d.includes('tests/test_repository.py:29: in _make_task\n    return Task(') && d.includes('src/taskmanager/models.py:45: in __post_init__') && d.includes('E   TypeError: fromisoformat: argument must be str'), `the chain from the test to the raise site: ${d}`);
-  assert(!d.includes('___ test_save'), 'the banner is not part of it');
-  const ts = summarizeCheck("src/a.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.\n  Types of property 'x' are incompatible.\nsrc/b.ts(1,1): error TS2304: Cannot find name 'y'.\n");
-  assert.equal(ts.byFile['src/b.ts']!.diagnostics![0], "src/b.ts(1,1): error TS2304: Cannot find name 'y'.", 'a continuation of the previous error never leaks into the next');
 });
 
 
@@ -415,11 +285,92 @@ test('A created file that imports a name its repository module does not declare 
   assert.deepEqual(await unresolvedImports('src/a.ts', "import { Nope } from './b';", async () => 'export const b = 1;'), [], 'TypeScript is left to its checker');
 });
 
-test('A check error whose head line names a repository file is that file\'s: a config the bundler could not load, an ESLint config error', () => {
-  const s = summarizeCheck('failed to load config from /x/app/vite.config.ts\nerror during build:\nError [ERR_MODULE_NOT_FOUND]: Cannot find package \'@vitejs/plugin-react\' imported from /x/app/node_modules/.vite-temp/vite.config.ts.timestamp-1.mjs', '/x/app');
-  assert.equal(Object.keys(s.byFile)[0], 'vite.config.ts', `the config file first, never the temp copy under node_modules: ${Object.keys(s.byFile)}`);
-  const e = summarizeCheck(JSON.stringify({ command: 'npm run lint', code: 2, output: 'Oops! Something went wrong! :(\n\nESLint: 9.0.0\n\nA config object is using the "extends" key, which is not supported in flat config system. (in eslint.config.js)' }));
-  assert.deepEqual(Object.keys(e.byFile), ['eslint.config.js'], 'a failed command with no recognisable diagnostic still names its file'); assert.match(e.byFile['eslint.config.js']!.diagnostics![0]!, /extends/);
-  assert.equal(summarizeCheck(JSON.stringify({ command: 'x', code: 0, output: 'all good' })).errors, 0, 'a command that passed reports nothing');
-  assert.deepEqual(Object.keys(summarizeCheck('error: no entry module found').byFile), ['(other)'], 'no file named, no attribution');
+test('A check summary is the exit code and the repository files its output names, whatever tool printed it', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-summary-')); t.after(() => rm(root, { recursive: true, force: true }));
+  for (const f of ['src/a.ts', 'src/b.tsx', 'app/models.py', 'src/main.rs', 'web/src/App.tsx']) { await mkdir(join(root, f, '..'), { recursive: true }); await writeFile(join(root, f), 'x\n'); }
+  await mkdir(join(root, 'node_modules', 'lib'), { recursive: true }); await writeFile(join(root, 'node_modules', 'lib', 'index.js'), 'x\n');
+  const output = [
+    "src/a.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.",
+    `  File "${root}/app/models.py", line 45, in __post_init__`,
+    ' --> src/main.rs:4:13',
+    `    at ${root}/node_modules/lib/index.js:10:7`,
+    'FAIL src/b.tsx > renders',
+    'src/missing.ts:9: not a file of the repository',
+    'App.tsx:12:3 - error from a check run inside web/src',
+    'see https://example.com/docs.html for help',
+  ].join('\n');
+  const s = await summarizeCheck(JSON.stringify({ command: 'check', output, code: 2 }), root, ['web/src/App.tsx']);
+  assert.equal(s.code, 2);
+  assert.deepEqual(s.files, { 'src/a.ts': [3], 'app/models.py': [45], 'src/main.rs': [4], 'src/b.tsx': [], 'web/src/App.tsx': [12] });
+  assert.deepEqual(await summarizeCheck('all good', root), { code: null, files: {} }, 'plain text with no file named: nothing attributed');
+});
+
+test('Objective clauses come only from a list the user wrote; prose is judged whole', () => {
+  assert.deepEqual(objectiveClauses('Bootstrap a React app with the latest and greatest best practices, a landing page and components'), [], 'no grammar parsing of prose');
+  assert.deepEqual(objectiveClauses('Build the app:\n- a landing page\n* a pricing table\n1. a contact form\n2) tests for the form'), ['a landing page', 'a pricing table', 'a contact form', 'tests for the form']);
+  assert.deepEqual(objectiveClauses('Do one thing:\n- only this'), [], 'a single item is the objective itself');
+});
+
+test('What a command changed is read from the tree: created, modified and deleted files, never dependency trees or what git ignores', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-tree-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'a.ts'), 'a\n'); await writeFile(join(root, 'src', 'gone.ts'), 'g\n');
+  await mkdir(join(root, '.venv'), { recursive: true }); await writeFile(join(root, '.venv', 'pyvenv.cfg'), 'home = /usr\n');
+  const before = (await treeSnapshot(root))!;
+  const r = await runCommand('bash', ['-c', 'cat > src/App.tsx <<EOF\nexport const App = 1;\nEOF\necho more >> src/a.ts; rm src/gone.ts; mkdir -p node_modules/x dist .venv/lib; echo 1 > node_modules/x/i.js; echo 1 > .venv/lib/m.py; echo 1 > dist/out.js'], root, 10000);
+  assert.equal(r.code, 0);
+  let changes = await treeChanges(root, before, (await treeSnapshot(root))!);
+  assert.deepEqual(changes.created.sort(), ['dist/out.js', 'src/App.tsx']); assert.deepEqual(changes.deleted, ['src/gone.ts']); assert(changes.changed.includes('src/a.ts'));
+  assert(!changes.changed.some(p => p.startsWith('node_modules/') || p.startsWith('.venv/')), 'installed environments are not edits');
+  if ((await runCommand('git', ['init', '-q'], root, 10000)).code === 0) {
+    await writeFile(join(root, '.gitignore'), 'dist/\n');
+    const again = (await treeSnapshot(root))!; await writeFile(join(root, 'dist', 'out2.js'), '2\n'); await writeFile(join(root, 'src', 'b.ts'), 'b\n');
+    changes = await treeChanges(root, again, (await treeSnapshot(root))!);
+    assert.deepEqual(changes.changed, ['src/b.ts'], 'build output git ignores is not an edit');
+  }
+});
+
+test('Every ecosystem in every manifest directory is a project: a JavaScript frontend beside a Python backend', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-projects-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'web', 'src'), { recursive: true }); await mkdir(join(root, 'api', 'app'), { recursive: true }); await mkdir(join(root, 'web', 'node_modules', 'dep'), { recursive: true });
+  await writeFile(join(root, 'web', 'package.json'), JSON.stringify({ name: 'web', dependencies: { react: '^19' } }));
+  await writeFile(join(root, 'web', 'node_modules', 'dep', 'package.json'), '{}');
+  await writeFile(join(root, 'api', 'requirements.txt'), 'flask==3.0\n');
+  const projects = await detectProjects(root);
+  assert.deepEqual(projects.map(p => `${p.eco.id}:${p.dir}`).sort(), ['node:web', 'python:api'], 'a manifest inside node_modules is not a project');
+  assert.equal((await projectFor(root, 'web/src/App.tsx', projects))!.dir, 'web'); assert.equal((await projectFor(root, 'api/app/main.py', projects))!.eco.id, 'python');
+  assert.equal(await projects.find(p => p.eco.id === 'node')!.eco.installCommand(root, 'web', true), 'cd web && npm install --no-audit --no-fund', 'installed in its own directory');
+  assert.deepEqual(await undeclaredPackages(root, 'web/src/App.tsx', "import React from 'react';\nimport clsx from 'clsx';\n", async () => null), ['clsx'], 'the frontend file is judged by the frontend manifest');
+});
+
+test('The files the objective names are pinned by the harness; chunks that do not all fit are ranked, and a changed file is pinned again', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-refs-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'docs'), { recursive: true });
+  const plan = Array.from({ length: 400 }, (_, i) => i === 250 ? 'The checkout page must show the order total.' : `filler line ${i + 1} of the plan`).join('\n');
+  await writeFile(join(root, 'docs', 'PLAN.md'), plan);
+  const s = await newSession(root, 'Implement the checkout described in PLAN.md, see src/missing.ts too.');
+  assert.deepEqual(await namedFiles(root, s.objective, s.knownFiles), ['docs/PLAN.md'], 'a bare name resolves to the one known file ending with it; a missing file is not pinned');
+  const queries: string[] = [];
+  const rank = async (query: string, chunks: string[]) => { queries.push(query); return chunks.map(c => /order total/.test(c) ? .95 : .05); };
+  assert.deepEqual(await pinReferences(s, root, rank), ['docs/PLAN.md']);
+  assert(queries.length >= 1 && queries.every(q => q.includes('docs/PLAN.md')));
+  const shown = referenceContext(s, 3000);
+  assert(shown.some(e => /251: The checkout page must show the order total\./.test(e.text)), 'the best-ranked chunk is shown within the budget');
+  assert(shown.every((e, i) => i === 0 || e.start! > shown[i - 1]!.start!), 'in document order');
+  assert.deepEqual(await pinReferences(s, root, rank), [], 'unchanged: not read or ranked again');
+  await writeFile(join(root, 'docs', 'PLAN.md'), 'short plan now\n');
+  assert.deepEqual(await pinReferences(s, root, rank), ['docs/PLAN.md']);
+  assert.deepEqual(referenceContext(s, 3000).map(e => e.text), ['1: short plan now\n2: '], 'the new version replaces the old, unranked when it fits');
+});
+
+test('move_lines is a plain cut and paste: nothing is exported, imported or rewritten around the moved lines', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-move-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true }); await mkdir(join(root, '.leana'), { recursive: true });
+  const source = "import { x } from './x.js';\nfunction helper() {\n  return x;\n}\nexport const y = helper();\n";
+  await writeFile(join(root, 'src', 'a.ts'), source);
+  const tools = new ToolBox(root, join(root, '.leana'), { ...defaults, allowWrite: true });
+  const r = await tools.execute('move_lines', { source: 'src/a.ts', expectedHash: hash(source), start: 2, end: 4, destination: 'src/helper.ts', destinationHash: 'new' });
+  assert.equal(r.ok, true); assert.deepEqual(r.changed, ['src/a.ts', 'src/helper.ts']);
+  assert.equal(await readFile(join(root, 'src', 'a.ts'), 'utf8'), "import { x } from './x.js';\nexport const y = helper();\n");
+  assert.equal(await readFile(join(root, 'src', 'helper.ts'), 'utf8'), 'function helper() {\n  return x;\n}\n');
+  assert.match(r.text, /nothing else in either file was changed/);
 });

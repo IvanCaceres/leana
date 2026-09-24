@@ -24,6 +24,8 @@ export interface EcosystemProfile {
   id: string;
   // The manifest the installer reads, and every file whose content defines the installed set.
   manifest: string; manifests: string[];
+  // The files whose presence in a directory makes it a project of this ecosystem.
+  markers: string[];
   // Configuration files of this ecosystem: created first, never a module to import.
   configFiles: RegExp;
   // Files that import packages of this ecosystem.
@@ -60,7 +62,7 @@ const exists = async (p: string) => { try { await stat(p); return true; } catch 
 const classOf = (text: string, table: [RegExp, VerificationClass][]): VerificationClass | null => { for (const [re, c] of table) if (re.test(text)) return c; return null; };
 
 const node: EcosystemProfile = {
-  id: 'node', manifest: 'package.json', manifests: ['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'],
+  id: 'node', manifest: 'package.json', markers: ['package.json'], manifests: ['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'],
   configFiles: /(^|\/)(package\.json|tsconfig[^/]*\.json|jsconfig\.json|vite\.config\.[cm]?[jt]s|vitest\.config\.[cm]?[jt]s|webpack\.config\.[cm]?js|next\.config\.[cm]?js|tailwind\.config\.[cm]?[jt]s|postcss\.config\.[cm]?js|\.eslintrc[^/]*|eslint\.config\.[cm]?js|\.prettierrc[^/]*)$/,
   sourceExtensions: /\.[cm]?[jt]sx?$/,
   detect: async (root, repository) => (await exists(join(root, 'package.json'))) || Object.keys(repository?.scripts ?? {}).length > 0 || nested(repository, 'package.json'),
@@ -112,7 +114,7 @@ async function pythonSources(dir: string, depth = 0): Promise<boolean> {
   return false;
 }
 const python: EcosystemProfile = {
-  id: 'python', manifest: 'pyproject.toml', manifests: ['pyproject.toml', 'requirements.txt', 'poetry.lock', 'uv.lock'],
+  id: 'python', manifest: 'pyproject.toml', markers: ['pyproject.toml', 'requirements.txt'], manifests: ['pyproject.toml', 'requirements.txt', 'poetry.lock', 'uv.lock'],
   configFiles: /(^|\/)(pyproject\.toml|requirements[^/]*\.txt|setup\.cfg|setup\.py|tox\.ini|mypy\.ini|pytest\.ini)$/,
   sourceExtensions: /\.py$/,
   detect: async (root, repository) => (await exists(join(root, 'pyproject.toml'))) || (await exists(join(root, 'requirements.txt'))) || nested(repository, 'pyproject.toml', 'requirements.txt'),
@@ -156,7 +158,7 @@ const python: EcosystemProfile = {
   commandWords: ['python', 'python3', 'pip', 'pytest', 'mypy', 'ruff', '.venv/bin/python'],
 };
 const rust: EcosystemProfile = {
-  id: 'rust', manifest: 'Cargo.toml', manifests: ['Cargo.toml', 'Cargo.lock'], configFiles: /(^|\/)(Cargo\.toml|rust-toolchain(?:\.toml)?|\.cargo\/config(?:\.toml)?)$/, sourceExtensions: /\.rs$/,
+  id: 'rust', manifest: 'Cargo.toml', markers: ['Cargo.toml'], manifests: ['Cargo.toml', 'Cargo.lock'], configFiles: /(^|\/)(Cargo\.toml|rust-toolchain(?:\.toml)?|\.cargo\/config(?:\.toml)?)$/, sourceExtensions: /\.rs$/,
   detect: async (root, repository) => (await exists(join(root, 'Cargo.toml'))) || nested(repository, 'Cargo.toml'),
   installCommand: async (_root, dir) => dir === '.' ? 'cargo fetch' : `cd ${dir} && cargo fetch`,
   errorLines: output => output.split('\n').filter(l => /error/i.test(l)).slice(0, 6).join(' | ') || output,
@@ -166,7 +168,7 @@ const rust: EcosystemProfile = {
   commandWords: ['cargo', 'rustc', 'rustfmt'],
 };
 const go: EcosystemProfile = {
-  id: 'go', manifest: 'go.mod', manifests: ['go.mod', 'go.sum'], configFiles: /(^|\/)(go\.mod|go\.work)$/, sourceExtensions: /\.go$/,
+  id: 'go', manifest: 'go.mod', markers: ['go.mod'], manifests: ['go.mod', 'go.sum'], configFiles: /(^|\/)(go\.mod|go\.work)$/, sourceExtensions: /\.go$/,
   detect: async (root, repository) => (await exists(join(root, 'go.mod'))) || nested(repository, 'go.mod'),
   installCommand: async (_root, dir) => dir === '.' ? 'go mod download' : `cd ${dir} && go mod download`,
   errorLines: output => output.split('\n').filter(l => /error|cannot|unknown|invalid/i.test(l)).slice(0, 6).join(' | ') || output,
@@ -176,10 +178,36 @@ const go: EcosystemProfile = {
   commandWords: ['go', 'gofmt'],
 };
 export const ecosystems: EcosystemProfile[] = [node, python, rust, go];
-export async function detectEcosystem(root: string): Promise<EcosystemProfile | null> {
-  for (const e of ecosystems) if (await e.detect(root)) return e;
-  return null;
+// Every project of the repository: each directory (the root and below it, to
+// depth 3, outside dependency and build trees) that holds an ecosystem's marker
+// file, once per ecosystem. A JavaScript frontend beside a Python backend is two
+// projects, each with its own manifest, install, environment and declared packages.
+export interface Project { eco: EcosystemProfile; dir: string }
+const skipDirs = /^(node_modules|\.git|\.leana|dist|build|coverage|target|vendor|__pycache__|\..*)$/;
+export async function detectProjects(root: string): Promise<Project[]> {
+  const out: Project[] = [];
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    let entries; try { entries = await readdir(join(root, dir), { withFileTypes: true }); } catch { return; }
+    if (depth > 0 && entries.some(e => e.name === 'pyvenv.cfg')) return;
+    const names = new Set(entries.filter(e => e.isFile()).map(e => e.name));
+    for (const eco of ecosystems) if (eco.markers.some(m => names.has(m))) out.push({ eco, dir });
+    if (depth >= 3 || out.length >= 16) return;
+    for (const e of entries) if (e.isDirectory() && !skipDirs.test(e.name)) await walk(dir === '.' ? e.name : `${dir}/${e.name}`, depth + 1);
+  };
+  await walk('.', 0);
+  return out;
 }
+// The project a file belongs to: the deepest project directory containing it
+// whose ecosystem's sources include it, else the deepest containing it at all.
+export async function projectFor(root: string, path: string, projects?: Project[]): Promise<Project | null> {
+  const all = projects ?? await detectProjects(root);
+  const holds = (p: Project) => p.dir === '.' || path === p.dir || path.startsWith(`${p.dir}/`);
+  const depth = (p: Project) => p.dir === '.' ? 0 : p.dir.split('/').length;
+  const candidates = all.filter(holds).sort((a, b) => depth(b) - depth(a));
+  return candidates.find(p => p.eco.sourceExtensions.test(path)) ?? candidates[0] ?? null;
+}
+// A path of a project's directory, as a repository path.
+export const inProject = (p: Project, file: string): string => p.dir === '.' ? file : `${p.dir}/${file}`;
 // Configuration and entry files of any ecosystem: created first, never a
 // module a source file imports.
 export const configFile = (path: string): boolean => /^index\.html$/.test(path) || ecosystems.some(e => e.configFiles.test(path));
@@ -236,7 +264,12 @@ export const lockfiles = (): string[] => ecosystems.flatMap(e => e.manifests.fil
 // The first manifest among these paths, in profile order.
 export const manifestOf = (paths: string[]): string | null => { for (const e of ecosystems) { const hit = paths.find(f => f === e.manifest || f.endsWith(`/${e.manifest}`)); if (hit) return hit; } return null; };
 // The prefix every harness-run command gets in this repository, from its ecosystem.
-export async function shellPrefixFor(root: string): Promise<string> { const eco = await detectEcosystem(root).catch(() => null); return eco?.shellPrefix ? await eco.shellPrefix(root).catch(() => '') : ''; }
+// Every project's prefix, the root's first, so a nested project's environment comes first on the path.
+export async function shellPrefixFor(root: string): Promise<string> {
+  let out = '';
+  for (const p of await detectProjects(root).catch(() => [] as Project[])) if (p.eco.shellPrefix) out += await p.eco.shellPrefix(join(root, p.dir)).catch(() => '');
+  return out;
+}
 // Every word a verification command may start with: each ecosystem's tools,
 // and the build drivers that belong to no ecosystem.
 export const commandWords = (): string[] => [...new Set([...ecosystems.flatMap(e => e.commandWords), 'make', 'cmake', 'ninja', 'sh', 'bash'])];
@@ -362,8 +395,9 @@ export async function unresolvedImports(path: string, text: string, read: (p: st
 // for the manifest's contract, never an install.
 const pythonStdlib = new Map<string, Promise<Set<string>>>();
 export async function undeclaredPackages(root: string, path: string, text: string, read: (p: string) => Promise<string | null>): Promise<string[]> {
-  const eco = await detectEcosystem(root); const lang = languageFor(path); if (!eco || !lang) return [];
-  const declared = new Set((await eco.declared(root).catch(() => [] as string[])).map(d => d.replace(/@[^@]*$/, '').toLowerCase()));
+  const project = await projectFor(root, path); const lang = languageFor(path); if (!project || !lang) return [];
+  const eco = project.eco; const projectRoot = join(root, project.dir);
+  const declared = new Set((await eco.declared(projectRoot).catch(() => [] as string[])).map(d => d.replace(/@[^@]*$/, '').toLowerCase()));
   const out = new Set<string>();
   for (const imp of await importsFor(path, text, true).catch(() => [] as ModuleImport[])) {
     const spec = imp.spec; let name: string | null = null;
@@ -375,7 +409,7 @@ export async function undeclaredPackages(root: string, path: string, text: strin
       const top = spec.split('.')[0]!;
       if (!pythonStdlib.has(root)) pythonStdlib.set(root, runCommand('bash', ['--noprofile', '--norc', '-c', `${await shellPrefixFor(root)}python3 -c "import sys;print('\\\\n'.join(sorted(sys.stdlib_module_names)))"`], root, 10000).then(r => new Set(r.code === 0 ? r.output.split('\n').map(l => l.trim()).filter(Boolean) : [])).catch(() => new Set<string>()));
       if ((await pythonStdlib.get(root)!).has(top)) continue;
-      let local = false; for (const c of moduleCandidates(path, top)) if ((await read(c)) !== null) { local = true; break; }
+      let local = false; for (const c of moduleCandidates(path, top).flatMap(c => [c, inProject(project, c)])) if ((await read(c)) !== null) { local = true; break; }
       if (local) continue;
       name = top;
     } else if (lang.id === 'rust') {
@@ -448,28 +482,3 @@ export const markupFile = (path: string): boolean => /\.(?:[jt]sx|html?|vue|svel
 // needs. The loop applies them as harness edits; it never knows the stack.
 // ---------------------------------------------------------------------------
 export const builtinModuleNames = new Set(builtinModules);
-// A name the checker cannot find that a declared package exports from its
-// declarations: the import line for it. Searched in the packages the manifest
-// declares, in their published type declarations, once per name.
-const packageExportCache = new Map<string, string | null>();
-export async function packageImportFor(root: string, name: string): Promise<string | null> {
-  const key = `${root}@${name}`; if (packageExportCache.has(key)) return packageExportCache.get(key)!;
-  let line: string | null = null;
-  try {
-    const eco = await detectEcosystem(root);
-    if (eco?.id === 'node' && /^[A-Za-z_$][\w$]*$/.test(name)) {
-      const declared = (await eco.declared(root)).map(d => d.replace(/@[^@]*$/, '')).filter(d => !d.startsWith('@types/')).slice(0, 60);
-      const esc = name.replace(/[$]/g, '\\$&');
-      for (const pkg of declared) {
-        const dir = join(root, 'node_modules', pkg); if (!(await exists(dir))) continue;
-        const r = await runCommand('rg', ['-l', '--max-count', '1', '-g', '*.d.ts', '-g', '*.d.mts', '-e', `export\\s+(?:declare\\s+)?(?:const|let|var|function|class|interface|type|enum|namespace)\\s+${esc}\\b`, '-e', `export\\s*\\{[^}]*\\b${esc}\\b`, '--', dir], root, 10000).catch(() => null);
-        if (!r || r.code !== 0) continue;
-        const file = r.output.split('\n').find(Boolean); if (!file) continue;
-        const text = await boundedRead(file).catch(() => '');
-        const typeOnly = new RegExp(`export\\s+(?:declare\\s+)?(?:interface|type|namespace)\\s+${esc}\\b`).test(text) && !new RegExp(`export\\s+(?:declare\\s+)?(?:const|let|var|function|class|enum)\\s+${esc}\\b`).test(text);
-        line = `import ${typeOnly ? 'type ' : ''}{ ${name} } from '${pkg}';`; break;
-      }
-    }
-  } catch { line = null; }
-  packageExportCache.set(key, line); return line;
-}

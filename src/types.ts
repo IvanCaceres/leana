@@ -3,9 +3,9 @@ export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' |
 // existing file, replace_lines edits by line number, move_lines relocates.
 export const editRoutes: readonly Route[] = ['create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines'];
 export interface Coverage { total: number; ranges: [number, number][] }
-// samples are short heads for decision state; diagnostics are the complete
-// messages with their continuation lines, for a repair prompt.
-export interface CheckSummary { errors: number; syntax: number; resolution?: number; byFile: Record<string, { count: number; syntax: number; resolution?: number; lines: number[]; samples: string[]; diagnostics?: string[] }> }
+// A check's exit code and the repository files its output names, with the
+// lines named for each; the output itself is in the check record's text.
+export interface CheckSummary { code: number | null; files: Record<string, number[]> }
 export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string>; command?: string }
 export interface SourceEvidence { path: string; hash?: string; facts: Record<string, unknown>[]; excerpt?: string; error?: string; omitted?: number }
 export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export' | 'import' | 'verify' | 'other';
@@ -14,7 +14,6 @@ export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export'
 // and every prompt can carry the exact signatures a file may import. A derived
 // item was added by the harness for an import a generated file made.
 export interface Deliverable { packages?: string[]; command?: string; commandProbed?: boolean; id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string; setAside?: boolean; placement?: string }
-export interface NameOrigin { name: string; inFile: string; importLine?: string; importedBy?: string; declaredIn?: string; exported?: boolean; note?: string; kind?: 'unused' | 'move' | 'reexport' | 'alias' | 'respec'; line?: number; move?: { source: string; start: number; end: number } }
 export type Phase = 'inspect' | 'implement' | 'verify';
 export type Question = { type: 'noul'; instructions: string } |
   { type: 'choice'; instructions: string; criteria: Record<string, string> };
@@ -40,8 +39,9 @@ export interface Session {
   editSnapshots: Record<string, string>;
   // Tool-confirmed edits survive ordinary evidence eviction; undo removes them.
   editEvidence: EditEvidence[];
-  // Tool-observed excerpts of documents explicitly referenced by the objective.
-  referenceEvidence: { path: string; hash: string; text: string; scope?: string }[];
+  // Chunks of the files the objective names, read by the harness; rank is Jev's
+  // relevance reading when the chunks did not all fit, start the first line.
+  referenceEvidence: { path: string; hash: string; text: string; start?: number; rank?: number }[];
   // unmet: the deliverables the audit did not accept; unmetPending: those of
   // them that were pending by source facts at the time, the only ones whose
   // later completion by facts answers the rejection without an edit.
@@ -52,7 +52,6 @@ export interface Session {
   coverageByHash: Record<string, Coverage>; repetitionSteps: Record<string, number>;
   // Harness-fetched context and harness-applied fixes, once per failing check.
   focusReadAt: number; autoFixKeys: Record<string, string>;
-  missingNames: NameOrigin[];
   // Edits of the current transaction (since the last check), and edits that a
   // rollback rejected: those must never be generated again verbatim.
   transaction: { key: string; identity: string; step: number; route: string; paths: string[]; summary: string; kind?: string }[];
@@ -65,10 +64,6 @@ export interface Session {
   actions: Record<string, number>; searches: Record<string, string>; blockedRoute: Route | null;
   // The last tool error per edit route: the same error twice in a row blocks the route.
   lastToolError: { route: Route; message: string; step: number } | null;
-  // The first successful move fixes the direction of the extraction; deliverables never travel back.
-  moveDirection: { source: string; destination: string } | null;
-  // Deliverables of kind move still declared in the source: performed by the harness.
-  pendingMoves: { name: string; source: string; start: number; end: number; destination: string }[];
   // The harness's own deliverable list, classified by Jev; statuses come from source facts.
   ledger: Deliverable[]; ledgerAttempts: number; ledgerBuilt: boolean; ledgerComplete: number;
   // The worker's design for an open-ended objective: what the whole should be and the conventions every file follows.
@@ -79,7 +74,8 @@ export interface Session {
   checkInferences: number; checkInferredFor: number; checkTrialKey?: string;
   // Dependencies installed by the harness when a check trial showed them missing:
   // once per manifest version; a failed install is fix work for the manifest.
-  setupDone: boolean; setupKey?: string; setupError?: string | null;
+  // setupKeys: per project (ecosystem and manifest directory), the manifests' state at its last install; setupErrors: the failed ones.
+  setupDone: boolean; setupKey?: string; setupError?: string | null; setupKeys?: Record<string, string>; setupErrors?: Record<string, string>;
   // Git's view of the tree when the session began: changes already present are not the session's.
   baselineStatus: string[] | null;
   // The first pre-edit snapshot of each changed file, for the completion diff ('@new' for created files).

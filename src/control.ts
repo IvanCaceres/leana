@@ -5,7 +5,7 @@
 // calibrated probability over a compact state; the policies that act on the
 // readings are deterministic and live in the loop.
 import type { Answers, Questions, Session } from './types.js';
-import { clip } from './context.js';
+import { clip, clipEnds } from './context.js';
 
 export interface Jev { decide(state: unknown, questions: Questions, context?: { step: number; phase: string }): Promise<Answers> }
 const noul = (a: Answers[string] | undefined): number => a?.type === 'noul' ? a.noul : 0;
@@ -19,7 +19,7 @@ export function watchState(s: Session): unknown {
     objective: clip(s.objective, 800), notes: clip(s.notes ?? '', 1200), step: s.step,
     lastThought: clip(s.lastThought ?? '', 400), lastAction: s.lastRoute, lastActionOk: s.lastResultOk,
     changedFiles: s.writes.slice(-12), changedFileCount: s.writes.length, lastWriteStep: s.lastWriteStep,
-    verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, errors: s.lastCheck.summary.errors, files: Object.keys(s.lastCheck.summary.byFile).slice(0, 6), firstError: clip(Object.values(s.lastCheck.summary.byFile)[0]?.samples[0] ?? '', 200), afterLastWrite: s.lastCheck.step > s.lastWriteStep } : null,
+    verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, exitCode: s.lastCheck.summary.code, files: Object.keys(s.lastCheck.summary.files).slice(0, 6), output: clipEnds(s.lastCheck.text, 400), afterLastWrite: s.lastCheck.step > s.lastWriteStep } : null,
     lastError: s.lastError ? clip(s.lastError, 300) : null,
     lastRender: s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, facts: clip(s.lastRender.text, 500) } : 'never rendered',
     turnsOnlyReading: s.readOnlyTurns ?? 0,
@@ -42,16 +42,21 @@ export async function watchdog(jev: Jev, s: Session): Promise<Reading> {
 
 // The evidence gate: code states the facts (what changed, what the check
 // said, what the worker claims); Jev judges the meaning.
-export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; render?: unknown; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; errors: number; text: string }; requirements: string[]; sources: unknown }
+export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; render?: unknown; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; exitCode: number | null; text: string }; requirements: string[]; sources: unknown }
 export const gateQuestions: Questions = {
-  implementation_matches_request: { type: 'noul', instructions: 'Does the change (changedFiles, diffStat, sources, and for anything user-facing the render facts: errors, failed requests, broken images, overflow, unstyled lists, a page never rendered) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken, unstyled or invented?' },
+  implementation_matches_request: { type: 'noul', instructions: 'Does the change (changedFiles, diffStat, sources, and for anything user-facing the render facts: errors, failed requests, broken images, overflow, how the page is styled, a page never rendered) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken, unstyled or invented?' },
   requirement_unaddressed: { type: 'noul', instructions: 'Does any requirement of the objective appear unaddressed by the change and the verification?' },
   claim_supported: { type: 'noul', instructions: 'Is the worker\'s completion summary supported by the facts shown (files that exist, a verification that passed after the last edit), rather than asserted?' },
   verification_needed: { type: 'choice', instructions: 'How much verification does this change deserve before it is accepted as complete?', criteria: { deterministic_only: 'The passing check and the facts are enough: a small, low-risk change.', semantic_review: 'The facts are consistent but the change is substantial or the check is weak: accept only if the answers above are confident.', human: 'The user should look before this is called done: risky, ambiguous, or the verification is missing.' } },
 };
 export interface GateVerdict { accepted: boolean; matches: number; unaddressed: number; supported: number; route: string; reason: string }
-// The clauses of an objective, so an unaddressed requirement is named, not merely counted.
-export const objectiveClauses = (objective: string): string[] => objective.split(/\n+|(?<=[a-z\)])[.;]\s+|,\s+(?:and\s+)?|\s+and\s+(?=[a-z])|\s+with\s+(?=[a-z])/i).map(c => c.trim().replace(/^(?:and|with)\s+/i, '')).filter(c => c.split(/\s+/).length >= 2).slice(0, 8);
+// The items of an objective the user wrote as a list (bullets or numbered
+// lines), so an unaddressed one is named, not merely counted. Prose is not
+// split: Jev reads it whole through the questions above.
+export const objectiveClauses = (objective: string): string[] => {
+  const items = [...objective.matchAll(/^[ \t]*(?:[-*+\u2022]|\d+[.)])[ \t]+(\S.*)$/gm)].map(m => m[1]!.trim());
+  return items.length >= 2 ? items.slice(0, 12) : [];
+};
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
   const state = { objective: s.objective, clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])), notes: clip(s.notes ?? '', 1500), ...facts, sources: facts.sources };
@@ -78,13 +83,17 @@ export async function triage(jev: Jev, s: Session, command: string, output: stri
   return { kind: a.failure.choice as keyof typeof failureKinds, probability: a.failure.probabilities[a.failure.choice] ?? 0 };
 }
 
-// Retrieval ranking: which of many search hits matter for what the worker is
-// doing, so the prompt carries the few that do.
+// Retrieval ranking: which of many search hits or document chunks matter for
+// what the worker is doing, so the prompt carries the few that do.
+export async function relevance(jev: Jev, s: Session, query: string, items: string[], clipTo = 200): Promise<number[]> {
+  const questions: Questions = Object.fromEntries(items.map((_, i) => [`hit_${i}`, { type: 'noul', instructions: `Is hit_${i} relevant to the query and the worker's current purpose?` }]));
+  const a = await jev.decide({ objective: clip(s.objective, 300), notes: clip(s.notes ?? '', 600), lastThought: clip(s.lastThought ?? '', 300), query, hits: Object.fromEntries(items.map((l, i) => [`hit_${i}`, clip(l, clipTo)])) }, questions, { step: s.step, phase: 'retrieval-rank' });
+  return items.map((_, i) => noul(a[`hit_${i}`]));
+}
 export async function rankExcerpts(jev: Jev, s: Session, query: string, lines: string[], keep = 10): Promise<{ kept: string[]; dropped: number }> {
   const pool = lines.slice(0, 24);
-  const questions: Questions = Object.fromEntries(pool.map((_, i) => [`hit_${i}`, { type: 'noul', instructions: `Is hit_${i} relevant to the query and the worker's current purpose?` }]));
-  const a = await jev.decide({ objective: clip(s.objective, 300), notes: clip(s.notes ?? '', 600), lastThought: clip(s.lastThought ?? '', 300), query, hits: Object.fromEntries(pool.map((l, i) => [`hit_${i}`, clip(l, 200)])) }, questions, { step: s.step, phase: 'retrieval-rank' });
-  const ranked = pool.map((l, i) => ({ l, p: noul(a[`hit_${i}`]) })).sort((x, y) => y.p - x.p);
+  const scores = await relevance(jev, s, query, pool);
+  const ranked = pool.map((l, i) => ({ l, p: scores[i]! })).sort((x, y) => y.p - x.p);
   const kept = ranked.filter(x => x.p >= .4).slice(0, keep).map(x => x.l);
   return { kept: kept.length ? kept : ranked.slice(0, Math.min(3, ranked.length)).map(x => x.l), dropped: lines.length - Math.max(kept.length, Math.min(3, ranked.length)) };
 }

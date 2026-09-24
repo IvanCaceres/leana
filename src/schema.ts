@@ -23,8 +23,9 @@ export const schemas: Record<Route, JsonSchema> = {
   write: obj({ path: str(500), expectedHash: str(64), oldText: str(), newText: str() }),
   replace_lines: obj({ path: str(500), expectedHash: str(64), edits: { type: 'array', minItems: 1, maxItems: 40,
     items: obj({ start: integer(1, 1000000), end: integer(1, 1000000), newText: str(), prepend: str(200) }) } }),
+  // A plain cut and paste: the lines leave source and are appended to destination unchanged.
   move_lines: obj({ source: str(500), expectedHash: str(64), start: integer(1, 1000000), end: integer(1, 1000000),
-    destination: str(500), destinationHash: str(64), replacement: str(), prefix: str() }),
+    destination: str(500), destinationHash: str(64) }),
   bash: obj({ command: str(2000), purpose: str(), check: { type: 'boolean' } }),
   finish: obj({ summary: str() }),
   ask_user: obj({ question: str() }),

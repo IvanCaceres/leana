@@ -162,11 +162,13 @@ test('A created file is checked against the repository as facts: an undeclared p
   const { root, store } = await repo(t);
   await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', dependencies: { react: '^19' } })); await mkdir(join(root, 'node_modules'), { recursive: true });
   await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'util.py'), 'def helper():\n    pass\n'); await writeFile(join(root, 'pyproject.toml'), '[project]\nname="x"\n');
+  // Both projects are detected; the Python one is already installed, so the one step goes to the worker.
+  await mkdir(join(root, '.venv', 'bin'), { recursive: true }); await writeFile(join(root, '.venv', 'bin', 'python'), ''); await writeFile(join(root, '.venv', '.leana-installed'), 'project');
   const bonsai = bonsaiOf({ steps: [{ thought: 'write', action: 'create_file', args: { path: 'src/app.tsx', purpose: 'the app' } }],
     files: { 'src/app.tsx': "import { useState } from 'react';\nimport clsx from 'clsx';\nexport function App() { return null; }\n" } });
   const result = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
   const entry = result.entries.find(e => e.kind === 'create_file')!;
-  assert.match(entry.text, /imports clsx, which package\.json does not declare/, entry.text);
+  assert.match(entry.text, /imports clsx, which package\.json does not declare/, entry.text); assert.doesNotMatch(entry.text, /pyproject/, 'a .tsx file belongs to the node project beside the Python one');
   assert.equal(JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).dependencies.clsx, undefined, 'the manifest is untouched');
 });
 
@@ -218,7 +220,7 @@ test('A command is the check only when the worker says so; a failing check carri
     { thought: 'done', action: 'finish', args: { summary: 'done' } },
   ] });
   const jev = jevOf({ clauses: c => /landing page/.test(c) ? .1 : .9 });
-  const s = await newSession(root, 'Bootstrap a react application with a landing page and components, using best practices');
+  const s = await newSession(root, 'Bootstrap a react application:\n- a landing page\n- components, using best practices');
   const { hash } = await import('../src/tools.js');
   const result = await new Agent({ ...config, maxSteps: 9 }, store, jev, filling(bonsai, async p => hash(await readFile(join(root, p), 'utf8'))), root, () => {}, () => {}).run(s);
   const ev = await events(store);
@@ -296,7 +298,7 @@ test('The render action shows the worker what the user sees: errors, a broken im
   const { root } = await repo(t);
   const r = await renderFacts(root, `http://127.0.0.1:${port}/`, undefined, join(root, 'shot.png'), 30000);
   assert.equal(r.ok, false);
-  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /overflowing the viewport horizontally: [^|]*div\.wide/); assert.match(r.text, /errors in the page: .*(kaput|boom)/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
+  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /overflowing the viewport horizontally: [^|]*div\.wide/); assert.match(r.text, /exceptions thrown in the page: .*kaput/); assert.match(r.text, /Console messages: .*boom/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
   assert((await readFile(join(root, 'shot.png'))).length > 1000, 'a screenshot is kept for the report');
 });
 
@@ -336,7 +338,7 @@ test('A broken render blocks completion: the harness does not propose it, and a 
   assert(result.completionFeedback && /render/.test(result.completionFeedback.text));
 });
 
-test('The render measures styling in the page itself: class names no CSS rule matches fail it with the names first; the browser\'s own favicon request does not', async t => {
+test('The render reports styling as facts, never as a failure: class names no CSS selector matches are named; the browser\'s own favicon request does not fail it', async t => {
   if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
   const page = (css: string) => `<!doctype html><html><head><title>T</title><style>${css}</style></head><body><header class="nav"><a class="nav__link" href="/">Home link</a></header><main class="hero"><h1 class="hero__title">A headline for the page</h1><p class="hero__text flex p-4">Some body text that is long enough</p><div class="grid"><span class="card">One card</span><span class="card">Two card</span></div></main></body></html>`;
   let css = 'body{margin:0}';
@@ -345,11 +347,12 @@ test('The render measures styling in the page itself: class names no CSS rule ma
   const url = `http://127.0.0.1:${(server.address() as any).port}/`;
   const { root } = await repo(t);
   let r = await renderFacts(root, url, undefined, null, 30000);
-  assert.equal(r.ok, false); assert.match(r.text, /^RENDER FAILED[^\n]*\n- \d+ of the 9 class names on the page match no CSS rule/, r.text);
+  assert.equal(r.ok, true, 'unmatched class names are a fact, not a failure: classes also serve scripts, and pages are styled inline or in shadow roots'); assert.match(r.text, /^RENDER OK/);
+  assert.match(r.text, /Styling: 1 CSS rules; 0 of the 9 class names on visible elements match a CSS selector \(without one: nav, nav__link/, r.text);
   assert.doesNotMatch(r.text, /favicon/, 'the browser\'s favicon request is not the page\'s failure');
   css = 'body{margin:0} .nav{display:flex} .nav__link{color:red} .hero,.hero__title{margin:0} @media (min-width:1px){.hero__text{color:#333}.flex{display:flex}.p-4{padding:1rem}} .grid{display:grid} .card{padding:4px}';
   r = await renderFacts(root, url, undefined, null, 30000);
-  assert.equal(r.ok, true, r.text); assert.match(r.text, /^RENDER OK: .* 9 of 9 class names styled/);
+  assert.equal(r.ok, true, r.text); assert.match(r.text, /Styling: \d+ CSS rules; 9 of the 9 class names on visible elements match a CSS selector;/);
 });
 
 test('Every call shares one prompt prefix: a reasoning turn and a file generation differ only after the evidence, and creating a file changes nothing before it', async t => {
@@ -415,7 +418,7 @@ test('A turn cut off by the token limit is told why and what to use instead; thr
   assert.match(note, /last 3 turns only read or searched/, note);
   assert.equal(jev.calls.filter(c => c.phase === 'watchdog').at(-1)!.state.turnsOnlyReading, 4, 'Jev reads the streak after the fourth read-only turn');
 });
-test('A render that finds unstyled class names lists every one by the source file that uses it, and the stylesheets that exist', async t => {
+test('A render that finds class names no selector matches lists every one by the source file that uses it, and the stylesheets that exist', async t => {
   if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
@@ -457,8 +460,8 @@ test('Every field the prompts name is one the model receives: descriptions, inst
   const { actions } = await import('../src/schema.js');
   const s = await newSession(root, 'x');
   // Every conditional block present, so the prompt holds every field it can hold.
-  s.lastCheck = { step: 2, ok: false, text: 'src/a.ts(3,1): error TS2304', summary: { errors: 1, syntax: 0, byFile: { 'src/a.ts': { count: 1, syntax: 0, lines: [3], samples: ['TS2304'] } } }, command: 'tsc' };
-  s.missingNames = [{ name: 'greet', inFile: 'src/a.ts', importLine: 'import { greet } from "./greet.js";' }];
+  s.lastCheck = { step: 2, ok: false, text: 'src/a.ts(3,1): error TS2304', summary: { code: 2, files: { 'src/a.ts': [3] } }, command: 'tsc' };
+  s.referenceEvidence = [{ path: 'PLAN.md', hash: 'h', text: '1: the plan', start: 1 }];
   s.completionFeedback = { step: 1, text: 'not accepted', awaitingEvidence: true }; s.editEvidence = [{ step: 1, route: 'write', paths: ['src/a.ts'], artifact: 'a', text: 't' }];
   s.allowedActions = [...actions];
   const step = stepMessages(s, [...actions], 'a note'); const file = newFileMessages(s, 'src/b.ts', 'p', 't', [], [], 0, 'old');
@@ -491,4 +494,23 @@ test('The prompts claim only what the harness does: an edit is not followed by a
   const claims = /re-?runs? the (check|verification)|check runs (next|automatically)|runs (the (check|verification)( command)?|it) (itself|automatically|after every edit)|harness (repairs|removes|imports|moves|rewrites|re-exports)|applies (itself|the fix)/i;
   const worded = [...Object.values(pinned).flatMap((a: any) => [a.description, a.instructions]), ...(await readFile(new URL('../../src/tools.ts', import.meta.url), 'utf8')).split('\n').filter(l => !/^\s*\/\//.test(l))];
   for (const text of worded) assert(!claims.test(text), `a prompt or tool result claims something the harness does not do: ${text.slice(0, 200)}`);
+});
+
+test('A shell command that writes files is an edit whatever it starts with: a heredoc through cat marks the earlier read stale and the check due; the check\'s own output is not an edit', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'App.tsx'), 'export const App = 1;\n');
+  await writeFile(join(root, 'check.mjs'), 'import { mkdirSync, writeFileSync } from "node:fs"; mkdirSync("dist", { recursive: true }); writeFileSync("dist/out.js", String(Date.now())); process.exit(0);\n');
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 5 }] } },
+    { thought: 'write through the shell', action: 'bash', args: { command: "cat > src/App.tsx <<'EOF'\nexport const App = 2;\nEOF", purpose: 'write', check: false } },
+    { thought: 'done', action: 'finish', args: { summary: 'done' } },
+    { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+  ] });
+  const result = await new Agent({ ...config, checkCommand: 'node check.mjs', maxSteps: 4 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.deepEqual(result.writes, ['src/App.tsx'], 'the heredoc is an edit; the check\'s dist/out.js is not');
+  assert(result.entries.some(e => e.kind === 'read_files' && /edited at step 2/.test(e.stale ?? '')), 'the earlier read is stale');
+  assert(result.entries.some(e => /has not run since the last edit/.test(e.text)), 'finish is refused until the check runs after the shell edit');
+  assert.match(result.entries.find(e => e.kind === 'bash' && /cat >/.test(e.text))!.text, /the command changed files \(modified 1\): src\/App\.tsx/);
+  assert(result.lastCheck && result.lastCheck.step > result.lastWriteStep, 'the check after the edit stands: its own output did not make it stale');
+  assert(result.knownFiles.includes('dist/out.js'), 'the file list still follows the tree');
 });

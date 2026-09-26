@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults };
-import { Bonsai, Jev, periodicStart, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
+import { Bonsai, Jev, loopingLineStart, periodicStart, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
 import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds } from '../src/context.js';
 import { namedFiles, pinReferences, referenceContext } from '../src/references.js';
 import { objectiveClauses } from '../src/control.js';
@@ -216,6 +216,24 @@ test('periodicStart finds a loop inside one line and leaves real content alone',
   const { validate, schemas } = await import('../src/schema.js');
   assert.doesNotThrow(() => validate(schemas.bash, { command: `cat > src/a.ts <<'EOF'\n${'const a = 1;\n'.repeat(400)}EOF`, purpose: 'write', check: false }), 'a long command the grammar let through is not discarded afterwards');
 });
+test('loopingLineStart catches a loop inside one line whose values drift, which no exact cycle finds, and leaves real long lines alone', () => {
+  // The shape of react-demo-24's Footer: an icon path that fell into a cycle whose signs and digits drift, so it never repeats exactly.
+  const unit = ['.28', '.57', '.85', '.27', '.48', '.21', '.56', '.79', '.31', '.8', '.23', '.37', '.11', '.16'];
+  // A cycle whose signs drop out at random, 2% of the time: never exact, as in the recorded loop.
+  let s0 = 7; const r0 = () => (s0 = (s0 * 48271) % 2147483647) / 2147483647;
+  let drift = ''; for (let i = 0; drift.length < 6000; i++) drift += `${r0() < .02 ? '' : '-'}${unit[i % unit.length]}`;
+  const looping = `      <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.7 9.8 8.9 11.18${drift}`;
+  assert.equal(periodicStart(looping), -1, 'no exact cycle: the old check misses it');
+  assert.equal(loopingLineStart(looping), 0, 'cut at the start of the looping line');
+  assert.equal(loopingLineStart(`const a = 1;\n${looping}`), 13);
+  // Real long lines: a varied path, a data array, minified code.
+  let seed = 7; const rnd = () => (seed = (seed * 48271) % 2147483647) / 2147483647;
+  const path = 'd="' + Array.from({ length: 700 }, () => `l${(rnd() * 40 - 20).toFixed(2)} ${(rnd() * 40 - 20).toFixed(2)}`).join('') + '"';
+  const data = JSON.stringify(Array.from({ length: 300 }, (_, i) => ({ id: i, name: `item-${Math.floor(rnd() * 1e6)}`, score: +(rnd() * 100).toFixed(3) })));
+  const minified = Array.from({ length: 400 }, (_, i) => `function f${i}(a,b){return a${['+', '*', '-'][i % 3]}b*${Math.floor(rnd() * 1000)}}`).join(';');
+  for (const honest of [path, data, minified]) assert.equal(loopingLineStart(honest), -1, honest.slice(0, 40));
+  assert.equal(loopingLineStart(looping.slice(0, 2500)), -1, 'a line shorter than the window is not judged');
+});
 test('generateText continues by token ids with the fence prefilled, stops on the closing fence, cuts a loop, and repairs a broken character', async t => {
   // A mock llama-server: tokens are character codes; /completion replies from a script and records the prompts it received.
   const requests: any[] = []; let script: { content: string; stop_type: string; tokens?: number[] }[] = [];
@@ -246,6 +264,13 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   script = [{ content: `const c = <path d="M0 0${' 0 0.267 0 0.4 0 0.133'.repeat(60)}`, stop_type: 'limit' }];
   const p = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
   assert.equal(p.finish, 'repetition'); assert(p.text.length < 60, p.text); assert.equal(script.length, 0);
+  // A chunk that loops inside one line with drifting values is cut at the start of that line.
+  const unit = ['.28', '.57', '.85', '.27', '.48', '.21', '.56', '.79', '.31', '.8', '.23', '.37', '.11', '.16'];
+  let s1 = 7; const r1 = () => (s1 = (s1 * 48271) % 2147483647) / 2147483647;
+  let drift = ''; for (let i = 0; drift.length < 4000; i++) drift += `${r1() < .02 ? '' : '-'}${unit[i % unit.length]}`;
+  script = [{ content: `const d = 1;\n<path d="M0 0${drift}`, stop_type: 'limit' }];
+  const dl = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
+  assert.equal(dl.finish, 'repetition'); assert.equal(dl.text, 'const d = 1;\n'); assert.equal(script.length, 0);
   // A chunk ending in a broken character is re-derived from the token ids.
   script = [{ content: 'caf�', stop_type: 'limit', tokens: [99, 97, 102, 233] }, { content: ' au lait', stop_type: 'eos' }];
   const d = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null });

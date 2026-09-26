@@ -433,6 +433,36 @@ test('The repeat check matches the action\'s own result, not the turn that share
   assert(!result.entries.some(e => e.kind === 'turn' && e.step === 5), 'the refused turn is not kept as a template to copy');
 });
 
+test('Reasoning copied word for word from the previous turn drops the earlier turns at once; turns that only open alike are kept', async t => {
+  const { root, store } = await repo(t);
+  const same = 'The build passes and the page renders. The render shows class names without CSS. Let me read the stylesheet to see what exists.';
+  const steps = [
+    { thought: 'Start by looking around the repository to see what is there already.', action: 'bash', args: { command: 'echo a', purpose: 'look', check: false } },
+    { thought: `${same} First the top part.`, action: 'bash', args: { command: 'echo b', purpose: 'look', check: false } },
+    { thought: `${same} Now the bottom part.`, action: 'bash', args: { command: 'echo c', purpose: 'look', check: false } },
+    { thought: `${same} Now the bottom part.`, action: 'bash', args: { command: 'echo d', purpose: 'look', check: false } },
+  ];
+  const prompts: Message[][] = []; const bonsai = bonsaiOf({ steps });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); } };
+  const result = await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const resets = (await events(store)).filter(e => e.type === 'reasoning-reset');
+  assert.equal(resets.length, 1, 'only the word-for-word repeat resets, not the turn that merely opens alike');
+  assert.deepEqual([resets[0].data.step, resets[0].data.reason, resets[0].data.turns], [4, 'repeated', ['t1', 't2', 't3']]);
+  assert.deepEqual(result.entries.filter(e => e.kind === 'turn').map(e => e.id), ['t4']);
+  assert.equal(result.entries.filter(e => e.kind === 'bash').length, 4, 'the results stay');
+});
+
+test('earlierSteps sits before the evidence: it changes only when evidence is evicted, so it is not reprocessed every step', async () => {
+  const { stepMessages, turnEntry } = await import('../src/context.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-trail-')), 'x');
+  s.entries = [turnEntry(3, 'look', [{ action: 'bash', args: { command: 'ls' } }]), { id: 'e3', step: 3, kind: 'bash', text: 'out', artifact: '', relevance: .5, turn: 't3' }];
+  s.trail = ['step 1: bash ls -> bash ok'];
+  const m = stepMessages(s, ['bash']);
+  assert.deepEqual(JSON.parse(m[2]!.content), { earlierSteps: s.trail }, 'right after the pinned block');
+  assert.equal(m[3]!.role, 'assistant');
+  assert(!m.slice(4).some(x => x.content.includes('earlierSteps')), 'not repeated in the volatile tail');
+});
+
 test('A stuck streak sets its reasoning aside and keeps its results: the turns of the no-progress steps leave the prompt, the worker is told', async t => {
   const { root, store } = await repo(t);
   const prompts: Message[][] = [];

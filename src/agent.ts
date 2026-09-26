@@ -376,7 +376,19 @@ export class Agent {
         }
         // The turn enters the evidence before its actions run: the prefix only grows,
         // and a file generated inside the batch already sees the reasoning behind it.
-        const turn = turnEntry(s.step, thought, batch); s.entries.push(turn); s.currentTurn = turn.id;
+        // Reasoning copied word for word from the previous turn is the worker anchoring on its
+        // own text: the earlier turns leave the prompt at once (results stay), without waiting
+        // for the watchdog to read the session as stuck. Whole-thought equality, as stored:
+        // turns that only open alike (a status sentence) are ordinary progress.
+        const turn = turnEntry(s.step, thought, batch);
+        const said = (e: { text: string }) => String(JSON.parse(e.text).thought ?? '').replace(/\s+/g, ' ').trim();
+        const previous = s.entries.filter(e => e.kind === 'turn').at(-1);
+        if (previous && said(turn).length >= 40 && said(previous) === said(turn)) {
+          const dropped = s.entries.filter(e => e.kind === 'turn');
+          s.entries = s.entries.filter(e => e.kind !== 'turn');
+          await this.store.log('reasoning-reset', { step: s.step, reason: 'repeated', turns: dropped.map(e => e.id) });
+        }
+        s.entries.push(turn); s.currentTurn = turn.id;
         let halted = false;
         for (let i = 0; i < batch.length; i++) {
           if (i > 0) { if (s.step >= endStep) break; s.step++; this.current = s.step; this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep }); }

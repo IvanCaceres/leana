@@ -152,7 +152,7 @@ function trailLine(turn: Entry): string {
 // The evidence's share of the prompt, estimated from its rendered length; the
 // batched eviction is decided on it, the hard budget by the server's count.
 export function evidenceTokens(s: Session): number {
-  return Math.ceil(agentPrefix(s).slice(2).reduce((n, m) => n + m.content.length, 0) / 3.5);
+  return Math.ceil(agentPrefix(s).slice(2).filter(m => !m.content.startsWith('{"earlierSteps"')).reduce((n, m) => n + m.content.length, 0) / 3.5);
 }
 const details: Record<Route, string> = {
   rewrite_file: 'path is an existing file; purpose says what the new version must contain and change. Never put file content in the arguments: it is generated next, as code, from the current content, your thought and purpose.',
@@ -242,11 +242,14 @@ function agentPrefix(s: Session): Message[] {
   return [
     { role: 'system', content: AGENT_SYSTEM },
     { role: 'user', content: JSON.stringify(orientationBlock(s, s.allowedActions)) },
+    // The trail changes only when evidence is evicted, which already reprocesses from the
+    // oldest entry, so it sits before the evidence rather than being reprocessed every step.
+    ...(s.trail?.length ? [{ role: 'user' as const, content: JSON.stringify({ earlierSteps: s.trail }) }] : []),
     ...s.entries.map(e => e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : { role: 'user' as const, content: JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } }) }),
   ];
 }
 function volatile(s: Session): Message[] {
-  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', ...(s.trail?.length ? { earlierSteps: s.trail } : {}), files: relevantFiles(s, 40), ...verificationBlock(s) }) }];
+  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s) }) }];
 }
 export function stepMessages(s: Session, allowed: string[], note?: string): Message[] {
   const request = { role: 'Reason, then act. Write thought: two to five sentences on where the work stands given the objective, your notes and the latest evidence, and what to do next and why. Then actions: an ordered list of one to eight actions (each an action name from allowedActions with its args under that action\'s schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and a render) and put a check or a render last; keep to one action when its result decides what comes next.',

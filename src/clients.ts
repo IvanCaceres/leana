@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
+import { deflateRawSync } from 'node:zlib';
 import type { Answers, Config, GenerationMeta, JsonSchema, Log, Message, Questions } from './types.js';
 import { samplingSchema, validate } from './schema.js';
 
@@ -117,6 +118,17 @@ export function periodicStart(text: string, span = 800): number {
   }
   return -1;
 }
+// A loop inside one long line whose values drift (an SVG path, a number
+// array): no exact cycle, but the text compresses to almost nothing. The last
+// `window` characters of the current line are compressed; real long lines
+// (minified bundles, source maps, data) stay above 0.057 at 3000 characters,
+// the recorded loops fall to 0.02-0.045. Returns the start of that line, or -1.
+export function loopingLineStart(text: string, window = 3000, threshold = .045): number {
+  const start = text.lastIndexOf('\n') + 1;
+  if (text.length - start < window) return -1;
+  const tail = Buffer.from(text.slice(-window));
+  return deflateRawSync(tail).length / tail.length < threshold ? start : -1;
+}
 export class Bonsai {
   // Timing and usage of the latest generation, for live progress and reports.
   lastMeta: GenerationMeta | null = null;
@@ -202,7 +214,8 @@ export class Bonsai {
     if (promptTokens > this.config.workingTokens || promptTokens + Math.min(budget, this.config.maxTokens) + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
     await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking });
-    const chunk = Math.min(this.config.maxTokens, 2048);
+    // Chunks are where a loop is checked for; a continuation reuses the cached ids, so a small one costs little.
+    const chunk = Math.min(this.config.maxTokens, 1024);
     let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = '';
     // The closing fence is the backtick run alone, whatever language opened it.
     const stopWords = fence ? [`\n${fence.match(/^`+/)?.[0] ?? '```'}`] : [];
@@ -234,7 +247,9 @@ export class Bonsai {
         const bodyStart = thinking ? text.indexOf('</think>') + 8 : 0;
         const at = thoughtClosed ? repetitionStart(text.slice(bodyStart)) : -1;
         if (at >= 0) { const kept = text.slice(bodyStart).split('\n').slice(0, at).join('\n'); text = `${text.slice(0, bodyStart)}${kept}`; finish = 'repetition'; break; }
-        const inLine = thoughtClosed ? periodicStart(text.slice(bodyStart)) : -1;
+        const body = text.slice(bodyStart);
+        const periodic = thoughtClosed ? periodicStart(body) : -1;
+        const inLine = periodic >= 0 ? periodic : thoughtClosed ? loopingLineStart(body) : -1;
         if (inLine >= 0) { text = text.slice(0, bodyStart + inLine); finish = 'repetition'; break; }
         if (generated >= budget) { finish = 'length'; break; }
         continuations++;

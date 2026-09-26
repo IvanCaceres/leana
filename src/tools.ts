@@ -5,7 +5,9 @@ import { spawn } from 'node:child_process';
 import { builtinModules } from 'node:module';
 import type { CheckSummary, Config, Route, SourceEvidence, ToolResult } from './types.js';
 import { clip } from './context.js';
-export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex');
+// The first 16 hex digits (64 bits) of SHA-256: enough to tell one version of a
+// file from another in a session, and a quarter of the tokens every prompt pays for.
+export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
 // A write whose target was never read, or was read before it changed. Only this
 // failure class requires a fresh read; other edit failures are argument mistakes.
 export class StaleWriteError extends Error {}

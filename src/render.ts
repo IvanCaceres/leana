@@ -103,7 +103,7 @@ export async function renderFacts(root: string, url: string, serve: string | und
       ].filter(Boolean);
       const ok = !verdict.length;
       const lines = [
-        ok ? `Rendered ${url}: no exception, every request and image loaded.` : `RENDER FAILED for ${url}, ${verdict.length} problem(s):\n- ${verdict.join('\n- ')}`,
+        ok ? `Rendered ${url}: no exception, every request and image loaded${c.used ? `; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS rule` : ''}.` : `RENDER FAILED for ${url}, ${verdict.length} problem(s):\n- ${verdict.join('\n- ')}`,
         messages.length ? `Console messages: ${messages.join(' | ')}` : '',
         `Page: title "${facts.title}"; ${facts.viewport}, height ${facts.docHeight}px; body font ${facts.font}; background ${facts.background}; ${facts.textLength} characters of text.`,
         `Styling: ${facts.rules} CSS rules; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS selector${c.unmatched ? ` (without one: ${c.sample.join(', ')}${c.unmatched > c.sample.length ? ', …' : ''})` : ''}; ${facts.inline} elements with a style attribute; ${facts.shadow} shadow roots.`,

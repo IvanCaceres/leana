@@ -79,8 +79,22 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
   const reason = !facts_ok ? 'the verification did not pass after the last edit' : renderMissing ? `Jev reads the render as the weakest evidence (${weakestP.toFixed(2)}) and the page ${facts.renderState === 'never' ? 'has never been rendered' : 'has not been rendered since the last write'}: render it and act on what it shows before finishing` : renderBroken ? `the last render of ${(facts.render as any).url ?? 'the page'} failed: ${clip(String((facts.render as any).facts ?? ''), 300)}` : humanReview ? 'Jev routes this completion to the user' : accepted ? 'the facts and Jev\'s reading agree' : weak.length ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}` : `Jev reads the change as ${matches < .75 ? 'not implementing the request' : ''}${supported < .6 ? ' not supported by the facts' : ''}`.replace(/\s+/g, ' ').trim();
   // A rejection says where Jev reads the gap, with the fact itself, so the worker acts on it rather than guessing.
   const pointer = accepted || humanReview || !facts_ok || renderBroken || renderMissing || !weakest ? '' : `. Jev reads the weakest evidence as ${weakestFact(weakest, facts)}`;
+  // A completion about to pass while Jev names one piece of evidence as its weakest gets
+  // a second, focused reading of that evidence alone; a clear no there stops it.
+  if ((accepted || humanReview) && weakest && weakestP >= .5 && focusQuestions[weakest]) {
+    const evidence = weakest === 'render' ? facts.render : weakest === 'verification' ? facts.verification : facts.sources;
+    const f = await jev.decide({ objective: s.objective, evidence: weakest, [weakest]: evidence }, { evidence_shows_done: { type: 'noul', instructions: focusQuestions[weakest]! } }, { step: s.step, phase: 'evidence-focus' });
+    const focus = noul(f.evidence_shows_done);
+    if (focus < .3) return { accepted: false, matches, unaddressed, supported, route: 'rejected', reason: `Jev's focused reading of the ${weakest} alone is that it does not show the work done (${focus.toFixed(2)}): ${weakestFact(weakest, facts)}` };
+  }
   return { accepted, matches, unaddressed, supported, route: humanReview ? 'human' : accepted ? route : 'rejected', reason: reason + pointer };
 }
+// The focused question per kind of evidence: judged by that evidence alone.
+const focusQuestions: Record<string, string> = {
+  render: 'Judged only by this render evidence, does the page look finished to the user the objective describes: styled and laid out as intended, its content present, nothing broken?',
+  verification: 'Judged only by this verification output, does the work build and run as the objective requires?',
+  sources: 'Judged only by these source files, do they implement what the objective asks, completely and without placeholders?',
+};
 function weakestFact(kind: string, facts: GateFacts): string {
   const render = facts.render && typeof facts.render === 'object' ? String((facts.render as any).facts ?? '') : String(facts.render ?? '');
   switch (kind) {

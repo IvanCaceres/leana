@@ -216,7 +216,7 @@ export class Bonsai {
     await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking });
     // Chunks are where a loop is checked for; a continuation reuses the cached ids, so a small one costs little.
     const chunk = Math.min(this.config.maxTokens, 1024);
-    let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = '';
+    let cutFrom = ''; let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = '';
     // The closing fence is the backtick run alone, whatever language opened it.
     const stopWords = fence ? [`\n${fence.match(/^`+/)?.[0] ?? '```'}`] : [];
     try {
@@ -245,12 +245,13 @@ export class Bonsai {
         // A tail that repeats itself is wrong content, the one case to stop
         // generating: the text is cut at the first repeat and reported as such.
         const bodyStart = thinking ? text.indexOf('</think>') + 8 : 0;
+        const uncut = text;
         const at = thoughtClosed ? repetitionStart(text.slice(bodyStart)) : -1;
-        if (at >= 0) { const kept = text.slice(bodyStart).split('\n').slice(0, at).join('\n'); text = `${text.slice(0, bodyStart)}${kept}`; finish = 'repetition'; break; }
+        if (at >= 0) { cutFrom = uncut; const kept = text.slice(bodyStart).split('\n').slice(0, at).join('\n'); text = `${text.slice(0, bodyStart)}${kept}`; finish = 'repetition'; break; }
         const body = text.slice(bodyStart);
         const periodic = thoughtClosed ? periodicStart(body) : -1;
         const inLine = periodic >= 0 ? periodic : thoughtClosed ? loopingLineStart(body) : -1;
-        if (inLine >= 0) { text = text.slice(0, bodyStart + inLine); finish = 'repetition'; break; }
+        if (inLine >= 0) { cutFrom = uncut; text = text.slice(0, bodyStart + inLine); finish = 'repetition'; break; }
         if (generated >= budget) { finish = 'length'; break; }
         continuations++;
       }
@@ -258,6 +259,8 @@ export class Bonsai {
       if (broken) { try { text = await this.detokenize(prompt.slice(promptTokens)); if (stoppingWord && text.endsWith(stoppingWord)) text = text.slice(0, -stoppingWord.length); } catch { /* keep the concatenation */ } }
       if (thinking) text = text.replace(/^[\s\S]*?<\/think>\s*/, '');
       this.lastMeta = { ms: performance.now() - start, usage: { prompt_tokens: promptTokens, completion_tokens: generated }, timings, finishReason: finish, promptTokens, continuations };
+      // What a loop cut discarded, so the next detector can be measured on real loops.
+      if (finish === 'repetition') await this.log('repetition-cut', { requestId, ...context, kept: text.length, generated: cutFrom.length, discardedTail: cutFrom.slice(-4000) });
       await this.log('bonsai', { requestId, ...context, model: this.config.model, ms: this.lastMeta.ms, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, usage: this.lastMeta.usage, timings, finishReason: finish, continuations, raw: true });
       return { text, finish, meta: this.lastMeta };
     } catch (e) {

@@ -20,6 +20,10 @@ import { renderFacts } from './render.js';
 import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
 import type { Bonsai } from './clients.js';
 
+// A repository file's text, or null when it cannot be read: missing (the worker
+// may delete any file it wrote), outside the root, or not text. Never throws.
+const readIfPresent = (root: string, path: string): Promise<string | null> => safePath(root, path).then(f => readFile(f, 'utf8')).catch(() => null);
+
 export async function newSession(root: string, objective: string): Promise<Session> {
   if (!objective.trim() || Buffer.byteLength(objective) > 6000) throw new Error('Objective must be 1..6000 UTF-8 bytes');
   let instructions = '';
@@ -97,7 +101,7 @@ export class Agent {
       if (!result.ok) {
         const sites: string[] = [];
         for (const [p, named] of Object.entries(s.lastCheck.summary.files).slice(0, 5)) {
-          const text = await readFile(await safePath(s.root, p), 'utf8').catch(() => null); if (text === null) continue;
+          const text = await readIfPresent(s.root, p); if (text === null) continue;
           const lines = text.split('\n');
           for (const n of named.filter(n => n <= lines.length).slice(0, 2)) { const a = Math.max(1, n - 4); const b = Math.min(lines.length, n + 4); sites.push(`${p} lines ${a}..${b} (error at ${n}):\n${lines.slice(a - 1, b).map((l, i) => `${a + i}: ${l}`).join('\n')}`); }
         }
@@ -132,7 +136,7 @@ export class Agent {
     // A written file that does not parse is a fact the worker sees at once, by the language's own tool.
     if (result.ok && editRoutes.includes(route) && result.changed?.length) {
       const facts: string[] = [];
-      for (const p of result.changed) { const text = await readFile(await safePath(this.tools.root, p), 'utf8').catch(() => null); if (text === null) continue; const problems = await syntaxCheck(this.tools.root, p, text).catch(() => [] as string[]); if (problems.length) facts.push(`${p} does not parse: ${problems.slice(0, 4).join('; ')}`); }
+      for (const p of result.changed) { const text = await readIfPresent(this.tools.root, p); if (text === null) continue; const problems = await syntaxCheck(this.tools.root, p, text).catch(() => [] as string[]); if (problems.length) facts.push(`${p} does not parse: ${problems.slice(0, 4).join('; ')}`); }
       if (facts.length) result.text += `\nHarness: ${facts.join(' | ')}`;
     }
     s.lastRoute = route; s.lastResultOk = result.ok;
@@ -292,7 +296,7 @@ export class Agent {
     const untracked = await runCommand('git', ['ls-files', '--others', '--exclude-standard'], s.root, 10000).catch(() => null);
     const diffStat = [diff?.code === 0 ? diff.output.trim() : '', untracked?.code === 0 && untracked.output.trim() ? `untracked: ${untracked.output.trim().split('\n').slice(0, 40).join(', ')}` : ''].filter(Boolean).join('\n') || `changed files: ${s.writes.join(', ') || 'none'}`;
     const sources: Record<string, string> = {};
-    for (const p of s.writes.slice(-12)) { const t = await readFile(await safePath(s.root, p), 'utf8').catch(() => null); if (t !== null) sources[p] = clip(t, 1200); }
+    for (const p of s.writes.slice(-12)) { const t = await readIfPresent(s.root, p); if (t !== null) sources[p] = clip(t, 1200); }
     // Whether the render action could run here: the worker may use it and the machine has a browser.
     const canRender = (s.allowedActions ?? []).includes('render') && Boolean((s.orientation as any)?.toolchain?.browser);
     const render = s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, url: s.lastRender.url, facts: s.lastRender.text } : canRender ? 'never rendered: nothing is known about what the user sees' : 'cannot be rendered here (no browser, or the shell is not allowed)';
@@ -424,7 +428,7 @@ export class Agent {
   private async perform(s: Session, routeIn: Route, argsIn: Record<string, any>, thought: string): Promise<'ok' | 'failed' | 'refused' | 'stop'> {
     let route = routeIn; let args = argsIn;
     const refuse = async (why: string) => { this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); return 'refused' as const; };
-    if (route === 'write' && args.expectedHash === 'new' && typeof args.path === 'string' && !(await stat(await safePath(this.tools.root, args.path, true)).then(() => true, () => false))) { route = 'create_file'; args = { path: args.path, purpose: thought, content: String(args.newText ?? '') }; }
+    if (route === 'write' && args.expectedHash === 'new' && typeof args.path === 'string' && !(await safePath(this.tools.root, args.path, true).then(f => stat(f)).then(() => true, () => false))) { route = 'create_file'; args = { path: args.path, purpose: thought, content: String(args.newText ?? '') }; }
     const key = Agent.actionKey(s, route, args);
     if (s.blockedActions!.includes(key)) return refuse('this exact action already failed the same way and Jev read the failure as unchanged; it is not run again. Change the approach.');
     const earlier = s.actions[key];
@@ -443,7 +447,7 @@ export class Agent {
         // Where each unstyled class name is used, so the stylesheet can be written without re-reading every component.
         const where: Record<string, string[]> = {};
         const hits = await runCommand('rg', ['-l', '--color', 'never', '-F', '-g', '!node_modules/**', '-g', '!dist/**', '-g', '!build/**', ...r.unmatched.flatMap((c: string) => ['-e', c]), '.'], this.tools.root, 15000).catch(() => null);
-        for (const f of (hits?.output ?? '').split('\n').map(l => l.replace(/^\.\//, '')).filter(Boolean).slice(0, 40)) { const text = await readFile(await safePath(this.tools.root, f), 'utf8').catch(() => ''); const used = r.unmatched!.filter((c: string) => new RegExp(`(^|[^\\w-])${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(text)); if (used.length && !/\.(?:css|scss|sass|less)$/.test(f)) where[f] = used; }
+        for (const f of (hits?.output ?? '').split('\n').map(l => l.replace(/^\.\//, '')).filter(Boolean).slice(0, 40)) { const text = await readIfPresent(this.tools.root, f).then(x => x ?? ''); const used = r.unmatched!.filter((c: string) => new RegExp(`(^|[^\\w-])${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(text)); if (used.length && !/\.(?:css|scss|sass|less)$/.test(f)) where[f] = used; }
         const stylesheets = s.knownFiles.filter(f => /\.(?:css|scss|sass|less)$/.test(f) && !/(^|\/)(?:node_modules|dist|build)\//.test(f));
         r.text += `\nClass names no CSS selector matches, by the file that uses them:\n${Object.entries(where).map(([f, cs]) => `  ${f}: ${cs.join(' ')}`).join('\n') || '  (not found in the sources)'}\nStylesheets in the project: ${stylesheets.join(', ') || 'none'}.`;
       }

@@ -271,6 +271,13 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   script = [{ content: `const d = 1;\n<path d="M0 0${drift}`, stop_type: 'limit' }];
   const dl = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
   assert.equal(dl.finish, 'repetition'); assert.equal(dl.text, 'const d = 1;\n'); assert.equal(script.length, 0);
+  // What a cut discards is logged, so the next loop can be measured rather than guessed at.
+  const logged: [string, any][] = [];
+  const logging = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 }, 'local', async (type, data) => { logged.push([type, data]); });
+  script = [{ content: `const d = 1;\n<path d="M0 0${drift}`, stop_type: 'limit' }];
+  await logging.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx', context: { step: 7, route: 'create_file' } });
+  const cut = logged.find(([type]) => type === 'repetition-cut')![1];
+  assert.equal(cut.step, 7); assert.equal(cut.kept, 13); assert(cut.generated > 4000 && cut.discardedTail.endsWith(drift.slice(-100)));
   // A chunk ending in a broken character is re-derived from the token ids.
   script = [{ content: 'caf�', stop_type: 'limit', tokens: [99, 97, 102, 233] }, { content: ' au lait', stop_type: 'eos' }];
   const d = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null });

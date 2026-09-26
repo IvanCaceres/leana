@@ -37,6 +37,7 @@ function jevOf(j: JevScript) {
     const phase = ctx?.phase ?? ''; calls.push({ phase, state });
     if (phase === 'watchdog') { const w = j.watch?.(++watches) ?? {}; return { progress: noul(w.progress ?? .8), same_failure: noul(w.same_failure ?? .05), stuck: noul(w.stuck ?? .05), objective_satisfied: noul(w.objective_satisfied ?? .2), needs_user: noul(w.needs_user ?? .05), in_scope: noul(w.in_scope ?? .9) }; }
     if (phase === 'evidence-gate') { const g = j.gate ?? {}; const route = g.verification_needed ?? 'deterministic_only'; const clauses = Object.fromEntries(Object.keys(q).filter(k => k.startsWith('clause_')).map(k => [k, noul(j.clauses?.((state as any).clauses[k]) ?? .9)])); const weakest = (g as any).weakest_evidence ?? 'sources'; const weakestAnswer: Answers = q.weakest_evidence ? { weakest_evidence: { type: 'choice' as const, choice: weakest, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.weakest_evidence as any).criteria).map(k => [k, k === weakest ? .9 : .02])) } } : {}; return { ...clauses, ...weakestAnswer, implementation_matches_request: noul(g.implementation_matches_request ?? .9), requirement_unaddressed: noul(g.requirement_unaddressed ?? .1), claim_supported: noul(g.claim_supported ?? .9), verification_needed: { type: 'choice', choice: route, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.verification_needed as any).criteria).map(k => [k, k === route ? .9 : .05])) } }; }
+    if (phase === 'evidence-focus') return { evidence_shows_done: noul((j.gate as any)?.focus ?? .8) };
     if (phase === 'failure-triage') { const kind = j.triage ?? 'code_bug'; return { failure: { type: 'choice', choice: kind, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.failure as any).criteria).map(k => [k, k === kind ? .9 : .01])) } }; }
     if (phase === 'retrieval-rank') { const hits = (state as any).hits as Record<string, string>; return Object.fromEntries(Object.entries(hits).map(([k, v]) => [k, noul(j.rank?.(v) ?? .1)])); }
     throw new Error(`unexpected Jev phase ${phase}`);
@@ -463,6 +464,59 @@ test('earlierSteps sits before the evidence: it changes only when evidence is ev
   assert(!m.slice(4).some(x => x.content.includes('earlierSteps')), 'not repeated in the volatile tail');
 });
 
+test('The per-turn tail carries short hashes, no duplicated edit history, and names the files written after the verification ran', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(2);\n'); await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'a.ts'), 'export const a = 1;\n');
+  const prompts: Message[][] = [];
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+    { thought: 'rewrite', action: 'rewrite_file', args: { path: 'src/a.ts', purpose: 'b' } },
+    { thought: 'look', action: 'bash', args: { command: 'echo hi', purpose: 'look', check: false } },
+  ], files: { 'src/a.ts': 'export const a = 2;\n' } });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); } };
+  await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const fields = (m: Message[]) => Object.assign({}, ...m.slice(-2).map(x => JSON.parse(x.content)));
+  const last = fields(prompts.at(-1)!);
+  assert.deepEqual(last.verification.writtenSince, ['src/a.ts'], 'the check ran before the rewrite: its output is about the old file');
+  assert(!('writtenSince' in fields(prompts[1]!).verification), 'nothing written since: no such field');
+  assert(!('editEvidence' in last), 'the turns already show what was done');
+  for (const h of Object.values(last.fileHashes as Record<string, string>)) assert.match(h, /^[0-9a-f]{16}$/);
+});
+
+test('A completion about to pass while Jev names the render as its weakest evidence gets a focused reading of the render alone; a clear no stops it, with the facts', async () => {
+  const { evidenceGate } = await import('../src/control.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Bootstrap a landing page');
+  // The shape of react-demo-26: rendered after the last write, match 0.78, render named weakest (0.79), 5 of 45 class names styled.
+  const render = { step: 33, afterLastWrite: true, ok: true, url: 'http://localhost:3000', facts: 'Rendered http://localhost:3000: no exception, every request and image loaded; 5 of the 45 class names on visible elements match a CSS rule.' };
+  const facts = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', render, renderState: 'current' as const, verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
+  const calls: string[] = [];
+  const jevWith = (focus: number, matches = .78) => { const j = jevOf({ gate: { implementation_matches_request: matches, claim_supported: .87, verification_needed: 'semantic_review', weakest_evidence: 'render', focus } as any }); return { decide: async (st: any, q: any, c: any) => { calls.push(c.phase); if (c.phase === 'evidence-focus') assert.deepEqual(Object.keys(st).sort(), ['evidence', 'objective', 'render']); return j.decide(st, q, c); } }; };
+  const broken = await evidenceGate(jevWith(.11) as any, s, facts);
+  assert.equal(broken.accepted, false); assert.match(broken.reason, /focused reading of the render alone .*\(0\.11\).*5 of the 45 class names/s);
+  assert.deepEqual(calls, ['evidence-gate', 'evidence-focus']);
+  const good = await evidenceGate(jevWith(.46) as any, s, facts);
+  assert.equal(good.accepted, true, 'a focused reading that is not a clear no leaves the verdict as it was');
+  calls.length = 0; const rejected = await evidenceGate(jevWith(.11, .4) as any, s, facts);
+  assert.equal(rejected.accepted, false); assert.deepEqual(calls, ['evidence-gate'], 'no second reading when the first already rejects');
+});
+
+test('A file the worker wrote and then deleted never stops the session: the completion the harness proposes reads the changed files that still exist', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'write two files', action: 'plan', batch: [{ action: 'create_file', args: { path: 'tailwind.config.ts', purpose: 'config' } }, { action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } }] },
+    { thought: 'the config is not needed', action: 'bash', args: { command: 'rm tailwind.config.ts', purpose: 'remove', check: false } },
+    { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+    { thought: 'never reached', action: 'bash', args: { command: 'echo x', purpose: 'x', check: false } },
+  ], files: { 'tailwind.config.ts': 'export default {};\n', 'src/a.ts': 'export const a = 1;\n' } });
+  // Jev reads the objective as satisfied after the check: the harness proposes completion, which reads the changed files.
+  const result = await new Agent({ ...config, maxSteps: 6 }, store, jevOf({ watch: n => ({ objective_satisfied: n >= 3 ? .9 : .2 }) }), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.doesNotMatch(result.stopReason, /ENOENT|realpath/);
+  assert.equal(result.status, 'complete', result.stopReason);
+  const facts = (await events(store)).find(e => e.type === 'completion')!;
+  assert(facts, 'the harness proposed completion and the gate judged it');
+});
+
 test('A stuck streak sets its reasoning aside and keeps its results: the turns of the no-progress steps leave the prompt, the worker is told', async t => {
   const { root, store } = await repo(t);
   const prompts: Message[][] = [];
@@ -538,7 +592,7 @@ test('The render reports styling as facts, never as a failure: class names no CS
   const url = `http://127.0.0.1:${(server.address() as any).port}/`;
   const { root } = await repo(t);
   let r = await renderFacts(root, url, undefined, null, 30000);
-  assert.equal(r.ok, true, 'unmatched class names are a fact, not a failure: classes also serve scripts, and pages are styled inline or in shadow roots'); assert.match(r.text, /^Rendered http:\S+: no exception, every request and image loaded\.\n/); assert.doesNotMatch(r.text, /\bOK\b/, 'the headline states facts, never a verdict the styling line would contradict');
+  assert.equal(r.ok, true, 'unmatched class names are a fact, not a failure: classes also serve scripts, and pages are styled inline or in shadow roots'); assert.match(r.text, /^Rendered http:\S+: no exception, every request and image loaded; 0 of the 9 class names on visible elements match a CSS rule\.\n/, 'the styling fact is in the first line, where the reader stops'); assert.doesNotMatch(r.text, /\bOK\b/, 'the headline states facts, never a verdict the styling line would contradict');
   assert.match(r.text, /Styling: 1 CSS rules; 0 of the 9 class names on visible elements match a CSS selector \(without one: nav, nav__link/, r.text);
   assert.doesNotMatch(r.text, /favicon/, 'the browser\'s favicon request is not the page\'s failure');
   css = 'body{margin:0} .nav{display:flex} .nav__link{color:red} .hero,.hero__title{margin:0} @media (min-width:1px){.hero__text{color:#333}.flex{display:flex}.p-4{padding:1rem}} .grid{display:grid} .card{padding:4px}';
@@ -654,7 +708,7 @@ test('Every field the prompts name is one the model receives: descriptions, inst
   s.lastCheck = { step: 2, ok: false, text: 'src/a.ts(3,1): error TS2304', summary: { code: 2, files: { 'src/a.ts': [3] } }, command: 'tsc' };
   s.referenceEvidence = [{ path: 'PLAN.md', hash: 'h', text: '1: the plan', start: 1 }];
   s.completionFeedback = { step: 1, text: 'not accepted', awaitingEvidence: true }; s.editEvidence = [{ step: 1, route: 'write', paths: ['src/a.ts'], artifact: 'a', text: 't' }];
-  s.allowedActions = [...actions]; s.trail = ['step 1: bash echo -> bash ok'];
+  s.allowedActions = [...actions]; s.trail = ['step 1: bash echo -> bash ok']; s.writeSteps = { 'src/a.ts': 3 };
   const step = stepMessages(s, [...actions], 'a note'); const file = newFileMessages(s, 'src/b.ts', 'p', [], [], 0, 'old');
   const data = [...step.slice(1), ...file.slice(1)].map(m => JSON.parse(m.content));
   const known = keysOf(data);

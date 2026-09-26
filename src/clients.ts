@@ -81,13 +81,16 @@ export interface TextOptions { budgetTokens?: number; temperature?: number; cont
 // to end the generation mid-line. A loop is caught by repetitionStart instead.
 export const codeSampling = { top_k: 20, top_p: .9 };
 // A generation that has started repeating itself: the same block of three or
-// more lines three times in the recent tail, or one line many times. Returns
-// the line index at which the first repeat begins, or -1.
+// more lines three times in a row in the recent tail, or one line six times in
+// a row. Only back-to-back repetition counts: a line that recurs across a file
+// (a closing tag, a brace, a return) is how code is made. Returns the line
+// index at which the first repeat begins, or -1.
 export function repetitionStart(text: string, tail = 80): number {
   const lines = text.split('\n'); const from = Math.max(0, lines.length - tail);
-  const counts = new Map<string, number[]>();
-  for (let i = from; i < lines.length; i++) { const l = lines[i]!.trim(); if (l.length < 3) continue; const at = counts.get(l) ?? []; at.push(i); counts.set(l, at); }
-  for (const [, at] of counts) if (at.length >= 6) return at[1]!;
+  for (let i = from, run = 1; i < lines.length; i++) {
+    const l = lines[i]!.trim(); run = i > from && l.length >= 3 && l === lines[i - 1]!.trim() ? run + 1 : 1;
+    if (run >= 6) return i - run + 2;
+  }
   for (let size = 3; size <= 8; size++) {
     const seen = new Map<string, number>();
     for (let i = from; i + size <= lines.length; i++) {
@@ -150,16 +153,16 @@ export class Bonsai {
   }
   // A structured, grammar-constrained generation: short arguments and designs.
   // maxTokens raises the output budget for the few generations that need it.
-  async generate(messages: Message[], schema: JsonSchema, temperature = .2, context?: { step: number; route: string }, maxTokens = this.config.maxTokens): Promise<Record<string, any>> {
+  async generate(messages: Message[], schema: JsonSchema, temperature = this.config.stepTemperature, context?: { step: number; route: string }, maxTokens = this.config.maxTokens): Promise<Record<string, any>> {
     const count = await this.count(messages);
     if (count.tokens > this.config.workingTokens || count.tokens + maxTokens + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
     const requestId = randomUUID();
-    await this.log('bonsai-request', { requestId, ...context, prompt: count, temperature, maxTokens });
+    await this.log('bonsai-request', { requestId, ...context, prompt: count, temperature, minP: this.config.stepMinP, maxTokens });
     const start = performance.now();
     try {
     const result = await postJson(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-      model: this.config.model, messages, temperature, max_tokens: maxTokens,
+      model: this.config.model, messages, temperature, min_p: this.config.stepMinP, max_tokens: maxTokens,
       stream: false, chat_template_kwargs: { enable_thinking: false },
       response_format: { type: 'json_schema', json_schema: { name: 'arguments', strict: true, schema: samplingSchema(schema) } },
     }, this.key, 60000 + maxTokens * 60, 0);
@@ -188,7 +191,7 @@ export class Bonsai {
   // With thinking, the model reasons first; a thought that outruns its budget
   // is closed by the harness so the answer still comes.
   async generateText(messages: Message[], options: TextOptions = {}): Promise<TextGeneration> {
-    const budget = options.budgetTokens ?? this.config.createTokens; const temperature = options.temperature ?? .3; const context = options.context;
+    const budget = options.budgetTokens ?? this.config.createTokens; const temperature = options.temperature ?? this.config.codeTemperature; const context = options.context;
     const thinking = options.thinking ?? false; const thinkingBudget = options.thinkingBudget ?? 2048;
     const fence = options.fence === undefined ? '```' : options.fence;
     const requestId = randomUUID();
@@ -198,7 +201,7 @@ export class Bonsai {
     catch (e) { await this.log('bonsai-error', { requestId, ...context, ms: 0, error: `render: ${(e as Error).message}` }); throw new Error(`The server could not render the prompt: ${(e as Error).message}`); }
     if (promptTokens > this.config.workingTokens || promptTokens + Math.min(budget, this.config.maxTokens) + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
-    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, budgetTokens: budget, raw: true, thinking });
+    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking });
     const chunk = Math.min(this.config.maxTokens, 2048);
     let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = '';
     // The closing fence is the backtick run alone, whatever language opened it.
@@ -209,7 +212,7 @@ export class Bonsai {
         const n = Math.min(chunk, budget - generated, room - generated);
         if (n <= 0) { finish = 'length'; break; }
         const timeout = 60000 + Math.ceil(n / Math.max(4, this.tokensPerSecond * .5)) * 1000;
-        const r = await postJson(`${this.root}/completion`, { prompt, n_predict: n, temperature, ...codeSampling, cache_prompt: true, return_tokens: true, stream: false, ...(thoughtClosed ? { stop: stopWords } : {}) }, this.key, timeout, 0);
+        const r = await postJson(`${this.root}/completion`, { prompt, n_predict: n, temperature, ...codeSampling, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, stream: false, ...(thoughtClosed ? { stop: stopWords } : {}) }, this.key, timeout, 0);
         if (typeof r.content !== 'string') throw new Error('Bonsai returned no content');
         const ids: number[] = Array.isArray(r.tokens) ? r.tokens : [];
         text += r.content; timings = r.timings; prompt = [...prompt, ...ids];

@@ -42,11 +42,12 @@ export async function watchdog(jev: Jev, s: Session): Promise<Reading> {
 
 // The evidence gate: code states the facts (what changed, what the check
 // said, what the worker claims); Jev judges the meaning.
-export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; render?: unknown; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; exitCode: number | null; text: string }; requirements: string[]; sources: unknown }
+export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; render?: unknown; renderState?: 'current' | 'stale' | 'never' | 'unavailable'; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; exitCode: number | null; text: string }; requirements: string[]; sources: unknown }
 export const gateQuestions: Questions = {
   implementation_matches_request: { type: 'noul', instructions: 'Does the change (changedFiles, diffStat, sources, and for anything user-facing the render facts: errors, failed requests, broken images, overflow, how the page is styled, a page never rendered) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken, unstyled or invented?' },
   requirement_unaddressed: { type: 'noul', instructions: 'Does any requirement of the objective appear unaddressed by the change and the verification?' },
   claim_supported: { type: 'noul', instructions: 'Is the worker\'s completion summary supported by the facts shown (files that exist, a verification that passed after the last edit), rather than asserted?' },
+  weakest_evidence: { type: 'choice', instructions: 'Which part of the evidence most undermines the completion claim?', criteria: { render: 'What the render shows the user sees: errors, styling, layout, content.', verification: 'What the verification command ran and reported.', sources: 'The source files and what they implement.', requirements: 'Parts of the objective the change does not yet build.', summary: 'The summary claims more than the facts show.' } },
   verification_needed: { type: 'choice', instructions: 'How much verification does this change deserve before it is accepted as complete?', criteria: { deterministic_only: 'The passing check and the facts are enough: a small, low-risk change.', semantic_review: 'The facts are consistent but the change is substantial or the check is weak: accept only if the answers above are confident.', human: 'The user should look before this is called done: risky, ambiguous, or the verification is missing.' } },
 };
 export interface GateVerdict { accepted: boolean; matches: number; unaddressed: number; supported: number; route: string; reason: string }
@@ -67,11 +68,28 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
   const route = a.verification_needed?.type === 'choice' ? a.verification_needed.choice : 'semantic_review';
   const facts_ok = facts.verification.ok !== false && facts.verification.afterLastWrite;
   const renderBroken = Boolean(facts.render && typeof facts.render === 'object' && (facts.render as any).ok === false);
-  const accepted = facts_ok && !renderBroken && route !== 'human' && !weak.length && (route === 'deterministic_only' ? matches >= .6 : matches >= .75 && supported >= .6);
+  // The evidence Jev reads as weakest, when it is evidence that could be gathered and was not
+  // (a render that never ran, or ran before the last write), is gathered before anything is accepted.
+  const weakest = a.weakest_evidence?.type === 'choice' ? a.weakest_evidence.choice : null;
+  const weakestP = a.weakest_evidence?.type === 'choice' ? a.weakest_evidence.probabilities[a.weakest_evidence.choice] ?? 0 : 0;
+  const renderMissing = weakest === 'render' && weakestP >= .5 && (facts.renderState === 'never' || facts.renderState === 'stale');
+  const accepted = facts_ok && !renderBroken && !renderMissing && route !== 'human' && !weak.length && (route === 'deterministic_only' ? matches >= .6 : matches >= .75 && supported >= .6);
   // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
-  const humanReview = route === 'human' && facts_ok && !renderBroken && !weak.length && matches >= .6;
-  const reason = !facts_ok ? 'the verification did not pass after the last edit' : renderBroken ? `the last render of ${(facts.render as any).url ?? 'the page'} failed: ${clip(String((facts.render as any).facts ?? ''), 300)}` : humanReview ? 'Jev routes this completion to the user' : accepted ? 'the facts and Jev\'s reading agree' : weak.length ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}` : `Jev reads the change as ${matches < .75 ? 'not implementing the request' : ''}${supported < .6 ? ' not supported by the facts' : ''}`.replace(/\s+/g, ' ').trim();
-  return { accepted, matches, unaddressed, supported, route: humanReview ? 'human' : accepted ? route : 'rejected', reason };
+  const humanReview = route === 'human' && facts_ok && !renderBroken && !renderMissing && !weak.length && matches >= .6;
+  const reason = !facts_ok ? 'the verification did not pass after the last edit' : renderMissing ? `Jev reads the render as the weakest evidence (${weakestP.toFixed(2)}) and the page ${facts.renderState === 'never' ? 'has never been rendered' : 'has not been rendered since the last write'}: render it and act on what it shows before finishing` : renderBroken ? `the last render of ${(facts.render as any).url ?? 'the page'} failed: ${clip(String((facts.render as any).facts ?? ''), 300)}` : humanReview ? 'Jev routes this completion to the user' : accepted ? 'the facts and Jev\'s reading agree' : weak.length ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}` : `Jev reads the change as ${matches < .75 ? 'not implementing the request' : ''}${supported < .6 ? ' not supported by the facts' : ''}`.replace(/\s+/g, ' ').trim();
+  // A rejection says where Jev reads the gap, with the fact itself, so the worker acts on it rather than guessing.
+  const pointer = accepted || humanReview || !facts_ok || renderBroken || renderMissing || !weakest ? '' : `. Jev reads the weakest evidence as ${weakestFact(weakest, facts)}`;
+  return { accepted, matches, unaddressed, supported, route: humanReview ? 'human' : accepted ? route : 'rejected', reason: reason + pointer };
+}
+function weakestFact(kind: string, facts: GateFacts): string {
+  const render = facts.render && typeof facts.render === 'object' ? String((facts.render as any).facts ?? '') : String(facts.render ?? '');
+  switch (kind) {
+    case 'render': return `the render, which reported: ${clip(render, 700)}`;
+    case 'verification': return `the verification (${facts.verification.command ?? 'none'}, exit ${facts.verification.exitCode ?? 'unknown'}): ${clip(facts.verification.text, 400)}`;
+    case 'sources': return `the source files (${facts.changedFiles.slice(-12).join(', ')}) and what they implement`;
+    case 'requirements': return 'parts of the objective the change does not build yet';
+    default: return 'the summary, which claims more than the facts show';
+  }
 }
 
 // Failure triage: what kind of failure a command hit. The policy (retry

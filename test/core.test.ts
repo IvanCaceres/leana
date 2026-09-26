@@ -104,6 +104,31 @@ test('Malformed generated arguments are rejected by Bonsai before effects', asyn
   await assert.rejects(bonsai.generate([{ role: 'user', content: 'test' }], schemas.bash), /missing purpose/);
 });
 
+test('Sampling comes from the config: reasoning turns and file content each send their own temperature and min_p; the defaults are what the server did before', async t => {
+  const bodies: Record<string, any[]> = { chat: [], completion: [] };
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk; const b = body ? JSON.parse(body) : {};
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/chat/completions') { bodies.chat!.push(b); return res.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{"command":"pwd","purpose":"p","check":false}' } }] })); }
+    if (req.url === '/apply-template') return res.end(JSON.stringify({ prompt: 'P' }));
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    if (req.url === '/completion') { bodies.completion!.push(b); return res.end(JSON.stringify({ content: 'x', tokens: [120], stop_type: 'word', tokens_predicted: 1, timings: {} })); }
+    res.statusCode = 404; res.end('{}');
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => server.once('listening', resolve)); t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${(server.address() as any).port}/v1`;
+  const plain = new Bonsai({ ...defaults, baseUrl }, 'local', noop);
+  await plain.generate([{ role: 'user', content: 'u' }], schemas.bash); await plain.generateText([{ role: 'user', content: 'u' }], { fence: null });
+  assert.deepEqual([bodies.chat![0].temperature, bodies.chat![0].min_p], [.2, .05]); assert.deepEqual([bodies.completion![0].temperature, bodies.completion![0].min_p], [.3, .05]);
+  const varied = new Bonsai({ ...defaults, baseUrl, stepTemperature: .7, stepMinP: .1, codeTemperature: .6, codeMinP: .08 }, 'local', noop);
+  await varied.generate([{ role: 'user', content: 'u' }], schemas.bash); await varied.generateText([{ role: 'user', content: 'u' }], { fence: null });
+  assert.deepEqual([bodies.chat![1].temperature, bodies.chat![1].min_p], [.7, .1]); assert.deepEqual([bodies.completion![1].temperature, bodies.completion![1].min_p], [.6, .08]);
+  await assert.rejects(loadConfig(undefined, { stepMinP: 1 }), /stepMinP must be between 0 and 1/);
+  await assert.rejects(loadConfig(undefined, { codeTemperature: 3 }), /codeTemperature must be above 0 and at most 2/);
+  const example = await loadConfig(new URL('../../leana.example.json', import.meta.url).pathname);
+  assert.equal(example.codeMinP, .05, 'the example config loads');
+});
+
 test('Routing returns the argmax option with margin tolerance and survives a mismatched choice field', () => {
   const c = { ...defaults, routeProbability: .4, routeMargin: .01 };
   assert.equal(confidentChoice({ type: 'choice', choice: 'read_files', probabilities: { read_files: .41, write: .40 }, confidence: .5 }, c), 'read_files');
@@ -172,6 +197,9 @@ test('repetitionStart finds a looping tail and leaves honest repetition alone', 
   const honest = Array.from({ length: 30 }, (_, i) => `export const v${i} = ${i};`).join('\n');
   assert.equal(repetitionStart(honest), -1);
   assert.equal(repetitionStart(Array.from({ length: 12 }, () => '}').join('\n')), -1, 'closing braces are not content');
+  // JSX closes the same tag at the same depth many times; recurring lines are code, only a back-to-back run is a loop.
+  const jsx = Array.from({ length: 10 }, (_, i) => [`        <div className="card-${i}">`, `          <p>{items[${i}].text}</p>`, '        </div>']).flat().join('\n');
+  assert.equal(repetitionStart(jsx), -1, 'a closing tag that recurs across a component is not a loop');
 });
 test('periodicStart finds a loop inside one line and leaves real content alone', async () => {
   // The shape of a run's Footer: an SVG path whose numbers fell into a cycle for 12,000 tokens.

@@ -36,7 +36,7 @@ function jevOf(j: JevScript) {
   return { calls, decide: async (state: unknown, q: Questions, ctx?: { step: number; phase: string }): Promise<Answers> => {
     const phase = ctx?.phase ?? ''; calls.push({ phase, state });
     if (phase === 'watchdog') { const w = j.watch?.(++watches) ?? {}; return { progress: noul(w.progress ?? .8), same_failure: noul(w.same_failure ?? .05), stuck: noul(w.stuck ?? .05), objective_satisfied: noul(w.objective_satisfied ?? .2), needs_user: noul(w.needs_user ?? .05), in_scope: noul(w.in_scope ?? .9) }; }
-    if (phase === 'evidence-gate') { const g = j.gate ?? {}; const route = g.verification_needed ?? 'deterministic_only'; const clauses = Object.fromEntries(Object.keys(q).filter(k => k.startsWith('clause_')).map(k => [k, noul(j.clauses?.((state as any).clauses[k]) ?? .9)])); return { ...clauses, implementation_matches_request: noul(g.implementation_matches_request ?? .9), requirement_unaddressed: noul(g.requirement_unaddressed ?? .1), claim_supported: noul(g.claim_supported ?? .9), verification_needed: { type: 'choice', choice: route, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.verification_needed as any).criteria).map(k => [k, k === route ? .9 : .05])) } }; }
+    if (phase === 'evidence-gate') { const g = j.gate ?? {}; const route = g.verification_needed ?? 'deterministic_only'; const clauses = Object.fromEntries(Object.keys(q).filter(k => k.startsWith('clause_')).map(k => [k, noul(j.clauses?.((state as any).clauses[k]) ?? .9)])); const weakest = (g as any).weakest_evidence ?? 'sources'; const weakestAnswer: Answers = q.weakest_evidence ? { weakest_evidence: { type: 'choice' as const, choice: weakest, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.weakest_evidence as any).criteria).map(k => [k, k === weakest ? .9 : .02])) } } : {}; return { ...clauses, ...weakestAnswer, implementation_matches_request: noul(g.implementation_matches_request ?? .9), requirement_unaddressed: noul(g.requirement_unaddressed ?? .1), claim_supported: noul(g.claim_supported ?? .9), verification_needed: { type: 'choice', choice: route, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.verification_needed as any).criteria).map(k => [k, k === route ? .9 : .05])) } }; }
     if (phase === 'failure-triage') { const kind = j.triage ?? 'code_bug'; return { failure: { type: 'choice', choice: kind, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.failure as any).criteria).map(k => [k, k === kind ? .9 : .01])) } }; }
     if (phase === 'retrieval-rank') { const hits = (state as any).hits as Record<string, string>; return Object.fromEntries(Object.entries(hits).map(([k, v]) => [k, noul(j.rank?.(v) ?? .1)])); }
     throw new Error(`unexpected Jev phase ${phase}`);
@@ -52,7 +52,7 @@ async function repo(t: any) {
   return { root, store };
 }
 const events = async (store: Store) => (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
-const config = { ...defaults, allowWrite: true, allowBash: true, maxSteps: 12, workingTokens: 60000, contextWindow: 200000 };
+const config = { ...defaults, allowWrite: true, allowBash: true, maxSteps: 12, workingTokens: 90000, contextWindow: 200000 };
 
 test('Orientation is gathered by code before the first step: the tree, the manifests, the toolchains present, the verification the ecosystem offers', async t => {
   const { root } = await repo(t);
@@ -380,6 +380,59 @@ test('A whole-file rewrite lands as generated even when it no longer parses, lik
   assert.match(e.text, /does not parse/); assert.match(e.text, /ran to its end \(\d+ lines, not cut off\); the parse errors are in the written content/);
 });
 
+test('A rejected completion names the evidence Jev reads as weakest and quotes it, so the worker acts on the gap instead of guessing', async () => {
+  const { evidenceGate } = await import('../src/control.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Bootstrap a landing page');
+  const render = { step: 3, afterLastWrite: true, ok: true, url: 'http://localhost:3000', facts: 'Rendered http://localhost:3000: no exception, every request and image loaded.\nStyling: 14 CSS rules; 0 of the 163 class names on visible elements match a CSS selector (without one: min-h-screen, bg-gray-50)' };
+  const facts = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', render, verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
+  const v = await evidenceGate(jevOf({ gate: { implementation_matches_request: .39, claim_supported: .45, verification_needed: 'semantic_review', weakest_evidence: 'render' } as any }) as any, s, facts);
+  assert.equal(v.accepted, false);
+  assert.match(v.reason, /Jev reads the weakest evidence as the render, which reported: .*0 of the 163 class names/s);
+  const ok = await evidenceGate(jevOf({}) as any, s, facts);
+  assert.equal(ok.accepted, true); assert.doesNotMatch(ok.reason, /weakest/);
+});
+
+test('A completion whose weakest evidence Jev reads as the render is not accepted while the page has not been rendered since the last write; where no render is possible it is judged as before', async () => {
+  const { evidenceGate } = await import('../src/control.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Bootstrap a landing page');
+  // The shape of react-demo-23: build passed, Jev reads the change as matching (0.77) with the render as the weakest evidence (0.84), never rendered.
+  const base = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
+  const jev = jevOf({ gate: { implementation_matches_request: .77, claim_supported: .85, verification_needed: 'semantic_review', weakest_evidence: 'render' } as any }) as any;
+  const never = await evidenceGate(jev, s, { ...base, render: 'never rendered: nothing is known about what the user sees', renderState: 'never' as const });
+  assert.equal(never.accepted, false); assert.equal(never.route, 'rejected');
+  assert.match(never.reason, /weakest evidence \(0\.90\) and the page has never been rendered: render it/);
+  const stale = await evidenceGate(jev, s, { ...base, render: { step: 2, afterLastWrite: false, ok: true, url: 'u', facts: 'f' }, renderState: 'stale' as const });
+  assert.match(stale.reason, /has not been rendered since the last write/);
+  const current = await evidenceGate(jev, s, { ...base, render: { step: 9, afterLastWrite: true, ok: true, url: 'u', facts: 'f' }, renderState: 'current' as const });
+  assert.equal(current.accepted, true, 'once rendered, Jev\'s reading decides as before');
+  const unavailable = await evidenceGate(jev, s, { ...base, render: 'cannot be rendered here', renderState: 'unavailable' as const });
+  assert.equal(unavailable.accepted, true, 'evidence that cannot be gathered here is not demanded');
+  const otherWeakest = await evidenceGate(jevOf({ gate: { implementation_matches_request: .77, claim_supported: .85, verification_needed: 'semantic_review' } }) as any, s, { ...base, render: 'never rendered', renderState: 'never' as const });
+  assert.equal(otherWeakest.accepted, true, 'a change Jev does not read as hinging on the render (a library, a CLI) is not held for one');
+});
+
+test('The repeat check matches the action\'s own result, not the turn that shares its step; a turn whose every action was refused leaves the prompt', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'a.ts'), 'export const a = 1;\n');
+  await writeFile(join(root, 'big.txt'), 'x'.repeat(2400) + '\n');
+  const read = { files: [{ path: 'src/a.ts', start: 1, end: 1 }] };
+  // Step 2 is a batch: the read, a large output, and a small failure that keeps the batch's turn in the evidence
+  // after the read's own result is evicted. That turn has step 2, like the read.
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read a', action: 'read_files', args: read },
+    { thought: 'read a with more', action: 'plan', batch: [{ action: 'read_files', args: read }, { action: 'bash', args: { command: 'cat big.txt', purpose: 'look', check: false } }, { action: 'bash', args: { command: 'node -e "process.exit(1)"', purpose: 'fail', check: false } }] },
+    { thought: 'read a again', action: 'read_files', args: read },
+    ...Array.from({ length: 6 }, (_, i) => ({ thought: `big ${i}`, action: 'bash', args: { command: `cat big.txt # ${i}`, purpose: 'look', check: false } })),
+    { thought: 'read a once more', action: 'read_files', args: read },
+  ] });
+  const result = await new Agent({ ...config, maxSteps: 12, workingTokens: 9000 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const reads = (await events(store)).filter(e => e.type === 'action' && e.data.route === 'read_files').map(e => e.data.step);
+  assert(result.entries.some(e => e.kind === 'turn' && e.step === 2) && !result.entries.some(e => e.kind === 'read_files' && e.step === 2), 'the scenario: the turn of step 2 remains, the read of step 2 does not');
+  // The first read learns the file's hash, so the second is keyed with it; the third repeats the second exactly.
+  assert.deepEqual(reads, [1, 2, 12], 'the repeat at step 5 was refused; at step 12 the read of step 2 had been evicted (its turn had not), so the read ran');
+  assert(!result.entries.some(e => e.kind === 'turn' && e.step === 5), 'the refused turn is not kept as a template to copy');
+});
+
 test('A stuck streak sets its reasoning aside and keeps its results: the turns of the no-progress steps leave the prompt, the worker is told', async t => {
   const { root, store } = await repo(t);
   const prompts: Message[][] = [];
@@ -455,7 +508,7 @@ test('The render reports styling as facts, never as a failure: class names no CS
   const url = `http://127.0.0.1:${(server.address() as any).port}/`;
   const { root } = await repo(t);
   let r = await renderFacts(root, url, undefined, null, 30000);
-  assert.equal(r.ok, true, 'unmatched class names are a fact, not a failure: classes also serve scripts, and pages are styled inline or in shadow roots'); assert.match(r.text, /^RENDER OK/);
+  assert.equal(r.ok, true, 'unmatched class names are a fact, not a failure: classes also serve scripts, and pages are styled inline or in shadow roots'); assert.match(r.text, /^Rendered http:\S+: no exception, every request and image loaded\.\n/); assert.doesNotMatch(r.text, /\bOK\b/, 'the headline states facts, never a verdict the styling line would contradict');
   assert.match(r.text, /Styling: 1 CSS rules; 0 of the 9 class names on visible elements match a CSS selector \(without one: nav, nav__link/, r.text);
   assert.doesNotMatch(r.text, /favicon/, 'the browser\'s favicon request is not the page\'s failure');
   css = 'body{margin:0} .nav{display:flex} .nav__link{color:red} .hero,.hero__title{margin:0} @media (min-width:1px){.hero__text{color:#333}.flex{display:flex}.p-4{padding:1rem}} .grid{display:grid} .card{padding:4px}';

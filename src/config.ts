@@ -8,6 +8,8 @@ export const defaults: Config = {
   compactCooldown: 4, maxSteps: 80, toolChars: 6000, commandTimeoutMs: 60000,
   allowWrite: false, allowBash: false, verbose: false, checkCommand: '',
   createTokens: 12000,
+  // The server's own min_p is 0.05, so these defaults change nothing it did before.
+  stepTemperature: .2, stepMinP: .05, codeTemperature: .3, codeMinP: .05,
 };
 export async function loadConfig(path?: string, overrides: Partial<Config> = {}): Promise<Config> {
   const input = path ? JSON.parse(await readFile(path, 'utf8')) : {};
@@ -28,6 +30,8 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   // allowed prompt must still fit the window, or a continuation is cut short.
   for (const k of ['createTokens'] as const)
     if (c[k] < c.maxTokens || c[k] > c.contextWindow - c.workingTokens - c.safetyTokens) throw new Error(`${k} must be between maxTokens and contextWindow minus workingTokens and the safety reserve`);
+  for (const k of ['stepTemperature', 'codeTemperature'] as const) if (c[k] > 2) throw new Error(`${k} must be above 0 and at most 2`);
+  for (const k of ['stepMinP', 'codeMinP'] as const) if (c[k] >= 1) throw new Error(`${k} must be between 0 and 1`);
   if (c.toolChars < 500 || c.toolChars > 20000) throw new Error('toolChars must be 500..20000');
   for (const key of ['baseUrl', 'jevUrl'] as const) {
     const u = new URL(c[key]);

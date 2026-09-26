@@ -221,7 +221,7 @@ export class Agent {
     s.lastPromptTokens = counted.tokens;
     return { prompt, tokens: counted.tokens };
   }
-  private async generateJson(s: Session, route: string, build: () => Message[], schema: any, temperature = .2): Promise<Record<string, any>> {
+  private async generateJson(s: Session, route: string, build: () => Message[], schema: any, temperature?: number): Promise<Record<string, any>> {
     const { prompt, tokens } = await this.fit(s, build);
     this.observe({ kind: 'route', step: s.step, route, tokens, entries: s.entries.length });
     await this.logPrompt(s, route, prompt, tokens);
@@ -242,7 +242,7 @@ export class Agent {
       const run = fence.match(/^`+/)?.[0].length ?? 3; const opened = g.text.match(/^\s*(`{3,})[^\n]*\n/);
       return { code: opened && opened[1]!.length >= run ? extractCode(g.text) : g.text.replace(/\s+$/, '') + '\n', finish: g.finish };
     }
-    const raw = await this.bonsai.generate(prompt, { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false }, .2, { step: s.step, route }, budget);
+    const raw = await this.bonsai.generate(prompt, { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false }, this.config.codeTemperature, { step: s.step, route }, budget);
     return { code: extractCode(String(raw.content ?? '')), finish: 'stop' };
   }
   // The modules a file names in its purpose, thought or notes, as real signatures.
@@ -293,8 +293,11 @@ export class Agent {
     const diffStat = [diff?.code === 0 ? diff.output.trim() : '', untracked?.code === 0 && untracked.output.trim() ? `untracked: ${untracked.output.trim().split('\n').slice(0, 40).join(', ')}` : ''].filter(Boolean).join('\n') || `changed files: ${s.writes.join(', ') || 'none'}`;
     const sources: Record<string, string> = {};
     for (const p of s.writes.slice(-12)) { const t = await readFile(await safePath(s.root, p), 'utf8').catch(() => null); if (t !== null) sources[p] = clip(t, 1200); }
-    const render = s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, url: s.lastRender.url, facts: s.lastRender.text } : 'never rendered: nothing is known about what the user sees';
-    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), render, verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), exitCode: s.lastCheck?.summary.code ?? null, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
+    // Whether the render action could run here: the worker may use it and the machine has a browser.
+    const canRender = (s.allowedActions ?? []).includes('render') && Boolean((s.orientation as any)?.toolchain?.browser);
+    const render = s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, url: s.lastRender.url, facts: s.lastRender.text } : canRender ? 'never rendered: nothing is known about what the user sees' : 'cannot be rendered here (no browser, or the shell is not allowed)';
+    const renderState = !canRender && !s.lastRender ? 'unavailable' as const : !s.lastRender ? 'never' as const : s.lastRender.step > s.lastWriteStep ? 'current' as const : 'stale' as const;
+    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), render, renderState, verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), exitCode: s.lastCheck?.summary.code ?? null, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
   }
 
   // ---- the loop ----------------------------------------------------------------
@@ -387,6 +390,9 @@ export class Agent {
           if ((outcome === 'failed' || outcome === 'refused') && i < batch.length - 1) { const e = s.entries.at(-1); if (e) e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch.slice(i + 1).map(b => b.action).join(', ')}); reason about the result first.`; break; }
         }
         s.currentTurn = null;
+        // A turn whose every action was refused changed nothing and is a template the
+        // worker copies word for word: it leaves the prompt, the refusals stay.
+        if (turn.outcomes!.length && turn.outcomes!.every(o => o.includes('refused'))) { s.entries = s.entries.filter(e => e !== turn); for (const e of s.entries) if (e.turn === turn.id) delete e.turn; }
         if (halted) break;
         s.readOnlyTurns = batch.every(b => b.action === 'read_files' || b.action === 'search_codebase') ? (s.readOnlyTurns ?? 0) + 1 : 0;
         await this.watch(s); await this.store.save(s);
@@ -410,7 +416,7 @@ export class Agent {
     const key = Agent.actionKey(s, route, args);
     if (s.blockedActions!.includes(key)) return refuse('this exact action already failed the same way and Jev read the failure as unchanged; it is not run again. Change the approach.');
     const earlier = s.actions[key];
-    if (earlier !== undefined && s.entries.some(e => e.step === earlier) && !(route === 'read_files' && (args.files as { path: string }[]).some(f => (s.writeSteps[f.path] ?? -1) > earlier)) && route !== 'bash' && route !== 'plan' && route !== 'render') return refuse(`this ${route} was already done at step ${earlier} and its result is in the evidence; act on it or choose another action`);
+    if (earlier !== undefined && s.entries.some(e => e.step === earlier && e.kind === route) && !(route === 'read_files' && (args.files as { path: string }[]).some(f => (s.writeSteps[f.path] ?? -1) > earlier)) && route !== 'bash' && route !== 'plan' && route !== 'render') return refuse(`this ${route} was already done at step ${earlier} and its result is in the evidence; act on it or choose another action`);
     // A command that succeeded, run again with nothing written or installed since
     // and its output still shown, prints the same thing: it is not run again.
     if (route === 'bash') { const prior = s.commandRuns?.[String(args.command ?? '').trim()]; if (prior?.ok && prior.world === Agent.world(s) && s.entries.some(e => e.step === prior.step && e.kind === 'bash')) return refuse(`this exact command already ran at step ${prior.step} and nothing has been written or installed since, so it would print the same output, which is in the evidence (e${prior.step}); act on that output or run something different`); }

@@ -133,6 +133,11 @@ export interface Config {
   routeProbability: number; routeMargin: number; compactProbability: number;
   completeProbability: number; compactCooldown: number; maxSteps: number;
   toolChars: number; commandTimeoutMs: number; allowWrite: boolean; allowBash: boolean; verbose: boolean;
+  // Sampling. temperature divides the model's scores before they become
+  // probabilities (low: near the top choice every time; high: more varied, more
+  // mistakes); minP drops every token less likely than minP times the most
+  // likely one. Reasoning turns (step) and file content (code) are set apart.
+  stepTemperature: number; stepMinP: number; codeTemperature: number; codeMinP: number;
   // The verification command. When set, it is run as a baseline before any edit and
   // after every edit; only this command counts as verification.
   checkCommand: string;

@@ -16,8 +16,10 @@
   "toolChars": 6000,
   "commandTimeoutMs": 60000,
   "createTokens": 12000,
-  "designTokens": 14000,
-  "designThinking": true,
+  "stepTemperature": 0.2,
+  "stepMinP": 0.05,
+  "codeTemperature": 0.3,
+  "codeMinP": 0.05,
   "allowWrite": false,
   "allowBash": false
 }

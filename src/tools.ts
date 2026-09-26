@@ -503,8 +503,8 @@ export class ToolBox {
       const share = Math.floor(this.config.toolChars / a.files.length);
       for (const f of a.files) {
         if (/[?*\[\]]/.test(f.path)) throw new Error(`read_files requires exact regular file paths; glob rejected: ${f.path}`);
-        if (f.end < f.start) throw new Error(`Read ranges must contain 1..250 lines: end must be between start and start+249 (got ${f.start}..${f.end})`);
-        if (f.end - f.start >= 250) f.end = f.start + 249; // clamp rather than fail: the budget cuts it anyway
+        if (f.end < f.start) throw new Error(`A read range needs end >= start (got ${f.start}..${f.end})`);
+        // No line cap of its own: the character budget below decides how much of the range is shown.
         const artifact = f.path.startsWith('@artifact/');
         const path = artifact ? await safePath(this.artifacts, f.path.slice(10)) : await safePath(this.root, f.path);
         const text = await boundedRead(path, artifact ? 8 * 1024 * 1024 : 1024 * 1024);
@@ -598,7 +598,7 @@ export class ToolBox {
       const updatedHash = hash(updated);
       const anchorLines = String(a.oldText).split('\n').length;
       const notes = [dropped.length ? `Dropped ${dropped.length} import line(s) the file already had.` : '', anchorLines > 6 && !a.wholeFile ? `The anchor was ${anchorLines} lines; replace_lines addresses a block by line number without retyping it.` : ''].filter(Boolean).join(' ');
-      return { ok: true, changed: [a.path], hashes: { [a.path]: updatedHash }, snapshots, text: a.wholeFile ? `Rewrote ${a.path} (${updated.split('\n').length} lines); sha256=${updatedHash}.` : `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.` };
+      return { ok: true, changed: [a.path], hashes: { [a.path]: updatedHash }, snapshots, text: a.region ? `Replaced lines ${a.region.start}..${a.region.end} of ${a.path} with ${a.region.lines} generated line(s); the file now has ${updated.replace(/\n$/, '').split('\n').length} lines; sha256=${updatedHash}.` : a.wholeFile ? `Rewrote ${a.path} (${updated.split('\n').length} lines); sha256=${updatedHash}.` : `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.` };
     }
     if (route === 'replace_lines') {
       if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');

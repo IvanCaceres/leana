@@ -18,7 +18,8 @@ export const schemas: Record<Route, JsonSchema> = {
   // request; the worker names only the path here.
   create_file: obj({ path: str(500), purpose: str() }),
   // A whole existing file regenerated as code: the worker names it and what must change.
-  rewrite_file: obj({ path: str(500), purpose: str() }),
+  // Optional start/end limit the regeneration to one block, spliced into the file.
+  rewrite_file: { type: 'object', properties: { path: str(500), purpose: str(), start: integer(1, 1000000), end: integer(0, 1000000) }, required: ['path', 'purpose'], additionalProperties: false },
   // An anchor replacement in an existing file. Creation is create_file's alone.
   write: obj({ path: str(500), expectedHash: str(16), oldText: str(), newText: str() }),
   replace_lines: obj({ path: str(500), expectedHash: str(16), edits: { type: 'array', minItems: 1, maxItems: 40,

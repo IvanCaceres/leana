@@ -482,3 +482,25 @@ export const markupFile = (path: string): boolean => /\.(?:[jt]sx|html?|vue|svel
 // needs. The loop applies them as harness edits; it never knows the stack.
 // ---------------------------------------------------------------------------
 export const builtinModuleNames = new Set(builtinModules);
+
+// The class names a project's markup uses, by file: the contract a stylesheet
+// is written against, as module signatures are for code. Read from class
+// attributes in source and markup files (JSX className, HTML/Vue/Svelte class),
+// static parts only. A fact for the generation, never a rule it must follow.
+const classAttribute = /\bclass(?:Name)?\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*`([^`]*)`\s*\}|\{\s*"([^"]*)"\s*\}|\{\s*'([^']*)'\s*\})/g;
+export function classNamesIn(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(classAttribute)) for (const n of (m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? '').replace(/\$\{[^}]*\}/g, ' ').split(/\s+/)) if (/^[A-Za-z_-][\w-]*$/.test(n)) out.add(n);
+  return [...out];
+}
+export async function markupClassNames(root: string, files: string[], limit = 400): Promise<Record<string, string[]>> {
+  const out: Record<string, string[]> = {}; let total = 0;
+  for (const p of files.filter(f => { const l = languageFor(f); return l && l.kind !== 'style' && !/(^|\/)(?:node_modules|dist|build|\.venv|vendor)\//.test(f); }).slice(0, 120)) {
+    let text: string; try { text = await boundedRead(join(root, p)); } catch { continue; }
+    const names = classNamesIn(text).slice(0, limit - total); if (!names.length) continue;
+    out[p] = names; total += names.length; if (total >= limit) break;
+  }
+  return out;
+}
+// Class names a stylesheet has a selector for (any rule that mentions .name).
+export const stylesheetClasses = (css: string): Set<string> => new Set([...css.matchAll(/\.(-?[_A-Za-z][\w-]*)/g)].map(m => m[1]!));

@@ -11,10 +11,10 @@ import { editRoutes } from './types.js';
 import type { ProgressEvent } from './display.js';
 import { Store } from './store.js';
 import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot } from './tools.js';
-import { clip, clipEnds, evictOne, evidenceTokens, turnEntry, fenceFor, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
+import { clip, clipEnds, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
-import { detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
+import { markupClassNames, stylesheetClasses, languageFor, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
 import { orient } from './orient.js';
 import { renderFacts } from './render.js';
 import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
@@ -262,19 +262,48 @@ export class Agent {
   }
   // A file's whole content generated as code: a new file, or an existing one
   // rewritten with its current content in front of the worker.
-  private async createFile(s: Session, path: string, purpose: string, thought: string, rewrite = false): Promise<void> {
+  private async createFile(s: Session, path: string, purpose: string, thought: string, rewrite = false, range?: { start?: unknown; end?: unknown }): Promise<void> {
     let current: string | undefined;
     try { current = await readFile(await safePath(this.tools.root, path, true), 'utf8'); } catch { current = undefined; }
     if (current !== undefined && !rewrite) throw new Error(`${path} already exists; use rewrite_file to replace its whole content, or replace_lines for a small edit`);
     if (current === undefined && rewrite) throw new Error(`${path} does not exist; use create_file`);
+    // A block of the file: lines start..end regenerated and spliced in, the rest untouched.
+    const lines = current === undefined || current === '' ? [] : (current.endsWith('\n') ? current.slice(0, -1) : current).split('\n');
+    const region = rewrite && (typeof range?.start === 'number' || typeof range?.end === 'number') ? (() => {
+      const start = Math.min(Math.max(1, typeof range!.start === 'number' ? range!.start : lines.length + 1), lines.length + 1);
+      const end = Math.min(typeof range!.end === 'number' ? range!.end : start - 1, lines.length);
+      if (end < start - 1) throw new Error(`lines ${start}..${end} of ${path} is not a range: end must be at least start - 1 (start - 1 inserts before line start)`);
+      // Line numbers name a version of the file: one the worker has not seen may have moved them. Appending needs no numbers.
+      const seen = s.hashes[path];
+      if (start <= lines.length && seen && seen !== hash(current!)) throw new Error(`${path} changed since the version you last saw, so lines ${start}..${end} may no longer be the lines you mean; read it again (or append with start = totalLines + 1)`);
+      return { start, end };
+    })() : null;
     const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
     const project = await projectFor(this.tools.root, path); const declared = project ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[]) : [];
-    const { code, finish } = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', [() => newFileMessages(s, path, purpose, contracts, declared, 0, current), () => newFileMessages(s, path, purpose, contracts, declared, 1, current)], this.config.createTokens, fenceFor(path));
+    // A stylesheet is written against the class names the markup uses (and, when it exists, those it has no rule for yet).
+    const markup: Record<string, unknown> = {};
+    if (languageFor(path)?.kind === 'style') {
+      const used = await markupClassNames(this.tools.root, s.knownFiles).catch(() => ({} as Record<string, string[]>));
+      if (Object.keys(used).length) {
+        markup.classNamesUsedByMarkup = used;
+        if (current !== undefined) { const has = stylesheetClasses(current); const without = [...new Set(Object.values(used).flat())].filter(n => !has.has(n)); if (without.length) markup.classNamesWithoutRuleInThisFile = without.slice(0, 200); }
+      }
+    }
+    const builds = region ? [0, 1].map(k => () => regionMessages(s, path, purpose, current!, region.start, region.end, contracts, declared, k, markup)) : [0, 1].map(k => () => newFileMessages(s, path, purpose, contracts, declared, k, current, markup));
+    const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', builds, this.config.createTokens, fenceFor(path));
+    const finish = generated.finish; let code = generated.code;
+    if (region) {
+      // The block alone, without context lines the model repeated around it, spliced between the untouched lines.
+      const block = trimContext(code, lines.slice(Math.max(0, region.start - 4), region.start - 1).join('\n'), lines.slice(region.end, region.end + 3).join('\n')).replace(/\n$/, '');
+      const blockLines = block === '' ? [] : block.split('\n');
+      code = [...lines.slice(0, region.start - 1), ...blockLines, ...lines.slice(region.end)].join('\n') + (current!.endsWith('\n') || !current ? '\n' : '');
+      (region as any).lines = blockLines.length;
+    }
     const ended = finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : finish === 'repetition' ? 'started repeating itself and was cut at the repeat' : finish === 'eos' ? 'ended before the file was complete (the model stopped without closing the code block)' : '';
     if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
     if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, '')) throw new Error(`the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}; nothing was written. Say in purpose exactly what must differ, or edit the lines that are wrong with replace_lines`);
     const result = rewrite
-      ? await this.execute(s, 'write', { path, expectedHash: hash(current!), oldText: current!, newText: code, wholeFile: true }, 'rewrite')
+      ? await this.execute(s, 'write', { path, expectedHash: hash(current!), oldText: current!, newText: code, wholeFile: true, ...(region ? { region } : {}) }, 'rewrite')
       : await this.execute(s, 'create_file', { path, content: code }, 'create');
     if (!result.ok) throw new Error(result.text);
     // Contracts the file breaks are facts for the worker: names a repository module does not declare, packages the manifest does not declare.
@@ -387,9 +416,11 @@ export class Agent {
         const turn = turnEntry(s.step, thought, batch);
         const said = (e: { text: string }) => String(JSON.parse(e.text).thought ?? '').replace(/\s+/g, ' ').trim();
         const previous = s.entries.filter(e => e.kind === 'turn').at(-1);
+        // Only the earlier copies go: they are what the worker copies from, and they sit
+        // late in the prompt, so the cache breaks near its end rather than at the top.
         if (previous && said(turn).length >= 40 && said(previous) === said(turn)) {
-          const dropped = s.entries.filter(e => e.kind === 'turn');
-          s.entries = s.entries.filter(e => e.kind !== 'turn');
+          const dropped = s.entries.filter(e => e.kind === 'turn' && said(e) === said(turn));
+          s.entries = s.entries.filter(e => !dropped.includes(e));
           await this.store.log('reasoning-reset', { step: s.step, reason: 'repeated', turns: dropped.map(e => e.id) });
         }
         s.entries.push(turn); s.currentTurn = turn.id;
@@ -471,7 +502,7 @@ export class Agent {
       await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text }); return 'failed';
     }
     if (route === 'create_file' || route === 'rewrite_file') {
-      try { if (route === 'create_file' && typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought, route === 'rewrite_file'); }
+      try { if (route === 'create_file' && typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought, route === 'rewrite_file', { start: args.start, end: args.end }); }
       catch (e) { return refuse((e as Error).message); }
       return s.lastResultOk ? 'ok' : 'failed';
     }

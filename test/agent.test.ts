@@ -434,7 +434,7 @@ test('The repeat check matches the action\'s own result, not the turn that share
   assert(!result.entries.some(e => e.kind === 'turn' && e.step === 5), 'the refused turn is not kept as a template to copy');
 });
 
-test('Reasoning copied word for word from the previous turn drops the earlier turns at once; turns that only open alike are kept', async t => {
+test('Reasoning copied word for word from the previous turn drops the earlier copy at once; turns that only open alike are kept', async t => {
   const { root, store } = await repo(t);
   const same = 'The build passes and the page renders. The render shows class names without CSS. Let me read the stylesheet to see what exists.';
   const steps = [
@@ -448,8 +448,8 @@ test('Reasoning copied word for word from the previous turn drops the earlier tu
   const result = await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
   const resets = (await events(store)).filter(e => e.type === 'reasoning-reset');
   assert.equal(resets.length, 1, 'only the word-for-word repeat resets, not the turn that merely opens alike');
-  assert.deepEqual([resets[0].data.step, resets[0].data.reason, resets[0].data.turns], [4, 'repeated', ['t1', 't2', 't3']]);
-  assert.deepEqual(result.entries.filter(e => e.kind === 'turn').map(e => e.id), ['t4']);
+  assert.deepEqual([resets[0].data.step, resets[0].data.reason, resets[0].data.turns], [4, 'repeated', ['t3']], 'only the earlier copy goes, so the cache breaks near the end of the prompt');
+  assert.deepEqual(result.entries.filter(e => e.kind === 'turn').map(e => e.id), ['t1', 't2', 't4']);
   assert.equal(result.entries.filter(e => e.kind === 'bash').length, 4, 'the results stay');
 });
 
@@ -515,6 +515,91 @@ test('A file the worker wrote and then deleted never stops the session: the comp
   assert.equal(result.status, 'complete', result.stopReason);
   const facts = (await events(store)).find(e => e.type === 'completion')!;
   assert(facts, 'the harness proposed completion and the gate judged it');
+});
+
+test('rewrite_file with start and end regenerates only that block as code and splices it in: an append, and a replacement whose repeated context lines are trimmed', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'app.css'), '.a { color: red; }\n.b { color: blue; }\n.c { color: green; }\n');
+  const prompts: Message[][] = [];
+  let calls = 0; const blocks = ['.d { color: black; }\n.e { color: white; }\n', '.a { color: red; }\n.b2 { color: navy; }\n.c { color: green; }\n'];
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'src/app.css', start: 1, end: 3 }] } },
+    { thought: 'append two rules', action: 'rewrite_file', args: { path: 'src/app.css', purpose: 'add .d and .e', start: 4, end: 3 } },
+    { thought: 'replace line 2', action: 'rewrite_file', args: { path: 'src/app.css', purpose: 'b becomes b2', start: 2, end: 2 } },
+  ] });
+  const spy = { ...bonsai, generateText: async (m: Message[]) => { prompts.push(m); return { text: blocks[calls++]!, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.equal(await readFile(join(root, 'src', 'app.css'), 'utf8'), '.a { color: red; }\n.b2 { color: navy; }\n.c { color: green; }\n.d { color: black; }\n.e { color: white; }\n', 'the append landed at the end, the replacement in place, the repeated context lines trimmed');
+  const req = JSON.parse(prompts[0]!.at(-1)!.content);
+  assert.equal(req.lines, '4..3 of 3'); assert.equal(req.region, ''); assert.match(req.before, /\.c \{ color: green; \}/); assert.match(req.currentContent, /\.a \{/);
+  const edits = result.entries.filter(e => e.kind === 'write');
+  assert.match(edits[0]!.text, /^Replaced lines 4\.\.3 of src\/app\.css with 2 generated line\(s\); the file now has 5 lines/);
+  assert.match(edits[1]!.text, /^Replaced lines 2\.\.2 of src\/app\.css with 1 generated line\(s\); the file now has 5 lines/);
+});
+
+test('A block rewrite by line numbers is refused when the file changed after the version the worker last saw; an append is not', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'a.css'), '.a {}\n.b {}\n');
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'a.css', start: 1, end: 2 }] } },
+    { thought: 'replace line 1', action: 'rewrite_file', args: { path: 'a.css', purpose: 'x', start: 1, end: 1 } },
+    { thought: 'append', action: 'rewrite_file', args: { path: 'a.css', purpose: 'y', start: 9, end: 8 } },
+  ], files: { 'a.css': '.z {}\n' } });
+  // Someone else changes the file between the read and the edit.
+  let n = 0; const spy = { ...bonsai, generate: async (m: Message[], s: any) => { if (++n === 2) await writeFile(join(root, 'a.css'), '.x {}\n.a {}\n.b {}\n'); return bonsai.generate(m, s); } };
+  const result = await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.match(result.entries.find(e => e.kind === 'generation_error')!.text, /changed since the version you last saw/);
+  assert.equal(await readFile(join(root, 'a.css'), 'utf8'), '.x {}\n.a {}\n.b {}\n.z {}\n', 'the append (start past the end) went through');
+});
+
+test('A render whose server announces a different address fails within seconds and names it, instead of waiting out the timeout', async t => {
+  const { announcedElsewhere } = await import('../src/render.js');
+  assert.deepEqual(announcedElsewhere('  \u001b[32m➜\u001b[39m  Local:   http://localhost:5173/\n', 'http://localhost:3000'), ['http://localhost:5173/']);
+  assert.equal(announcedElsewhere('Local: http://localhost:3000/', 'http://localhost:3000/'), null, 'the requested port is announced: keep waiting');
+  assert.equal(announcedElsewhere('starting…', 'http://localhost:3000'), null, 'nothing announced yet');
+  assert.deepEqual(announcedElsewhere('Starting development server at http://127.0.0.1:8000/', 'http://localhost:3000'), ['http://127.0.0.1:8000/']);
+  if (!(await findBrowser())) return;
+  const root = await mkdtemp(join(tmpdir(), 'leana-port-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, 'serve.mjs'), 'import { createServer } from "node:http"; const s = createServer((q, r) => r.end("hi")).listen(0, "127.0.0.1", () => console.log(`Local: http://localhost:${s.address().port}/`));\n');
+  const t0 = Date.now();
+  const r = await renderFacts(root, 'http://127.0.0.1:39123/', 'node serve.mjs', null, 60000);
+  assert.equal(r.ok, false); assert.match(r.text, /says it is listening at http:\/\/localhost:\d+\//);
+  assert(Date.now() - t0 < 15000, `failed fast (${Date.now() - t0} ms), not after the 45 s timeout`);
+});
+
+test('A read shows as much of the range as the character budget allows, not a fixed number of lines', async t => {
+  const { root } = await repo(t);
+  await writeFile(join(root, 'big.css'), Array.from({ length: 600 }, (_, i) => `.c${i} { margin: ${i}px; }`).join('\n') + '\n');
+  const { ToolBox } = await import('../src/tools.js');
+  const wide = new ToolBox(root, join(root, '.art'), { ...config, toolChars: 20000 }, async () => '');
+  const r = await wide.execute('read_files', { files: [{ path: 'big.css', start: 1, end: 600 }] });
+  assert.match(r.text, /shown=1\.\.(\d+)/); const shown = Number(r.text.match(/shown=1\.\.(\d+)/)![1]);
+  assert(shown > 250, `a 20k-character budget shows ${shown} lines, more than the old 250-line cap`);
+  const narrow = new ToolBox(root, join(root, '.art'), { ...config, toolChars: 2000 }, async () => '');
+  const n = Number((await narrow.execute('read_files', { files: [{ path: 'big.css', start: 1, end: 600 }] })).text.match(/shown=1\.\.(\d+)/)![1]);
+  assert(n < shown && n > 20, `a smaller budget shows fewer lines (${n})`);
+});
+
+test('A stylesheet is generated against the class names the markup uses, and a rewrite of it is told which of them it has no rule for yet', async t => {
+  const { classNamesIn } = await import('../src/profiles.js');
+  assert.deepEqual(classNamesIn('<div className="hero hero--dark"><p className={`hero__text ${big ? "x" : ""}`} /><a class=\'nav-link\'>'), ['hero', 'hero--dark', 'hero__text', 'nav-link']);
+  assert.deepEqual(classNamesIn('<template><div class="card card__body">{{ x }}</div></template>'), ['card', 'card__body']);
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  const prompts: Message[][] = [];
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'component', action: 'create_file', args: { path: 'src/Hero.tsx', purpose: 'hero' } },
+    { thought: 'styles', action: 'create_file', args: { path: 'src/app.css', purpose: 'styles' } },
+    { thought: 'append the missing rules', action: 'rewrite_file', args: { path: 'src/app.css', purpose: 'rules for the rest', start: 99, end: 98 } },
+    { thought: 'code file', action: 'create_file', args: { path: 'src/util.ts', purpose: 'util' } },
+  ], files: { 'src/Hero.tsx': 'export const Hero = () => <section className="hero"><h1 className="hero__title">Hi</h1><p className="hero__text">x</p></section>;\n', 'src/app.css': '.hero { padding: 2rem; }\n', 'src/util.ts': 'export const u = 1;\n' } });
+  const spy = { ...bonsai, generateText: async (m: Message[], o: any) => { prompts.push(m); return bonsai.generateText(m); } };
+  await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const req = (i: number) => JSON.parse(prompts[i]!.at(-1)!.content);
+  assert.deepEqual(req(1).classNamesUsedByMarkup, { 'src/Hero.tsx': ['hero', 'hero__title', 'hero__text'] }, 'the new stylesheet sees the class names the component uses');
+  assert.deepEqual(req(2).classNamesWithoutRuleInThisFile, ['hero__title', 'hero__text'], 'the rewrite is told which ones still have no rule in the file');
+  assert(!('classNamesUsedByMarkup' in req(0)) && !('classNamesUsedByMarkup' in req(3)), 'only stylesheets get this fact');
 });
 
 test('A stuck streak sets its reasoning aside and keeps its results: the turns of the no-progress steps leave the prompt, the worker is told', async t => {

@@ -41,6 +41,22 @@ export function assertNoBulkDuplication(before: string, inserted: string[], labe
     if (substantive(w) && windows.has(w.join('\n'))) throw new Error(`Edit refused: it would insert a block that ${label} already contains (starting ${JSON.stringify(w[0]!.slice(0, 60))}). The file already has these lines; add only what is missing.`);
   }
 }
+// The lines the replaced ranges held that their new text does not contain
+// (compared trimmed, each new line matching one old line), as "n: text".
+export function droppedLines(lines: string[], edits: { start: number; end: number }[], rendered: (e: any) => string[], limit = 6): string[] {
+  const out: string[] = [];
+  for (const e of [...edits].sort((x, y) => x.start - y.start)) {
+    if (e.end < e.start) continue;
+    const left = new Map<string, number>();
+    for (const l of rendered(e)) { const t = l.trim(); left.set(t, (left.get(t) ?? 0) + 1); }
+    for (let n = e.start; n <= e.end; n++) {
+      const t = (lines[n - 1] ?? '').trim(); if (!t) continue;
+      const k = left.get(t) ?? 0;
+      if (k > 0) left.set(t, k - 1); else out.push(`${n}: ${t.slice(0, 80)}`);
+    }
+  }
+  return out.length > limit ? [...out.slice(0, limit), `${out.length - limit} more`] : out;
+}
 // A large range whose new text mostly equals the old is a retype. The lines
 // that differ are the change the worker meant, so the edit is applied and the
 // note names them; refusing it would only discard the generation.
@@ -670,12 +686,21 @@ export class ToolBox {
         delta += fresh.length - removed;
       }
       const updated = result.join('\n');
-      assertBalancePreserved(original, updated, a.path);
-      await assertParses(a.path, original, updated);
+      // A refusal names the lines the ranges held that the new text drops: the
+      // cause of an unclosed tag or brace, not only where the parser noticed it.
+      try { assertBalancePreserved(original, updated, a.path); await assertParses(a.path, original, updated); }
+      catch (e) { const gone = droppedLines(lines, edits.filter(x => !x.prepend), rendered); throw new Error(gone.length ? `${(e as Error).message} The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.` : (e as Error).message); }
       // Retyping a range in place is a rewrite, not a paste: judge the inserted
       // lines against the file without the ranges they replace.
       const outside = lines.filter((_, i) => !edits.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end)).join('\n');
-      if (!harness) assertNoBulkDuplication(outside, edits.filter(e => !e.prepend).flatMap(e => rendered(e)), a.path);
+      // The refusal states what the edit replaces and what stays, so a whole new
+      // file sent as a small range shows itself as that.
+      if (!harness) try { assertNoBulkDuplication(outside, edits.filter(e => !e.prepend).flatMap(e => rendered(e)), a.path); }
+      catch (e) {
+        const removed = edits.reduce((n, x) => n + Math.max(0, x.end - x.start + 1), 0); const added = edits.filter(x => !x.prepend && x.newText).reduce((n, x) => n + x.newText.replace(/\n$/, '').split('\n').length, 0);
+        const total = lines.length - (trailing ? 1 : 0);
+        throw new Error(`${(e as Error).message} This edit replaces ${removed} line(s) (${edits.map(x => `${x.start}..${x.end}`).reverse().join(', ')}) with ${added}; the other ${total - removed} line(s) of ${a.path} stay as they are. rewrite_file replaces a whole file.`);
+      }
       const temp = `${path}.leana-${randomUUID()}.tmp`;
       try {
         const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);

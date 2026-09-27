@@ -11,7 +11,7 @@ import { editRoutes } from './types.js';
 import type { ProgressEvent } from './display.js';
 import { Store } from './store.js';
 import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot } from './tools.js';
-import { clip, clipEnds, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
+import { breakIndex, clip, clipEnds, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
 import { generationFacts, missingRelativeModules, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
@@ -219,11 +219,23 @@ export class Agent {
   }
   // A prompt is fitted to the working budget by evicting evidence, never swapped for a generic one.
   private async fit(s: Session, build: () => Message[]): Promise<{ prompt: Message[]; tokens: number }> {
-    let prompt = build(); let counted = await this.bonsai.count(prompt); let forced = 0;
+    let prompt = build(); let counted = await this.bonsai.count(prompt); let forced = 0; const before = Agent.shape(s);
     while (counted.tokens > this.config.workingTokens) { for (let i = 0; i < 3; i++) { if (!evictOne(s)) { if (!i) throw new Error('The pinned objective, orientation and notes exceed the working budget'); break; } forced++; } prompt = build(); counted = await this.bonsai.count(prompt); }
-    if (forced) { s.lastCompact = s.step; await this.store.log('compact', { step: s.step, removed: forced, reason: 'hard-budget' }); }
+    if (forced) { s.lastCompact = s.step; await this.store.log('compact', { step: s.step, removed: forced, reason: 'hard-budget' }); if (await this.compactBehind(s, before, 'hard-budget')) { prompt = build(); counted = await this.bonsai.count(prompt); } }
     s.lastPromptTokens = counted.tokens;
     return { prompt, tokens: counted.tokens };
+  }
+  static shape(s: Session): { ids: string[]; trail: string[] } { return { ids: s.entries.map(e => e.id), trail: [...(s.trail ?? [])] }; }
+  // A removal (a reset, a forced eviction) already makes the prompt change at one
+  // point, and the server reprocesses everything after it. The compaction the
+  // evidence would need at a later step is done now, behind that point only, so
+  // its reprocessing is not paid a second time and the cached part is not cut shorter.
+  private async compactBehind(s: Session, before: { ids: string[]; trail: string[] }, reason: string): Promise<number> {
+    const at = breakIndex(before, s); if (at === null) return 0;
+    let removed = 0;
+    while (evidenceTokens(s) > this.config.workingTokens * evictTo && evictOne(s, at)) removed++;
+    if (removed) await this.store.log('compact', { step: s.step, removed, reason: `with-${reason}`, at, retained: s.entries.length, trail: s.trail?.length ?? 0 });
+    return removed;
   }
   private async generateJson(s: Session, route: string, build: () => Message[], schema: any, temperature?: number): Promise<Record<string, any>> {
     const { prompt, tokens } = await this.fit(s, build);
@@ -353,8 +365,8 @@ export class Agent {
           // Every earlier turn is dropped, the results kept: the facts stay, the
           // line of thought the worker would copy and anchor on goes (a turn
           // before the streak often holds the same reasoning).
-          const dropped = s.entries.filter(e => e.kind === 'turn');
-          if (dropped.length) { s.entries = s.entries.filter(e => !dropped.includes(e)); await this.store.log('reasoning-reset', { step: s.step, turns: dropped.map(e => e.id) }); }
+          const dropped = s.entries.filter(e => e.kind === 'turn'); const before = Agent.shape(s);
+          if (dropped.length) { s.entries = s.entries.filter(e => !dropped.includes(e)); await this.store.log('reasoning-reset', { step: s.step, turns: dropped.map(e => e.id) }); await this.compactBehind(s, before, 'reasoning-reset'); }
           notes.push(`Jev reads no progress for ${s.watch.noProgress} steps (stuck ${last.stuck.toFixed(2)}).${dropped.length ? ' Your reasoning from those steps was set aside; their results are still shown.' : ''} Do not repeat what was tried; change the approach, or ask the user if only they can decide.`);
           s.watch.noProgress = 0;
         }
@@ -413,9 +425,10 @@ export class Agent {
         // Only the earlier copies go: they are what the worker copies from, and they sit
         // late in the prompt, so the cache breaks near its end rather than at the top.
         if (previous && said(turn).length >= 40 && said(previous) === said(turn)) {
-          const dropped = s.entries.filter(e => e.kind === 'turn' && said(e) === said(turn));
+          const dropped = s.entries.filter(e => e.kind === 'turn' && said(e) === said(turn)); const before = Agent.shape(s);
           s.entries = s.entries.filter(e => !dropped.includes(e));
           await this.store.log('reasoning-reset', { step: s.step, reason: 'repeated', turns: dropped.map(e => e.id) });
+          await this.compactBehind(s, before, 'reasoning-reset');
         }
         s.entries.push(turn); s.currentTurn = turn.id;
         let halted = false;
@@ -530,6 +543,9 @@ export class Agent {
   }
 }
 // The evidence's share of the working budget that triggers a batched eviction, and the share it is cut to.
-const evictAt = .45; const evictTo = .3;
+// Each eviction reprocesses what it keeps, so the gap between the two sets how often that is paid:
+// replayed over 28 runs at 32k, .6 against .45 halves the evictions and keeps more evidence on average.
+// A file request too large for the peak is fitted by a forced eviction, which cuts to evictTo as well.
+const evictAt = .6; const evictTo = .3;
 const failureKindText = (k: string): string => ({ code_bug: 'the code or configuration written is wrong', wrong_assumption: 'an assumption the output disproves', bad_command: 'the command itself', environment: 'a tool or service the machine lacks', dependency: 'a package missing, unresolvable or at a version that does not exist', permission: 'permission or credentials', transient: 'a network or timing failure', insufficient_context: 'acting without reading what was needed', unknown: 'unclear' } as Record<string, string>)[k] ?? k;
 export { boundedRead };

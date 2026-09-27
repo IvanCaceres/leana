@@ -284,13 +284,13 @@ test('The harness proposes completion itself: Jev reads the objective as satisfi
 
 test('Evidence is evicted in batches so the cached prompt prefix survives several steps between reprocessings', async t => {
   const { root, store } = await repo(t);
-  // Each step prints about 2 KB, so the evidence reaches its share of the budget after a dozen steps.
-  const steps = Array.from({ length: 16 }, (_, i) => ({ thought: `look ${i}`, action: 'bash', args: { command: `node -e "console.log('${i}'.repeat(2000))"`, purpose: 'look', check: false } }));
-  const result = await new Agent({ ...config, maxSteps: 16, workingTokens: 20000 }, store, jevOf({}), bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'x'));
+  // Each step prints about 2 KB, so the evidence reaches its share of the budget (60%) after about seventeen steps.
+  const steps = Array.from({ length: 22 }, (_, i) => ({ thought: `look ${i}`, action: 'bash', args: { command: `node -e "console.log('${i}'.repeat(2000))"`, purpose: 'look', check: false } }));
+  const result = await new Agent({ ...config, maxSteps: 22, workingTokens: 20000 }, store, jevOf({}), bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'x'));
   const compactions = (await events(store)).filter(e => e.type === 'compact' && e.data.reason === 'evidence-share');
-  assert.equal(compactions.length, 1, `one batched eviction across sixteen steps, not one per step: ${compactions.length}`);
-  assert(compactions[0].data.removed >= 4, `the eviction cuts well below the trigger: ${compactions[0].data.removed}`);
-  assert(evidenceTokens(result) <= 20000 * .45);
+  assert.equal(compactions.length, 1, `one batched eviction across twenty-two steps, not one per step: ${compactions.length}`);
+  assert(compactions[0].data.removed >= 6, `the eviction cuts well below the trigger: ${compactions[0].data.removed}`);
+  assert(evidenceTokens(result) <= 20000 * .6);
 });
 
 test('The worker sees its own earlier turns: each is an assistant message before the results of its batch, arguments compacted, recorded before the batch runs', async t => {
@@ -943,4 +943,42 @@ test('A shell command that writes files is an edit whatever it starts with: a he
   assert.match(result.entries.find(e => e.kind === 'bash' && /cat >/.test(e.text))!.text, /the command changed files \(modified 1\): src\/App\.tsx/);
   assert(result.lastCheck && result.lastCheck.step > result.lastWriteStep, 'the check after the edit stands: its own output did not make it stale');
   assert(result.knownFiles.includes('dist/out.js'), 'the file list still follows the tree');
+});
+
+test('An eviction bounded by a break point never touches the prompt before it: earlier entries and the trail stay, so the cached part is not cut shorter', async t => {
+  const { evictOne, turnEntry, breakIndex } = await import('../src/context.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-evict-from-')), 'x');
+  const result = (id: string, step: number, turn: string | undefined, stale?: string) => ({ id, step, kind: 'bash', text: 'x'.repeat(100), artifact: '', relevance: stale ? .1 : .5, ...(turn ? { turn } : {}), ...(stale ? { stale } : {}) });
+  const t1 = turnEntry(1, 'scaffold', [{ action: 'bash', args: { command: 'npm create vite' } }]);
+  const t2 = turnEntry(2, 'build', [{ action: 'bash', args: { command: 'npm run build' } }, { action: 'bash', args: { command: 'npm test' } }]);
+  const t4 = turnEntry(4, 'fix', [{ action: 'bash', args: { command: 'npm run build' } }]);
+  s.entries = [t1, result('e1', 1, 't1', 'superseded'), t2, result('e2', 2, 't2', 'superseded'), result('e3', 3, 't2'), result('e3b', 3, undefined, 'superseded'), t4, result('e4', 4, 't4')];
+  // Unbounded, the stale entry at the front goes first and its turn leaves a trail line.
+  const shape = { ids: s.entries.map(e => e.id), trail: [...(s.trail ?? [])] };
+  const copy = structuredClone(s);
+  assert.equal(evictOne(copy)!.id, 'e1'); assert.equal(copy.trail?.length, 1); assert.equal(breakIndex(shape, copy), 0, 'a trail change breaks the prompt in front of the evidence');
+  // Bounded at index 4 (e3): e1/e2 lie before the point; e3 may go, since e2 keeps t2 in the prompt and no trail line is added.
+  assert.equal(evictOne(s, 4)!.id, 'e3b', 'stale first'); assert.equal(evictOne(s, 4)!.id, 'e3'); assert.equal(s.trail, undefined);
+  assert.equal(evictOne(s, 4), undefined, 'the freshest entry stays and t4 keeps its result');
+  assert.deepEqual(s.entries.map(e => e.id), ['t1', 'e1', 't2', 'e2', 't4', 'e4']);
+  assert.equal(breakIndex(shape, s), 4, 'the prompt changes where e3 was, not earlier');
+  // The last result of a turn that is still in the prompt is never taken behind a point: that would add a trail line in front of the evidence.
+  s.entries = [t1, result('e1', 1, 't1'), t2, result('e2', 2, 't2'), t4, result('e4', 4, 't4')];
+  assert.equal(evictOne(s, 3), undefined, 'e2 ends t2 and e4 is the freshest');
+  assert.equal(breakIndex({ ids: s.entries.map(e => e.id), trail: [] }, s), null, 'nothing removed, nothing changed');
+});
+
+test('A stuck reset that already reprocesses the prompt from its first turn carries the pending compaction with it, instead of a second reprocessing some steps later', async t => {
+  const { root, store } = await repo(t);
+  // About 2.5 KB of evidence per step: after a dozen steps the evidence is above the share an eviction cuts to, below the one that triggers it.
+  const steps = Array.from({ length: 14 }, (_, i) => ({ thought: `look ${i}`, action: 'bash', args: { command: `node -e "console.log('${i}'.repeat(2400))"`, purpose: 'look', check: false } }));
+  await new Agent({ ...config, maxSteps: 14, workingTokens: 20000 }, store, jevOf({ watch: n => n <= 10 ? { progress: .8, stuck: .1 } : { progress: .1, stuck: .95 } }), bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const log = await events(store);
+  const reset = log.find(e => e.type === 'reasoning-reset' && !e.data.reason);
+  assert(reset, 'the stuck streak reset the reasoning');
+  const carried = log.find(e => e.type === 'compact' && e.data.reason === 'with-reasoning-reset');
+  assert(carried, 'the compaction rides on the reset');
+  assert.equal(carried.data.step, reset.data.step); assert.equal(carried.data.at, 0, 'the reset changed the prompt from its first entry, so every eviction behind it is free');
+  assert(carried.data.removed >= 1);
+  assert.equal(log.filter(e => e.type === 'compact' && e.data.reason === 'evidence-share').length, 0, 'no separate compaction follows');
 });

@@ -453,3 +453,20 @@ test('move_lines is a plain cut and paste: nothing is exported, imported or rewr
   assert.equal(await readFile(join(root, 'src', 'helper.ts'), 'utf8'), 'function helper() {\n  return x;\n}\n');
   assert.match(r.text, /nothing else in either file was changed/);
 });
+
+test('a refused replace_lines states the facts of the edit: the lines it drops, and a whole file sent as one line', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-refusal-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true }); await mkdir(join(root, '.leana'), { recursive: true });
+  const tools = new ToolBox(root, join(root, '.leana'), { ...defaults, allowWrite: true });
+  // Run 46, step 76: wrapping <Routes> in a router, the new text lost the </Route> that closed the layout route.
+  const app = "import { Routes, Route } from 'react-router-dom'\nimport { AppLayout } from './AppLayout'\nimport { Landing } from './Landing'\n\nexport default function App() {\n  return (\n    <Routes>\n      <Route element={<AppLayout />}>\n        <Route path=\"/\" element={<Landing />} />\n      </Route>\n    </Routes>\n  )\n}\n";
+  await writeFile(join(root, 'src', 'App.tsx'), app);
+  await assert.rejects(tools.execute('replace_lines', { path: 'src/App.tsx', expectedHash: hash(app), edits: [{ start: 7, end: 11, newText: '    <BrowserRouter>\n      <Routes>\n        <Route element={<AppLayout />}>\n          <Route path="/" element={<Landing />} />\n      </Routes>\n    </BrowserRouter>' }] }),
+    /would no longer parse[\s\S]*held line\(s\) the new text does not contain: 10: <\/Route>\.$/, 'the dropped closing tag is named with its line number');
+  // Run 46, step 78: the whole new main.tsx sent as a replacement of line 1.
+  const main = "import { StrictMode } from 'react'\nimport { createRoot } from 'react-dom/client'\nimport App from './App.tsx'\n\nconst queryClient = new QueryClient({\n  defaultOptions: {\n    queries: {\n      staleTime: 5 * 60 * 1000,\n      retry: 2,\n    },\n  },\n})\n\ncreateRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>)\n";
+  await writeFile(join(root, 'src', 'main.tsx'), main);
+  await assert.rejects(tools.execute('replace_lines', { path: 'src/main.tsx', expectedHash: hash(main), edits: [{ start: 1, end: 1, newText: "import { BrowserRouter } from 'react-router-dom'\n" + main.replace(/\n$/, '').replace('<App />', '<BrowserRouter><App /></BrowserRouter>') }] }),
+    /already contains[\s\S]*This edit replaces 1 line\(s\) \(1\.\.1\) with 15; the other 13 line\(s\) of src\/main\.tsx stay as they are\. rewrite_file replaces a whole file\.$/);
+  assert.equal(await readFile(join(root, 'src', 'main.tsx'), 'utf8'), main, 'nothing was written');
+});

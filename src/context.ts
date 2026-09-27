@@ -115,11 +115,16 @@ export function confidentChoice(a: Answers[string] | undefined, c: Config): stri
 // misleads, so a turn stays while any result of its batch remains and goes
 // with the last of them, leaving one line in the trail. The running turn and
 // the freshest entry are never evicted.
-export function evictOne(s: Session): Entry | undefined {
+// from: only entries at that index or later are candidates, and none whose
+// removal would add a line to the trail (the trail sits before the evidence):
+// an eviction that stays behind a point the prompt already changes at costs
+// no reprocessing of its own.
+export function evictOne(s: Session, from = 0): Entry | undefined {
   retireEvidence(s);
   const hasResults = (turn: Entry) => s.entries.some(e => e.turn === turn.id);
   const protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]);
-  const candidates = s.entries.filter(e => (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
+  const endsTurn = (e: Entry) => e.kind === 'turn' || (e.turn !== undefined && s.entries.some(t => t.kind === 'turn' && t.id === e.turn) && !s.entries.some(x => x !== e && x.turn === e.turn));
+  const candidates = s.entries.filter((e, i) => i >= from && !(from > 0 && endsTurn(e)) && (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
   // Stale entries go first, then the least relevant, then the oldest.
   const candidate = [...candidates].sort((a, b) => Number(Boolean(b.stale)) - Number(Boolean(a.stale)) || a.relevance - b.relevance || a.step - b.step)[0];
   if (!candidate) return undefined;
@@ -151,6 +156,15 @@ function trailLine(turn: Entry): string {
 }
 // The evidence's share of the prompt, estimated from its rendered length; the
 // batched eviction is decided on it, the hard budget by the server's count.
+// Where the prompt changed between two states of the session: the index of the
+// first entry of before that is gone, 0 when the trail changed (it sits in
+// front of the evidence), or null when nothing before the new entries changed.
+export function breakIndex(before: { ids: string[]; trail: string[] }, s: Session): number | null {
+  if ((s.trail ?? []).join('\n') !== before.trail.join('\n')) return 0;
+  const now = new Set(s.entries.map(e => e.id));
+  const i = before.ids.findIndex(id => !now.has(id));
+  return i < 0 ? null : i;
+}
 export function evidenceTokens(s: Session): number {
   return Math.ceil(agentPrefix(s).slice(2).filter(m => !m.content.startsWith('{"earlierSteps"')).reduce((n, m) => n + m.content.length, 0) / 3.5);
 }

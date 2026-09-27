@@ -129,6 +129,15 @@ export function loopingLineStart(text: string, window = 3000, threshold = .045):
   const tail = Buffer.from(text.slice(-window));
   return deflateRawSync(tail).length / tail.length < threshold ? start : -1;
 }
+// How long one generation request may take: a minute of slack, the prompt to
+// process when it is not cached (the first chunk; a cold 30k-token prompt takes
+// ~90 s at ~350 tok/s, so it is allowed at 150 tok/s), and the tokens to generate
+// at half the observed speed, that speed capped so a burst of accepted drafts
+// never shrinks the allowance.
+export function requestTimeoutMs(promptTokens: number, generate: number, tokensPerSecond: number): number {
+  const decode = Math.max(4, Math.min(tokensPerSecond, 60) * .5);
+  return 60000 + Math.ceil(promptTokens / 150) * 1000 + Math.ceil(generate / decode) * 1000;
+}
 export class Bonsai {
   // Timing and usage of the latest generation, for live progress and reports.
   lastMeta: GenerationMeta | null = null;
@@ -224,7 +233,7 @@ export class Bonsai {
         const room = this.config.contextWindow - this.config.safetyTokens - promptTokens;
         const n = Math.min(chunk, budget - generated, room - generated);
         if (n <= 0) { finish = 'length'; break; }
-        const timeout = 60000 + Math.ceil(n / Math.max(4, this.tokensPerSecond * .5)) * 1000;
+        const timeout = requestTimeoutMs(continuations === 0 ? promptTokens : 0, n, this.tokensPerSecond);
         const r = await postJson(`${this.root}/completion`, { prompt, n_predict: n, temperature, ...codeSampling, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, stream: false, ...(thoughtClosed ? { stop: stopWords } : {}) }, this.key, timeout, 0);
         if (typeof r.content !== 'string') throw new Error('Bonsai returned no content');
         const ids: number[] = Array.isArray(r.tokens) ? r.tokens : [];

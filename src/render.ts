@@ -10,6 +10,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
 import { runCommand } from './tools.js';
+import { announcedElsewhere, notAnswering, startServer, type Started } from './serve.js';
+export { announcedElsewhere };
 
 const candidates = ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'chrome'];
 export async function findBrowser(): Promise<string | null> {
@@ -56,40 +58,17 @@ class Cdp {
   }
 }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-// Waits for the URL to answer. A server that announces its own address and it
-// is another port is not going to answer at this one: after a short grace the
-// wait ends with the addresses it announced, instead of running out the clock.
-async function waitForUrl(url: string, timeoutMs: number, elsewhere?: () => string[] | null): Promise<true | string[] | false> {
-  const until = Date.now() + timeoutMs; let seenAt = 0;
-  while (Date.now() < until) {
-    try { const r = await fetch(url, { signal: AbortSignal.timeout(2000) }); if (r.status < 500) return true; } catch { /* not yet */ }
-    const other = elsewhere?.() ?? null;
-    if (other?.length) { seenAt ||= Date.now(); if (Date.now() - seenAt > 3000) return other; }
-    await sleep(500);
-  }
-  return false;
-}
-// Addresses on this machine a server's output says it listens at, when none has the requested URL's port.
-export function announcedElsewhere(output: string, url: string): string[] | null {
-  let port: string; try { const u = new URL(url); port = u.port || (u.protocol === 'https:' ? '443' : '80'); } catch { return null; }
-  const plain = output.replace(/\u001b\[[0-9;]*m/g, '');
-  const found = [...new Set([...plain.matchAll(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\])(?::(\d+))?[^\s'"]*/g)].map(m => m[0].replace(/[.,;)]+$/, '')))];
-  if (!found.length) return null;
-  const ports = found.map(f => f.match(/:(\d+)(?:\/|$)/)?.[1] ?? (f.startsWith('https') ? '443' : '80'));
-  return ports.includes(port) ? null : found.slice(0, 4);
-}
 // Render a URL, optionally after starting a server with `serve` in `root`
 // (stopped afterwards, whatever happens). Returns facts as text and, when a
 // path is given, a PNG screenshot for the session's report.
 export async function renderFacts(root: string, url: string, serve: string | undefined, screenshotPath: string | null, timeoutMs = 60000): Promise<{ ok: boolean; text: string; unmatched?: string[] }> {
   const browser = await findBrowser(); if (!browser) return { ok: false, text: 'No browser is installed on this machine (chromium or google-chrome); the page cannot be rendered.' };
-  let server: ChildProcess | null = null; const serverLog: string[] = [];
+  let server: Started | null = null;
   try {
     if (serve && serve.trim()) {
-      server = spawn('bash', ['--noprofile', '--norc', '-c', serve], { cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: '1', FORCE_COLOR: '0', BROWSER: 'none' } });
-      server.stdout?.on('data', d => serverLog.push(String(d))); server.stderr?.on('data', d => serverLog.push(String(d)));
-      const waited = await waitForUrl(url, Math.min(timeoutMs, 45000), () => announcedElsewhere(serverLog.join(''), url));
-      if (waited !== true) return { ok: false, text: waited ? `The server started with "${serve}" says it is listening at ${waited.join(', ')}, and nothing answered at ${url}. Its output:\n${serverLog.join('').slice(-1500)}` : `The server started with "${serve}" did not answer at ${url} within ${Math.round(Math.min(timeoutMs, 45000) / 1000)}s. Its output:\n${serverLog.join('').slice(-1500)}` };
+      const wait = Math.min(timeoutMs, 45000);
+      server = await startServer(root, serve, url, wait);
+      if (server.ready !== true) return { ok: false, text: notAnswering(serve, url, server, wait) };
     }
     const child = spawn(browser, ['--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run', '--disable-extensions', '--remote-debugging-pipe', '--window-size=1280,900', '--hide-scrollbars', 'about:blank'], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
     const cdp = new Cdp(child);
@@ -134,6 +113,6 @@ export async function renderFacts(root: string, url: string, serve: string | und
       return { ok, text: lines.join('\n'), ...(c.unmatched ? { unmatched: c.all } : {}) };
     } finally { try { child.kill('SIGKILL'); } catch { /* gone */ } }
   } finally {
-    if (server?.pid) { try { process.kill(-server.pid, 'SIGTERM'); } catch { /* gone */ } setTimeout(() => { try { process.kill(-server!.pid!, 'SIGKILL'); } catch { /* gone */ } }, 2000).unref(); }
+    server?.stop();
   }
 }

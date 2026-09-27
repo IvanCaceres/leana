@@ -49,6 +49,9 @@ export class Store {
       await this.recoverEditEvidence(s);
     }
     s.referenceEvidence ??= [];
+    // Sessions from before observations were generalized kept the last page render.
+    const legacy = (s as any).lastRender as { step: number; ok: boolean; url: string; text: string } | undefined;
+    if (legacy && !s.lastObservation) s.lastObservation = { step: legacy.step, kind: 'page', ok: legacy.ok, target: legacy.url, text: legacy.text };
     // Designs from before the neutral schema carried landing-page field names.
     if (s.design) { const d = s.design as any; if (d.pageComposition && !d.composition) d.composition = d.pageComposition; if (d.copy && !d.fixtures) d.fixtures = d.copy; delete d.pageComposition; delete d.copy; }
     for (const d of s.ledger ?? []) { const x = d as any; if (x.layout && !x.placement) x.placement = x.layout; delete x.layout; }

@@ -504,3 +504,33 @@ export async function markupClassNames(root: string, files: string[], limit = 40
 }
 // Class names a stylesheet has a selector for (any rule that mentions .name).
 export const stylesheetClasses = (css: string): Set<string> => new Set([...css.matchAll(/\.(-?[_A-Za-z][\w-]*)/g)].map(m => m[1]!));
+
+// Facts for a file about to be generated, from what the repository holds, by
+// the kind of file: a stylesheet is written against the class names the markup
+// uses (and, when it exists, told which of them it has no rule for yet).
+export async function generationFacts(root: string, path: string, current: string | undefined, files: string[]): Promise<Record<string, unknown>> {
+  const out: Record<string, unknown> = {};
+  if (languageFor(path)?.kind === 'style') {
+    const used = await markupClassNames(root, files).catch(() => ({} as Record<string, string[]>));
+    if (Object.keys(used).length) {
+      out.classNamesUsedByMarkup = used;
+      if (current !== undefined) { const has = stylesheetClasses(current); const without = [...new Set(Object.values(used).flat())].filter(n => !has.has(n)); if (without.length) out.classNamesWithoutRuleInThisFile = without.slice(0, 200); }
+    }
+  }
+  return out;
+}
+
+// Relative imports of a file that no repository file answers: the module is
+// named but not written yet. Relative forms only (./x, .x, crate::/self::/super::);
+// packages are the manifest's business. A fact at creation time, so the missing
+// file is written in the same batch rather than found by a failing build.
+export async function missingRelativeModules(path: string, text: string, read: (p: string) => Promise<string | null>): Promise<string[]> {
+  const out: string[] = [];
+  for (const imp of await importsFor(path, text, true).catch(() => [] as ModuleImport[])) {
+    if (!/^\.|^(?:crate|self|super)::/.test(imp.spec)) continue;
+    const candidates = moduleCandidates(path, imp.spec); if (!candidates.length) continue;
+    let found = false; for (const c of candidates) if ((await read(c)) !== null) { found = true; break; }
+    if (!found) out.push(`${path} imports ${imp.spec}, which does not exist yet (no ${candidates.slice(0, 3).join(', ')}): the build fails until it does`);
+  }
+  return out;
+}

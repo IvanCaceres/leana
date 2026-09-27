@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults };
-import { Bonsai, Jev, loopingLineStart, periodicStart, postJson, repetitionStart, validateAnswers } from '../src/clients.js';
+import { Bonsai, Jev, loopingLineStart, periodicStart, postJson, requestTimeoutMs, repetitionStart, validateAnswers } from '../src/clients.js';
 import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds } from '../src/context.js';
 import { namedFiles, pinReferences, referenceContext } from '../src/references.js';
 import { objectiveClauses } from '../src/control.js';
@@ -215,6 +215,13 @@ test('periodicStart finds a loop inside one line and leaves real content alone',
   for (const honest of [path, data, css, divider]) assert.equal(periodicStart(honest), -1, honest.slice(0, 40));
   const { validate, schemas } = await import('../src/schema.js');
   assert.doesNotThrow(() => validate(schemas.bash, { command: `cat > src/a.ts <<'EOF'\n${'const a = 1;\n'.repeat(400)}EOF`, purpose: 'write', check: false }), 'a long command the grammar let through is not discarded afterwards');
+});
+test('A generation request is allowed the time to process a cold prompt, and a burst of fast decoding never shrinks its allowance', () => {
+  // react-demo-42 step 28: a 31,767-token rewrite prompt after an eviction was aborted at 72 s, before its ~85 s of prompt processing ended.
+  const cold = requestTimeoutMs(31767, 1024, 35);
+  assert(cold >= 60000 + 212000, `a cold 31.8k prompt gets its processing time (${cold} ms)`);
+  assert.equal(requestTimeoutMs(0, 1024, 35), 60000 + 59000, 'a continuation, whose prompt is cached, gets decode time only');
+  assert.equal(requestTimeoutMs(0, 1024, 123), requestTimeoutMs(0, 1024, 60), 'a measured 123 tok/s from accepted drafts counts as 60');
 });
 test('loopingLineStart catches a loop inside one line whose values drift, which no exact cycle finds, and leaves real long lines alone', () => {
   // The shape of react-demo-24's Footer: an icon path that fell into a cycle whose signs and digits drift, so it never repeats exactly.

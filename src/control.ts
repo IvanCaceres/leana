@@ -21,7 +21,7 @@ export function watchState(s: Session): unknown {
     changedFiles: s.writes.slice(-12), changedFileCount: s.writes.length, lastWriteStep: s.lastWriteStep,
     verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, exitCode: s.lastCheck.summary.code, files: Object.keys(s.lastCheck.summary.files).slice(0, 6), output: clipEnds(s.lastCheck.text, 400), afterLastWrite: s.lastCheck.step > s.lastWriteStep } : null,
     lastError: s.lastError ? clip(s.lastError, 300) : null,
-    lastRender: s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, facts: clip(s.lastRender.text, 500) } : 'never rendered',
+    lastObservation: s.lastObservation ? { kind: s.lastObservation.kind, step: s.lastObservation.step, afterLastWrite: s.lastObservation.step > s.lastWriteStep, ok: s.lastObservation.ok, facts: clip(s.lastObservation.text, 500) } : 'never observed',
     turnsOnlyReading: s.readOnlyTurns ?? 0,
     recent, previousReading: previous ? { progress: previous.progress, stuck: previous.stuck, sameFailure: previous.sameFailure } : null, noProgressSteps: s.watch?.noProgress ?? 0,
   };
@@ -42,12 +42,12 @@ export async function watchdog(jev: Jev, s: Session): Promise<Reading> {
 
 // The evidence gate: code states the facts (what changed, what the check
 // said, what the worker claims); Jev judges the meaning.
-export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; render?: unknown; renderState?: 'current' | 'stale' | 'never' | 'unavailable'; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; exitCode: number | null; text: string }; requirements: string[]; sources: unknown }
+export interface GateFacts { summary: string; changedFiles: string[]; diffStat: string; observation?: unknown; observationState?: 'current' | 'stale' | 'never' | 'unavailable'; verification: { command: string | null; ok: boolean | null; afterLastWrite: boolean; exitCode: number | null; text: string }; requirements: string[]; sources: unknown }
 export const gateQuestions: Questions = {
-  implementation_matches_request: { type: 'noul', instructions: 'Does the change (changedFiles, diffStat, sources, and for anything user-facing the render facts: errors, failed requests, broken images, overflow, how the page is styled, a page never rendered) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken, unstyled or invented?' },
+  implementation_matches_request: { type: 'noul', instructions: 'Does the change (changedFiles, diffStat, sources, and the observation of the result as its user meets it, or its absence) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken or invented?' },
   requirement_unaddressed: { type: 'noul', instructions: 'Does any requirement of the objective appear unaddressed by the change and the verification?' },
   claim_supported: { type: 'noul', instructions: 'Is the worker\'s completion summary supported by the facts shown (files that exist, a verification that passed after the last edit), rather than asserted?' },
-  weakest_evidence: { type: 'choice', instructions: 'Which part of the evidence most undermines the completion claim?', criteria: { render: 'What the render shows the user sees: errors, styling, layout, content.', verification: 'What the verification command ran and reported.', sources: 'The source files and what they implement.', requirements: 'Parts of the objective the change does not yet build.', summary: 'The summary claims more than the facts show.' } },
+  weakest_evidence: { type: 'choice', instructions: 'Which part of the evidence most undermines the completion claim?', criteria: { observation: 'What observing the result as its user meets it showed, or that it was never observed.', verification: 'What the verification command ran and reported.', sources: 'The source files and what they implement.', requirements: 'Parts of the objective the change does not yet build.', summary: 'The summary claims more than the facts show.' } },
   verification_needed: { type: 'choice', instructions: 'How much verification does this change deserve before it is accepted as complete?', criteria: { deterministic_only: 'The passing check and the facts are enough: a small, low-risk change.', semantic_review: 'The facts are consistent but the change is substantial or the check is weak: accept only if the answers above are confident.', human: 'The user should look before this is called done: risky, ambiguous, or the verification is missing.' } },
 };
 export interface GateVerdict { accepted: boolean; matches: number; unaddressed: number; supported: number; route: string; reason: string }
@@ -60,45 +60,49 @@ export const objectiveClauses = (objective: string): string[] => {
 };
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
-  const state = { objective: s.objective, clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])), notes: clip(s.notes ?? '', 1500), ...facts, sources: facts.sources };
+  const observation = facts.observation && typeof facts.observation === 'object' ? { ...(facts.observation as Record<string, unknown>), question: undefined } : facts.observation;
+  const state = { objective: s.objective, clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])), notes: clip(s.notes ?? '', 1500), ...facts, observation, sources: facts.sources };
   const questions: Questions = { ...gateQuestions, ...Object.fromEntries(clauses.map((_, i) => [`clause_${i}`, { type: 'noul', instructions: `Is clause_${i} of the objective addressed by the change and the verification shown?` }])) };
   const a = await jev.decide(state, questions, { step: s.step, phase: 'evidence-gate' });
   const weak = clauses.map((c, i) => ({ c, p: noul(a[`clause_${i}`]) })).filter(x => x.p < .4);
   const matches = noul(a.implementation_matches_request); const unaddressed = noul(a.requirement_unaddressed); const supported = noul(a.claim_supported);
   const route = a.verification_needed?.type === 'choice' ? a.verification_needed.choice : 'semantic_review';
   const facts_ok = facts.verification.ok !== false && facts.verification.afterLastWrite;
-  const renderBroken = Boolean(facts.render && typeof facts.render === 'object' && (facts.render as any).ok === false);
+  const obs = facts.observation && typeof facts.observation === 'object' ? facts.observation as { kind?: string; target?: string; ok?: boolean; facts?: string; question?: string } : null;
+  const observationBroken = obs?.ok === false;
   // The evidence Jev reads as weakest, when it is evidence that could be gathered and was not
-  // (a render that never ran, or ran before the last write), is gathered before anything is accepted.
+  // (an observation never made, or made before the last write), is gathered before anything is accepted.
   const weakest = a.weakest_evidence?.type === 'choice' ? a.weakest_evidence.choice : null;
   const weakestP = a.weakest_evidence?.type === 'choice' ? a.weakest_evidence.probabilities[a.weakest_evidence.choice] ?? 0 : 0;
-  const renderMissing = weakest === 'render' && weakestP >= .5 && (facts.renderState === 'never' || facts.renderState === 'stale');
-  const accepted = facts_ok && !renderBroken && !renderMissing && route !== 'human' && !weak.length && (route === 'deterministic_only' ? matches >= .6 : matches >= .75 && supported >= .6);
+  const observationMissing = weakest === 'observation' && weakestP >= .5 && (facts.observationState === 'never' || facts.observationState === 'stale');
+  const accepted = facts_ok && !observationBroken && !observationMissing && route !== 'human' && !weak.length && (route === 'deterministic_only' ? matches >= .6 : matches >= .75 && supported >= .6);
   // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
-  const humanReview = route === 'human' && facts_ok && !renderBroken && !renderMissing && !weak.length && matches >= .6;
-  const reason = !facts_ok ? 'the verification did not pass after the last edit' : renderMissing ? `Jev reads the render as the weakest evidence (${weakestP.toFixed(2)}) and the page ${facts.renderState === 'never' ? 'has never been rendered' : 'has not been rendered since the last write'}: render it and act on what it shows before finishing` : renderBroken ? `the last render of ${(facts.render as any).url ?? 'the page'} failed: ${clip(String((facts.render as any).facts ?? ''), 300)}` : humanReview ? 'Jev routes this completion to the user' : accepted ? 'the facts and Jev\'s reading agree' : weak.length ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}` : `Jev reads the change as ${matches < .75 ? 'not implementing the request' : ''}${supported < .6 ? ' not supported by the facts' : ''}`.replace(/\s+/g, ' ').trim();
+  const humanReview = route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && matches >= .6;
+  const reason = !facts_ok ? 'the verification did not pass after the last edit' : observationMissing ? `Jev reads the observation as the weakest evidence (${weakestP.toFixed(2)}) and the result ${facts.observationState === 'never' ? 'has never been observed' : 'has not been observed since the last write'}: observe it as its user meets it and act on what that shows before finishing` : observationBroken ? `the last observation (${obs!.kind} ${obs!.target ?? ''}) failed: ${clip(String(obs!.facts ?? ''), 300)}` : humanReview ? 'Jev routes this completion to the user' : accepted ? 'the facts and Jev\'s reading agree' : weak.length ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}` : `Jev reads the change as ${matches < .75 ? 'not implementing the request' : ''}${supported < .6 ? ' not supported by the facts' : ''}`.replace(/\s+/g, ' ').trim();
   // A rejection says where Jev reads the gap, with the fact itself, so the worker acts on it rather than guessing.
-  const pointer = accepted || humanReview || !facts_ok || renderBroken || renderMissing || !weakest ? '' : `. Jev reads the weakest evidence as ${weakestFact(weakest, facts)}`;
+  const pointer = accepted || humanReview || !facts_ok || observationBroken || observationMissing || !weakest ? '' : `. Jev reads the weakest evidence as ${weakestFact(weakest, facts)}`;
   // A completion about to pass while Jev names one piece of evidence as its weakest gets
-  // a second, focused reading of that evidence alone; a clear no there stops it.
-  if ((accepted || humanReview) && weakest && weakestP >= .5 && focusQuestions[weakest]) {
-    const evidence = weakest === 'render' ? facts.render : weakest === 'verification' ? facts.verification : facts.sources;
-    const f = await jev.decide({ objective: s.objective, evidence: weakest, [weakest]: evidence }, { evidence_shows_done: { type: 'noul', instructions: focusQuestions[weakest]! } }, { step: s.step, phase: 'evidence-focus' });
+  // a second, focused reading of that evidence alone; a clear no there stops it. The
+  // question about an observation comes from the observer that made it.
+  const focusQuestion = weakest === 'observation' ? (obs ? obs.question ?? genericObservationQuestion : null) : focusQuestions[weakest ?? ''];
+  if ((accepted || humanReview) && weakest && weakestP >= .5 && focusQuestion) {
+    const evidence = weakest === 'observation' ? { kind: obs!.kind, target: obs!.target, ok: obs!.ok, facts: obs!.facts } : weakest === 'verification' ? facts.verification : facts.sources;
+    const f = await jev.decide({ objective: s.objective, evidence: weakest, [weakest]: evidence }, { evidence_shows_done: { type: 'noul', instructions: focusQuestion } }, { step: s.step, phase: 'evidence-focus' });
     const focus = noul(f.evidence_shows_done);
     if (focus < .3) return { accepted: false, matches, unaddressed, supported, route: 'rejected', reason: `Jev's focused reading of the ${weakest} alone is that it does not show the work done (${focus.toFixed(2)}): ${weakestFact(weakest, facts)}` };
   }
   return { accepted, matches, unaddressed, supported, route: humanReview ? 'human' : accepted ? route : 'rejected', reason: reason + pointer };
 }
 // The focused question per kind of evidence: judged by that evidence alone.
+const genericObservationQuestion = 'Judged only by this observation, does the result work for its user as the objective requires, complete and with nothing broken?';
 const focusQuestions: Record<string, string> = {
-  render: 'Judged only by this render evidence, does the page look finished to the user the objective describes: styled and laid out as intended, its content present, nothing broken?',
   verification: 'Judged only by this verification output, does the work build and run as the objective requires?',
   sources: 'Judged only by these source files, do they implement what the objective asks, completely and without placeholders?',
 };
 function weakestFact(kind: string, facts: GateFacts): string {
-  const render = facts.render && typeof facts.render === 'object' ? String((facts.render as any).facts ?? '') : String(facts.render ?? '');
+  const o = facts.observation && typeof facts.observation === 'object' ? facts.observation as { kind?: string; target?: string; facts?: string } : null;
   switch (kind) {
-    case 'render': return `the render, which reported: ${clip(render, 700)}`;
+    case 'observation': return o ? `the observation (${o.kind} ${o.target ?? ''}), which reported: ${clip(String(o.facts ?? ''), 700)}` : `the observation: ${String(facts.observation ?? 'none made')}`;
     case 'verification': return `the verification (${facts.verification.command ?? 'none'}, exit ${facts.verification.exitCode ?? 'unknown'}): ${clip(facts.verification.text, 400)}`;
     case 'sources': return `the source files (${facts.changedFiles.slice(-12).join(', ')}) and what they implement`;
     case 'requirements': return 'parts of the objective the change does not build yet';

@@ -14,9 +14,9 @@ import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand
 import { clip, clipEnds, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
-import { markupClassNames, stylesheetClasses, languageFor, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
+import { generationFacts, missingRelativeModules, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
 import { orient } from './orient.js';
-import { renderFacts } from './render.js';
+import { observeResult, observerFor } from './observe.js';
 import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
 import type { Bonsai } from './clients.js';
 
@@ -57,7 +57,7 @@ export class Agent {
   // ---- observation: what a tool result does to the session -----------------
   async evidence(s: Session, kind: string, result: ToolResult, args?: Record<string, any>): Promise<void> {
     const artifact = await this.store.artifact(s.step, result.text);
-    const limit = kind === 'read_files' || kind === 'render' ? this.config.toolChars : kind === 'bash' ? Math.min(this.config.toolChars, 2500) : kind === 'search_codebase' ? Math.min(this.config.toolChars, 1500) : Math.min(this.config.toolChars, 600);
+    const limit = kind === 'read_files' || kind === 'observe' ? this.config.toolChars : kind === 'bash' ? Math.min(this.config.toolChars, 2500) : kind === 'search_codebase' ? Math.min(this.config.toolChars, 1500) : Math.min(this.config.toolChars, 600);
     if (kind === 'read_files' && result.ok && args) {
       for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
@@ -280,15 +280,8 @@ export class Agent {
     })() : null;
     const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
     const project = await projectFor(this.tools.root, path); const declared = project ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[]) : [];
-    // A stylesheet is written against the class names the markup uses (and, when it exists, those it has no rule for yet).
-    const markup: Record<string, unknown> = {};
-    if (languageFor(path)?.kind === 'style') {
-      const used = await markupClassNames(this.tools.root, s.knownFiles).catch(() => ({} as Record<string, string[]>));
-      if (Object.keys(used).length) {
-        markup.classNamesUsedByMarkup = used;
-        if (current !== undefined) { const has = stylesheetClasses(current); const without = [...new Set(Object.values(used).flat())].filter(n => !has.has(n)); if (without.length) markup.classNamesWithoutRuleInThisFile = without.slice(0, 200); }
-      }
-    }
+    // What the repository says this kind of file is written against (the profiles decide which facts apply).
+    const markup = await generationFacts(this.tools.root, path, current, s.knownFiles).catch(() => ({} as Record<string, unknown>));
     const builds = region ? [0, 1].map(k => () => regionMessages(s, path, purpose, current!, region.start, region.end, contracts, declared, k, markup)) : [0, 1].map(k => () => newFileMessages(s, path, purpose, contracts, declared, k, current, markup));
     const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', builds, this.config.createTokens, fenceFor(path));
     const finish = generated.finish; let code = generated.code;
@@ -308,7 +301,7 @@ export class Agent {
     if (!result.ok) throw new Error(result.text);
     // Contracts the file breaks are facts for the worker: names a repository module does not declare, packages the manifest does not declare.
     const readRepo = async (p: string) => { try { return await readFile(await safePath(this.tools.root, p), 'utf8'); } catch { return null; } };
-    const facts = [...await unresolvedImports(path, code, readRepo).catch(() => [] as string[])];
+    const facts = [...await missingRelativeModules(path, code, readRepo).catch(() => [] as string[]), ...await unresolvedImports(path, code, readRepo).catch(() => [] as string[])];
     const manifest = project ? project.eco.markers.map(m => inProject(project, m)) : [];
     const present = []; for (const m of manifest) if ((await readRepo(m)) !== null) present.push(m);
     if (present.length) { const missing = await undeclaredPackages(this.tools.root, path, code, readRepo).catch(() => [] as string[]); if (missing.length) facts.push(`${path} imports ${missing.join(', ')}, which ${present.join(' or ')} does not declare: declare them (the package manager chooses the version) so they can be installed`); }
@@ -326,11 +319,12 @@ export class Agent {
     const diffStat = [diff?.code === 0 ? diff.output.trim() : '', untracked?.code === 0 && untracked.output.trim() ? `untracked: ${untracked.output.trim().split('\n').slice(0, 40).join(', ')}` : ''].filter(Boolean).join('\n') || `changed files: ${s.writes.join(', ') || 'none'}`;
     const sources: Record<string, string> = {};
     for (const p of s.writes.slice(-12)) { const t = await readIfPresent(s.root, p); if (t !== null) sources[p] = clip(t, 1200); }
-    // Whether the render action could run here: the worker may use it and the machine has a browser.
-    const canRender = (s.allowedActions ?? []).includes('render') && Boolean((s.orientation as any)?.toolchain?.browser);
-    const render = s.lastRender ? { step: s.lastRender.step, afterLastWrite: s.lastRender.step > s.lastWriteStep, ok: s.lastRender.ok, url: s.lastRender.url, facts: s.lastRender.text } : canRender ? 'never rendered: nothing is known about what the user sees' : 'cannot be rendered here (no browser, or the shell is not allowed)';
-    const renderState = !canRender && !s.lastRender ? 'unavailable' as const : !s.lastRender ? 'never' as const : s.lastRender.step > s.lastWriteStep ? 'current' as const : 'stale' as const;
-    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), render, renderState, verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), exitCode: s.lastCheck?.summary.code ?? null, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
+    // Whether the result can be observed here (the shell runs what is observed), and the last observation of it.
+    const canObserve = (s.allowedActions ?? []).includes('observe');
+    const o = s.lastObservation;
+    const observation = o ? { kind: o.kind, step: o.step, afterLastWrite: o.step > s.lastWriteStep, ok: o.ok, target: o.target, facts: o.text, question: observerFor(o.kind)?.question } : canObserve ? 'never observed: nothing is known about the result as its user meets it' : 'cannot be observed here (the shell is not allowed)';
+    const observationState = !canObserve && !o ? 'unavailable' as const : !o ? 'never' as const : o.step > s.lastWriteStep ? 'current' as const : 'stale' as const;
+    return { summary: clip(summary, 1500), changedFiles: s.writes, diffStat: clip(diffStat, 2500), observation, observationState, verification: { command: s.lastCheck?.command ?? s.lastCheckCommand, ok: s.lastCheck?.ok ?? null, afterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep), exitCode: s.lastCheck?.summary.code ?? null, text: clip(s.lastCheck?.text ?? '', 800) }, requirements: referenceContext(s, 2000).map(e => clip(e.text, 300)), sources };
   }
 
   // ---- the loop ----------------------------------------------------------------
@@ -370,9 +364,9 @@ export class Agent {
         // The harness proposes completion itself when Jev reads the objective as
         // satisfied and the check passed after the last edit: once per check,
         // judged by the evidence gate like a worker's claim; a rejection says why.
-        // Never on a page that last rendered broken, and never on user-facing work that was never rendered after the last edit.
-        const renderStands = !s.lastRender || (s.lastRender.ok && s.lastRender.step > s.lastWriteStep);
-        const proposeFinish = Boolean(last && last.objective >= .7 && s.lastCheck?.ok && s.lastCheck.step > s.lastWriteStep && renderStands && s.finishTriedAtCheck !== s.lastCheck.step);
+        // Never while the last observation of the result failed or predates the last edit.
+        const observationStands = !s.lastObservation || (s.lastObservation.ok && s.lastObservation.step > s.lastWriteStep);
+        const proposeFinish = Boolean(last && last.objective >= .7 && s.lastCheck?.ok && s.lastCheck.step > s.lastWriteStep && observationStands && s.finishTriedAtCheck !== s.lastCheck.step);
         if (proposeFinish) {
           s.finishTriedAtCheck = s.lastCheck!.step;
           await this.store.log('auto-finish', { step: s.step, objective: last!.objective, check: s.lastCheck!.step });
@@ -389,7 +383,7 @@ export class Agent {
         if (readOnly >= 3) notes.push(`Your last ${readOnly} turns only read or searched; nothing changed. The evidence already holds what they returned. Act on it now, or say in your thought exactly which fact is still missing.`);
         if (s.setupError) notes.push(`The dependency install failed for the current manifest: ${s.setupError}. The manifest is yours to change; the install runs again by itself after the change.`);
         if (s.completionFeedback && !s.completionFeedback.addressed) notes.push(s.completionFeedback.text);
-        const allowed: Route[] = [...actions].filter(a => (this.config.allowWrite || !editRoutes.includes(a as Route)) && (this.config.allowBash || (a !== 'bash' && a !== 'render'))) as Route[];
+        const allowed: Route[] = [...actions].filter(a => (this.config.allowWrite || !editRoutes.includes(a as Route)) && (this.config.allowBash || (a !== 'bash' && a !== 'observe'))) as Route[];
         s.allowedActions = allowed;
         // One reasoning per batch of actions, not per action: the worker names an
         // ordered list, the harness runs it back to back and stops at the first
@@ -463,28 +457,21 @@ export class Agent {
     const key = Agent.actionKey(s, route, args);
     if (s.blockedActions!.includes(key)) return refuse('this exact action already failed the same way and Jev read the failure as unchanged; it is not run again. Change the approach.');
     const earlier = s.actions[key];
-    if (earlier !== undefined && s.entries.some(e => e.step === earlier && e.kind === route) && !(route === 'read_files' && (args.files as { path: string }[]).some(f => (s.writeSteps[f.path] ?? -1) > earlier)) && route !== 'bash' && route !== 'plan' && route !== 'render') return refuse(`this ${route} was already done at step ${earlier} and its result is in the evidence; act on it or choose another action`);
+    if (earlier !== undefined && s.entries.some(e => e.step === earlier && e.kind === route) && !(route === 'read_files' && (args.files as { path: string }[]).some(f => (s.writeSteps[f.path] ?? -1) > earlier)) && route !== 'bash' && route !== 'plan' && route !== 'observe') return refuse(`this ${route} was already done at step ${earlier} and its result is in the evidence; act on it or choose another action`);
     // A command that succeeded, run again with nothing written or installed since
     // and its output still shown, prints the same thing: it is not run again.
     if (route === 'bash') { const prior = s.commandRuns?.[String(args.command ?? '').trim()]; if (prior?.ok && prior.world === Agent.world(s) && s.entries.some(e => e.step === prior.step && e.kind === 'bash')) return refuse(`this exact command already ran at step ${prior.step} and nothing has been written or installed since, so it would print the same output, which is in the evidence (e${prior.step}); act on that output or run something different`); }
     s.actions[key] = s.step;
     if (route === 'plan') { s.notes = clip(String(args.notes ?? ''), 4000); await this.store.log('plan', { step: s.step, notes: s.notes }); await this.evidence(s, 'plan', { ok: true, text: `Notes updated (${s.notes.split('\n').length} lines).` }); return 'ok'; }
-    if (route === 'render') {
-      if (!this.config.allowBash) return refuse('render needs --allow-bash (it starts the server).');
-      const url = String(args.url ?? ''); const serve = String(args.serve ?? '');
-      const shot = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-render.png`);
-      const r = await renderFacts(this.tools.root, url, serve || undefined, shot, this.config.commandTimeoutMs).catch(e => ({ ok: false, text: `Render failed: ${(e as Error).message}` }) as { ok: boolean; text: string; unmatched?: string[] });
-      if (r.unmatched?.length) {
-        // Where each unstyled class name is used, so the stylesheet can be written without re-reading every component.
-        const where: Record<string, string[]> = {};
-        const hits = await runCommand('rg', ['-l', '--color', 'never', '-F', '-g', '!node_modules/**', '-g', '!dist/**', '-g', '!build/**', ...r.unmatched.flatMap((c: string) => ['-e', c]), '.'], this.tools.root, 15000).catch(() => null);
-        for (const f of (hits?.output ?? '').split('\n').map(l => l.replace(/^\.\//, '')).filter(Boolean).slice(0, 40)) { const text = await readIfPresent(this.tools.root, f).then(x => x ?? ''); const used = r.unmatched!.filter((c: string) => new RegExp(`(^|[^\\w-])${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`).test(text)); if (used.length && !/\.(?:css|scss|sass|less)$/.test(f)) where[f] = used; }
-        const stylesheets = s.knownFiles.filter(f => /\.(?:css|scss|sass|less)$/.test(f) && !/(^|\/)(?:node_modules|dist|build)\//.test(f));
-        r.text += `\nClass names no CSS selector matches, by the file that uses them:\n${Object.entries(where).map(([f, cs]) => `  ${f}: ${cs.join(' ')}`).join('\n') || '  (not found in the sources)'}\nStylesheets in the project: ${stylesheets.join(', ') || 'none'}.`;
-      }
-      await this.store.log('render', { step: s.step, url, serve, ok: r.ok, text: clip(r.text, 3000) });
-      s.lastRender = { step: s.step, ok: r.ok, url, text: clip(r.text, 1800) };
-      await this.evidence(s, 'render', { ok: r.ok, text: r.text }, args);
+    if (route === 'observe') {
+      if (!this.config.allowBash) return refuse('observe needs --allow-bash (it starts and runs what it observes).');
+      const kind = String(args.kind ?? ''); const start = String(args.start ?? ''); const target = String(args.target ?? '');
+      const artifactPath = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-observe.png`);
+      const prefix = await shellPrefixFor(this.tools.root).catch(() => '');
+      const r = await observeResult(kind, start, target, { root: this.tools.root, artifactPath, timeoutMs: this.config.commandTimeoutMs, prefix, files: s.knownFiles });
+      await this.store.log('observe', { step: s.step, kind, start, target, ok: r.ok, text: clip(r.text, 3000) });
+      s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 1800) };
+      await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
       this.observe({ kind: 'result', step: s.step, route, ok: r.ok, ms: 0, chars: r.text.length, text: clip(r.text, 200) });
       return r.ok ? 'ok' : 'failed';
     }

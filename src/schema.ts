@@ -1,4 +1,5 @@
 import type { JsonSchema, Route } from './types.js';
+import { observerKinds } from './observe-catalog.js';
 const str = (maxLength?: number): JsonSchema => maxLength === undefined ? { type: 'string' } : { type: 'string', maxLength };
 const integer = (minimum: number, maximum: number): JsonSchema => ({ type: 'integer', minimum, maximum });
 const obj = (properties: Record<string, JsonSchema>): JsonSchema => ({
@@ -32,14 +33,14 @@ export const schemas: Record<Route, JsonSchema> = {
   ask_user: obj({ question: str() }),
   // The worker's own notes: its plan and what it has learned, replaced whole.
   plan: obj({ notes: str() }),
-  // Render a page of the running application in a headless browser: serve is the
-  // command that starts the server (empty when one is already running), url the page.
-  render: obj({ serve: str(500), url: str(300) }),
+  // Observe the result as its user does: kind names the observer, start the command
+  // that starts what is observed (empty when none), target the URL or command.
+  observe: obj({ kind: { type: 'string', enum: observerKinds }, start: str(500), target: str(1000) }),
 };
 // One step of the orient-reason-act loop: the worker reasons in a few
 // sentences, then names one action; the action's arguments are generated next
 // under that action's schema, with the reasoning in front of the worker.
-export const actions = ['read_files', 'search_codebase', 'bash', 'create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines', 'plan', 'render', 'finish', 'ask_user'] as const;
+export const actions = ['read_files', 'search_codebase', 'bash', 'create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines', 'plan', 'observe', 'finish', 'ask_user'] as const;
 export const stepSchema: JsonSchema = { anyOf: actions.map(a => obj({ thought: str(), action: { type: 'string', const: a, enum: [a] }, args: schemas[a] })) };
 // A decided edit of a known file: the harness fills path and expectedHash, so
 // the worker generates only the edits it was asked for.

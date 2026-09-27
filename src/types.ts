@@ -1,4 +1,4 @@
-export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'plan' | 'render' | 'rewrite_file' | 'finish' | 'ask_user';
+export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'plan' | 'observe' | 'rewrite_file' | 'finish' | 'ask_user';
 // One tool, one meaning: create_file creates, write replaces an anchor in an
 // existing file, replace_lines edits by line number, move_lines relocates.
 export const editRoutes: readonly Route[] = ['create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines'];
@@ -120,8 +120,8 @@ export interface Session {
   currentTurn?: string | null; trail?: string[];
   watch?: { noProgress: number; readings: { step: number; progress: number; stuck: number; sameFailure: number; objective: number; needsUser: number; inScope?: number }[]; escalations: number };
   blockedActions?: string[];
-  // The last render of the running application: what the user would see, as facts.
-  lastRender?: { step: number; ok: boolean; url: string; text: string };
+  // The last observation of the result as its user meets it (a page, a service, a program run), as facts.
+  lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string };
   // The actions this session may take, fixed at its start so the pinned block never changes.
   allowedActions?: string[];
   // Consecutive turns that only read or searched.

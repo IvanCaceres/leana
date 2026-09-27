@@ -41,7 +41,7 @@ export async function orient(root: string): Promise<Orientation> {
   const toolchain: Record<string, string> = {};
   const probe = await runCommand('bash', ['--noprofile', '--norc', '-c', `${prefix}for t in ${tools.join(' ')}; do if command -v -- "$t" >/dev/null 2>&1; then v=$("$t" --version 2>&1 | head -1); echo "$t=$v"; fi; done`], root, 20000).catch(() => null);
   for (const line of (probe?.output ?? '').split('\n')) { const i = line.indexOf('='); if (i > 0) toolchain[line.slice(0, i)] = clip(line.slice(i + 1).trim(), 60); }
-  if (browser) toolchain.browser = `${browser} (headless; the render action uses it to show you what a page looks like)`;
+  if (browser) toolchain.browser = `${browser} (headless; the observe action uses it for kind page)`;
   return { repository: { git: status.git, changedCount: status.changedCount, fileCount: files.length, topLevel: status.topLevel.slice(0, 40), directories: Object.fromEntries(Object.entries(directories).sort((a, b) => b[1] - a[1]).slice(0, 30)), scripts: status.scripts },
     ecosystems: present, projects, manifests, toolchain, root: files.length === 0 ? 'This directory is the project root the user named, and it is empty. Scaffold and build here, not in a subdirectory.' : 'This directory is the project root the user named; work lands here, not in a new subdirectory, unless the objective says otherwise.', shell: 'Commands run with bash in the repository root, without a terminal and with CI=1: anything that prompts is cancelled, so pass every choice as flags or arguments (a template, --yes, a directory) and never rely on an interactive step.', verificationCandidates: candidates.slice(0, 8), declaredPackages: declared };
 }

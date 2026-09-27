@@ -384,32 +384,32 @@ test('A whole-file rewrite lands as generated even when it no longer parses, lik
 test('A rejected completion names the evidence Jev reads as weakest and quotes it, so the worker acts on the gap instead of guessing', async () => {
   const { evidenceGate } = await import('../src/control.js');
   const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Bootstrap a landing page');
-  const render = { step: 3, afterLastWrite: true, ok: true, url: 'http://localhost:3000', facts: 'Rendered http://localhost:3000: no exception, every request and image loaded.\nStyling: 14 CSS rules; 0 of the 163 class names on visible elements match a CSS selector (without one: min-h-screen, bg-gray-50)' };
-  const facts = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', render, verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
-  const v = await evidenceGate(jevOf({ gate: { implementation_matches_request: .39, claim_supported: .45, verification_needed: 'semantic_review', weakest_evidence: 'render' } as any }) as any, s, facts);
+  const observation = { kind: 'page', step: 3, afterLastWrite: true, ok: true, target: 'http://localhost:3000', facts: 'Rendered http://localhost:3000: no exception, every request and image loaded.\nStyling: 14 CSS rules; 0 of the 163 class names on visible elements match a CSS selector (without one: min-h-screen, bg-gray-50)' };
+  const facts = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', observation, verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
+  const v = await evidenceGate(jevOf({ gate: { implementation_matches_request: .39, claim_supported: .45, verification_needed: 'semantic_review', weakest_evidence: 'observation' } as any }) as any, s, facts);
   assert.equal(v.accepted, false);
-  assert.match(v.reason, /Jev reads the weakest evidence as the render, which reported: .*0 of the 163 class names/s);
+  assert.match(v.reason, /Jev reads the weakest evidence as the observation \(page http:\/\/localhost:3000\), which reported: .*0 of the 163 class names/s);
   const ok = await evidenceGate(jevOf({}) as any, s, facts);
   assert.equal(ok.accepted, true); assert.doesNotMatch(ok.reason, /weakest/);
 });
 
-test('A completion whose weakest evidence Jev reads as the render is not accepted while the page has not been rendered since the last write; where no render is possible it is judged as before', async () => {
+test('A completion whose weakest evidence Jev reads as the observation is not accepted while the result has not been observed since the last write; where nothing can be observed it is judged as before', async () => {
   const { evidenceGate } = await import('../src/control.js');
   const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Bootstrap a landing page');
-  // The shape of react-demo-23: build passed, Jev reads the change as matching (0.77) with the render as the weakest evidence (0.84), never rendered.
+  // The shape of react-demo-23: build passed, Jev reads the change as matching (0.77) with the observation as the weakest evidence (0.84), never observed.
   const base = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
-  const jev = jevOf({ gate: { implementation_matches_request: .77, claim_supported: .85, verification_needed: 'semantic_review', weakest_evidence: 'render' } as any }) as any;
-  const never = await evidenceGate(jev, s, { ...base, render: 'never rendered: nothing is known about what the user sees', renderState: 'never' as const });
+  const jev = jevOf({ gate: { implementation_matches_request: .77, claim_supported: .85, verification_needed: 'semantic_review', weakest_evidence: 'observation' } as any }) as any;
+  const never = await evidenceGate(jev, s, { ...base, observation: 'never observed: nothing is known about the result as its user meets it', observationState: 'never' as const });
   assert.equal(never.accepted, false); assert.equal(never.route, 'rejected');
-  assert.match(never.reason, /weakest evidence \(0\.90\) and the page has never been rendered: render it/);
-  const stale = await evidenceGate(jev, s, { ...base, render: { step: 2, afterLastWrite: false, ok: true, url: 'u', facts: 'f' }, renderState: 'stale' as const });
-  assert.match(stale.reason, /has not been rendered since the last write/);
-  const current = await evidenceGate(jev, s, { ...base, render: { step: 9, afterLastWrite: true, ok: true, url: 'u', facts: 'f' }, renderState: 'current' as const });
-  assert.equal(current.accepted, true, 'once rendered, Jev\'s reading decides as before');
-  const unavailable = await evidenceGate(jev, s, { ...base, render: 'cannot be rendered here', renderState: 'unavailable' as const });
+  assert.match(never.reason, /weakest evidence \(0\.90\) and the result has never been observed: observe it/);
+  const stale = await evidenceGate(jev, s, { ...base, observation: { kind: 'program', step: 2, afterLastWrite: false, ok: true, target: 'u', facts: 'f' }, observationState: 'stale' as const });
+  assert.match(stale.reason, /has not been observed since the last write/);
+  const current = await evidenceGate(jev, s, { ...base, observation: { kind: 'program', step: 9, afterLastWrite: true, ok: true, target: 'u', facts: 'f' }, observationState: 'current' as const });
+  assert.equal(current.accepted, true, 'once observed, Jev\'s reading decides as before');
+  const unavailable = await evidenceGate(jev, s, { ...base, observation: 'cannot be observed here', observationState: 'unavailable' as const });
   assert.equal(unavailable.accepted, true, 'evidence that cannot be gathered here is not demanded');
-  const otherWeakest = await evidenceGate(jevOf({ gate: { implementation_matches_request: .77, claim_supported: .85, verification_needed: 'semantic_review' } }) as any, s, { ...base, render: 'never rendered', renderState: 'never' as const });
-  assert.equal(otherWeakest.accepted, true, 'a change Jev does not read as hinging on the render (a library, a CLI) is not held for one');
+  const otherWeakest = await evidenceGate(jevOf({ gate: { implementation_matches_request: .77, claim_supported: .85, verification_needed: 'semantic_review' } }) as any, s, { ...base, observation: 'never observed', observationState: 'never' as const });
+  assert.equal(otherWeakest.accepted, true, 'a change Jev does not read as hinging on an observation is not held for one');
 });
 
 test('The repeat check matches the action\'s own result, not the turn that shares its step; a turn whose every action was refused leaves the prompt', async t => {
@@ -483,16 +483,17 @@ test('The per-turn tail carries short hashes, no duplicated edit history, and na
   for (const h of Object.values(last.fileHashes as Record<string, string>)) assert.match(h, /^[0-9a-f]{16}$/);
 });
 
-test('A completion about to pass while Jev names the render as its weakest evidence gets a focused reading of the render alone; a clear no stops it, with the facts', async () => {
+test('A completion about to pass while Jev names the observation as its weakest evidence gets a focused reading of it alone, asked with the observer\'s own question; a clear no stops it, with the facts', async () => {
   const { evidenceGate } = await import('../src/control.js');
   const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Bootstrap a landing page');
   // The shape of react-demo-26: rendered after the last write, match 0.78, render named weakest (0.79), 5 of 45 class names styled.
-  const render = { step: 33, afterLastWrite: true, ok: true, url: 'http://localhost:3000', facts: 'Rendered http://localhost:3000: no exception, every request and image loaded; 5 of the 45 class names on visible elements match a CSS rule.' };
-  const facts = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', render, renderState: 'current' as const, verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
+  const { observerFor } = await import('../src/observe.js');
+  const observation = { kind: 'page', step: 33, afterLastWrite: true, ok: true, target: 'http://localhost:3000', facts: 'Rendered http://localhost:3000: no exception, every request and image loaded; 5 of the 45 class names on visible elements match a CSS rule.', question: observerFor('page')!.question };
+  const facts = { summary: 'done', changedFiles: ['src/App.tsx'], diffStat: '', observation, observationState: 'current' as const, verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' }, requirements: [], sources: {} };
   const calls: string[] = [];
-  const jevWith = (focus: number, matches = .78) => { const j = jevOf({ gate: { implementation_matches_request: matches, claim_supported: .87, verification_needed: 'semantic_review', weakest_evidence: 'render', focus } as any }); return { decide: async (st: any, q: any, c: any) => { calls.push(c.phase); if (c.phase === 'evidence-focus') assert.deepEqual(Object.keys(st).sort(), ['evidence', 'objective', 'render']); return j.decide(st, q, c); } }; };
+  const jevWith = (focus: number, matches = .78) => { const j = jevOf({ gate: { implementation_matches_request: matches, claim_supported: .87, verification_needed: 'semantic_review', weakest_evidence: 'observation', focus } as any }); return { decide: async (st: any, q: any, c: any) => { calls.push(c.phase); if (c.phase === 'evidence-focus') { assert.deepEqual(Object.keys(st).sort(), ['evidence', 'objective', 'observation']); assert.equal(q.evidence_shows_done.instructions, observerFor('page')!.question, 'the page observer\'s own question'); } else assert.equal(st.observation.question, undefined, 'the main reading is not handed the focused question'); return j.decide(st, q, c); } }; };
   const broken = await evidenceGate(jevWith(.11) as any, s, facts);
-  assert.equal(broken.accepted, false); assert.match(broken.reason, /focused reading of the render alone .*\(0\.11\).*5 of the 45 class names/s);
+  assert.equal(broken.accepted, false); assert.match(broken.reason, /focused reading of the observation alone .*\(0\.11\).*5 of the 45 class names/s);
   assert.deepEqual(calls, ['evidence-gate', 'evidence-focus']);
   const good = await evidenceGate(jevWith(.46) as any, s, facts);
   assert.equal(good.accepted, true, 'a focused reading that is not a clear no leaves the verdict as it was');
@@ -602,6 +603,105 @@ test('A stylesheet is generated against the class names the markup uses, and a r
   assert(!('classNamesUsedByMarkup' in req(0)) && !('classNamesUsedByMarkup' in req(3)), 'only stylesheets get this fact');
 });
 
+test('Observers beyond pages: a service answering HTTP and a program run from the shell, each reported as facts with a clear failure', async t => {
+  const { observeResult } = await import('../src/observe.js');
+  const root = await mkdtemp(join(tmpdir(), 'leana-observe-')); t.after(() => rm(root, { recursive: true, force: true }));
+  const ctx = { root, artifactPath: join(root, 'shot.png'), timeoutMs: 30000, prefix: '', files: [] };
+  const port = 40000 + Math.floor(Math.random() * 20000);
+  await writeFile(join(root, 'api.mjs'), `import { createServer } from 'node:http'; createServer((q, r) => { if (q.url === '/api/tasks') { r.writeHead(200, { 'content-type': 'application/json' }); r.end(JSON.stringify([{ id: 1, title: 'a', done: false }])); } else { r.writeHead(404); r.end('no'); } }).listen(${port}, '127.0.0.1');\n`);
+  const ok = await observeResult('http', 'node api.mjs', `http://127.0.0.1:${port}/api/tasks`, ctx);
+  assert.equal(ok.ok, true, ok.text); assert.match(ok.text, /^Answered: GET .* -> 200/); assert.match(ok.text, /JSON array of 1 item\(s\), items with keys id, title, done/);
+  const missing = await observeResult('http', 'node api.mjs', `http://127.0.0.1:${port}/nope`, ctx);
+  assert.equal(missing.ok, false); assert.match(missing.text, /^HTTP ERROR: GET .* -> 404/);
+  await writeFile(join(root, 'cli.mjs'), 'if (process.argv[2] === "add") { console.log("Added task: " + process.argv[3]); } else { console.error("usage: cli add TITLE"); process.exit(2); }\n');
+  const ran = await observeResult('program', '', 'node cli.mjs add "buy milk"', ctx);
+  assert.equal(ran.ok, true); assert.match(ran.text, /exit 0[\s\S]*Added task: buy milk/);
+  const bad = await observeResult('program', '', 'node cli.mjs', ctx);
+  assert.equal(bad.ok, false); assert.match(bad.text, /^RUN FAILED: .* exit 2[\s\S]*usage: cli add TITLE/);
+  assert.match((await observeResult('radio', '', 'x', ctx)).text, /no observer of kind "radio"; the kinds are page, http, program/);
+});
+
+test('A command-line objective is observed as a program run, and the gate\'s focused reading asks the program observer\'s question, not a page\'s', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  await writeFile(join(root, 'cli.mjs'), 'console.log("3 tasks");\n');
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'check and run it', action: 'plan', batch: [{ action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } }, { action: 'observe', args: { kind: 'program', start: '', target: 'node cli.mjs list' } }] },
+    { thought: 'done', action: 'finish', args: { summary: 'a task CLI' } },
+  ] });
+  const questions: string[] = [];
+  const base = jevOf({ gate: { implementation_matches_request: .8, claim_supported: .9, verification_needed: 'semantic_review', weakest_evidence: 'observation', focus: .7 } as any });
+  const jev = { decide: async (st: any, q: any, c: any) => { if (c.phase === 'evidence-focus') questions.push(q.evidence_shows_done.instructions); return base.decide(st, q, c); } };
+  const result = await new Agent({ ...config, maxSteps: 3 }, store, jev as any, bonsai, root, () => {}, () => {}).run(await newSession(root, 'A command-line task manager'));
+  assert.equal(result.lastObservation?.kind, 'program'); assert.match(result.lastObservation!.text, /3 tasks/);
+  assert.equal(result.status, 'complete', result.stopReason);
+  const { describeObserver } = await import('../src/observe-catalog.js');
+  assert.deepEqual(questions, [describeObserver('program')!.question]);
+});
+
+test('The loop and the gate know observations, not pages: no web vocabulary in agent.ts or control.ts', async () => {
+  for (const f of ['agent.ts', 'control.ts']) {
+    const code = (await readFile(new URL(`../../src/${f}`, import.meta.url), 'utf8')).split('\n').filter(l => !/^\s*\/\//.test(l)).join('\n');
+    const hits = code.match(/\b(?:render(?:ed|s)?|pages?|css|scss|stylesheets?|browsers?|html|class ?names?|styl(?:ed|ing))\b/gi) ?? [];
+    assert.deepEqual(hits, [], `${f} names ${[...new Set(hits)].join(', ')}: that belongs in an observer or a profile`);
+  }
+});
+
+test('A created file whose relative import names a module that does not exist is told so at once, in any language; packages and existing modules are not', async t => {
+  const { missingRelativeModules } = await import('../src/profiles.js');
+  const files: Record<string, string> = { 'src/components/Button.tsx': 'export const Button = () => null;\n', 'app/models.py': 'class Task: pass\n' };
+  const read = async (p: string) => files[p] ?? null;
+  const tsx = 'import { useState } from "react";\nimport "./Hero.css";\nimport { Button } from "./Button";\nexport const Hero = () => null;\n';
+  assert.deepEqual(await missingRelativeModules('src/components/Hero.tsx', tsx, read), ['src/components/Hero.tsx imports ./Hero.css, which does not exist yet (no src/components/Hero.css): the build fails until it does']);
+  assert.deepEqual(await missingRelativeModules('app/cli.py', 'from .models import Task\nfrom .store import Store\nimport json\n', read), ['app/cli.py imports .store, which does not exist yet (no app/store.py, app/store/__init__.py): the build fails until it does']);
+  // In the loop: the fact lands on the creation result.
+  const { root, store } = await repo(t);
+  const bonsai = bonsaiOf({ steps: [{ thought: 'hero', action: 'create_file', args: { path: 'src/Hero.tsx', purpose: 'hero' } }], files: { 'src/Hero.tsx': 'import "./Hero.css";\nexport const Hero = () => null;\n' } });
+  const result = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.match(result.entries.find(e => e.kind === 'create_file')!.text, /Harness: src\/Hero\.tsx imports \.\/Hero\.css, which does not exist yet/);
+});
+
+test('A shell command that turns out to be a server (announces a local address, then goes quiet) is stopped within seconds and pointed at observe; a busy command or a check is not', async t => {
+  const { root } = await repo(t);
+  const { ToolBox } = await import('../src/tools.js');
+  const tools = new ToolBox(root, join(root, '.art'), { ...config, commandTimeoutMs: 30000 }, async () => '');
+  await writeFile(join(root, 'dev.mjs'), 'console.log("  VITE ready\\n  Local:   http://localhost:5173/"); setInterval(() => {}, 1000);\n');
+  const t0 = Date.now();
+  const server = await tools.execute('bash', { command: 'node dev.mjs', purpose: 'start', check: false });
+  assert(Date.now() - t0 < 12000, `stopped early (${Date.now() - t0} ms), not at the 30 s timeout`);
+  assert.equal(server.ok, false); assert.match(server.text, /^\{"command":"node dev\.mjs","purpose":"start","stoppedEarly":"This command is a server: it announced http:\/\/localhost:5173\/ .*use observe with start set to this command/);
+  // A command that prints an address but keeps working and then exits (a test run with a server inside) runs to its end.
+  await writeFile(join(root, 'busy.mjs'), 'console.log("listening on http://127.0.0.1:4000"); let n = 0; const i = setInterval(() => { console.log("test " + ++n); if (n === 8) { clearInterval(i); console.log("8 passed"); } }, 900);\n');
+  const busy = await tools.execute('bash', { command: 'node busy.mjs', purpose: 'tests', check: false });
+  assert.equal(busy.ok, true); assert.match(busy.text, /8 passed/); assert.doesNotMatch(busy.text, /stoppedEarly/);
+  // The check is never cut short this way.
+  const quick = new ToolBox(root, join(root, '.art'), { ...config, commandTimeoutMs: 7000 }, async () => '');
+  const check = await quick.execute('bash', { command: 'node dev.mjs', purpose: 'check', check: true });
+  assert.doesNotMatch(check.text, /stoppedEarly/); assert.match(check.text, /"timedOut":true/);
+});
+
+test('After edits, the last check\'s diagnostics about the edited files are withheld and its evidence is marked stale; errors in untouched files stay', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'a.ts'), 'export const a: number = "x";\n'); await writeFile(join(root, 'src', 'b.ts'), 'export const b: number = "y";\n');
+  await writeFile(join(root, 'check.mjs'), 'console.log("src/a.ts(1,14): error TS2322: Type string is not assignable to type number.\\nsrc/b.ts(1,14): error TS2322: Type string is not assignable to type number."); process.exit(2);\n');
+  const prompts: Message[][] = [];
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+    { thought: 'fix a', action: 'rewrite_file', args: { path: 'src/a.ts', purpose: 'a is a number' } },
+    { thought: 'next', action: 'bash', args: { command: 'echo next', purpose: 'look', check: false } },
+  ], files: { 'src/a.ts': 'export const a: number = 1;\n' } });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); } };
+  await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const tail = (m: Message[]) => Object.assign({}, ...m.slice(-2).map(x => JSON.parse(x.content)));
+  const before = tail(prompts[1]!).verification; const after = tail(prompts[2]!).verification;
+  assert(before.output && Object.keys(before.files).length === 2, 'right after the check: its output and both files');
+  assert.deepEqual(Object.keys(after.files), ['src/b.ts'], 'errors in the untouched file stay; those about the edited one are withheld');
+  assert.equal(after.output, undefined); assert.match(after.outputWithheld, /files were edited after this check ran \(src\/a\.ts\)/);
+  const stale = tail(prompts[2]!).staleEvidence as Record<string, string>;
+  assert(Object.values(stale).some(v => /files edited since this check \(src\/a\.ts\)/.test(v)), JSON.stringify(stale));
+});
+
 test('A stuck streak sets its reasoning aside and keeps its results: the turns of the no-progress steps leave the prompt, the worker is told', async t => {
   const { root, store } = await repo(t);
   const prompts: Message[][] = [];
@@ -656,16 +756,16 @@ test('A broken render blocks completion: the harness does not propose it, and a 
   const port = 40000 + Math.floor(Math.random() * 20000);
   const serve = `node -e "const h=require('http');const fs=require('fs');h.createServer((q,r)=>{r.writeHead(200,{'content-type':'text/html'});r.end(fs.readFileSync('index.html'))}).listen(${port})"`;
   const bonsai = bonsaiOf({ steps: [
-    { thought: 'check and render', action: 'plan', batch: [{ action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } }, { action: 'render', args: { serve, url: `http://127.0.0.1:${port}/` } }] },
+    { thought: 'check and render', action: 'plan', batch: [{ action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } }, { action: 'observe', args: { kind: 'page', start: serve, target: `http://127.0.0.1:${port}/` } }] },
     { thought: 'claim it anyway', action: 'finish', args: { summary: 'done' } },
   ] });
   const jev = jevOf({ watch: () => ({ objective_satisfied: .9 }), gate: { implementation_matches_request: .15, verification_needed: 'human' } });
   const result = await new Agent({ ...config, maxSteps: 3 }, store, jev, bonsai, root, () => {}, () => {}).run(await newSession(root, 'A page that says hello'));
   const ev = await events(store);
-  assert(!ev.some(e => e.type === 'auto-finish'), 'no proposal while the last render is broken, whatever Jev reads');
-  const completion = ev.find(e => e.type === 'completion')!; assert.equal(completion.data.accepted, false); assert.equal(completion.data.route, 'rejected'); assert.match(completion.data.reason, /render .* failed/);
+  assert(!ev.some(e => e.type === 'auto-finish'), 'no proposal while the last observation failed, whatever Jev reads');
+  const completion = ev.find(e => e.type === 'completion')!; assert.equal(completion.data.accepted, false); assert.equal(completion.data.route, 'rejected'); assert.match(completion.data.reason, /observation \(page .*\) failed/);
   assert.equal(result.status, 'paused'); assert.match(result.stopReason, /step limit/, 'the worker keeps working; nothing was sent to the user');
-  assert(result.completionFeedback && /render/.test(result.completionFeedback.text));
+  assert(result.completionFeedback && /observation/.test(result.completionFeedback.text));
 });
 
 test('The render reports styling as facts, never as a failure: class names no CSS selector matches are named; the browser\'s own favicon request does not fail it', async t => {
@@ -758,9 +858,9 @@ test('A render that finds class names no selector matches lists every one by the
   await writeFile(join(root, 'index.html'), '<!doctype html><html><head><title>T</title><style>body{margin:0}</style></head><body><section class="hero"><h1 class="hero__title">Title here</h1></section><div class="card card--wide">Card body text</div><p class="note">A note that is long enough</p></body></html>');
   const port = 40000 + Math.floor(Math.random() * 20000);
   const serve = `node -e "const h=require('http');const fs=require('fs');h.createServer((q,r)=>{r.writeHead(200,{'content-type':'text/html'});r.end(fs.readFileSync('index.html'))}).listen(${port})"`;
-  const bonsai = bonsaiOf({ steps: [{ thought: 'look', action: 'render', args: { serve, url: `http://127.0.0.1:${port}/` } }] });
+  const bonsai = bonsaiOf({ steps: [{ thought: 'look', action: 'observe', args: { kind: 'page', start: serve, target: `http://127.0.0.1:${port}/` } }] });
   const result = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
-  const e = result.entries.find(x => x.kind === 'render')!;
+  const e = result.entries.find(x => x.kind === 'observe')!;
   assert.match(e.text, /src\/Hero\.tsx: hero hero__title/); assert.match(e.text, /src\/Card\.tsx: card card--wide/); assert.match(e.text, /Stylesheets in the project: src\/index\.css/);
 });
 

@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { builtinModules } from 'node:module';
 import type { CheckSummary, Config, Route, SourceEvidence, ToolResult } from './types.js';
 import { clip } from './context.js';
+import { localAddresses } from './serve.js';
 // The first 16 hex digits (64 bits) of SHA-256: enough to tell one version of a
 // file from another in a session, and a quarter of the tokens every prompt pays for.
 export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -444,7 +445,7 @@ export async function safePath(root: string, name: string, create = false): Prom
     }
   }
 }
-export async function runCommand(command: string, args: string[], cwd: string, timeout: number, limit = 1024 * 1024): Promise<{ output: string; code: number | null; truncated: boolean; timedOut: boolean }> {
+export async function runCommand(command: string, args: string[], cwd: string, timeout: number, limit = 1024 * 1024, settle?: (output: string, quietMs: number) => string | null): Promise<{ stoppedEarly?: string; output: string; code: number | null; truncated: boolean; timedOut: boolean }> {
   return new Promise((resolveResult, reject) => {
     const env: NodeJS.ProcessEnv = {};
     for (const key of ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM'])
@@ -453,16 +454,19 @@ export async function runCommand(command: string, args: string[], cwd: string, t
     // continuous integration tells them, and npm's own prompts are pre-answered.
     Object.assign(env, { CI: '1', FORCE_COLOR: '0', npm_config_yes: 'true', DEBIAN_FRONTEND: 'noninteractive' });
     const child = spawn(command, args, { cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
-    const chunks: Buffer[] = []; let size = 0; let truncated = false; let timedOut = false;
+    const chunks: Buffer[] = []; let size = 0; let truncated = false; let timedOut = false; let lastOutput = Date.now(); let stoppedEarly: string | undefined;
     const kill = () => {
       if (!child.pid) return;
       try { if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { /* already exited */ }
     };
     const timer = setTimeout(() => { timedOut = true; kill(); }, timeout);
+    // A command can say it has become something that will not exit (a server): settle decides from its output and how long it has been quiet.
+    const watch = settle ? setInterval(() => { const why = settle(Buffer.concat(chunks).toString('utf8'), Date.now() - lastOutput); if (why) { stoppedEarly = why; kill(); } }, 1000) : null;
     const collect = (data: Buffer) => {
       const room = Math.max(0, limit - size);
       if (room) { const part = data.subarray(0, room); chunks.push(part); size += part.length; }
       if (data.length > room) { truncated = true; kill(); }
+      lastOutput = Date.now();
     };
     child.stdout.on('data', collect); child.stderr.on('data', collect);
     child.on('error', (e: NodeJS.ErrnoException) => {
@@ -472,8 +476,8 @@ export async function runCommand(command: string, args: string[], cwd: string, t
         : e);
     });
     child.on('close', code => {
-      clearTimeout(timer); kill();
-      resolveResult({ output: Buffer.concat(chunks).toString('utf8'), code, truncated, timedOut });
+      clearTimeout(timer); if (watch) clearInterval(watch); kill();
+      resolveResult({ output: Buffer.concat(chunks).toString('utf8'), code, truncated, timedOut, ...(stoppedEarly ? { stoppedEarly } : {}) });
     });
   });
 }
@@ -732,13 +736,16 @@ export class ToolBox {
       // Preserve failures hidden by commands such as `pnpm test 2>&1 | tail`.
       // Without pipefail, the tail process masks the test runner's exit code.
       const prefix = this.commandPrefix ? await this.commandPrefix().catch(() => '') : '';
-      const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', `${prefix}${a.command}`], this.root, this.config.commandTimeoutMs);
+      // A command that announces a local address and then goes quiet while still running is a
+      // server: a shell step cannot keep it alive, so it is stopped and said to be one. Never a check.
+      const settle = a.check === true ? undefined : (output: string, quietMs: number) => { const at = localAddresses(output); return at.length && quietMs >= 5000 ? `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.` : null; };
+      const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', `${prefix}${a.command}`], this.root, this.config.commandTimeoutMs, undefined, settle);
       // With a configured check command, only that command is verification; the
       // command words of the profiles are a fallback for sessions that did not declare one.
       // A command is verification when the worker says so, or when it is the configured check; never by its words.
       const looksLikeCheck = a.check === true || Boolean(this.config.checkCommand && a.command.trim() === this.config.checkCommand.trim());
       return { ok: r.code === 0 && !r.truncated && !r.timedOut, check: looksLikeCheck && r.code === 0 && !r.truncated && !r.timedOut, verification: looksLikeCheck,
-        text: JSON.stringify({ command: a.command, purpose: a.purpose, ...r }) };
+        text: JSON.stringify({ command: a.command, purpose: a.purpose, ...(r.stoppedEarly ? { stoppedEarly: r.stoppedEarly } : {}), ...r }) };
     }
     throw new Error(`Not an executable filesystem tool: ${route}`);
   }

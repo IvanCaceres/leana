@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults };
-import { Bonsai, Jev, loopingLineStart, periodicStart, postJson, requestTimeoutMs, repetitionStart, validateAnswers } from '../src/clients.js';
+import { Bonsai, Jev, cyclingLine, lineCut, periodic, periodicStart, postJson, requestTimeoutMs, repetitionStart, validateAnswers } from '../src/clients.js';
 import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds } from '../src/context.js';
 import { namedFiles, pinReferences, referenceContext } from '../src/references.js';
 import { objectiveClauses } from '../src/control.js';
@@ -223,23 +223,56 @@ test('A generation request is allowed the time to process a cold prompt, and a b
   assert.equal(requestTimeoutMs(0, 1024, 35), 60000 + 59000, 'a continuation, whose prompt is cached, gets decode time only');
   assert.equal(requestTimeoutMs(0, 1024, 123), requestTimeoutMs(0, 1024, 60), 'a measured 123 tok/s from accepted drafts counts as 60');
 });
-test('loopingLineStart catches a loop inside one line whose values drift, which no exact cycle finds, and leaves real long lines alone', () => {
-  // The shape of react-demo-24's Footer: an icon path that fell into a cycle whose signs and digits drift, so it never repeats exactly.
-  const unit = ['.28', '.57', '.85', '.27', '.48', '.21', '.56', '.79', '.31', '.8', '.23', '.37', '.11', '.16'];
-  // A cycle whose signs drop out at random, 2% of the time: never exact, as in the recorded loop.
-  let s0 = 7; const r0 = () => (s0 = (s0 * 48271) % 2147483647) / 2147483647;
-  let drift = ''; for (let i = 0; drift.length < 6000; i++) drift += `${r0() < .02 ? '' : '-'}${unit[i % unit.length]}`;
-  const looping = `      <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.7 9.8 8.9 11.18${drift}`;
-  assert.equal(periodicStart(looping), -1, 'no exact cycle: the old check misses it');
-  assert.equal(loopingLineStart(looping), 0, 'cut at the start of the looping line');
-  assert.equal(loopingLineStart(`const a = 1;\n${looping}`), 13);
-  // Real long lines: a varied path, a data array, minified code.
+// Recorded generations of this model (fixtures/cycling): in-line loops as the chunk that showed them ended, and a Footer that finished normally.
+const cycling = new URL('../../test/fixtures/cycling/', import.meta.url).pathname;
+const cyclingMeta = JSON.parse(readFileSync(`${cycling}meta.json`, 'utf8')) as { loops: { file: string; id: string; tokens: number; previousBoundaryChars: number; cutAt: number }[]; legit: { file: string; why: string }[] };
+const cyclingStart = (text: string) => cyclingLine(text)?.start ?? -1;
+test('cyclingLine cuts each recorded in-line loop at the start of its line, at the first 1024-token chunk that shows the cycle over 3,000 characters', () => {
+  for (const l of cyclingMeta.loops) {
+    const text = readFileSync(`${cycling}loops/${l.file}`, 'utf8');
+    assert.equal(cyclingStart(text), l.cutAt, `${l.id} at ${l.tokens} tokens`);
+    assert.equal(text[l.cutAt - 1], '\n', `${l.id}: the cut is a line start`);
+    assert.equal(cyclingStart(text.slice(0, l.previousBoundaryChars)), -1, `${l.id} one chunk earlier: not yet a cycle over 3,000 characters`);
+  }
+  const footer = readFileSync(`${cycling}loops/react-demo-54-step14.txt`, 'utf8');
+  assert.equal(footer.slice(0, 3845).split('\n').length, 99);
+  assert.equal(cyclingLine(footer)!.unit, 888, 'run 54 Footer line 99 repeats one 888-character unit');
+  for (const f of cyclingMeta.legit) {
+    const text = readFileSync(`${cycling}legit/${f.file}`, 'utf8');
+    for (let e = 64; e <= text.length; e += 16) assert.equal(cyclingStart(text.slice(0, e)), -1, `${f.file} (${f.why}) at ${e}`);
+  }
+});
+test('a periodic run is cut at the start of its line, and the cut reports the line, its opening, its uncut length and the unit', () => {
+  // Run 54 step 13 as generated: periodicStart fired mid-line and left 2,172 characters of line 99 in the file, which every later rewrite copied back into the loop.
+  const body = readFileSync(`${cycling}loops/react-demo-54-step13-uncut.txt`, 'utf8');
+  const hit = periodic(body)!; assert.equal(hit.start, 6017); assert.equal(hit.unit, 118);
+  const { kept, cut } = lineCut(body, hit.start, 'cycle', hit.unit);
+  assert.equal(kept.length, 3845); assert(kept.endsWith('\n'));
+  assert.deepEqual({ line: cut.line, lineChars: cut.lineChars, unit: cut.unit }, { line: 99, lineChars: 4039, unit: 118 });
+  assert(cut.opening.startsWith('<path d="M12 0c-6.626'), cut.opening);
+  assert.equal(lineCut('a\nbcd', 2, 'cycle').kept, 'a\n', 'a run that starts exactly at a line start keeps the lines before it');
+  assert.equal(lineCut('abc', 1, 'cycle').kept, '', 'a run in the first line keeps nothing');
+});
+test('cyclingLine: the rule on synthetic lines, and real long lines it leaves alone', () => {
   let seed = 7; const rnd = () => (seed = (seed * 48271) % 2147483647) / 2147483647;
-  const path = 'd="' + Array.from({ length: 700 }, () => `l${(rnd() * 40 - 20).toFixed(2)} ${(rnd() * 40 - 20).toFixed(2)}`).join('') + '"';
+  const num = () => (rnd() * 20 - 10).toFixed(3);
+  const unit = Array.from({ length: 66 }, () => `${num()} ${num()}`).join('c'); // ~870 characters, no inner period
+  const head = '      <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.7 9.8 8.9 11.18';
+  const looping = head + unit.repeat(4);
+  assert.equal(cyclingStart(looping), 0, 'a unit repeated verbatim, ~3,500 characters: cut at the line start');
+  assert.equal(cyclingStart(`const a = 1;\n${looping}`), 13);
+  assert.equal(cyclingStart(head + unit + unit.slice(0, 700)), -1, 'less than two full copies is not yet a cycle');
+  const filler = Array.from({ length: 90 }, () => `${num()} ${num()}`).join('l'); // ~1,200 varied characters
+  assert.equal(cyclingStart(head + filler + unit.repeat(3)), -1, 'three copies of ~870 characters (~2,600) are under the 3,000-character span');
+  assert.equal(cyclingStart(head + filler + unit.repeat(4)), 0, 'four copies (~3,500) are a cycle');
+  assert.equal(cyclingStart(`${looping}\n  </svg>`), -1, 'a line that ended is not judged');
+  const big = Array.from({ length: 170 }, () => `${num()} ${num()}`).join('c'); // ~2,300 characters
+  assert.equal(cyclingStart(head + big + big), -1, 'a unit longer than 2,000 characters is not looked for');
+  const varied = 'd="' + Array.from({ length: 700 }, () => `l${num()} ${num()}`).join('') + '"';
   const data = JSON.stringify(Array.from({ length: 300 }, (_, i) => ({ id: i, name: `item-${Math.floor(rnd() * 1e6)}`, score: +(rnd() * 100).toFixed(3) })));
   const minified = Array.from({ length: 400 }, (_, i) => `function f${i}(a,b){return a${['+', '*', '-'][i % 3]}b*${Math.floor(rnd() * 1000)}}`).join(';');
-  for (const honest of [path, data, minified]) assert.equal(loopingLineStart(honest), -1, honest.slice(0, 40));
-  assert.equal(loopingLineStart(looping.slice(0, 2500)), -1, 'a line shorter than the window is not judged');
+  const classes = `<div className="${Array.from({ length: 300 }, (_, i) => ['flex', 'items-center', `gap-${i % 12}`, `md:px-${i % 9}`, 'hover:bg-slate-100'][i % 5]).join(' ')}">`;
+  for (const honest of [varied, data, minified, classes]) assert.equal(cyclingStart(honest), -1, honest.slice(0, 40));
 });
 test('generateText continues by token ids with the fence prefilled, stops on the closing fence, cuts a loop, and repairs a broken character', async t => {
   // A mock llama-server: tokens are character codes; /completion replies from a script and records the prompts it received.
@@ -267,24 +300,43 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   script = [{ content: `const b = 2;\n${loop}\n`, stop_type: 'limit' }];
   const r = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
   assert.equal(r.finish, 'repetition'); assert(r.text.startsWith('const b = 2;\n<div className="feature">')); assert(r.text.split('\n').length < 12, 'cut at the first repeat'); assert.equal(script.length, 0);
-  // A chunk that loops inside one line is cut where the cycle starts, reported as repetition, not continued.
+  assert.equal(r.cut?.kind, 'lines'); assert(r.text.endsWith('\n'), 'whole lines only');
+  // A chunk that loops inside one line is cut at the start of that line, reported as repetition, not continued.
   script = [{ content: `const c = <path d="M0 0${' 0 0.267 0 0.4 0 0.133'.repeat(60)}`, stop_type: 'limit' }];
   const p = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
-  assert.equal(p.finish, 'repetition'); assert(p.text.length < 60, p.text); assert.equal(script.length, 0);
-  // A chunk that loops inside one line with drifting values is cut at the start of that line.
-  const unit = ['.28', '.57', '.85', '.27', '.48', '.21', '.56', '.79', '.31', '.8', '.23', '.37', '.11', '.16'];
+  assert.equal(p.finish, 'repetition'); assert.equal(p.text, '', 'the looping line never reaches the file'); assert.equal(script.length, 0);
+  assert.deepEqual({ kind: p.cut?.kind, line: p.cut?.line, unit: p.cut?.unit }, { kind: 'cycle', line: 1, unit: 22 });
+  // A long unit (as recorded: 19 to 1,875 characters) repeated verbatim over 3,000 characters is cut at the start of its line.
   let s1 = 7; const r1 = () => (s1 = (s1 * 48271) % 2147483647) / 2147483647;
-  let drift = ''; for (let i = 0; drift.length < 4000; i++) drift += `${r1() < .02 ? '' : '-'}${unit[i % unit.length]}`;
-  script = [{ content: `const d = 1;\n<path d="M0 0${drift}`, stop_type: 'limit' }];
+  const unit = Array.from({ length: 66 }, () => `${(r1() * 20 - 10).toFixed(3)} ${(r1() * 20 - 10).toFixed(3)}`).join('c');
+  const drift = `<path d="M0 0${unit.repeat(4)}`;
+  script = [{ content: `const d = 1;\n${drift}`, stop_type: 'limit' }];
   const dl = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
   assert.equal(dl.finish, 'repetition'); assert.equal(dl.text, 'const d = 1;\n'); assert.equal(script.length, 0);
+  assert.equal(dl.cut?.line, 2); assert.equal(dl.cut?.unit, unit.length); assert(dl.cut!.opening.startsWith('<path d="M0 0'));
   // What a cut discards is logged, so the next loop can be measured rather than guessed at.
   const logged: [string, any][] = [];
   const logging = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 }, 'local', async (type, data) => { logged.push([type, data]); });
   script = [{ content: `const d = 1;\n<path d="M0 0${drift}`, stop_type: 'limit' }];
   await logging.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx', context: { step: 7, route: 'create_file' } });
   const cut = logged.find(([type]) => type === 'repetition-cut')![1];
-  assert.equal(cut.step, 7); assert.equal(cut.kept, 13); assert(cut.generated > 4000 && cut.discardedTail.endsWith(drift.slice(-100)));
+  assert.equal(cut.step, 7); assert.equal(cut.kept, 13); assert(cut.generated > 3000 && cut.discardedTail.endsWith(drift.slice(-100))); assert.equal(cut.cut.line, 2);
+  // A chunk that ends inside a character, followed by a looping line: the detectors judge the repaired text, and the cut stays cut.
+  script = [{ content: 'const s = "caf�', stop_type: 'limit', tokens: [...'const s = "caf'].map(c => c.codePointAt(0)!).concat(233) }, { content: `";\n${drift}`, stop_type: 'limit' }];
+  const bc = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
+  assert.equal(bc.finish, 'repetition'); assert.equal(bc.text, 'const s = "café";\n', 'the repair of the broken character does not restore the cut line');
+  // Short lines repeated (closing braces) are found by the periodic check across line ends and reported as repeating lines, not as one line.
+  script = [{ content: `function f() {\n  if (a) {\n${'    }\n'.repeat(200)}`, stop_type: 'limit' }];
+  const ml = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```ts' });
+  assert.equal(ml.finish, 'repetition'); assert.equal(ml.text, 'function f() {\n  if (a) {\n'); assert.equal(ml.cut?.kind, 'lines'); assert.equal(ml.cut?.unit, undefined);
+  // An end-of-generation stop after a repaired character: the end token in the ids is not written into the text.
+  script = [{ content: 'const s = "caf�', stop_type: 'limit', tokens: [...'const s = "caf'].map(c => c.codePointAt(0)!).concat(233) }, { content: '";\nexport default s;\n', stop_type: 'eos', tokens: [...'";\nexport default s;\n'].map(c => c.codePointAt(0)!).concat(151645) }];
+  const eo = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null });
+  assert.equal(eo.text, 'const s = "café";\nexport default s;\n');
+  // A fenced file that reaches the budget inside a line: the unfinished line is left out and reported.
+  script = [{ content: `const a = 1;\nconst b = "${'x'.repeat(60)}`, stop_type: 'limit' }];
+  const bl = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', budgetTokens: 40 });
+  assert.equal(bl.finish, 'length'); assert.equal(bl.text, 'const a = 1;\n'); assert.deepEqual({ kind: bl.cut?.kind, line: bl.cut?.line, lineChars: bl.cut?.lineChars }, { kind: 'budget', line: 2, lineChars: 71 });
   // A chunk ending in a broken character is re-derived from the token ids.
   script = [{ content: 'caf�', stop_type: 'limit', tokens: [99, 97, 102, 233] }, { content: ' au lait', stop_type: 'eos' }];
   const d = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null });
@@ -476,4 +528,15 @@ test('a refused replace_lines states the facts of the edit: the lines it drops, 
   await assert.rejects(tools.execute('replace_lines', { path: 'src/main.tsx', expectedHash: hash(main), edits: [{ start: 1, end: 1, newText: "import { BrowserRouter } from 'react-router-dom'\n" + main.replace(/\n$/, '').replace('<App />', '<BrowserRouter><App /></BrowserRouter>') }] }),
     /already contains[\s\S]*This edit replaces 1 line\(s\) \(1\.\.1\) with 15; the other 13 line\(s\) of src\/main\.tsx stay as they are\. rewrite_file replaces a whole file\.$/);
   assert.equal(await readFile(join(root, 'src', 'main.tsx'), 'utf8'), main, 'nothing was written');
+});
+
+test('Shell command output reaches the harness without colour or hyperlink sequences; content ESC bytes elsewhere are kept', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'leana-plain-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const tools = new ToolBox(dir, join(dir, '.leana'), { ...defaults, allowBash: true });
+  const r = await tools.execute('bash', { command: `printf '\\033[96msrc/a.ts\\033[0m:\\033[93m3\\033[0m - \\033]8;;http://x\\007link\\033]8;;\\007 \\033[2K%s\\n' "$NO_COLOR"`, purpose: 'print', check: false });
+  assert.equal(JSON.parse(r.text).output, 'src/a.ts:3 - link 1\n', 'NO_COLOR is set, and colour, erase and hyperlink sequences are gone');
+  const raw = await runCommand('bash', ['-c', `printf 'RESET = "\\033c"\\n'`], dir, 10000);
+  assert.equal(raw.output, 'RESET = "\u001bc"\n', 'a command run for its content (a search, a program) keeps its bytes');
+  const { plainText } = await import('../src/tools.js');
+  assert.equal(plainText('SAVE = "\u001b7"; RED = "\u001b[31m"'), 'SAVE = "\u001b7"; RED = ""', 'only CSI and OSC sequences are removed');
 });

@@ -120,6 +120,11 @@ export interface Session {
   currentTurn?: string | null; trail?: string[];
   watch?: { noProgress: number; readings: { step: number; progress: number; stuck: number; sameFailure: number; objective: number; needsUser: number; inScope?: number }[]; escalations: number };
   blockedActions?: string[];
+  // The last run of each edit the worker asked for, by its exact arguments (file hash
+  // included), recorded after it ran: its step, whether it succeeded, the expectedHash it
+  // carried, and the target files' hashes before and after it. An edit run again with the
+  // same arguments on files as that run left them is known to repeat what it did.
+  attempts?: Record<string, EditAttempt>;
   // The last observation of the result as its user meets it (a page, a service, a program run), as facts.
   lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string };
   // The actions this session may take, fixed at its start so the pinned block never changes.
@@ -154,8 +159,11 @@ export type JsonSchema = {
   items?: JsonSchema; minItems?: number; maxItems?: number; minLength?: number; maxLength?: number;
   minimum?: number; maximum?: number; enum?: string[];
 };
+export interface EditAttempt { step: number; ok: boolean; exact: string; what: string; sent?: string; error?: string; before: Record<string, string | null>; after: Record<string, string | null> }
 export interface ToolResult { text: string; ok: boolean; changed?: string[]; check?: boolean; verification?: boolean; stale?: boolean; hashes?: Record<string, string>; snapshots?: Record<string, string>;
   // A created file reports what the parser found and what it imports, so the
   // harness can queue a repair and derive the deliverables its imports imply.
-  parseErrors?: string[]; imports?: { spec: string; names: string[] }[] }
+  parseErrors?: string[]; imports?: { spec: string; names: string[] }[];
+  // The arguments as applied when the tool changed them (ranges mapped through earlier edits of the batch).
+  applied?: Record<string, any> }
 export type Log = (type: string, data: unknown) => Promise<void>;

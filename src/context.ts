@@ -122,12 +122,13 @@ export function confidentChoice(a: Answers[string] | undefined, c: Config): stri
 // removal would add a line to the trail (the trail sits before the evidence):
 // an eviction that stays behind a point the prompt already changes at costs
 // no reprocessing of its own.
-export function evictOne(s: Session, from = 0): Entry | undefined {
+// only: the one entry that may be taken (for following a planned order).
+export function evictOne(s: Session, from = 0, only?: string): Entry | undefined {
   retireEvidence(s);
   const hasResults = (turn: Entry) => s.entries.some(e => e.turn === turn.id);
   const protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]);
   const endsTurn = (e: Entry) => e.kind === 'turn' || (e.turn !== undefined && s.entries.some(t => t.kind === 'turn' && t.id === e.turn) && !s.entries.some(x => x !== e && x.turn === e.turn));
-  const candidates = s.entries.filter((e, i) => i >= from && !(from > 0 && endsTurn(e)) && (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
+  const candidates = s.entries.filter((e, i) => (only === undefined || e.id === only) && i >= from && !(from > 0 && endsTurn(e)) && (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
   // Stale entries go first, then the least relevant, then the oldest.
   const candidate = [...candidates].sort((a, b) => Number(Boolean(b.stale)) - Number(Boolean(a.stale)) || a.relevance - b.relevance || a.step - b.step)[0];
   if (!candidate) return undefined;
@@ -135,6 +136,29 @@ export function evictOne(s: Session, from = 0): Entry | undefined {
   const turn = candidate.kind === 'turn' ? candidate : s.entries.find(e => e.kind === 'turn' && e.id === candidate.turn);
   if (turn && !hasResults(turn) && turn.id !== s.currentTurn) { s.entries = s.entries.filter(e => e !== turn); s.trail = [...(s.trail ?? []), trailLine(turn)].sort((a, b) => Number(a.match(/^step (\d+)/)?.[1]) - Number(b.match(/^step (\d+)/)?.[1])).slice(-12); }
   return candidate;
+}
+// The entries the next batched eviction would take, in its order, down to target
+// tokens: evictOne's own global order, run on a copy of the session.
+export function plannedEviction(s: Session, target: number): string[] {
+  const copy = structuredClone(s); const ids: string[] = [];
+  while (evidenceTokens(copy) > target) { const e = evictOne(copy); if (!e) break; ids.push(e.id); }
+  return ids;
+}
+// An eviction that rides on a change the prompt already makes at index at: it
+// takes only the start of the planned order that lies behind that point, and
+// stops at the first planned entry in front of it (or one whose removal would
+// change the trail). So it removes exactly what the next eviction would remove
+// first, never a fresh entry the planned order keeps, and never widens the change.
+export function evictBehind(s: Session, at: number, target: number): Entry[] {
+  const out: Entry[] = [];
+  for (const id of plannedEviction(s, target)) {
+    const i = s.entries.findIndex(e => e.id === id);
+    if (i < 0) continue;
+    if (i < at) break;
+    const e = evictOne(s, at, id); if (!e) break;
+    out.push(e);
+  }
+  return out;
 }
 // Generated content in a turn's arguments is on disk and in the results; the
 // turn keeps what identifies the action (paths, commands, queries, ranges).
@@ -177,7 +201,7 @@ const details: Record<Route, string> = {
   plan: 'notes is the whole of your notes, replaced: a short plan with what is done, what you have learned (versions, commands that work, decisions), and what comes next. Keep it under forty lines.',
   read_files: 'When verification.files names lines in the file being fixed, read around those lines rather than from line 1. Use exact regular repository-relative file paths; globs, directories, and wildcard paths are invalid. Use 1-based inclusive start/end; a read shows as many lines of the range as fit in the read budget (shared across the requested files; the result reports the last line shown), so a long file is read in a few large ranges, or located first with search_codebase and read around the definition; readCoverage shows what was already read, and reading it again yields nothing new. Output is cut at line boundaries within a character budget shared across the requested files and reports the last line shown; continue from the next line in a later read. Use @artifact/NAME to retrieve prior outputs. Read before editing.',
   search_codebase: 'Use a narrow literal query or mode files. Text matches are returned as path:line:text, so a query such as "const DEFAULT_DEPENDENCIES" gives the exact line to read next. searched lists every query already run and what it found; never repeat one, search for the next symbol the objective still needs. The path is a repository-relative directory, usually "."; use "@artifacts" to search archived tool outputs. Do not use search results as read_files paths unless they are exact regular files.',
-  replace_lines: 'Each edit is { start, end, newText, prepend }. To insert lines without replacing any, use end = start - 1: the newText is inserted before line start (start = totalLines + 1 appends); this is how imports are added, never by retyping an existing line. With prepend non-empty (for example "export ") every line in start..end keeps its text and gets that prefix; newText must be "" and nothing is retyped. This is how declarations are exported: one edit per declaration line, all in one call. With prepend "", the range is replaced by newText ("" deletes it). Edits that would leave the file unparseable are refused with the parser message. An error at a line means that line needs fixing in place: a missing import is added at the top of the file, never by overwriting the line that uses the name. The file must have been read since it last changed: expectedHash must equal the sha256 of that read. edits is a list of up to 40 non-overlapping ranges {start, end, newText} (1-based, inclusive) of path, all numbered as in that read, never from a check that ran before the latest edit of the file (verification.writtenSince names the files edited after that check ran); the harness applies them bottom-up so they never shift each other. expectedHash comes from fileHashes. newText may be empty to delete the lines. Only new text is generated, so this is the way to remove many unused import lines in one step (one edit per reported line) or rewrite a region. After it runs, line numbers below the first edit have shifted: re-read before addressing them.',
+  replace_lines: 'Each edit is { start, end, newText, prepend }. To insert lines without replacing any, use end = start - 1: the newText is inserted before line start (start = totalLines + 1 appends); this is how imports are added, never by retyping an existing line. With prepend non-empty (for example "export ") every line in start..end keeps its text and gets that prefix; newText must be "" and nothing is retyped. This is how declarations are exported: one edit per declaration line, all in one call. With prepend "", the range is replaced by newText ("" deletes it). Edits that would leave the file unparseable are refused with the parser message. An error at a line means that line needs fixing in place: a missing import is added at the top of the file, never by overwriting the line that uses the name. The file must have been read since it last changed: expectedHash must equal the sha256 of that read. edits is a list of up to 40 non-overlapping ranges {start, end, newText} (1-based, inclusive) of path, all numbered as in that read, never from a check that ran before the latest edit of the file (verification.writtenSince names the files edited after that check ran); the harness applies them bottom-up so they never shift each other. expectedHash comes from fileHashes. newText may be empty to delete the lines. Only new text is generated, so this is the way to remove many unused import lines in one step (one edit per reported line) or rewrite a region. After it runs, line numbers below the first edit have shifted: its result gives the new sha256 and the lines as they now read. Line numbers are always those of the text whose sha256 is expectedHash: a later edit of the same file in the same batch that carries the same hash is numbered as in that same text, and the harness maps its ranges through the batch\'s earlier edits (the result states old -> new ranges; a range an earlier edit changed is refused with the facts).',
   move_lines: 'Cut lines start..end (1-based, inclusive, at most 2000) from source and append them unchanged to the end of destination; take the numbers from read_files or search_codebase. expectedHash is the current source sha256 from fileHashes; destinationHash is the destination sha256 from fileHashes, or "new" only when the destination does not exist yet. Nothing else is changed in either file: whatever the moved lines need in their new place (imports, exports, references) is yours to add with an edit.',
   create_file: 'path is the repository-relative path of a file that does not exist yet (never an existing file: those are edited with write or replace_lines); purpose says in one sentence what the file must contain. The content itself is not written here: the harness asks for it as code in the next generation.',
   write: 'For a short anchor only (a few lines) in a file that exists: for a region of many lines use replace_lines, and to relocate a block use move_lines. expectedHash must be the current sha256 of the path from fileHashes (the same value the latest read_files or edit result reported). oldText is a small unique anchor (a few consecutive lines) copied exactly from that read; never paste a truncated excerpt or an entire file. newText replaces the anchor and must differ from it. Never overwrite an unread file; a new file is made with create_file.',
@@ -195,16 +219,18 @@ export const fenceFor = (path: string): string => /\.(md|mdx|markdown)$/i.test(p
 export interface FileContract { path: string; importPath: string; status: 'exists' | 'planned'; exports: string[] }
 // A rewritten region that repeats the context lines shown around it is trimmed
 // to the region: the worker's intent is unambiguous, so the output is repaired.
-export function trimContext(output: string, before: string, after: string): string {
+// cut: the output was cut at a loop, so it may consist of nothing but echoed
+// context (every one of its lines may be taken as repeated context).
+export function trimContext(output: string, before: string, after: string, cut = false): string {
   let lines = output.replace(/\n$/, '').split('\n');
   const b = before ? before.split('\n') : []; const a = after ? after.split('\n') : [];
   // A single matching line of brackets or a few characters is ambiguous (the
   // region's own closing brace looks like the context's): only a run of two or
   // more lines, or one substantive line, is taken as repeated context.
   const substantive = (l: string) => l.trim().replace(/[{}()[\];,]/g, '').length >= 8;
-  for (let n = Math.min(b.length, lines.length - 1); n > 0; n--) if (b.slice(-n).every((l, i) => l.trim() === lines[i]!.trim()) && (n >= 2 || substantive(lines[0]!))) { lines = lines.slice(n); break; }
+  for (let n = Math.min(b.length, lines.length - (cut ? 0 : 1)); n > 0; n--) if (b.slice(-n).every((l, i) => l.trim() === lines[i]!.trim()) && (n >= 2 || substantive(lines[0]!))) { lines = lines.slice(n); break; }
   for (let n = Math.min(a.length, lines.length - 1); n > 0; n--) if (a.slice(0, n).every((l, i) => l.trim() === lines[lines.length - n + i]!.trim()) && (n >= 2 || substantive(lines[lines.length - 1]!))) { lines = lines.slice(0, lines.length - n); break; }
-  return `${lines.join('\n')}\n`;
+  return lines.length ? `${lines.join('\n')}\n` : '';
 }
 // Every field of the prompt merged into one object, for inspection and tests.
 export function promptFields(prompt: Message[]): Record<string, any> {
@@ -285,7 +311,8 @@ export function regionMessages(s: Session, path: string, purpose: string, curren
     role: `Write the new content for lines ${start}..${end} of ${path} as code: only those lines, which replace the ones in region (${end < start ? 'an insertion: region is empty' : `${end - start + 1} line(s)`}). Everything outside them stays as it is. The harness has opened the code block; write only the new lines and close the block.`,
     file: path, purpose, lines: `${start}..${end} of ${total}`,
     before: lines.slice(Math.max(0, start - 1 - window), start - 1).join('\n'), region: lines.slice(start - 1, end).join('\n'), after: lines.slice(end, end + window).join('\n'),
-    ...(!shrink && current.length <= 16000 ? { currentContent: current } : {}),
+    // The whole file only when before, region and after do not already show all of it.
+    ...(!shrink && current.length <= 16000 && !(start - 1 - window <= 0 && end + window >= total) ? { currentContent: current } : {}),
     modules: contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
     declaredPackages: declared.slice(0, 60), ...markup,
     rules: [`Write only the new lines ${start}..${end} of ${path}: working code with no placeholders, and nothing from before or after (they stay in the file).`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', 'Write the lines only, then the closing fence; no explanation before or after them.'],

@@ -12,6 +12,26 @@ export const hash = (text: string | Buffer): string => createHash('sha256').upda
 // A write whose target was never read, or was read before it changed. Only this
 // failure class requires a fresh read; other edit failures are argument mistakes.
 export class StaleWriteError extends Error {}
+// One edit that landed, in the numbering of the text it was applied to: lines
+// start..end (end = start - 1: none, an insertion before start) were replaced by
+// count lines; every other line is unchanged and moves by the difference.
+// changes null: the whole text was replaced, so no line of it maps forward.
+export type LineChange = { start: number; end: number; count: number };
+export type EditRecord = { path: string; step: number; route: string; before: string; after: string; changes: LineChange[] | null };
+const describeChange = (c: LineChange) => c.end < c.start ? `inserted ${c.count} line(s) before ${c.start}` : `${c.start}..${c.end} -> ${c.count} line(s)`;
+// Where lines start..end (end = start - 1: the position before start) of a text
+// are after changes numbered in that same text landed; null when a change
+// replaced any of those lines or put lines between them. The arithmetic is the
+// bottom-up application replace_lines does within one call.
+export function mapRange(start: number, end: number, changes: LineChange[]): { start: number; end: number } | null {
+  const insert = end === start - 1; let shift = 0;
+  for (const c of changes) {
+    const cInsert = c.end === c.start - 1; const delta = c.count - (c.end - c.start + 1);
+    if (cInsert ? c.start <= start : c.end < start) shift += delta;
+    else if (insert ? !cInsert && c.start < start : c.start <= end) return null;
+  }
+  return { start: start + shift, end: end + shift };
+}
 // An import or export line the file already has is dropped from an insertion:
 // the intent (have that import) is already met, so the edit is repaired, not
 // refused. Returns the lines to insert and the ones dropped.
@@ -461,6 +481,11 @@ export async function safePath(root: string, name: string, create = false): Prom
     }
   }
 }
+// Colour and hyperlink sequences (CSI, 7- and 8-bit; OSC ended by BEL or ST) a tool
+// printed although no terminal is attached: they carry no fact, and they split a path
+// from its line number. Only these: an ESC that is content (a file shown by cat, a
+// search hit) is left alone.
+export const plainText = (text: string): string => text.replace(/\u001b\[[0-?]*[ -\/]*[@-~]|\u009b[0-?]*[ -\/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '');
 export async function runCommand(command: string, args: string[], cwd: string, timeout: number, limit = 1024 * 1024, settle?: (output: string, quietMs: number) => string | null): Promise<{ stoppedEarly?: string; output: string; code: number | null; truncated: boolean; timedOut: boolean }> {
   return new Promise((resolveResult, reject) => {
     const env: NodeJS.ProcessEnv = {};
@@ -468,7 +493,10 @@ export async function runCommand(command: string, args: string[], cwd: string, t
       if (process.env[key]) env[key] = process.env[key];
     // No terminal is attached: tools that would prompt are told so, the way
     // continuous integration tells them, and npm's own prompts are pre-answered.
-    Object.assign(env, { CI: '1', FORCE_COLOR: '0', npm_config_yes: 'true', DEBIAN_FRONTEND: 'noninteractive' });
+    // NO_COLOR as well as FORCE_COLOR=0: some tools read FORCE_COLOR's presence,
+    // whatever its value, as "force" (TypeScript 6's tsc, picocolors), and NO_COLOR
+    // takes precedence in them.
+    Object.assign(env, { CI: '1', FORCE_COLOR: '0', NO_COLOR: '1', npm_config_yes: 'true', DEBIAN_FRONTEND: 'noninteractive' });
     const child = spawn(command, args, { cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = []; let size = 0; let truncated = false; let timedOut = false; let lastOutput = Date.now(); let stoppedEarly: string | undefined;
     const kill = () => {
@@ -512,8 +540,37 @@ export class ToolBox {
   // What the repository's ecosystem prefixes every command with (its
   // environment's tools on the path), set by the loop from the profiles.
   commandPrefix: (() => Promise<string>) | null = null;
+  // The edits of the running batch, in order (the loop starts a new list per
+  // batch; null records nothing): every action of one batch was named from the
+  // same evidence, so an edit carrying a hash from before an earlier edit of its
+  // batch is numbered as in that text, and the harness knows exactly how it changed.
+  journal: EditRecord[] | null = null;
+  step = 0;
   constructor(readonly root: string, readonly artifacts: string, readonly config: Config,
     readonly snapshot: (path: string, text: string) => Promise<string> = async () => '') {}
+  private record(path: string, route: string, before: string, after: string, changes: LineChange[] | null): void {
+    this.journal?.push({ path, step: this.step, route, before, after, changes });
+  }
+  // The edits of this batch that lead from the text with hash `from` to the
+  // text with hash `to`, or null when the batch's own edits do not account for
+  // the difference (a command, another process, or a read from an earlier turn).
+  private chain(path: string, from: string, to: string): EditRecord[] | null {
+    const out: EditRecord[] = []; let at = from;
+    while (at !== to) {
+      const next = [...(this.journal ?? [])].reverse().find(r => r.path === path && r.before === at && !out.includes(r));
+      if (!next) return null;
+      out.push(next); at = next.after;
+    }
+    return out;
+  }
+  // The stale-hash fact: which earlier edit of this batch changed the file, how,
+  // and what the file is now.
+  private staleFacts(path: string, expected: string, current: string, lineCount: number, why?: string): string {
+    const links = this.chain(path, expected, current);
+    if (!links?.length) return `Stale file hash for ${path}: read the file again and use the sha256 from that result`;
+    const done = links.map(r => `step ${r.step} (${r.route}) ${r.changes ? `replaced ${r.changes.map(describeChange).join(', ')}` : 'replaced the whole file'}, sha256 ${r.before} -> ${r.after}`).join('; then ');
+    return `Stale file hash for ${path}: ${expected} is the text before an earlier edit of this batch: ${done}. ${why ?? ''}${why ? ' ' : ''}${path} is now sha256=${current} totalLines=${lineCount}. One replace_lines call carries several ranges of one file, all numbered as in one read.`;
+  }
   async execute(route: Route, a: Record<string, any>): Promise<ToolResult> {
     if (route === 'read_files') {
       const results: string[] = [];
@@ -590,7 +647,7 @@ export class ToolBox {
       try { original = await boundedRead(path); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
       if (original === null) throw new StaleWriteError(`${a.path} does not exist: write replaces an anchor in an existing file; a new file is made with create_file`);
       if (a.expectedHash === 'new') throw new StaleWriteError(`expectedHash=new is not a hash; ${a.path} exists: read it with read_files and use the returned sha256`);
-      if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.path}: read the file again and use the sha256 from that result`);
+      if (hash(original) !== a.expectedHash) throw new StaleWriteError(this.staleFacts(a.path, a.expectedHash, hash(original), original.split('\n').length));
       const snapshots = { [a.path]: await this.snapshot(a.path, original) };
       const matches = a.oldText ? original.split(a.oldText).length - 1 : 0;
       if (matches === 0) throw new Error('oldText must match exactly once: it was not found in the current file. Copy a small anchor exactly from the latest read_files result of this path; never paste a truncated excerpt');
@@ -616,6 +673,12 @@ export class ToolBox {
         await rename(temp, path);
       } finally { await unlink(temp).catch(() => {}); }
       const updatedHash = hash(updated);
+      // The lines that differ between the text before and after (an anchor that starts or ends
+      // with a line break leaves its neighbouring lines as they were); a whole-file write maps nothing forward.
+      const ol = original.split('\n'); const ul = updated.split('\n'); let pre = 0; while (pre < ol.length && pre < ul.length && ol[pre] === ul[pre]) pre++;
+      let suf = 0; while (suf < ol.length - pre && suf < ul.length - pre && ol[ol.length - 1 - suf] === ul[ul.length - 1 - suf]) suf++;
+      // A region rewrite replaced exactly lines region.start..region.end (end = start - 1: an insertion) with region.lines lines.
+      this.record(a.path, a.region ? 'rewrite_file' : a.wholeFile ? 'rewrite' : 'write', a.expectedHash, updatedHash, a.region ? [{ start: a.region.start, end: Math.max(a.region.end, a.region.start - 1), count: a.region.lines }] : a.wholeFile ? null : [{ start: pre + 1, end: ol.length - suf, count: ul.length - pre - suf }]);
       const anchorLines = String(a.oldText).split('\n').length;
       const notes = [dropped.length ? `Dropped ${dropped.length} import line(s) the file already had.` : '', anchorLines > 6 && !a.wholeFile ? `The anchor was ${anchorLines} lines; replace_lines addresses a block by line number without retyping it.` : ''].filter(Boolean).join(' ');
       return { ok: true, changed: [a.path], hashes: { [a.path]: updatedHash }, snapshots, text: a.region ? `Replaced lines ${a.region.start}..${a.region.end} of ${a.path} with ${a.region.lines} generated line(s); the file now has ${updated.replace(/\n$/, '').split('\n').length} lines; sha256=${updatedHash}.` : a.wholeFile ? `Rewrote ${a.path} (${updated.split('\n').length} lines); sha256=${updatedHash}.` : `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.` };
@@ -624,9 +687,24 @@ export class ToolBox {
       if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
       const path = await safePath(this.root, a.path);
       const original = await boundedRead(path);
-      if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.path}: read the file again and use the sha256 from that result`);
-      const snapshots = { [a.path]: await this.snapshot(a.path, original) };
+      const base = hash(original);
       const lines = original.split('\n');
+      // A hash from before an earlier edit of this batch: the ranges are numbered
+      // as in that text, and the batch's edits say exactly where its lines are now.
+      // Ranges no earlier edit touched are mapped; any other is refused with the facts.
+      let requested = a.edits as { start: number; end: number; newText: string; prepend?: string }[]; let mapped = '';
+      if (base !== a.expectedHash) {
+        const links = this.chain(a.path, a.expectedHash, base);
+        if (!links?.length || links.some(r => !r.changes)) throw new StaleWriteError(this.staleFacts(a.path, a.expectedHash, base, lines.length, links?.length ? 'No range of the earlier text maps into a whole-file replacement.' : undefined));
+        const moved = requested.map(e => { let r: { start: number; end: number } | null = { start: e.start, end: e.end }; for (const l of links) r = r && mapRange(r.start, r.end, l.changes!); return { e, r }; });
+        const hit = moved.filter(m => !m.r);
+        if (hit.length) throw new StaleWriteError(this.staleFacts(a.path, a.expectedHash, base, lines.length, `Range(s) ${hit.map(m => `${m.e.start}..${m.e.end}`).join(', ')} of this edit cover lines that edit changed, so they have no place in the current text.`));
+        requested = moved.map(m => ({ ...m.e, ...m.r! }));
+        mapped = ` The ranges were numbered as in sha256=${a.expectedHash}, the text before step ${links.map(l => l.step).join(', ')} of this batch, and were mapped to the current text: ${moved.map(m => `${m.e.start}..${m.e.end} -> ${m.r!.start}..${m.r!.end}`).join(', ')}.`;
+      }
+      // A refusal after the ranges were mapped states the mapping: its line numbers are the current text's.
+      try {
+      const snapshots = { [a.path]: await this.snapshot(a.path, original) };
       // All ranges refer to the file as read; apply from the bottom up so no
       // edit shifts the line numbers of another. Overlaps are rejected.
       // prepend: prefix every line in the range with the text, keeping the lines
@@ -634,9 +712,11 @@ export class ToolBox {
       // A file ending in a newline splits into a trailing empty element; appending
       // at totalLines + 1 must land before it so the file keeps its final newline.
       const trailing = lines.length > 1 && lines.at(-1) === '';
-      const all = [...a.edits as { start: number; end: number; newText: string; prepend?: string }[]]
+      // At an equal start a replacement is taken before an insertion: inserting before line k
+      // and replacing k..m do not overlap, whatever order they were sent in.
+      const all = [...requested]
         .map(e => trailing && e.end === e.start - 1 && e.start === lines.length + 1 ? { ...e, start: lines.length, end: lines.length - 1 } : e)
-        .sort((x, y) => y.start - x.start);
+        .sort((x, y) => y.start - x.start || Number(x.end === x.start - 1) - Number(y.end === y.start - 1));
       for (const [i, e] of all.entries()) {
         // end = start - 1 is an insertion before start (start = totalLines + 1 appends).
         const insert = e.end === e.start - 1;
@@ -705,7 +785,7 @@ export class ToolBox {
       try {
         const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
         try { await h.writeFile(updated); } finally { await h.close(); }
-        if (hash(await boundedRead(path)) !== a.expectedHash) throw new StaleWriteError('File changed while preparing edit; read it again');
+        if (hash(await boundedRead(path)) !== base) throw new StaleWriteError('File changed while preparing edit; read it again');
         await rename(temp, path);
       } finally { await unlink(temp).catch(() => {}); }
       const summary = edits.map(e => `${e.start}..${e.end}`).reverse().join(', ');
@@ -713,8 +793,10 @@ export class ToolBox {
       const region = hi >= lo && hi - lo < 120 ? `\nThe file now reads, lines ${lo}..${hi}:\n${newLines.slice(lo - 1, hi).map((l, i) => `${lo + i}: ${l}`).join('\n')}` : '';
       const note = [skipped.length ? ` Skipped ${skipped.length} unchanged range(s): ${skipped.map(e => `${e.start}..${e.end}`).reverse().join(', ')}.` : '',
         droppedImports.length ? ` Dropped ${droppedImports.length} import line(s) the file already had.` : '', retypes.length ? ` Note: ${retypes.join('; ')}.` : ''].join('');
-      return { ok: true, changed: [a.path], hashes: { [a.path]: hash(updated) }, snapshots,
-        text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${note} Line numbers below the first edit shifted by ${delta} in total.${region} Run focused validation.` };
+      this.record(a.path, 'replace_lines', base, hash(updated), edits.map(e => ({ start: e.start, end: Math.max(e.end, e.start - 1), count: rendered(e).length })));
+      return { ok: true, changed: [a.path], hashes: { [a.path]: hash(updated) }, snapshots, ...(mapped ? { applied: { ...a, edits: requested } } : {}),
+        text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${mapped}${note} Line numbers below the first edit shifted by ${delta} in total.${region} Run focused validation.` };
+      } catch (e) { if (mapped && e instanceof Error && !(e instanceof StaleWriteError)) e.message = `${e.message}${mapped} Line numbers in this message are those of the current text, sha256=${base}.`; throw e; }
     }
     if (route === 'move_lines') {
       // A plain cut and paste: the lines leave source and are appended to
@@ -726,7 +808,7 @@ export class ToolBox {
       const sourcePath = await safePath(this.root, a.source);
       const destinationPath = await safePath(this.root, a.destination, true);
       const original = await boundedRead(sourcePath);
-      if (hash(original) !== a.expectedHash) throw new StaleWriteError(`Stale file hash for ${a.source}: read the file again and use the sha256 from that result`);
+      if (hash(original) !== a.expectedHash) throw new StaleWriteError(this.staleFacts(a.source, a.expectedHash, hash(original), original.split('\n').length));
       const lines = original.split('\n');
       if (a.end > lines.length) throw new Error(`Range ${a.start}..${a.end} exceeds ${a.source} (${lines.length} lines)`);
       const snapshots: Record<string, string> = { [a.source]: await this.snapshot(a.source, original) };
@@ -751,6 +833,8 @@ export class ToolBox {
         if (hash(await boundedRead(sourcePath)) !== a.expectedHash) throw new StaleWriteError('File changed while preparing edit; read it again');
         await rename(temp, sourcePath);
       } finally { await unlink(temp).catch(() => {}); }
+      this.record(a.source, 'move_lines', a.expectedHash, hash(remaining), [{ start: a.start, end: a.end, count: 0 }]);
+      if (existing !== null) this.record(a.destination, 'move_lines', hash(existing), hash(output), existing === '' ? null : [existing.endsWith('\n') ? { start: existing.split('\n').length, end: existing.split('\n').length - 1, count: a.end - a.start + 1 } : { start: existing.split('\n').length + 1, end: existing.split('\n').length, count: a.end - a.start + 2 }]);
       return { ok: true, changed: [a.source, a.destination], hashes: { [a.source]: hash(remaining), [a.destination]: hash(output) }, snapshots,
         text: `Moved lines ${a.start}..${a.end} (${a.end - a.start + 1} lines) from ${a.source} to the end of ${a.destination}, unchanged; nothing else in either file was changed. ` +
         `${a.source} sha256=${hash(remaining)} totalLines=${remaining.split('\n').length}; ${a.destination} sha256=${hash(output)} totalLines=${output.split('\n').length}.` +
@@ -764,7 +848,8 @@ export class ToolBox {
       // A command that announces a local address and then goes quiet while still running is a
       // server: a shell step cannot keep it alive, so it is stopped and said to be one. Never a check.
       const settle = a.check === true ? undefined : (output: string, quietMs: number) => { const at = localAddresses(output); return at.length && quietMs >= 5000 ? `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.` : null; };
-      const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', `${prefix}${a.command}`], this.root, this.config.commandTimeoutMs, undefined, settle);
+      const ran = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', `${prefix}${a.command}`], this.root, this.config.commandTimeoutMs, undefined, settle);
+      const r = { ...ran, output: plainText(ran.output) };
       // With a configured check command, only that command is verification; the
       // command words of the profiles are a fallback for sessions that did not declare one.
       // A command is verification when the worker says so, or when it is the configured check; never by its words.

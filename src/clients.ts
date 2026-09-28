@@ -1,6 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
-import { deflateRawSync } from 'node:zlib';
 import type { Answers, Config, GenerationMeta, JsonSchema, Log, Message, Questions } from './types.js';
 import { samplingSchema, validate } from './schema.js';
 
@@ -72,7 +71,7 @@ export class Jev {
     }
   }
 }
-export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'repetition' | 'eos'; meta: GenerationMeta }
+export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'repetition' | 'eos'; meta: GenerationMeta; cut?: GenerationCut }
 export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number }
 // Sampling for code. The server's defaults (top_k 20, top_p 0.95) stay; the DRY
 // sampler penalises the verbatim repetition a 1-bit model falls into without
@@ -107,27 +106,51 @@ export function repetitionStart(text: string, tail = 80): number {
 // A generation caught in a loop inside one line (a path, a data array, a
 // string that never closes): the tail is one short unit over and over. Real
 // content does not repeat a unit of 4..200 characters verbatim for 800
-// characters. Returns the index where the repeating run starts, or -1.
-export function periodicStart(text: string, span = 800): number {
-  if (text.length < span) return -1;
+// characters. Returns where the repeating run starts and the unit, or null.
+export function periodic(text: string, span = 800): { start: number; unit: number } | null {
+  if (text.length < span) return null;
   const end = text.length;
   for (let p = 4; p <= 200; p++) {
     let i = end - 1; while (i - p >= 0 && text[i] === text[i - p]) i--;
     const run = end - 1 - i; // characters equal to the character p before them
-    if (run + p >= span && (run + p) / p >= 8) return i + 1;
+    if (run + p >= span && (run + p) / p >= 8) return { start: i + 1, unit: p };
   }
-  return -1;
+  return null;
 }
-// A loop inside one long line whose values drift (an SVG path, a number
-// array): no exact cycle, but the text compresses to almost nothing. The last
-// `window` characters of the current line are compressed; real long lines
-// (minified bundles, source maps, data) stay above 0.057 at 3000 characters,
-// the recorded loops fall to 0.02-0.045. Returns the start of that line, or -1.
-export function loopingLineStart(text: string, window = 3000, threshold = .045): number {
-  const start = text.lastIndexOf('\n') + 1;
-  if (text.length - start < window) return -1;
-  const tail = Buffer.from(text.slice(-window));
-  return deflateRawSync(tail).length / tail.length < threshold ? start : -1;
+export function periodicStart(text: string, span = 800): number { return periodic(text, span)?.start ?? -1; }
+// A loop inside one line with a longer unit: the recorded in-line loops (an SVG
+// path, a number array) drift for a few hundred characters, then repeat one unit
+// of 19 to 1,875 characters verbatim until the budget. The current line ends in
+// two or more verbatim copies of a unit of up to maxPeriod characters, covering
+// span characters. Measured on the recorded loops and 46,000 real long lines
+// (source maps, bundles, data, icon paths, generated code): it catches every
+// recorded in-line loop, and fires on fewer real lines than the deflate-ratio
+// check it replaced; it does cut a real line whose unit of 201..2000 characters
+// repeats verbatim over 3,000 characters (a synthesized tone as a one-line data
+// URI, one paragraph pasted eight times). Returns where the line starts and the
+// unit, or null.
+export function cyclingLine(text: string, maxPeriod = 2000, span = 3000): { start: number; unit: number } | null {
+  const start = text.lastIndexOf('\n') + 1; const end = text.length;
+  if (end - start < span) return null;
+  for (let p = 4; p <= maxPeriod && 2 * p <= end - start; p++) {
+    let i = end - 1; while (i - p >= start && text.charCodeAt(i) === text.charCodeAt(i - p)) i--;
+    const run = end - 1 - i; // characters equal to the character p before them
+    if (run >= p && run + p >= span) return { start, unit: p };
+  }
+  return null;
+}
+// Where a generation was stopped inside a line, and what that line was: the
+// cut is always at the start of the line, so an unfinished or looping line
+// never reaches the file (a rewrite would show it as current content, and the
+// model copies it back into the same loop).
+// opening is the line without its indentation, at most 60 characters (truncated
+// when there is more); kind 'lines' is a repeat of whole lines, 'cycle' one inside
+// a single line, 'budget' an unfinished line at the token budget.
+export interface GenerationCut { kind: 'cycle' | 'lines' | 'budget'; line: number; opening: string; truncated?: true; lineChars: number; unit?: number }
+export function lineCut(body: string, at: number, kind: GenerationCut['kind'], unit?: number): { kept: string; cut: GenerationCut } {
+  const ls = body.lastIndexOf('\n', at - 1) + 1; const le = body.indexOf('\n', ls);
+  const line = body.slice(ls, le < 0 ? body.length : le); const trimmed = line.trimStart();
+  return { kept: body.slice(0, ls), cut: { kind, line: body.slice(0, ls).split('\n').length, opening: trimmed.slice(0, 60), ...(trimmed.length > 60 ? { truncated: true as const } : {}), lineChars: line.length, ...(unit ? { unit } : {}) } };
 }
 // How long one generation request may take: a minute of slack, the prompt to
 // process when it is not cached (the first chunk; a cold 30k-token prompt takes
@@ -225,7 +248,7 @@ export class Bonsai {
     await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking });
     // Chunks are where a loop is checked for; a continuation reuses the cached ids, so a small one costs little.
     const chunk = Math.min(this.config.maxTokens, 1024);
-    let cutFrom = ''; let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = '';
+    let cutFrom = ''; let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = ''; let cut: GenerationCut | undefined; let lastStop = ''; let lastIds: number[] = []; let lastContent = '';
     // The closing fence is the backtick run alone, whatever language opened it.
     const stopWords = fence ? [`\n${fence.match(/^`+/)?.[0] ?? '```'}`] : [];
     try {
@@ -242,6 +265,7 @@ export class Bonsai {
         generated += typeof r.tokens_predicted === 'number' ? r.tokens_predicted : ids.length || n;
         if (r.content.endsWith('�')) broken = true;
         const stop: string = r.stop_type ?? (r.stopped_limit ? 'limit' : r.stopped_word ? 'word' : r.stopped_eos ? 'eos' : 'none');
+        lastStop = stop; lastIds = ids; lastContent = r.content;
         if (stop === 'word' && typeof r.stopping_word === 'string') stoppingWord = r.stopping_word;
         if (r.truncated) { finish = 'length'; break; }
         if (!thoughtClosed) {
@@ -252,26 +276,40 @@ export class Bonsai {
         if (stop === 'eos' && fence && thoughtClosed) { finish = 'eos'; break; }
         if (stop !== 'limit') break;
         // A tail that repeats itself is wrong content, the one case to stop
-        // generating: the text is cut at the first repeat and reported as such.
+        // generating: the text is cut at the start of the line the repeat begins
+        // in and reported as such. The detectors judge the text the ids spell (a
+        // chunk can end inside a character).
+        if (broken && thoughtClosed) { try { text = await this.detokenize(prompt.slice(promptTokens)); broken = text.endsWith('\uFFFD'); } catch { /* keep the concatenation */ } }
         const bodyStart = thinking ? text.indexOf('</think>') + 8 : 0;
-        const uncut = text;
-        const at = thoughtClosed ? repetitionStart(text.slice(bodyStart)) : -1;
-        if (at >= 0) { cutFrom = uncut; const kept = text.slice(bodyStart).split('\n').slice(0, at).join('\n'); text = `${text.slice(0, bodyStart)}${kept}`; finish = 'repetition'; break; }
-        const body = text.slice(bodyStart);
-        const periodic = thoughtClosed ? periodicStart(body) : -1;
-        const inLine = periodic >= 0 ? periodic : thoughtClosed ? loopingLineStart(body) : -1;
-        if (inLine >= 0) { cutFrom = uncut; text = text.slice(0, bodyStart + inLine); finish = 'repetition'; break; }
+        const uncut = text; const body = text.slice(bodyStart);
+        if (thoughtClosed) {
+          // A chunk that still ends inside a character is judged without it; the cut is at a line start anyway.
+          const judged = body.replace(/\uFFFD+$/, '');
+          const at = repetitionStart(judged);
+          // A periodic run whose unit holds a line end repeats whole short lines (closing brackets, blank lines), not one line.
+          const hit = at >= 0 ? { start: at ? judged.split('\n').slice(0, at).join('\n').length + 1 : 0, kind: 'lines' as const, unit: undefined }
+            : (() => { const h = periodic(judged) ?? cyclingLine(judged); return !h ? null : judged.slice(h.start).includes('\n') ? { start: h.start, kind: 'lines' as const, unit: undefined } : { ...h, kind: 'cycle' as const }; })();
+          if (hit) { const c = lineCut(body, hit.start, hit.kind, hit.unit); cutFrom = uncut; text = text.slice(0, bodyStart) + c.kept; cut = c.cut; finish = 'repetition'; break; }
+        }
         if (generated >= budget) { finish = 'length'; break; }
         continuations++;
       }
       // The token ids of a stop on a word include that word; the text never does.
-      if (broken) { try { text = await this.detokenize(prompt.slice(promptTokens)); if (stoppingWord && text.endsWith(stoppingWord)) text = text.slice(0, -stoppingWord.length); } catch { /* keep the concatenation */ } }
+      // Never after a cut: the ids still spell what was cut.
+      if (broken && !cut) { try {
+        text = await this.detokenize(prompt.slice(promptTokens)); if (stoppingWord && text.endsWith(stoppingWord)) text = text.slice(0, -stoppingWord.length);
+        // The ids of an end-of-generation stop include the end token, which the content never shows.
+        if (lastStop === 'eos' && lastIds.length) { const piece = await this.detokenize(lastIds.slice(-1)); if (piece && text.endsWith(piece) && !lastContent.endsWith(piece)) text = text.slice(0, -piece.length); }
+      } catch { /* keep the concatenation */ } }
       if (thinking) text = text.replace(/^[\s\S]*?<\/think>\s*/, '');
+      // A file that reached the budget inside a line: that line is unfinished,
+      // so it is left out like a cut one.
+      if (finish === 'length' && fence && thoughtClosed && !cut && text !== '' && !text.endsWith('\n')) { const c = lineCut(text, text.length, 'budget'); cutFrom = text; text = c.kept; cut = c.cut; }
       this.lastMeta = { ms: performance.now() - start, usage: { prompt_tokens: promptTokens, completion_tokens: generated }, timings, finishReason: finish, promptTokens, continuations };
       // What a loop cut discarded, so the next detector can be measured on real loops.
-      if (finish === 'repetition') await this.log('repetition-cut', { requestId, ...context, kept: text.length, generated: cutFrom.length, discardedTail: cutFrom.slice(-4000) });
+      if (cut) await this.log(finish === 'repetition' ? 'repetition-cut' : 'budget-cut', { requestId, ...context, kept: text.length, generated: cutFrom.length, cut, discardedTail: cutFrom.slice(-4000) });
       await this.log('bonsai', { requestId, ...context, model: this.config.model, ms: this.lastMeta.ms, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, usage: this.lastMeta.usage, timings, finishReason: finish, continuations, raw: true });
-      return { text, finish, meta: this.lastMeta };
+      return { text, finish, meta: this.lastMeta, ...(cut ? { cut } : {}) };
     } catch (e) {
       await this.log('bonsai-error', { requestId, ...context, ms: performance.now() - start, error: (e as Error).message });
       throw e;

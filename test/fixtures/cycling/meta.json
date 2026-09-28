@@ -1,0 +1,68 @@
+{
+ "loops": [
+  {
+   "file": "react-demo-54-step14.txt",
+   "id": "react-demo-54#14",
+   "tokens": 6144,
+   "previousBoundaryChars": 7862,
+   "cutAt": 3845,
+   "generatedTokens": 12001
+  },
+  {
+   "file": "react-demo-54-step23.txt",
+   "id": "react-demo-54#23",
+   "tokens": 5120,
+   "previousBoundaryChars": 6114,
+   "cutAt": 2832,
+   "generatedTokens": 12001
+  },
+  {
+   "file": "react-demo-42-step26.txt",
+   "id": "react-demo-42#26",
+   "tokens": 4096,
+   "previousBoundaryChars": 3657,
+   "cutAt": 112,
+   "generatedTokens": 12001
+  },
+  {
+   "file": "react-demo-51-step10.txt",
+   "id": "react-demo-51#10",
+   "tokens": 5120,
+   "previousBoundaryChars": 5632,
+   "cutAt": 1984,
+   "generatedTokens": 12001
+  },
+  {
+   "file": "react-demo-24-step10.txt",
+   "id": "react-demo-24#10",
+   "tokens": 5120,
+   "previousBoundaryChars": 5825,
+   "cutAt": 1326,
+   "generatedTokens": 11823
+  },
+  {
+   "file": "react-demo-13-step17.txt",
+   "id": "react-demo-13#17",
+   "tokens": 5120,
+   "previousBoundaryChars": 4841,
+   "cutAt": 388,
+   "generatedTokens": 12001
+  },
+  {
+   "file": "react-demo-15-step14.txt",
+   "id": "react-demo-15#14",
+   "tokens": 3072,
+   "previousBoundaryChars": 3196,
+   "cutAt": 1122,
+   "generatedTokens": 12000
+  }
+ ],
+ "legit": [
+  {
+   "file": "generated-Footer.tsx.txt",
+   "source": "react-demo-16-0afd8ff577#17:src/components/Footer.tsx",
+   "chars": 7217,
+   "why": "a recorded Footer that finished stop, with the real GitHub icon path"
+  }
+ ]
+}

@@ -26,7 +26,8 @@ export interface Task { id: string; description: string; status: 'pending' | 'do
 // batch, shown back to it as an assistant message; the results of that batch
 // carry its id in turn, and outcomes (never rendered) feed the trail once the
 // group is evicted.
-export interface Entry { id: string; step: number; kind: string; text: string; artifact: string; relevance: number; stale?: string; verification?: boolean; turn?: string; outcomes?: string[] }
+// cites: the entries a harness statement in this entry names (a repeated read's answer).
+export interface Entry { id: string; step: number; kind: string; text: string; artifact: string; relevance: number; stale?: string; verification?: boolean; turn?: string; outcomes?: string[]; cites?: string[] }
 export interface EditEvidence { step: number; route: string; paths: string[]; artifact: string; text: string; applied?: string }
 export interface Session {
   version: 1; root: string; objective: string; instructions: string; step: number;
@@ -131,6 +132,8 @@ export interface Session {
   allowedActions?: string[];
   // Consecutive turns that only read or searched.
   readOnlyTurns?: number;
+  // Consecutive turns that changed nothing: every action refused or repeated what the evidence shows, the notes as they were.
+  unchangedTurns?: number;
 }
 export interface Config {
   baseUrl: string; model: string; contextWindow: number; maxTokens: number;
@@ -143,6 +146,12 @@ export interface Config {
   // mistakes); minP drops every token less likely than minP times the most
   // likely one. Reasoning turns (step) and file content (code) are set apart.
   stepTemperature: number; stepMinP: number; codeTemperature: number; codeMinP: number;
+  // The temperatures of the steps that follow turns which changed nothing (every
+  // action refused or repeated what the evidence shows, notes as they were): the
+  // k-th such turn in a row samples the next step at the k-th value (the last one
+  // from then on), never below stepTemperature; the first turn that changes
+  // something returns to stepTemperature. Empty: always stepTemperature.
+  stepTemperatureEscalation: number[];
   // The verification command. When set, it is run as a baseline before any edit and
   // after every edit; only this command counts as verification.
   checkCommand: string;

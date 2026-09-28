@@ -13,7 +13,7 @@ const noul = (a: Answers[string] | undefined): number => a?.type === 'noul' ? a.
 // The state every watchdog reading is made from: small, literal, the same
 // shape each step, so the readings are comparable across a run.
 export function watchState(s: Session): unknown {
-  const recent = s.entries.filter(e => e.kind !== 'turn').slice(-3).map(e => ({ step: e.step, kind: e.kind, ok: !e.text.startsWith('No action executed') && !/^\{"command"[^}]*"code":[1-9]/.test(e.text), excerpt: clip(e.text, 300) }));
+  const recent = s.entries.filter(e => e.kind !== 'turn').slice(-3).map(e => ({ step: e.step, kind: e.kind, ok: e.kind !== 'repeat' && !e.text.startsWith('No action executed') && !/^\{"command"[^}]*"code":[1-9]/.test(e.text), excerpt: clip(e.text, 300) }));
   const previous = s.watch?.readings.at(-1);
   return {
     objective: clip(s.objective, 800), notes: clip(s.notes ?? '', 1200), step: s.step,

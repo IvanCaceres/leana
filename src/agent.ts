@@ -11,7 +11,7 @@ import { editRoutes } from './types.js';
 import type { ProgressEvent } from './display.js';
 import { Store } from './store.js';
 import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot } from './tools.js';
-import { breakIndex, clip, clipEnds, evictBehind, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, type FileContract } from './context.js';
+import { breakIndex, clip, clipEnds, evictBehind, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, shownLines, lineRanges, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
 import { generationFacts, missingRelativeModules, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
@@ -39,6 +39,10 @@ export async function newSession(root: string, objective: string): Promise<Sessi
 type BonsaiLike = Pick<Bonsai, 'count' | 'generate'> & { generateText?: Bonsai['generateText']; lastMeta?: Bonsai['lastMeta'] };
 export class Agent {
   readonly tools: ToolBox; private current = 0;
+  // The entries a harness statement being recorded names (see repeat): kept from supersession and eviction while it is the freshest entry.
+  private citing: string[] = [];
+  // Whether the last refusal was of a request already made (the same arguments on the same state), not a new fact.
+  private duplicate = false;
   constructor(readonly config: Config, readonly store: Store, readonly jev: JevLike, readonly bonsai: BonsaiLike, root: string, readonly log: (line: string) => void, readonly observe: (e: ProgressEvent) => void) {
     this.tools = new ToolBox(root, store.artifacts, config, (path, text) => store.snapshot(this.current, path, text));
     this.tools.commandPrefix = () => shellPrefixFor(root);
@@ -82,11 +86,11 @@ export class Agent {
   // ---- observation: what a tool result does to the session -----------------
   async evidence(s: Session, kind: string, result: ToolResult, args?: Record<string, any>): Promise<void> {
     const artifact = await this.store.artifact(s.step, result.text);
-    const limit = kind === 'read_files' || kind === 'observe' ? this.config.toolChars : kind === 'bash' ? Math.min(this.config.toolChars, 2500) : kind === 'search_codebase' ? Math.min(this.config.toolChars, 1500) : Math.min(this.config.toolChars, 600);
+    const limit = kind === 'repeat' ? result.text.length : kind === 'read_files' || kind === 'observe' ? this.config.toolChars : kind === 'bash' ? Math.min(this.config.toolChars, 2500) : kind === 'search_codebase' ? Math.min(this.config.toolChars, 1500) : Math.min(this.config.toolChars, 600);
     if (kind === 'read_files' && result.ok && args) {
-      for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
+      for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && !this.citing.includes(e.id) && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
     }
-    s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, ...(s.currentTurn ? { turn: s.currentTurn } : {}), text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
+    s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, ...(s.currentTurn ? { turn: s.currentTurn } : {}), ...(this.citing.length ? { cites: [...this.citing] } : {}), text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
     if (result.ok && result.changed?.length && editRoutes.includes(kind as Route)) rememberEdit(s, s.step, kind, result.changed, artifact, result.text, result.applied ?? args);
     if ((kind === 'read_files' || kind === 'search_codebase') && result.ok) s.inspectionCount++;
     if (kind === 'search_codebase' && result.ok && args) {
@@ -250,7 +254,7 @@ export class Agent {
 
   // ---- generation --------------------------------------------------------------
   private async logPrompt(s: Session, route: string, prompt: Message[], tokens: number): Promise<void> {
-    const artifact = await this.store.promptArtifact(s.step, 1, prompt);
+    const artifact = await this.store.promptArtifact(s.step, 1, prompt, route === 'step' ? undefined : route);
     await this.store.log('prompt', { step: s.step, route, tokens, artifact });
     this.observe({ kind: 'context', step: s.step, tokens, workingTokens: this.config.workingTokens, contextWindow: this.config.contextWindow, breakdown: Agent.breakdown(prompt), entries: s.entries.length });
   }
@@ -262,7 +266,7 @@ export class Agent {
   // A prompt is fitted to the working budget by evicting evidence, never swapped for a generic one.
   private async fit(s: Session, build: () => Message[]): Promise<{ prompt: Message[]; tokens: number }> {
     let prompt = build(); let counted = await this.bonsai.count(prompt); let forced = 0; const before = Agent.shape(s);
-    while (counted.tokens > this.config.workingTokens) { for (let i = 0; i < 3; i++) { if (!evictOne(s)) { if (!i) throw new Error('The pinned objective, orientation and notes exceed the working budget'); break; } forced++; } prompt = build(); counted = await this.bonsai.count(prompt); }
+    while (counted.tokens > this.config.workingTokens) { for (let i = 0; i < 3; i++) { if (!evictOne(s, 0, undefined, true)) { if (!i) throw new Error('The pinned objective, orientation and notes exceed the working budget'); break; } forced++; } prompt = build(); counted = await this.bonsai.count(prompt); }
     if (forced) { s.lastCompact = s.step; await this.store.log('compact', { step: s.step, removed: forced, reason: 'hard-budget' }); if (await this.compactBehind(s, before, 'hard-budget')) { prompt = build(); counted = await this.bonsai.count(prompt); } }
     s.lastPromptTokens = counted.tokens;
     return { prompt, tokens: counted.tokens };
@@ -410,11 +414,13 @@ export class Agent {
     this.tools.config.checkCommand = s.lastCheckCommand ?? '';
     const endStep = s.step + this.config.maxSteps;
     let generationFailures = 0;
+    // A new invocation starts from the base temperature, as the four in a row starts from zero.
+    s.unchangedTurns = 0;
     try {
       for (; s.step < endStep;) {
         s.step++; this.current = s.step; s.currentTurn = null;
         this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep });
-        if (this.config.allowBash && await this.retrySetup(s)) { await this.store.save(s); continue; }
+        if (this.config.allowBash && await this.retrySetup(s)) { s.unchangedTurns = 0; await this.store.save(s); continue; }
         // The files the objective names, pinned as read by the harness; a changed one is read and ranked again.
         const pinned = await pinReferences(s, this.tools.root, (query, chunks) => relevance(this.jev, s, query, chunks, 1200)).catch(() => [] as string[]);
         if (pinned.length) await this.store.log('references', { step: s.step, files: pinned, chunks: s.referenceEvidence.filter(e => pinned.includes(e.path)).length });
@@ -462,12 +468,20 @@ export class Agent {
         // ordered list, the harness runs it back to back and stops at the first
         // failure, which is when reasoning is worth paying for again.
         let thought = ''; let batch: { action: Route; args: Record<string, any> }[] = [];
+        // A turn that changed nothing leaves the state as it was: it leaves the prompt, and
+        // only the harness's statements about it are added, so the prompt is (nearly) the one
+        // that produced it, and near-greedy sampling of it returns that turn again (run 58: the
+        // same 196 tokens at steps 54 and 55). Each further step of such a streak is sampled at
+        // the next temperature of the escalation; a turn that changes something ends it.
+        const streak = s.unchangedTurns ?? 0; const escalation = this.config.stepTemperatureEscalation ?? [];
+        const temperature = streak && escalation.length ? Math.max(this.config.stepTemperature, escalation[Math.min(streak, escalation.length) - 1]!) : this.config.stepTemperature;
+        if (temperature !== this.config.stepTemperature) await this.store.log('sampling', { step: s.step, unchangedTurns: streak, temperature });
         try {
           const item = { anyOf: stepSchema.anyOf!.filter(alt => allowed.includes(alt.properties!.action!.const as Route)) };
-          const gen = await this.generateJson(s, 'step', () => stepMessages(s, allowed, notes.join(' ') || undefined), { type: 'object', properties: { thought: { type: 'string' }, actions: { type: 'array', minItems: 1, maxItems: 8, items: item } }, required: ['thought', 'actions'], additionalProperties: false });
+          const gen = await this.generateJson(s, 'step', () => stepMessages(s, allowed, notes.join(' ') || undefined), { type: 'object', properties: { thought: { type: 'string' }, actions: { type: 'array', minItems: 1, maxItems: 8, items: item } }, required: ['thought', 'actions'], additionalProperties: false }, temperature);
           thought = String(gen.thought ?? '').trim(); batch = (gen.actions as any[]).map(a => ({ action: String(a.action) as Route, args: (a.args ?? {}) as Record<string, any> }));
           s.lastThought = thought;
-          await this.store.log('thought', { step: s.step, thought: clip(thought, 2000), actions: batch.map(b => b.action) });
+          await this.store.log('thought', { step: s.step, thought: clip(thought, 2000), actions: batch.map(b => b.action), temperature });
         } catch (e) {
           if (++generationFailures >= 4) throw e;
           const cut = /\(length\)/.test((e as Error).message);
@@ -495,23 +509,34 @@ export class Agent {
         // The batch's edits are recorded from its first action on: a later action of
         // the batch that carries a hash from before one of them is mapped through them.
         this.tools.journal = [];
-        let halted = false;
+        let halted = false; const outcomes: string[] = []; const duplicates: boolean[] = []; const startFailures = generationFailures; const notesBefore: string | undefined = s.notes;
         for (let i = 0; i < batch.length; i++) {
           if (i > 0) { if (s.step >= endStep) break; s.step++; this.current = s.step; this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep }); }
-          const outcome = await this.perform(s, batch[i]!.action, batch[i]!.args, thought);
-          turn.outcomes!.push(`${batch[i]!.action} ${outcome}${outcome === 'failed' || outcome === 'refused' ? `: ${(s.lastError ?? '').split('\n')[0]!.slice(0, 90)}` : ''}`);
-          // A refused action (repeated, blocked, malformed) counts toward the four
-          // in a row that end the attempt; a command that ran and failed is a result.
-          if (outcome === 'ok' || outcome === 'failed') generationFailures = 0;
+          this.duplicate = false; const outcome = await this.perform(s, batch[i]!.action, batch[i]!.args, thought); outcomes.push(outcome); duplicates.push(outcome === 'repeated' || (outcome === 'refused' && this.duplicate));
+          turn.outcomes!.push(`${batch[i]!.action} ${outcome}${outcome === 'failed' || outcome === 'refused' ? `: ${(s.lastError ?? '').split('\n')[0]!.slice(0, 90)}` : outcome === 'repeated' ? `: shown in ${s.entries.at(-1)?.cites?.join(', ') || 'no entry'}` : ''}`);
+          // A refused action (blocked, malformed) counts toward the four in a row that
+          // end the attempt; a command that ran and failed is a result, except after a
+          // repeat in the same turn. A repeated read stops nothing: the batch goes on,
+          // and the turn is judged as a whole below.
+          if ((outcome === 'ok' && !(batch[i]!.action === 'plan' && s.notes === notesBefore)) || outcome === 'failed') generationFailures = 0;
           if (outcome === 'refused' && ++generationFailures >= 4) throw new Error('four actions in a row could not be executed; the session needs a different approach');
           if (outcome === 'stop') { halted = true; break; }
           if ((outcome === 'failed' || outcome === 'refused') && i < batch.length - 1) { const e = s.entries.at(-1); if (e) e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch.slice(i + 1).map(b => b.action).join(', ')}); reason about the result first.`; break; }
         }
         s.currentTurn = null;
-        // A turn whose every action was refused changed nothing and is a template the
-        // worker copies word for word: it leaves the prompt, the refusals stay.
-        if (turn.outcomes!.length && turn.outcomes!.every(o => o.includes('refused'))) { s.entries = s.entries.filter(e => e !== turn); for (const e of s.entries) if (e.turn === turn.id) delete e.turn; }
+        // A turn whose every action was refused or repeated what the evidence shows changed
+        // nothing and is a template the worker copies word for word: it leaves the prompt, the
+        // refusals and the repeats' facts stay. A turn of repeats, and of a failure after them,
+        // counts once toward the four in a row (a refusal among them has counted already).
+        if (outcomes.length && outcomes.every(o => o === 'refused' || o === 'repeated')) { s.entries = s.entries.filter(e => e !== turn); for (const e of s.entries) if (e.turn === turn.id) delete e.turn; }
+        // Judged as a whole, whatever the order: a turn whose repeats came with nothing but
+        // failures and notes counts once from where the turn began (a plan or a failure inside
+        // it does not reset the count).
+        if (outcomes.includes('repeated') && outcomes.every((o, k) => o === 'repeated' || o === 'failed' || (o === 'ok' && batch[k]!.action === 'plan')) && (generationFailures = startFailures + 1) >= 4) throw new Error('four turns in a row could not be executed or only repeated earlier requests; the session needs a different approach');
         if (halted) break;
+        // Changed nothing: no action ran (each was refused or repeated what the evidence shows)
+        // but a plan that left the notes as they were.
+        s.unchangedTurns = outcomes.length && s.notes === notesBefore && outcomes.every((o, k) => duplicates[k] || (o === 'ok' && batch[k]!.action === 'plan')) ? (s.unchangedTurns ?? 0) + 1 : 0;
         s.readOnlyTurns = batch.every(b => b.action === 'read_files' || b.action === 'search_codebase') ? (s.readOnlyTurns ?? 0) + 1 : 0;
         await this.watch(s); await this.store.save(s);
       }
@@ -527,14 +552,14 @@ export class Agent {
 
   // Run one action with every check the harness can make around it. Returns
   // whether it succeeded, failed, or ended the session.
-  private async perform(s: Session, routeIn: Route, argsIn: Record<string, any>, thought: string): Promise<'ok' | 'failed' | 'refused' | 'stop'> {
+  private async perform(s: Session, routeIn: Route, argsIn: Record<string, any>, thought: string): Promise<'ok' | 'failed' | 'refused' | 'repeated' | 'stop'> {
     let route = routeIn; let args = argsIn;
-    const refuse = async (why: string) => { this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.store.log('refused', { step: s.step, route, args, why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); return 'refused' as const; };
+    const refuse = async (why: string, duplicate = false) => { this.duplicate = duplicate; this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.store.log('refused', { step: s.step, route, args, why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); return 'refused' as const; };
     if (route === 'write' && args.expectedHash === 'new' && typeof args.path === 'string' && !(await safePath(this.tools.root, args.path, true).then(f => stat(f)).then(() => true, () => false))) { route = 'create_file'; args = { path: args.path, purpose: thought, content: String(args.newText ?? '') }; }
     const key = Agent.actionKey(s, route, args); const exact = Agent.actionKey(s, route, args, true);
     const what = Agent.describe(route, args);
     // Blocked by exact arguments; a checkpoint from before exact keys blocked by the arguments without the hash.
-    if (s.blockedActions!.includes(exact) || (!s.attempts?.[exact] && s.blockedActions!.includes(key))) return refuse(`this exact ${what} already failed the same way and Jev read the failure as unchanged; it is not run again. Change the approach.`);
+    if (s.blockedActions!.includes(exact) || (!s.attempts?.[exact] && s.blockedActions!.includes(key))) return refuse(`this exact ${what} already failed the same way and Jev read the failure as unchanged; it is not run again. Change the approach.`, true);
     const earlier = s.actions[key];
     const paths = Agent.targets(route, args); const now = paths.length ? await this.diskHashes(paths) : {};
     const prior = paths.length ? s.attempts?.[exact] : undefined;
@@ -554,13 +579,18 @@ export class Agent {
       const files = paths.length > 1 ? 'these files' : paths[0]!;
       if (prior.ok && !same(now, prior.before)) {
         const later = same(now, prior.after) ? [] : Agent.editsSince(s, paths, prior, now);
-        if (later) return refuse(`the ${what} was applied at step ${prior.step} with these same arguments, and ${later.length ? `since then ${files} changed only by ${later.map(a => `the ${a.what} at step ${a.step}`).join(', ')}` : `${files} ${paths.length > 1 ? 'are' : 'is'} as it left them`} (${state(now)}): running it again would apply it a second time. ${shown(prior.step)[0]!.toUpperCase()}${shown(prior.step).slice(1)}.`);
+        if (later) return refuse(`the ${what} was applied at step ${prior.step} with these same arguments, and ${later.length ? `since then ${files} changed only by ${later.map(a => `the ${a.what} at step ${a.step}`).join(', ')}` : `${files} ${paths.length > 1 ? 'are' : 'is'} as it left them`} (${state(now)}): running it again would apply it a second time. ${shown(prior.step)[0]!.toUpperCase()}${shown(prior.step).slice(1)}.`, true);
       }
-      if (!prior.ok && textFailure.test(prior.error ?? '') && same(now, prior.after)) return refuse(`this exact ${what} ran at step ${prior.step} and failed (${clip(prior.error ?? '', 200)}); ${files} ${paths.length > 1 ? 'are' : 'is'} unchanged since (${state(now)}), so the same arguments would fail the same way`);
-    } else if (!paths.length && earlier !== undefined && s.entries.some(e => e.step === earlier && e.kind === route) && !(route === 'read_files' && (args.files as { path: string }[]).some(f => (s.writeSteps[f.path] ?? -1) > earlier)) && route !== 'bash' && route !== 'plan' && route !== 'observe') return refuse(`this ${route} was already done at step ${earlier} and its result is in the evidence; act on it or choose another action`);
+      if (!prior.ok && textFailure.test(prior.error ?? '') && same(now, prior.after)) return refuse(`this exact ${what} ran at step ${prior.step} and failed (${clip(prior.error ?? '', 200)}); ${files} ${paths.length > 1 ? 'are' : 'is'} unchanged since (${state(now)}), so the same arguments would fail the same way`, true);
+    } else if ((route === 'read_files' || route === 'search_codebase') && earlier !== undefined && (route === 'read_files' || s.entries.some(e => e.step === earlier && e.kind === route)) && !(route === 'read_files' && (args.files as { path: string }[]).some(f => (s.writeSteps[f.path] ?? -1) > earlier)) && !(route === 'search_codebase' && (s.lastWriteStep > earlier || s.lastCheckStep > earlier))) {
+      // The same arguments failed then, and nothing they name has changed since: they would fail the same way.
+      const failed = s.entries.find(e => e.step === earlier && e.kind === route && e.text.startsWith('Tool error'));
+      if (failed) return refuse(`this exact ${route} failed at step ${earlier} (${clip(failed.text.split('\n')[0]!.replace(/^Tool error: /, ''), 200)}) and nothing it names has changed since, so it would fail the same way; the error is e${earlier}`, true);
+      return this.repeat(s, route, args, earlier, thought);
+    }
     // A command that succeeded, run again with nothing written or installed since
     // and its output still shown, prints the same thing: it is not run again.
-    if (route === 'bash') { const ran = s.commandRuns?.[String(args.command ?? '').trim()]; if (ran?.ok && ran.world === Agent.world(s) && s.entries.some(e => e.step === ran.step && e.kind === 'bash')) return refuse(`this exact command already ran at step ${ran.step} and nothing has been written or installed since, so it would print the same output, which is in the evidence (e${ran.step}); act on that output or run something different`); }
+    if (route === 'bash') { const ran = s.commandRuns?.[String(args.command ?? '').trim()]; if (ran?.ok && ran.world === Agent.world(s) && s.entries.some(e => e.step === ran.step && e.kind === 'bash')) return refuse(`this exact command already ran at step ${ran.step} and nothing has been written or installed since, so it would print the same output, which is in the evidence (e${ran.step}); act on that output or run something different`, true); }
     s.actions[key] = s.step; const step = s.step;
     const outcome = await this.act(s, route, args, thought);
     // Recorded after it ran, with what it found and what it left; a refusal inside the
@@ -568,8 +598,87 @@ export class Agent {
     if (paths.length && outcome !== 'stop') (s.attempts ??= {})[exact] = { step, ok: outcome === 'ok', exact, what, ...(typeof args.expectedHash === 'string' ? { sent: args.expectedHash } : {}), ...(outcome === 'ok' ? {} : { error: (s.lastError ?? '').split('\n')[0]!.replace(/^(Tool error|No action executed): /, '') }), before: now, after: await this.diskHashes(paths) };
     return outcome;
   }
+  // A read or a search asked again while its answer is still in the evidence has no side
+  // effect to prevent, so nothing stops: the batch goes on. What the request asks that the
+  // evidence does not show at the file's current hash (lines a read budget or a clip cut
+  // off, a file changed outside the harness) is read now, and only that; when the evidence
+  // already shows all of it, the answer is where: the entries, the lines, the hash. A line
+  // longer than any read shows whole is cut by every read, so it is stated, never read again.
+  private async repeat(s: Session, route: 'read_files' | 'search_codebase', args: Record<string, any>, earlier: number, thought: string): Promise<'ok' | 'failed' | 'refused' | 'repeated' | 'stop'> {
+    if (route === 'search_codebase') return this.answer(s, route, args, earlier, [`e${earlier}`], [], `This search_codebase has the same arguments as the search of step ${earlier} (${args.mode} ${JSON.stringify(String(args.query ?? ''))} in ${args.path}), and the harness has recorded no write and no check since; its result is e${earlier}. It was not run again.`);
+    const where: string[] = []; const missing: { path: string; start: number; end: number }[] = []; const cited = new Set<string>();
+    const files = args.files as { path: string; start: number; end: number }[];
+    // Each file as read_files reads it (the same decoding, so the same sha256); an archived output never changes.
+    const texts = new Map<string, string | null>();
+    for (const p of new Set(files.map(f => f.path))) texts.set(p, await (p.startsWith('@artifact/') ? safePath(this.tools.artifacts, p.slice(10)).then(f => boundedRead(f, 8 * 1024 * 1024)) : safePath(this.tools.root, p).then(f => boundedRead(f))).catch(() => null));
+    for (const f of files) {
+      const text = texts.get(f.path) ?? null;
+      if (text === null) { missing.push({ path: f.path, start: f.start, end: f.end }); continue; }
+      const lines = text.split('\n'); const sha = f.path.startsWith('@artifact/') ? undefined : hash(text);
+      const { by } = shownLines(s, f.path, sha);
+      const want = Array.from({ length: Math.max(0, Math.min(f.end, lines.length) - f.start + 1) }, (_, k) => f.start + k);
+      // The most of one line a read shows: a read of that range alone (read_files' own budget).
+      const budget = Math.max(400, this.config.toolChars - f.path.length - 240);
+      // Measured as a read shows it: with its "n: " prefix.
+      const width = (n: number) => `${n}: ${lines[n - 1]}`.length;
+      const long = want.filter(n => !by.has(n) && width(n) > budget);
+      for (const [a, b] of lineRanges(want.filter(n => !by.has(n) && !long.includes(n)))) missing.push({ path: f.path, start: a, end: b });
+      const runs: string[] = [];
+      for (const [a, b] of lineRanges(want.filter(n => by.has(n)))) { let from = a; for (let n = a + 1; n <= b + 1; n++) if (n > b || by.get(n) !== by.get(from)) { runs.push(`${from}..${n - 1} in ${by.get(from)}`); cited.add(by.get(from)!); from = n; } }
+      const parts = [...(!want.length ? [`no line in ${f.start}..${f.end}`] : []), ...(runs.length ? [`lines ${runs.join(', ')}`] : []), ...(long.length ? [`${long.length > 1 ? 'lines' : 'line'} ${long.map(n => `${n} (${width(n)} characters with its number)`).join(', ')} ${long.length > 1 ? 'are' : 'is'} longer than a read shows whole (${budget} characters), so every read of ${long.length > 1 ? 'them' : 'it'} shows ${long.length > 1 ? 'their' : 'its'} two ends only`] : [])];
+      if (parts.length) where.push(`${f.path}${sha ? ` sha256=${sha}` : ''} (${lines.length} lines): ${parts.join('; ')}`);
+    }
+    if (!missing.length) return this.answer(s, route, args, earlier, [...cited], where, `This read_files repeats the request of step ${earlier}; for the file${where.length > 1 ? 's' : ''} as ${where.length > 1 ? 'they are' : 'it is'} now, the evidence already shows every requested line that a read shows whole: ${where.join('; ')}. Nothing was read again.`);
+    // The rest of the request, read as any read is, under a fresh read budget. The entries the
+    // statement names stay as they are (this read does not supersede them, nor evict them).
+    // The rest is read one contiguous range per file (the first gap): gaps left by eviction
+    // are read in whole pages, never as many slivers sharing one read budget.
+    const firstGaps = missing.filter((m, k) => missing.findIndex(x => x.path === m.path) === k);
+    await this.store.log('repeated', { step: s.step, route, args, earlier, shown: where, read: firstGaps });
+    // The lines some read of this run returned before this one, at each file's current hash
+    // (taken now: this read adds to the same record).
+    const coveredBefore = new Map(firstGaps.map(m => { const t = texts.get(m.path); const ranges = t && !m.path.startsWith('@artifact/') ? s.coverageByHash[`${m.path}@${hash(t)}`]?.ranges.map(r => [...r] as [number, number]) : undefined; return [m.path, ranges ?? []] as const; }));
+    const step = s.step; this.citing = [...cited];
+    let outcome: Awaited<ReturnType<Agent['act']>>;
+    try { outcome = await this.act(s, 'read_files', { files: firstGaps }, thought); } finally { this.citing = []; }
+    s.actions[Agent.actionKey(s, 'read_files', { files: firstGaps })] = step;
+    const e = s.entries.at(-1);
+    // A rest that failed (a file removed outside the harness) is the request failing: the next
+    // identical request finds this failure and is refused with it, and this turn counts.
+    if (outcome === 'failed') { s.actions[Agent.actionKey(s, 'read_files', args)] = step; return 'repeated'; }
+    if (e?.step === step && e.kind === 'read_files') e.text += `\nHarness: this repeats the read_files of step ${earlier}; ${where.length ? `at this step the evidence showed ${where.join('; ')}, so ` : ''}only ${firstGaps.map(m => `${m.path} ${m.start}..${m.end}`).join(', ')} ${firstGaps.length > 1 ? 'were' : 'was'} read${missing.length > firstGaps.length ? ` (the first gap of each file; ${missing.filter(m => !firstGaps.includes(m)).map(m => `${m.path} ${m.start}..${m.end}`).join(', ')} not yet)` : ''}.`;
+    // Progress is a read that makes the evidence show the whole request again (a re-read after
+    // eviction, the rest of a clipped read), or one that returned lines no read of this run
+    // returned before (the first pass through a file larger than a read). A read the budget cut
+    // that returned only lines read before is the same request cycling through a file larger
+    // than the evidence: no progress, so four of them end the attempt.
+    const restored = missing.length === firstGaps.length && firstGaps.every(m => { const t = texts.get(m.path); const shown = shownLines(s, m.path, m.path.startsWith('@artifact/') || !t ? undefined : hash(t)).by; for (let n = m.start; n <= m.end; n++) if (shown.get(n) !== e?.id) return false; return true; });
+    // Judged by the lines this read showed whole, not by the range asked: a large range always
+    // holds lines never read, but a read budget shows only its first page.
+    const newlyShown = firstGaps.some(m => { const t = texts.get(m.path); if (m.path.startsWith('@artifact/') || !t) return true; const shown = shownLines(s, m.path, hash(t)).by; const was = coveredBefore.get(m.path) ?? []; for (let n = m.start; n <= m.end; n++) if (shown.get(n) === e?.id && !was.some(([a, b]) => n >= a && n <= b)) return true; return false; });
+    if (outcome === 'ok' && !restored && !newlyShown) return 'repeated';
+    // A read that showed none of those lines whole added nothing to the evidence: it counts as a repeat.
+    if (outcome === 'ok' && !firstGaps.some(m => { const t = texts.get(m.path); const { by } = shownLines(s, m.path, m.path.startsWith('@artifact/') || !t ? undefined : hash(t)); for (let n = m.start; n <= m.end; n++) if (by.get(n) === e?.id) return true; return false; })) return 'repeated';
+    return outcome;
+  }
+  // The statement that answers a repeat, as evidence of its own, marked when an entry it names
+  // leaves. Each turn that repeats a request keeps its own statement, an identical one included:
+  // a turn of repeats leaves the prompt, so its statement is the one record that the request was
+  // made again, and one that replaced the previous turn's copy left the prompt as it was but for
+  // a step number (run 58, steps 54 and 55: the same turn came back word for word). Within one
+  // turn an identical statement replaces the earlier one (nothing after it is cached yet).
+  private async answer(s: Session, route: 'read_files' | 'search_codebase', args: Record<string, any>, earlier: number, cites: string[], shown: string[], text: string): Promise<'repeated'> {
+    await this.store.log('repeated', { step: s.step, route, args, earlier, shown });
+    const copy = s.entries.map(e => e.kind === 'repeat' && e.text === text && Boolean(s.currentTurn) && e.turn === s.currentTurn).lastIndexOf(true);
+    if (copy >= 0) s.entries.splice(copy, 1);
+    this.citing = cites;
+    try { await this.evidence(s, 'repeat', { ok: true, text }); } finally { this.citing = []; }
+    const e = s.entries.at(-1); if (e?.kind === 'repeat') e.relevance = .2;
+    this.observe({ kind: 'result', step: s.step, route, ok: true, ms: 0, chars: text.length, text: clip(text, 200) });
+    return 'repeated';
+  }
   private async act(s: Session, route: Route, args: Record<string, any>, thought: string): Promise<'ok' | 'failed' | 'refused' | 'stop'> {
-    const refuse = async (why: string) => { this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.store.log('refused', { step: s.step, route, args, why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); return 'refused' as const; };
+    const refuse = async (why: string, duplicate = false) => { this.duplicate = duplicate; this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.store.log('refused', { step: s.step, route, args, why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); return 'refused' as const; };
     if (route === 'plan') { s.notes = clip(String(args.notes ?? ''), 4000); await this.store.log('plan', { step: s.step, notes: s.notes }); await this.evidence(s, 'plan', { ok: true, text: `Notes updated (${s.notes.split('\n').length} lines).` }); return 'ok'; }
     if (route === 'observe') {
       if (!this.config.allowBash) return refuse('observe needs --allow-bash (it starts and runs what it observes).');

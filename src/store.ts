@@ -100,8 +100,9 @@ export class Store {
     return `@artifact/${name}`;
   }
   // The exact worker prompt of a step, for inspection; not part of the evidence.
-  async promptArtifact(step: number, attempt: number, messages: unknown): Promise<string> {
-    const name = `${step.toString().padStart(5, '0')}-prompt${attempt > 1 ? `-${attempt}` : ''}.json`;
+  // A label names a prompt other than the step's own (a file's code generation in the same step), so neither overwrites the other.
+  async promptArtifact(step: number, attempt: number, messages: unknown, label?: string): Promise<string> {
+    const name = `${step.toString().padStart(5, '0')}-prompt${label ? `-${label.replace(/[^\w.-]/g, '_')}` : ''}${attempt > 1 ? `-${attempt}` : ''}.json`;
     await writeFile(join(this.artifacts, name), JSON.stringify(messages, null, 2), { mode: 0o600 });
     return `@artifact/${name}`;
   }

@@ -93,14 +93,50 @@ export function retireEvidence(s: Session): void {
       if (command) { try { verification = JSON.parse(command[1]!) === s.lastCheckCommand; } catch { /* incomplete legacy entry */ } }
     }
     const supersededCheck = verification && s.lastCheck && e.step < s.lastCheck.step;
-    const historicalAttempt = e.kind === 'generation_error' && e.step < Math.max(s.lastWriteStep, s.lastCheck?.step ?? -1);
+    // A repeat's statement that a file is unchanged holds until the next write or check.
+    const historicalAttempt = (e.kind === 'generation_error' || e.kind === 'repeat') && e.step < Math.max(s.lastWriteStep, s.lastCheck?.step ?? -1);
     // A check followed by edits describes files as they were: its errors may already be fixed.
     const editedAfter = verification && !supersededCheck ? Object.entries(s.writeSteps).filter(([, step]) => step > e.step).map(([p]) => p) : [];
     if (!e.stale && (supersededCheck || historicalAttempt || editedAfter.length)) {
-      e.stale = supersededCheck ? `superseded by verification at step ${s.lastCheck!.step}` : editedAfter.length ? `files edited since this check (${editedAfter.slice(0, 6).join(', ')}): its errors describe them as they were` : 'historical generation attempt; later edits or verification have run';
+      e.stale = supersededCheck ? `superseded by verification at step ${s.lastCheck!.step}` : editedAfter.length ? `files edited since this check (${editedAfter.slice(0, 6).join(', ')}): its errors describe them as they were` : e.kind === 'repeat' ? 'stated before later edits or verification ran' : 'historical generation attempt; later edits or verification have run';
       e.relevance = .1;
     }
   }
+}
+// The lines of a file the evidence shows as numbered text of the version with the given
+// sha256 (any version when undefined: an archived output never changes): from every read
+// result still in the prompt and not marked stale, each line with the entry that shows it.
+// A line a clip cut into is not counted as shown.
+export function shownLines(s: Session, path: string, sha: string | undefined): { total: number | null; by: Map<number, string> } {
+  const by = new Map<number, string>(); let total: number | null = null;
+  const esc = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const header = new RegExp(`^${esc} sha256=(\\w+) totalLines=(\\d+) shown=(\\d+)\\.\\.(\\d+)$`);
+  // clip() keeps a result's two ends around a marker line; the line each side of it is cut.
+  const marker = '[…truncated; use a narrower read';
+  for (const e of s.entries) {
+    if (e.kind !== 'read_files' || e.stale) continue;
+    const lines = e.text.split('\n'); let next = -1;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const h = i === 0 || lines[i - 1] === '' ? line.match(header) : null;
+      if (h) { next = sha === undefined || h[1] === sha ? Number(h[3]) : -1; if (next > 0) total = Number(h[2]); continue; }
+      if (next < 0) continue;
+      // After a clip marker the text may belong to another file of the same read: nothing is
+      // credited until the next complete header.
+      if (line.startsWith(marker)) { next = -1; continue; }
+      const n = Number(line.match(/^(\d+): /)?.[1] ?? NaN);
+      if (n !== next) { next = -1; continue; }
+      if (!lines[i + 1]?.startsWith(marker)) by.set(n, e.id);
+      next++;
+    }
+  }
+  return { total, by };
+}
+// Line numbers as ranges: [1, 2, 3, 7] -> [[1, 3], [7, 7]].
+export function lineRanges(ns: number[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (const n of [...ns].sort((a, b) => a - b)) { const last = out.at(-1); if (last && n === last[1] + 1) last[1] = n; else if (!last || n > last[1]) out.push([n, n]); }
+  return out;
 }
 export function rememberEdit(s: Session, step: number, route: string, paths: string[], artifact: string, text: string, args?: Record<string, any>): void {
   const applied = args ? clip(JSON.stringify({ ...args, expectedHash: undefined, destinationHash: undefined }), 700) : undefined;
@@ -123,16 +159,23 @@ export function confidentChoice(a: Answers[string] | undefined, c: Config): stri
 // an eviction that stays behind a point the prompt already changes at costs
 // no reprocessing of its own.
 // only: the one entry that may be taken (for following a planned order).
-export function evictOne(s: Session, from = 0, only?: string): Entry | undefined {
+// allowCited: over the hard budget, the entries the freshest entry names give way when nothing else can go.
+export function evictOne(s: Session, from = 0, only?: string, allowCited = false): Entry | undefined {
   retireEvidence(s);
   const hasResults = (turn: Entry) => s.entries.some(e => e.turn === turn.id);
-  const protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]);
+  // The freshest entry is never evicted, nor while it is the freshest the entries it names.
+  // The entries it names give way when nothing else can go (their citing statement is then marked).
+  let protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined, ...(s.entries.at(-1)?.cites ?? [])]);
   const endsTurn = (e: Entry) => e.kind === 'turn' || (e.turn !== undefined && s.entries.some(t => t.kind === 'turn' && t.id === e.turn) && !s.entries.some(x => x !== e && x.turn === e.turn));
-  const candidates = s.entries.filter((e, i) => (only === undefined || e.id === only) && i >= from && !(from > 0 && endsTurn(e)) && (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
+  const pick = () => s.entries.filter((e, i) => (only === undefined || e.id === only) && i >= from && !(from > 0 && endsTurn(e)) && (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
+  let candidates = pick();
+  if (!candidates.length && allowCited && s.entries.at(-1)?.cites?.length) { protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]); candidates = pick(); }
   // Stale entries go first, then the least relevant, then the oldest.
   const candidate = [...candidates].sort((a, b) => Number(Boolean(b.stale)) - Number(Boolean(a.stale)) || a.relevance - b.relevance || a.step - b.step)[0];
   if (!candidate) return undefined;
   s.entries = s.entries.filter(e => e !== candidate);
+  // A repeat's answer that names the entry no longer describes the prompt: it is marked, not removed (nothing before it changes).
+  for (const e of s.entries) if (e.kind === 'repeat' && !e.stale && e.cites?.includes(candidate.id)) { e.stale = `names ${candidate.id}, which has left the prompt`; e.relevance = .1; }
   const turn = candidate.kind === 'turn' ? candidate : s.entries.find(e => e.kind === 'turn' && e.id === candidate.turn);
   if (turn && !hasResults(turn) && turn.id !== s.currentTurn) { s.entries = s.entries.filter(e => e !== turn); s.trail = [...(s.trail ?? []), trailLine(turn)].sort((a, b) => Number(a.match(/^step (\d+)/)?.[1]) - Number(b.match(/^step (\d+)/)?.[1])).slice(-12); }
   return candidate;

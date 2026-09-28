@@ -18,6 +18,7 @@
   "createTokens": 12000,
   "stepTemperature": 0.2,
   "stepMinP": 0.05,
+  "stepTemperatureEscalation": [0.5, 0.8, 1.0],
   "codeTemperature": 0.3,
   "codeMinP": 0.05,
   "allowWrite": false,

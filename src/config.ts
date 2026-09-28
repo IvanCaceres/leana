@@ -10,6 +10,9 @@ export const defaults: Config = {
   createTokens: 12000,
   // The server's own min_p is 0.05, so these defaults change nothing it did before.
   stepTemperature: .2, stepMinP: .05, codeTemperature: .3, codeMinP: .05,
+  // Only after turns that changed nothing. The server applies temperature after top_k,
+  // top_p and min_p, so a higher value reweights the same candidate tokens, never adds one.
+  stepTemperatureEscalation: [.5, .8, 1],
 };
 export async function loadConfig(path?: string, overrides: Partial<Config> = {}): Promise<Config> {
   const input = path ? JSON.parse(await readFile(path, 'utf8')) : {};
@@ -32,6 +35,8 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
     if (c[k] < c.maxTokens || c[k] > c.contextWindow - c.workingTokens - c.safetyTokens) throw new Error(`${k} must be between maxTokens and contextWindow minus workingTokens and the safety reserve`);
   for (const k of ['stepTemperature', 'codeTemperature'] as const) if (c[k] > 2) throw new Error(`${k} must be above 0 and at most 2`);
   for (const k of ['stepMinP', 'codeMinP'] as const) if (c[k] >= 1) throw new Error(`${k} must be between 0 and 1`);
+  if (!Array.isArray(c.stepTemperatureEscalation) || c.stepTemperatureEscalation.length > 8 || c.stepTemperatureEscalation.some(t => typeof t !== 'number' || !Number.isFinite(t) || t <= 0 || t > 2))
+    throw new Error('stepTemperatureEscalation must be a list of at most 8 temperatures, each above 0 and at most 2');
   if (c.toolChars < 500 || c.toolChars > 20000) throw new Error('toolChars must be 500..20000');
   for (const key of ['baseUrl', 'jevUrl'] as const) {
     const u = new URL(c[key]);

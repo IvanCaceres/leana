@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaults } from '../src/config.js';
 import { Agent, newSession } from '../src/agent.js';
 import { evidenceTokens } from '../src/context.js';
+import { hash } from '../src/tools.js';
 import { Store } from '../src/store.js';
 import { orient } from '../src/orient.js';
 import { findBrowser, renderFacts } from '../src/render.js';
@@ -379,6 +380,41 @@ test('A whole-file rewrite lands as generated even when it no longer parses, lik
   assert.match(e.text, /^Rewrote src\/Hero\.tsx \(5 lines\)/); assert.doesNotMatch(e.text, /anchor was|replace_lines/);
   assert.equal(await readFile(join(root, 'src', 'Hero.tsx'), 'utf8'), 'export const Hero = () => (\n  <div>one</div>\n  <div>two</div>\n);\n', 'the generation is kept, not discarded');
   assert.match(e.text, /does not parse/); assert.match(e.text, /ran to its end \(\d+ lines, not cut off\); the parse errors are in the written content/);
+});
+
+test('Run 67, steps 11-15: a rewrite that reproduces the replaced text\'s parse problem at the same text is told the problem is the same and that text did not change, with the column the parser names', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'Hero.tsx'), 'export const Hero = () => <div>old</div>;\n');
+  // Each regeneration changes other lines (as the style block changed in run 67) and keeps the broken call.
+  const versions = ['export const Hero = () => {\n  const n = count(;\n  return <div>{n}</div>;\n};\n', '// the hero\nexport const Hero = () => {\n  const title = "Pets";\n  const n = count(;\n  return <h1>{title} {n}</h1>;\n};\n'];
+  const scripted = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'src/Hero.tsx', start: 1, end: 1 }] } },
+    { thought: 'rewrite', action: 'rewrite_file', args: { path: 'src/Hero.tsx', purpose: 'a counting hero' } },
+    { thought: 'rewrite again', action: 'rewrite_file', args: { path: 'src/Hero.tsx', purpose: 'a counting hero with a title' } },
+  ] });
+  const bonsai = { ...scripted, generateText: async () => ({ text: versions.shift()!, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }) };
+  const result = await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const [first, second] = result.entries.filter(x => x.kind === 'write');
+  assert.match(first!.text, /Harness: src\/Hero\.tsx does not parse: line 2, column 19 \(at ";" of "count\(;"\): '\)' expected: "const n = count\(;"/, first!.text);
+  assert.doesNotMatch(first!.text, /Same problem/, 'the text it replaced parsed');
+  assert.match(second!.text, /does not parse: line 4, column 19 \(at ";" of "count\(;"\): '\)' expected: "const n = count\(;"\. Same problem as before this write, at the same text: line 4 \(was line 2\); that text did not change/, second!.text);
+});
+
+test('A component file is judged by its parser in the loop: a created file cut short is told it does not parse, and an edit that drops a block\'s end tag is refused before it lands (run 63, steps 15 and 41)', async t => {
+  const { root, store } = await repo(t);
+  const home = "<script setup>\nimport { computed } from 'vue'\nconst a = computed(() => 1)\n</script>\n\n<template>\n  <div class=\"home\">{{ a }}</div>\n</template>\n";
+  await mkdir(join(root, 'src', 'views'), { recursive: true }); await writeFile(join(root, 'src', 'views', 'HomeView.vue'), home);
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'the not-found view', action: 'create_file', args: { path: 'src/views/NotFoundView.vue', purpose: 'a 404 page' } },
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'src/views/HomeView.vue', start: 1, end: 8 }] } },
+    { thought: 'add a ref', action: 'replace_lines', args: { path: 'src/views/HomeView.vue', expectedHash: 'FILL', edits: [{ start: 4, end: 4, newText: "const email = ref('')\n" }] } },
+  ], files: { 'src/views/NotFoundView.vue': '<template>\n  <div class="not-found">\n    <div class="not-found-container">\n' } });
+  const s = await newSession(root, 'x');
+  const result = await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), filling(bonsai, async p => s.hashes[p]!), root, () => {}, () => {}).run(s);
+  const created = result.entries.find(e => e.kind === 'create_file')!;
+  assert.match(created.text, /src\/views\/NotFoundView\.vue does not parse: line 1: "<template>" opens a <template> block that no <\/template> closes/, created.text);
+  assert(result.entries.some(e => /HomeView\.vue would no longer parse \(line 1: "<script setup>" opens a <script> block[\s\S]*does not contain: 4: <\/script>/.test(e.text)), result.entries.map(e => e.text).join('\n---\n'));
+  assert.equal(await readFile(join(root, 'src', 'views', 'HomeView.vue'), 'utf8'), home, 'the refused edit wrote nothing');
 });
 
 test('A rejected completion names the evidence Jev reads as weakest and quotes it, so the worker acts on the gap instead of guessing', async () => {
@@ -894,6 +930,100 @@ test('A shell command that turns out to be a server (announces a local address, 
   assert.doesNotMatch(check.text, /stoppedEarly/); assert.match(check.text, /"timedOut":true/);
 });
 
+test('A shell step that leaves processes running when it ends names them and says they were stopped; one that exits on its own, a plain command and a check say nothing', async t => {
+  const { root } = await repo(t);
+  const { ToolBox } = await import('../src/tools.js');
+  const tools = new ToolBox(root, join(root, '.art'), { ...config, commandTimeoutMs: 30000 }, async () => '');
+  await writeFile(join(root, 'idle.mjs'), 'setInterval(() => {}, 1000);\n');
+  // Gone once reaped (a killed process is a zombie until its new parent collects it).
+  const alive = async (pid: number) => { for (let i = 0; i < 20; i++) { try { process.kill(pid, 0); } catch { return false; } await new Promise(r => setTimeout(r, 50)); } return true; };
+  // Run 63, step 74: a server started with a trailing & and its output sent to a file; the command ends at once.
+  let t0 = Date.now();
+  const bg = await tools.execute('bash', { command: `node idle.mjs >${join(root, 'dev.log')} 2>&1 & echo started`, purpose: 'start', check: false });
+  const said = JSON.parse(bg.text);
+  assert(Date.now() - t0 < 5000); assert.equal(bg.ok, true); assert.equal(said.output, 'started\n');
+  assert.match(said.stoppedAtEnd, /^When this command ended, a process it started was still running, and it was stopped: "node idle\.mjs" \(pid (\d+)\)\. A shell step cannot keep a process alive: whatever it starts is stopped when it ends\. The start command of an observe runs for the length of that observation\.$/);
+  assert.equal(await alive(Number(said.stoppedAtEnd.match(/pid (\d+)/)[1])), false, 'and it was stopped');
+  assert(!('leftRunning' in said), 'the process table rows are not shown raw');
+  // Still holding the command's output: the command's end is when its shell exits, not the 30 s timeout.
+  t0 = Date.now();
+  const held = JSON.parse((await tools.execute('bash', { command: 'node idle.mjs & echo held', purpose: 'start', check: false })).text);
+  assert(Date.now() - t0 < 5000, `ended with its shell (${Date.now() - t0} ms)`); assert.equal(held.timedOut, false); assert.equal(held.code, 0); assert.match(held.stoppedAtEnd, /"node idle\.mjs" \(pid \d+\)/);
+  // A tree: what the command started is named, and what that started is counted.
+  const tree = JSON.parse((await tools.execute('bash', { command: 'bash -c "node idle.mjs & node idle.mjs & wait" >/dev/null 2>&1 & sleep 0.5; echo tree', purpose: 'start', check: false })).text);
+  assert.match(tree.stoppedAtEnd, /^When this command ended, 3 processes it started were still running, and they were stopped: "bash -c node idle\.mjs & node idle\.mjs & wait" \(pid \d+\) and 2 processes started by it\./);
+  // A subshell the command forked carries the harness's own command line: named as what it is, not by that line.
+  const sub = JSON.parse((await tools.execute('bash', { command: '( while true; do sleep 1; done ) >/dev/null 2>&1 & echo sub', purpose: 'start', check: false })).text);
+  assert.match(sub.stoppedAtEnd, /stopped: a subshell of this command \(pid \d+\)/); assert.doesNotMatch(sub.stoppedAtEnd, /--noprofile|pipefail/);
+  // A background process on its way out when the command ends, a plain command and a check: nothing to say.
+  for (const [command, check] of [['sleep 0.1 >/dev/null 2>&1 & echo quick', false], ['echo plain', false], ['node -e "console.log(1)"', true]] as const) {
+    const r = await tools.execute('bash', { command, purpose: 'x', check });
+    assert.equal(r.ok, true, r.text); assert.doesNotMatch(r.text, /stoppedAtEnd/, command);
+  }
+});
+
+test('An observation with nothing to start at an address where nothing is listening says so, instead of reporting the browser\'s error page', async t => {
+  const { observeResult } = await import('../src/observe.js');
+  const root = await mkdtemp(join(tmpdir(), 'leana-observe-')); t.after(() => rm(root, { recursive: true, force: true }));
+  const ctx = { root, artifactPath: join(root, 'shot.png'), timeoutMs: 30000, prefix: '', files: [] };
+  // A port that was just free.
+  const port = await new Promise<number>(done => { const s = createServer(); s.listen(0, '127.0.0.1', () => { const p = (s.address() as any).port; s.close(() => done(p)); }); });
+  const kinds = (await findBrowser()) ? ['http', 'page'] : ['http'];
+  for (const kind of kinds) {
+    const t0 = Date.now();
+    const r = await observeResult(kind, '', `http://127.0.0.1:${port}/`, ctx);
+    assert(Date.now() - t0 < 3000, `${kind}: at once (${Date.now() - t0} ms)`); assert.equal(r.ok, false);
+    assert.equal(r.text, `Nothing is listening at 127.0.0.1:${port}: the connection to http://127.0.0.1:${port}/ was refused, and nothing was started for this observation (start was empty). Processes a shell step starts are stopped when the step ends, and the start command of an observe when that observation ends.`);
+  }
+  // Something listening, started elsewhere: observed as before.
+  const server = createServer((q, r) => { r.writeHead(200, { 'content-type': 'text/plain' }); r.end('up'); }); await new Promise<void>(done => server.listen(port, '127.0.0.1', () => done())); t.after(() => server.close());
+  const up = await observeResult('http', '', `http://127.0.0.1:${port}/`, ctx);
+  assert.equal(up.ok, true, up.text); assert.match(up.text, /^Answered: GET .* -> 200/);
+  // A program's target is a command, not an address: never probed.
+  const ran = await observeResult('program', '', 'node -e "console.log(7)"', ctx);
+  assert.equal(ran.ok, true); assert.match(ran.text, /exit 0[\s\S]*7/); assert.doesNotMatch(ran.text, /Still running/);
+  // An address that is not this machine is not probed: whatever refuses it may be between, and the request reports it.
+  const { connectionRefused, localHost } = await import('../src/serve.js');
+  let t1 = Date.now(); assert.equal(await connectionRefused('http://192.0.2.1:9/'), false); assert(Date.now() - t1 < 500, `not probed (${Date.now() - t1} ms)`);
+  for (const h of ['localhost', 'app.localhost', '127.0.0.1', '127.1.2.3', '0.0.0.0', '[::1]', '[::]']) assert.equal(localHost(h), true, h);
+  for (const h of ['example.com', '192.168.1.2', '10.0.0.1', 'localhost.example.com']) assert.equal(localHost(h), false, h);
+  // A program that leaves something running when it ends: said, as for a shell step.
+  const left = await observeResult('program', '', 'node -e "setInterval(() => {}, 1000)" >/dev/null 2>&1 & echo left', ctx);
+  assert.match(left.text, /^Ran: .* -> exit 0\.\nStill running when it ended, and stopped with it: "node -e setInterval\(\(\) => \{\}, 1000\)" \(pid \d+\)\.\nOutput:\nleft/);
+});
+
+test('A program observation runs its start command beside the program for the length of the observation: ready once its announced address accepts a connection, said when it ends first', async t => {
+  const { observeResult } = await import('../src/observe.js');
+  const root = await mkdtemp(join(tmpdir(), 'leana-program-')); t.after(() => rm(root, { recursive: true, force: true }));
+  const ctx = { root, artifactPath: join(root, 'shot.png'), timeoutMs: 30000, prefix: '', files: [] };
+  const port = await new Promise<number>(done => { const s = createServer(); s.listen(0, '127.0.0.1', () => { const p = (s.address() as any).port; s.close(() => done(p)); }); });
+  await writeFile(join(root, 'srv.mjs'), `import { createServer } from 'node:http'; setTimeout(() => createServer((q, r) => r.end('pong')).listen(${port}, '127.0.0.1', () => console.log('Listening on http://127.0.0.1:${port}/')), 300);\n`);
+  const client = `node -e "fetch('http://127.0.0.1:${port}/').then(r => r.text()).then(console.log)"`;
+  const r = await observeResult('program', 'node srv.mjs', client, ctx);
+  assert.equal(r.ok, true, r.text); assert.match(r.text, /^Ran: .* -> exit 0\.\nOutput:\npong/);
+  const { connectionRefused } = await import('../src/serve.js');
+  let refused = false; for (let i = 0; i < 40 && !refused; i++) { refused = await connectionRefused(`http://127.0.0.1:${port}/`); if (!refused) await new Promise(res => setTimeout(res, 100)); }
+  assert.equal(refused, true, 'stopped when the observation ended');
+  // A start command that ends before the program runs: said, with its output; the program does not run.
+  const early = await observeResult('program', 'node -e "console.error(\'no config\'); process.exit(3)"', 'echo never', ctx);
+  assert.equal(early.ok, false); assert.match(early.text, /^The command started with "node -e .*" ended \(exit 3\) before echo never ran\. Its output:\nno config/);
+});
+
+test('Run 63, steps 74-75: the worker is told the server it started in the background was stopped, and the observation that follows says nothing is listening', async t => {
+  const { root, store } = await repo(t);
+  const port = await new Promise<number>(done => { const s = createServer(); s.listen(0, '127.0.0.1', () => { const p = (s.address() as any).port; s.close(() => done(p)); }); });
+  await writeFile(join(root, 'dev.mjs'), `import { createServer } from 'node:http'; createServer((q, r) => r.end('<!doctype html><p>hi</p>')).listen(${port}, '127.0.0.1');\n`);
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'start the dev server', action: 'bash', args: { command: `node dev.mjs &>dev.log & sleep 1 && node -e "fetch('http://127.0.0.1:${port}/').then(r => r.text()).then(console.log)"`, purpose: 'start and verify', check: false } },
+    { thought: 'the dev server is running; look at it', action: 'observe', args: { kind: 'http', start: '', target: `http://127.0.0.1:${port}/` } },
+  ] });
+  const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const bash = result.entries.find(e => e.kind === 'bash')!.text;
+  assert.match(bash, /"output":"<!doctype html><p>hi<\/p>\\n"/, 'the command itself saw the server answer');
+  assert.match(bash, /"stoppedAtEnd":"When this command ended, a process it started was still running, and it was stopped: \\"node dev\.mjs\\" \(pid \d+\)\. A shell step cannot keep a process alive/);
+  assert.match(result.entries.find(e => e.kind === 'observe')!.text, new RegExp(`^Nothing is listening at 127\\.0\\.0\\.1:${port}: .*nothing was started for this observation \\(start was empty\\)`));
+});
+
 test('After edits, the last check\'s diagnostics about the edited files are withheld and its evidence is marked stale; errors in untouched files stay', async t => {
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
@@ -1157,6 +1287,39 @@ test('A shell command that writes files is an edit whatever it starts with: a he
   assert.match(result.entries.find(e => e.kind === 'bash' && /cat >/.test(e.text))!.text, /the command changed files \(modified 1\): src\/App\.tsx/);
   assert(result.lastCheck && result.lastCheck.step > result.lastWriteStep, 'the check after the edit stands: its own output did not make it stale');
   assert(result.knownFiles.includes('dist/out.js'), 'the file list still follows the tree');
+});
+
+test('A shell command that writes a file with the content it already had is not an edit: it is said to be left as it was, with its hash when the session knows the file, the read of it stands, and a written file that does not parse is said as for an edit; a byte-order mark added is a change', async t => {
+  const { root, store } = await repo(t);
+  // Run 67: the page did not parse; the worker wrote the same bytes again through a heredoc and took the unchanged build error for a write that had not happened.
+  const page = 'export const App = (\n  <ul>{pets.map(p => <li>{p}</li>)}</ul>\n;\n';
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'App.tsx'), page);
+  await writeFile(join(root, 'src', 'c.ts'), 'export const c = 1;\n'); await writeFile(join(root, 'src', 'd.ts'), 'export const d = 1;\n');
+  const past = new Date(Date.now() - 60000); for (const f of ['App.tsx', 'c.ts', 'd.ts']) await utimes(join(root, 'src', f), past, past);
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 3 }] } },
+    { thought: 'write it through the shell', action: 'bash', args: { command: `cat > src/App.tsx <<'EOF'\n${page}EOF`, purpose: 'write', check: false } },
+    { thought: 'a new file through the shell', action: 'bash', args: { command: "printf 'export const b = ;\\n' > src/b.ts", purpose: 'write', check: false } },
+    { thought: 'touch', action: 'bash', args: { command: 'touch src/d.ts', purpose: 'touch', check: false } },
+    { thought: 'a byte-order mark', action: 'bash', args: { command: "sed -i '1s/^/\\xef\\xbb\\xbf/' src/c.ts", purpose: 'bom', check: false } },
+  ] });
+  const result = await new Agent({ ...config, maxSteps: 5 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const same = result.entries.find(e => e.kind === 'bash' && /cat >/.test(e.text))!.text;
+  assert.match(same, new RegExp(`Harness: the command left a file with the content it had before \\(the modification time changed, the content did not\\): src/App\\.tsx sha256=${hash(page)}`));
+  assert.doesNotMatch(same, /the command changed files/);
+  assert.match(same, /Harness: src\/App\.tsx does not parse: line \d+, column \d+ /, 'the file still does not parse, and is said so as after an edit');
+  assert(!result.entries.some(e => e.kind === 'read_files' && e.stale), 'the read of the file still matches it');
+  assert.deepEqual([...result.writes].sort(), ['src/b.ts', 'src/c.ts'], 'only the new file and the one whose bytes changed are edits');
+  assert.equal(result.hashes['src/App.tsx'], hash(page));
+  const created = result.entries.find(e => e.kind === 'bash' && /printf/.test(e.text))!.text;
+  assert.match(created, /the command changed files \(created 1\): src\/b\.ts/); assert.match(created, /Harness: src\/b\.ts does not parse: line 1, column 18 /); assert.doesNotMatch(same + created, /Same problem/, 'what a shell command replaced is not kept');
+  const touched = result.entries.find(e => e.kind === 'bash' && /touch/.test(e.text))!.text;
+  assert.match(touched, /Harness: the command left a file with the content it had before \(the modification time changed, the content did not\): src\/d\.ts$/m, 'a file the session never read or wrote is named without a hash');
+  const bom = result.entries.find(e => e.kind === 'bash' && /xbb/.test(e.text))!.text;
+  assert.match(bom, /the command changed files \(modified 1\): src\/c\.ts/, 'decoded text hashes the same without the mark, but the size differs'); assert.doesNotMatch(bom, /content it had before/);
+  const log = await events(store);
+  assert.deepEqual(log.filter(e => e.type === 'bash-unchanged').map(e => [e.data.step, e.data.files]), [[2, ['src/App.tsx']], [4, ['src/d.ts']]]);
+  assert.deepEqual(log.filter(e => e.type === 'bash-edit').map(e => e.data.files), [['src/b.ts'], ['src/c.ts']]);
 });
 
 test('An eviction bounded by a break point never touches the prompt before it: earlier entries and the trail stay, so the cached part is not cut shorter', async t => {
@@ -1790,4 +1953,124 @@ test('PROBE informative: a refusal that states a new fact (the file exists) is f
   await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
   const ev = await events(store);
   console.log('PROBE-informative', JSON.stringify({ temps: temperatures, refused: ev.filter(e => e.type === 'refused').map(e => e.data.why.slice(0, 60)) }));
+});
+
+// Run 71, steps 31-37: the build failed at step 31; rewrite_file of src/utils/index.ts wrote at
+// steps 32 and 33, then the same request (same path and purpose) generated the current content
+// back three times (1452 tokens each, 64 s), and the model kept citing the step-31 errors.
+test('Run 71, steps 31-37: a rewrite that reproduces its file states when and by what the file was last written and that the last check ran before it; the same request on the same content is not generated again', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'utils.ts'), 'export const cx = (...a: string[]) => a.join(" ");\n');
+  await writeFile(join(root, 'check.mjs'), 'process.exit(1);\n');
+  const fixed = 'export const cx = (...a: (string | false)[]) => a.filter(Boolean).join(" ");\n';
+  const purpose = 'cx that accepts booleans';
+  const rewrite = { thought: 'The build failed: cx does not accept booleans.', action: 'rewrite_file', args: { path: 'src/utils.ts', purpose } };
+  const base = bonsaiOf({ steps: [
+    { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+    rewrite, rewrite, rewrite,
+    { thought: 'say what differs', action: 'rewrite_file', args: { path: 'src/utils.ts', purpose: `${purpose}, with a default export` } },
+    { thought: 'restore it', action: 'bash', args: { command: `printf 'export const cx = 1;\\n' > src/utils.ts`, purpose: 'restore' } },
+    rewrite,
+  ] });
+  const generated: number[] = [];
+  const bonsai = { ...base, generateText: async (m: Message[]) => { const req = JSON.parse(m.at(-1)!.content); generated.push(req.purpose); const text = req.purpose === purpose ? fixed : `${fixed}export default cx;\n`; return { text, finish: 'stop' as const, meta: { ms: 21400, promptTokens: 1, usage: { completion_tokens: 1452 } } }; } };
+  const result = await new Agent({ ...config, maxSteps: 7 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const at = (step: number) => result.entries.find(e => e.step === step && e.kind !== 'turn')!;
+  assert.match(at(2).text, /^Rewrote src\/utils\.ts/, 'step 2 wrote the fix');
+  // Step 3: generated, reproduced, refused with the facts it was asked on.
+  assert.match(at(3).text, /the rewrite of src\/utils\.ts reproduced its current content unchanged: the generated file \(1452 tokens, 21\.4 s\) equals src\/utils\.ts as it is \(sha256=\w+\); nothing was written/);
+  assert.match(at(3).text, /src\/utils\.ts was last written at step 2 by a rewrite_file with these same arguments/);
+  assert.match(at(3).text, /the last check \(node check\.mjs, step 1\) ran before that write and none has run since: its output describes the file as it was at step 1\./);
+  assert.doesNotMatch(at(3).text, /Say in purpose|edit the lines that are wrong/, 'facts, no instruction');
+  // Step 4: the same arguments on the same content: refused before generating.
+  assert.match(at(4).text, /this exact rewrite_file of src\/utils\.ts reproduced the file unchanged at step 3 \(1452 tokens, 21\.4 s\) from the same request as now \(sha256=\w+, and the same purpose, lines, notes, check state, modules and packages; only earlier steps differ\); it was not generated again \(e3\)/);
+  assert.doesNotMatch(at(4).text, /truncated/, 'the refusal fits the evidence entry whole');
+  assert.match(at(4).text, /last written at step 2 by a rewrite_file with these same arguments; the last check \(node check\.mjs, step 1\) ran before that write/);
+  assert.deepEqual(generated, [purpose, purpose, `${purpose}, with a default export`, purpose], 'steps 2, 3, 5 and 7 generated; step 4 did not');
+  // Step 5: another purpose generates; step 7: the same request on other content generates.
+  assert.match(at(5).text, /^Rewrote src\/utils\.ts/);
+  assert.match(at(7).text, /^Rewrote src\/utils\.ts/, 'the same arguments on content they have not reproduced are generated');
+  const refused = (await events(store)).filter(e => e.type === 'refused').map(e => e.data.step);
+  assert.deepEqual(refused, [3, 4]);
+});
+
+test('Run 71, steps 26-30: a whole-file rewrite states how many of the lines it generated differ from the content it replaced, and what generating them cost', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  const before = Array.from({ length: 10 }, (_, i) => `export const v${i + 1} = ${i + 1};`).join('\n') + '\n';
+  await writeFile(join(root, 'src', 'a.ts'), before);
+  const after = before.replace('export const v3 = 3;', 'export const v3 = 30;');
+  const base = bonsaiOf({ steps: [
+    { thought: 'fix v3', action: 'rewrite_file', args: { path: 'src/a.ts', purpose: 'v3 is 30' } },
+    { thought: 'append', action: 'rewrite_file', args: { path: 'src/a.ts', purpose: 'v11', start: 11, end: 10 } },
+  ] });
+  const bonsai = { ...base, generateText: async (m: Message[]) => { const req = JSON.parse(m.at(-1)!.content); return { text: req.region !== undefined ? 'export const v11 = 11;\n' : after, finish: 'stop' as const, meta: { ms: 9100, promptTokens: 1, usage: { completion_tokens: 120 } } }; } };
+  const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const writes = result.entries.filter(e => e.kind === 'write');
+  assert.match(writes[0]!.text, /\nHarness: the rewrite generated every line of src\/a\.ts \(120 tokens, 9\.1 s\); compared with the content it replaced, 1 line went, 1 line came and 9 lines stayed as they were\.$/);
+  assert.doesNotMatch(writes[1]!.text, /the rewrite generated every line/, 'a region rewrite generates only its block: nothing to state');
+  assert.doesNotMatch(result.lastError ?? '', /generated every line/, 'a fact about the write, not an error');
+});
+
+// Review of the run-71 patch: the same arguments on the same content are not the same
+// generation when what the generation is shown has changed since (a check ran, a module it
+// is written against changed); those are generated.
+test('Run 71 review: a rewrite that reproduced its file is generated again, with the same arguments on the same content, once a check has run since or a module it names has changed', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'utils.ts'), 'export const cx = (...a: string[]) => a.join(" ");\n');
+  await writeFile(join(root, 'src', 'b.ts'), 'export const b = 1;\n');
+  await writeFile(join(root, 'check.mjs'), 'process.exit(1);\n');
+  const fixed = 'export const cx = (...a: (string | false)[]) => a.filter(Boolean).join(" ");\n';
+  const purpose = 'cx that accepts booleans, as src/b.ts expects';
+  const rewrite = { thought: 'The build failed: cx does not accept booleans.', action: 'rewrite_file', args: { path: 'src/utils.ts', purpose } };
+  const base = bonsaiOf({ steps: [
+    { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+    rewrite, rewrite,
+    { thought: 'check again', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+    rewrite, rewrite,
+    { thought: 'b changes', action: 'bash', args: { command: `printf 'export const b = 2;\\nexport const c = 3;\\n' > src/b.ts`, purpose: 'b' } },
+    rewrite,
+  ] });
+  const seen: { step: number | null; modules: string }[] = [];
+  const bonsai = { ...base, generateText: async (m: Message[]) => { const req = JSON.parse(m.at(-1)!.content); const vol = JSON.parse(m.at(-2)!.content); seen.push({ step: vol.verification?.step ?? null, modules: JSON.stringify(req.modules) }); return { text: fixed, finish: 'stop' as const, meta: { ms: 20000, promptTokens: 1, usage: { completion_tokens: 1452 } } }; } };
+  const result = await new Agent({ ...config, maxSteps: 8 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const at = (step: number) => result.entries.find(e => e.step === step && e.kind !== 'turn')!;
+  assert.match(at(3).text, /reproduced its current content unchanged/);
+  // Step 5: the check of step 4 ran on the file as it is and is now in front of the generation.
+  assert.equal(seen.length >= 3, true, `generated at steps 2, 3 and 5 (saw ${JSON.stringify(seen.map(x => x.step))})`);
+  assert.match(at(5).text, /reproduced its current content unchanged/);
+  assert.match(at(5).text, /the last check \(node check\.mjs, step 4\) ran on it as it is and failed/);
+  // Step 6: nothing in front of the generation changed since step 5: not generated.
+  assert.match(at(6).text, /not generated again/);
+  // Step 8: src/b.ts, named in the purpose, changed: its exports are in front of the generation.
+  assert.doesNotMatch(at(8).text, /not generated again/);
+  assert.equal(seen.length, 4, 'steps 2, 3, 5 and 8 generated');
+});
+
+test('Run 71 review: a rewrite that differs from the file only in trailing whitespace is not said to equal it; a whole-file rewrite of a CRLF file counts its lines without their endings', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'a.ts'), 'export const a = 1;\nexport const b = 2;');
+  const crlf = Array.from({ length: 10 }, (_, i) => `export const v${i + 1} = ${i + 1};`).join('\r\n') + '\r\n';
+  await writeFile(join(root, 'src', 'c.ts'), crlf);
+  const base = bonsaiOf({ steps: [
+    { thought: 'a', action: 'rewrite_file', args: { path: 'src/a.ts', purpose: 'a' } },
+    { thought: 'c', action: 'rewrite_file', args: { path: 'src/c.ts', purpose: 'v3 is 30' } },
+  ] });
+  const bonsai = { ...base, generateText: async (m: Message[]) => { const req = JSON.parse(m.at(-1)!.content); const text = req.file === 'src/a.ts' ? 'export const a = 1;\nexport const b = 2;\n' : crlf.replace(/\r\n/g, '\n').replace('v3 = 3;', 'v3 = 30;'); return { text, finish: 'stop' as const, meta: { ms: 1000, promptTokens: 1, usage: { completion_tokens: 10 } } }; } };
+  const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const at = (step: number) => result.entries.find(e => e.step === step && e.kind !== 'turn')!;
+  assert.doesNotMatch(at(1).text, /equals src\/a\.ts as it is/, 'the generated text is not byte-equal to the file');
+  assert.match(at(1).text, /the generated file \(10 tokens, 1\.0 s\) differs only in trailing whitespace from src\/a\.ts as it is \(sha256=\w+\)/);
+  assert.match(at(2).text, /1 line went, 1 line came and 9 lines stayed as they were/);
+  assert.match(at(2).text, /CRLF/);
+});
+test('A rewrite of a file that starts with a byte-order mark lands: the file is read and hashed as the write tool reads it', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'a.ts'), '﻿export const a = 1;\n');
+  const bonsai = bonsaiOf({ steps: [{ thought: 'rewrite a', action: 'rewrite_file', args: { path: 'a.ts', purpose: 'a becomes 2' } }], files: { 'a.ts': 'export const a = 2;\n' } });
+  const result = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'export const a = 2;\n', result.entries.map(e => e.text).join('\n'));
 });

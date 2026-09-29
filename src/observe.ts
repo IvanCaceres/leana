@@ -7,8 +7,8 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { findBrowser, renderFacts } from './render.js';
-import { notAnswering, startServer } from './serve.js';
-import { runCommand } from './tools.js';
+import { connectionRefused, listeningAt, localAddresses, notAnswering, startServer } from './serve.js';
+import { commandShell, describeProcesses, runCommand } from './tools.js';
 import { describeObserver, observerKinds } from './observe-catalog.js';
 const described = (kind: string) => describeObserver(kind)!;
 
@@ -68,10 +68,20 @@ const http: Observer = {
 const program: Observer = {
   ...described('program'),
   available: async () => true,
-  async observe(_start, target, ctx) {
-    const r = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', `${ctx.prefix}${target}`], ctx.root, ctx.timeoutMs).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
-    const ok = r.code === 0 && !r.timedOut;
-    return { ok, text: `${ok ? 'Ran' : 'RUN FAILED'}: ${target} -> exit ${r.code}${r.timedOut ? ' (timed out)' : ''}.\nOutput:\n${clipEnds(r.output || '(no output)', 3000)}` };
+  async observe(start, target, ctx) {
+    // What start names runs beside the program for the length of the observation (a service the program talks to).
+    const wait = Math.min(ctx.timeoutMs, 45000);
+    const started = start.trim() ? await startServer(ctx.root, start, null, wait) : null;
+    try {
+      if (started && started.ready !== true) {
+        const code = started.exited?.() ?? null;
+        return { ok: false, text: `${code !== null ? `The command started with "${start}" ended (${typeof code === 'number' ? `exit ${code}` : code}) before ${target} ran` : `The command started with "${start}" announced ${localAddresses(started.log()).slice(0, 3).join(', ')}, and nothing accepted a connection there within ${Math.round(wait / 1000)}s; ${target} did not run`}. Its output:\n${started.log().slice(-1500) || '(no output)'}` };
+      }
+      const r = await runCommand(commandShell[0]!, [...commandShell.slice(1), `${ctx.prefix}${target}`], ctx.root, ctx.timeoutMs).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
+      const ok = r.code === 0 && !r.timedOut;
+      const left = 'leftRunning' in r && r.leftRunning?.length ? `\nStill running when it ended, and stopped with it: ${describeProcesses(r.leftRunning)}.` : '';
+      return { ok, text: `${ok ? 'Ran' : 'RUN FAILED'}: ${target} -> exit ${r.code}${r.timedOut ? ' (timed out)' : ''}.${left}\nOutput:\n${clipEnds(r.output || '(no output)', 3000)}` };
+    } finally { started?.stop(); }
   },
 };
 
@@ -83,5 +93,7 @@ export async function observeResult(kind: string, start: string, target: string,
   if (!o) return { ok: false, text: `There is no observer of kind "${kind}"; the kinds are ${observerKinds.join(', ')}.` };
   if (!target.trim()) return { ok: false, text: `observe needs a target: the URL to load (page, http) or the command to run (program).` };
   if (!(await o.available())) return { ok: false, text: `The ${kind} observer cannot run on this machine${kind === 'page' ? ' (no chromium or google-chrome is installed)' : ''}.` };
+  // Nothing to start and nothing accepting connections at the address: that is the whole observation.
+  if (!start.trim() && await connectionRefused(target)) return { ok: false, text: `Nothing is listening at ${listeningAt(target)}: the connection to ${target} was refused, and nothing was started for this observation (start was empty). Processes a shell step starts are stopped when the step ends, and the start command of an observe when that observation ends.` };
   return o.observe(start, target, ctx).catch(e => ({ ok: false, text: `The ${kind} observation failed: ${(e as Error).message}` }));
 }

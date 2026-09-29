@@ -126,6 +126,14 @@ export interface Session {
   // carried, and the target files' hashes before and after it. An edit run again with the
   // same arguments on files as that run left them is known to repeat what it did.
   attempts?: Record<string, EditAttempt>;
+  // The worker's edit that last changed each file, with the hash it left: its step, how it
+  // reads (EditAttempt.what) and its exact key. A later run of the same arguments replaces
+  // the attempt, not this.
+  writers?: Record<string, { step: number; what: string; exact: string; sha: string | null }>;
+  // A rewrite_file that reproduced its file, by its exact key: the step, the file's hash, the
+  // hash of the request in front of the generation (generateCode) and what it cost. The same
+  // key, hash and request are not generated again.
+  reproduced?: Record<string, { step: number; sha: string; request: string; ms?: number; tokens?: number }>;
   // The last observation of the result as its user meets it (a page, a service, a program run), as facts.
   lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string };
   // The actions this session may take, fixed at its start so the pinned block never changes.

@@ -2,9 +2,9 @@ import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { builtinModules } from 'node:module';
+import { builtinModules, createRequire } from 'node:module';
 import type { CheckSummary } from './types.js';
-import { boundedRead, exportedSignatures, hash, importCandidates, installCommand, installedPackages, manifestFailures, relativeImports, repositoryStatus, runCommand, safePath, solutionTsconfigReferences, syntaxErrors, topLevelDeclarations } from './tools.js';
+import { boundedRead, exportedSignatures, hash, importCandidates, installCommand, problemAt, problemKey, installedPackages, manifestFailures, relativeImports, repositoryStatus, runCommand, safePath, solutionTsconfigReferences, syntaxErrors, topLevelDeclarations } from './tools.js';
 type RepositoryStatus = Awaited<ReturnType<typeof repositoryStatus>>;
 const nested = (repository: RepositoryStatus | undefined, ...manifests: string[]) => (repository?.packages ?? []).some(p => p.tools.some(f => manifests.includes(f)));
 const neverCheck = /\b(dev|start|serve|preview|watch|format|fix|deploy|publish|storybook|release|clean)\b|--watch|--write|--fix/;
@@ -234,6 +234,9 @@ export interface LanguageProfile {
   // How a promised export is spelled in a derived module's contract, from the
   // importer's usage; the bare name when absent.
   exportHead?(name: string, usage: string, typeOnly?: boolean): string;
+  // The language's own parser, run in process (cheap enough to judge every
+  // edit before it lands): the problems it reports, none when the text parses.
+  parse?(root: string, path: string, text: string): Promise<string[]>;
 }
 const identifier = (segment: string) => segment.match(/^([A-Za-z_$][\w$]*)/)?.[1] ?? null;
 export const languages: LanguageProfile[] = [
@@ -252,11 +255,109 @@ export const languages: LanguageProfile[] = [
   { id: 'go', extensions: /\.go$/, kind: 'source', callSite: segment => segment.match(/^([A-Za-z_][\w.]*)\s*\(/)?.[1] ?? identifier(segment) },
   { id: 'jvm', extensions: /\.(?:java|kt|kts|scala)$/, kind: 'source', callSite: segment => segment.match(/^([A-Za-z_][\w.]*)\s*\(/)?.[1] ?? identifier(segment) },
   { id: 'other-source', extensions: /\.(?:rb|php|swift|cs|c|cc|cpp|h|hpp|ex|exs|zig|lua|sh)$/, kind: 'source', callSite: segment => identifier(segment) },
-  { id: 'vue-svelte', extensions: /\.(?:vue|svelte|astro)$/, kind: 'markup', callSite: segment => segment.match(/^<\s*([A-Za-z_][\w.-]*)/)?.[1] ?? identifier(segment) },
+  { id: 'vue-svelte', extensions: /\.(?:vue|svelte|astro)$/, kind: 'markup', callSite: segment => segment.match(/^<\s*([A-Za-z_][\w.-]*)/)?.[1] ?? identifier(segment), parse: (root, path, text) => componentProblems(root, path, text) },
   { id: 'html', extensions: /\.html?$/, kind: 'markup', callSite: segment => segment.match(/^<\s*([A-Za-z][\w-]*)/)?.[1] ?? null },
   { id: 'style', extensions: /\.(?:css|scss|sass|less)$/, kind: 'style' },
 ];
 export const languageFor = (path: string): LanguageProfile | null => languages.find(l => l.extensions.test(path)) ?? null;
+
+// Single-file component formats: the compiler package whose parse the
+// format's build runs, and the blocks the file is made of at its top level
+// ('any': every top-level element is a block; markup: the blocks whose content
+// is elements, where a block of the same name may nest; every other block is
+// raw text that only its own end tag ends). A format a component compiler is
+// not installed for is judged by its block balance alone.
+// A compiler's problem where it places it: an offset into the text, or a line and
+// a 1-based column (either may be missing), and its message.
+type ComponentProblem = { offset?: number; line?: number; column?: number; message: string };
+interface ComponentFormat { extension: RegExp; compiler?: string | string[]; parse?(compiler: any, text: string, path: string): ComponentProblem[] | null; blocks: string[] | 'any'; markup: string[]; frontmatter?: boolean; expression: '{{' | '{' }
+// Script or style content in a preprocessor's language (a lang attribute) is
+// blanked for a compiler that would read it as plain JavaScript or CSS; the
+// lines keep their numbers.
+const blankPreprocessed = (text: string) => text.replace(/(<(script|style)\b[^>]*\blang\s*=[^>]*>)([\s\S]*?)(<\/\2\s*>)/gi, (_m, open: string, _n: string, body: string, close: string) => open + body.replace(/[^\n]/g, ' ') + close);
+export const componentFormats: ComponentFormat[] = [
+  { extension: /\.vue$/i, compiler: ['vue/compiler-sfc', '@vue/compiler-sfc'], blocks: 'any', markup: ['template'], expression: '{{',
+    parse: (c, text, path) => { const r = c.parse?.(text, { filename: path, sourceMap: false }); return Array.isArray(r?.errors) ? r.errors.map((e: any) => { const at = e?.loc?.start; return { offset: at?.offset, line: at?.line, column: at?.column, message: String(e?.message ?? e) }; }) : null; } },
+  { extension: /\.svelte$/i, compiler: 'svelte/compiler', blocks: ['script', 'style'], markup: [], expression: '{',
+    // Svelte drops a leading byte-order mark and places its errors in the text after it: the mark is
+    // taken off before it parses and its unit added back, so the offset is one into the file as read.
+    parse: (c, text) => { if (typeof c.parse !== 'function') return null; const bom = text.charCodeAt(0) === 0xfeff ? 1 : 0; try { c.parse(blankPreprocessed(text.slice(bom))); return []; } catch (e: any) { if (!e || typeof e.message !== 'string') throw e; const at = Array.isArray(e.position) ? e.position[0] : e.start?.character; return [{ offset: typeof at === 'number' ? at + bom : undefined, line: e.start?.line, message: e.message }]; } } },
+  { extension: /\.astro$/i, blocks: ['script', 'style'], markup: [], frontmatter: true, expression: '{' },
+];
+// A package as the project at a path resolves it (the node_modules its build
+// loads it from), loaded once per resolved file; null when it is not installed.
+const projectModules = new Map<string, Promise<any>>();
+export async function projectModule(root: string, path: string, spec: string): Promise<any | null> {
+  let file: string; try { file = createRequire(join(root, path)).resolve(spec); } catch { return null; }
+  if (!projectModules.has(file)) projectModules.set(file, (async () => { try { return createRequire(file)(file); } catch { return import(pathToFileURL(file).href).then(m => m.default && !m.parse ? m.default : m).catch(() => null); } })());
+  return projectModules.get(file)!;
+}
+// Top-level block balance of a single-file component: each block that opens
+// is closed by its own end tag before the file ends, and no end tag closes a
+// block that is not open. Language-neutral: no element inside a block is judged,
+// and neither is the text of an expression or of a text-only element (textarea,
+// title), where a tag is a string.
+export function blockBalance(text: string, format: Pick<ComponentFormat, 'blocks' | 'markup' | 'frontmatter' | 'expression'>): string[] {
+  const lines = text.split('\n'); const starts: number[] = [0]; for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) starts.push(i + 1);
+  const lineOf = (i: number) => { let lo = 0, hi = starts.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid]! <= i) lo = mid; else hi = mid - 1; } return lo + 1; };
+  const reads = (n: number) => JSON.stringify((lines[n - 1] ?? '').trim().slice(0, 80));
+  const out: string[] = []; let from = 0;
+  const first = lines.findIndex(l => l.trim());
+  if (format.frontmatter && first >= 0 && /^---\s*$/.test(lines[first]!)) {
+    const close = /\n---\s*(?:\n|$)/g; close.lastIndex = starts[first]! + lines[first]!.length; const c = close.exec(text);
+    if (!c) return [`line ${first + 1}: the frontmatter fence --- is not closed by a second --- line`];
+    from = close.lastIndex;
+  }
+  // Where the expression opened at i ends: the first }} (Vue), or the brace that
+  // balances it outside string literals; -1 when the file ends first, and from
+  // then on expressions are not skipped (the scan stays linear).
+  let expressions = true; let textOnly = true;
+  const expressionEnd = (i: number): number => {
+    if (format.expression === '{{') { const e = text.indexOf('}}', i + 2); return e < 0 ? -1 : e + 2; }
+    let depth = 0;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (ch === '"' || ch === "'" || ch === '`') { for (j++; j < text.length && text[j] !== ch; j++) if (text[j] === '\\') j++; continue; }
+      if (ch === '{') depth++; else if (ch === '}' && --depth === 0) return j + 1;
+    }
+    return -1;
+  };
+  const tag = new RegExp(`<!--|${format.expression === '{{' ? '\\{\\{' : '\\{'}|<(\\/?)([A-Za-z][\\w-]*)(?:\\s(?:"[^"]*"|'[^']*'|[^'"<>])*?)?(\\/?)>`, 'g'); tag.lastIndex = from;
+  let open: { name: string; at: number; depth: number } | null = null;
+  for (let m; (m = tag.exec(text));) {
+    if (m[0] === '<!--') { const end = text.indexOf('-->', m.index + 4); if (end < 0) break; tag.lastIndex = end + 3; continue; }
+    if (m[0][0] === '{') { if (!expressions) continue; const end = expressionEnd(m.index); if (end < 0) expressions = false; else tag.lastIndex = end; continue; }
+    const closing = m[1] === '/'; const name = m[2]!.toLowerCase(); const selfClosing = m[3] === '/';
+    if (textOnly && !closing && !selfClosing && (name === 'textarea' || name === 'title') && !(open === null && format.blocks === 'any')) {
+      const end = new RegExp(`</${name}\\s*>`, 'gi'); end.lastIndex = tag.lastIndex; if (end.exec(text)) tag.lastIndex = end.lastIndex; else textOnly = false; continue;
+    }
+    if (open) { if (name === open.name) { if (closing) { if (--open.depth === 0) open = null; } else if (!selfClosing) open.depth++; } continue; }
+    if (format.blocks !== 'any' && !format.blocks.includes(name)) continue;
+    const line = lineOf(m.index);
+    if (closing) { out.push(`line ${line}: ${reads(line)} ends a <${name}> block that is not open`); if (out.length >= 5) return out; continue; }
+    if (selfClosing) continue;
+    open = { name, at: m.index, depth: 1 };
+    if (format.markup.includes(name)) continue;
+    const end = new RegExp(`</${name}\\s*>`, 'gi'); end.lastIndex = tag.lastIndex;
+    if (!end.exec(text)) break;
+    tag.lastIndex = end.lastIndex; open = null;
+  }
+  if (open) { const line = lineOf(open.at); out.push(`line ${line}: ${reads(line)} opens a <${open.name}> block that no </${open.name}> closes before the file ends`); }
+  return out;
+}
+// A component file's problems by the project's own compiler when it is
+// installed, each with the line it names, the column and the text there when the
+// compiler gives a position, and the text of the line; by its top-level block
+// balance otherwise (or when the installed compiler's parse is not the one
+// known here).
+export async function componentProblems(root: string, path: string, text: string): Promise<string[]> {
+  const format = componentFormats.find(f => f.extension.test(path)); if (!format) return [];
+  let compiler: any = null; if (format.parse) for (const spec of ([] as string[]).concat(format.compiler ?? [])) if ((compiler = await projectModule(root, path, spec))) break;
+  let found: ComponentProblem[] | null = null;
+  if (compiler) try { found = format.parse!(compiler, text, path); } catch { found = null; }
+  if (!found) return blockBalance(text, format).slice(0, 5);
+  return found.slice(0, 5).map(p => problemAt(text, p.message, p));
+}
 // Command prefixes of every ecosystem's tools: a name that starts with one is a command.
 // The lockfiles of every ecosystem: files a package manager rewrites that no
 // deliverable names and no scope question is about.
@@ -456,9 +557,17 @@ export function importSpelling(from: string, to: string): string {
 // Whether a file parses, by the language's own tool when the machine has it:
 // the TypeScript parser in process; Python's ast, gofmt and rustfmt as commands.
 // A language without a tool here has no gate, which is the honest answer.
-export async function syntaxCheck(root: string, path: string, text: string): Promise<string[]> {
+// The parsers that run in process, cheap enough to judge an edit before it
+// lands: TypeScript's for JS, TS and JSON, and a language profile's own parse.
+// null: the language has none here.
+export async function parseInProcess(root: string, path: string, text: string): Promise<string[] | null> {
   const lang = languageFor(path);
   if (!lang || lang.id === 'typescript' || /\.json$/i.test(path)) return syntaxErrors(path, text);
+  return lang.parse ? lang.parse(root, path, text) : null;
+}
+export async function syntaxCheck(root: string, path: string, text: string): Promise<string[]> {
+  const own = await parseInProcess(root, path, text); if (own) return own;
+  const lang = languageFor(path); if (!lang) return [];
   const tool = lang.id === 'python' ? { cmd: 'python3', args: (f: string) => ['-c', 'import ast, sys\nsrc = open(sys.argv[1], encoding="utf-8").read()\ntry:\n    ast.parse(src, sys.argv[2])\nexcept SyntaxError as e:\n    print(f"{sys.argv[2]}({e.lineno},{e.offset or 1}): error: {e.msg}")\n    sys.exit(1)', f, path] }
     : lang.id === 'go' ? { cmd: 'gofmt', args: (f: string) => ['-e', '-l', f] } : lang.id === 'rust' ? { cmd: 'rustfmt', args: (f: string) => ['--check', '--edition', '2021', f] } : null;
   if (!tool) return [];
@@ -470,6 +579,37 @@ export async function syntaxCheck(root: string, path: string, text: string): Pro
     const lines = r.output.split('\n').map(l => l.replaceAll(file, path).trim()).filter(l => /error|expected|invalid|unexpected/i.test(l));
     return r.code === 0 ? [] : lines.length ? lines.slice(0, 6) : [`${path}: the ${tool.cmd} parser rejected the file (exit ${r.code})`];
   } finally { await rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+// Each line of after that is a line of before unchanged but for indentation, by a
+// longest common subsequence of the trimmed lines (after's line number to before's);
+// only the common head and tail when the part between them is too large to align cheaply.
+export function unchangedLines(before: string, after: string): Map<number, number> {
+  const a = before.split('\n').map(l => l.trim()), b = after.split('\n').map(l => l.trim()); const map = new Map<number, number>();
+  let s = 0; while (s < a.length && s < b.length && a[s] === b[s]) { map.set(s + 1, s + 1); s++; }
+  let ea = a.length, eb = b.length; while (ea > s && eb > s && a[ea - 1] === b[eb - 1]) { map.set(eb, ea); ea--; eb--; }
+  const n = ea - s, m = eb - s; if (!n || !m || n * m > 4_000_000) return map;
+  const L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i]![j] = a[s + i] === b[s + j] ? L[i + 1]![j + 1]! + 1 : Math.max(L[i + 1]![j]!, L[i]![j + 1]!);
+  for (let i = 0, j = 0; i < n && j < m;) { if (a[s + i] === b[s + j]) { map.set(s + j + 1, s + i + 1); i++; j++; } else if (L[i + 1]![j]! >= L[i]![j + 1]!) i++; else j++; }
+  return map;
+}
+// A written file that does not parse, as the facts the worker reads: its
+// problems, and which of them the text it replaced had on the same line (the
+// written line is that line, unchanged but for indentation, wherever it moved,
+// with the same message at the same text): the text such a problem names is
+// text the write did not change. null when the file parses.
+export async function parseFact(root: string, path: string, before: string | null, after: string): Promise<string | null> {
+  const problems = (await syntaxCheck(root, path, after).catch(() => [] as string[])).slice(0, 4);
+  if (!problems.length) return null;
+  // A problem at a line with text; one at the end of the file names no text.
+  const located = (p: string, text: string) => { const n = Number(p.match(/^line (\d+)/)?.[1] ?? 0); return n && text.split('\n')[n - 1]?.trim() ? n : 0; };
+  const had = before ? await syntaxCheck(root, path, before).catch(() => [] as string[]) : [];
+  // Same only where the written line is the replaced text's line that had the problem, unchanged but for
+  // indentation (by a line alignment), never another line that reads the same.
+  const kept = had.length ? unchangedLines(before!, after) : new Map<number, number>();
+  const was = new Set(had.filter(p => located(p, before!)).map(p => `${located(p, before!)}\u0000${problemKey(p)}`));
+  const same = [...new Set(problems.filter(p => { const n = located(p, after); return n && kept.has(n) && was.has(`${kept.get(n)}\u0000${problemKey(p)}`); }).map(p => `line ${located(p, after)} (was line ${kept.get(located(p, after))})`))];
+  return `${path} does not parse: ${problems.join('; ')}${same.length ? `. Same problem${same.length > 1 ? 's' : ''} as before this write, at the same text: ${same.join(', ')}; that text did not change` : ''}`;
 }
 // A file worth reviewing against its specification: any source, style or markup file.
 export const sourceFile = (path: string): boolean => languageFor(path) !== null;

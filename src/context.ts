@@ -132,6 +132,22 @@ export function shownLines(s: Session, path: string, sha: string | undefined): {
   }
   return { total, by };
 }
+// How many lines one text has that another does not, and the other way round: the lines a
+// longest common subsequence leaves over, after the common first and last lines. Lines are
+// compared without their endings (a CRLF line equals its LF copy). A middle too large to compare
+// line by line counts whole, and exact is false (the counts are then upper bounds).
+export function lineDiff(before: string, after: string): { removed: number; added: number; exact: boolean } {
+  const split = (t: string) => t === '' ? [] : t.replace(/\r?\n$/, '').split('\n').map(l => l.replace(/\r$/, ''));
+  const a = split(before); const b = split(after); let pre = 0; while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0; while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const x = a.slice(pre, a.length - suf); const y = b.slice(pre, b.length - suf);
+  if (!x.length || !y.length) return { removed: x.length, added: y.length, exact: true };
+  if (x.length * y.length > 4_000_000) return { removed: x.length, added: y.length, exact: false };
+  let row = new Array<number>(y.length + 1).fill(0);
+  for (const line of x) { const next = new Array<number>(y.length + 1).fill(0); for (let j = 1; j <= y.length; j++) next[j] = line === y[j - 1] ? row[j - 1]! + 1 : Math.max(row[j]!, next[j - 1]!); row = next; }
+  const common = row[y.length]!;
+  return { removed: x.length - common, added: y.length - common, exact: true };
+}
 // Line numbers as ranges: [1, 2, 3, 7] -> [[1, 3], [7, 7]].
 export function lineRanges(ns: number[]): [number, number][] {
   const out: [number, number][] = [];

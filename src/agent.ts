@@ -10,11 +10,11 @@ import type { Answers, Config, EditAttempt, Message, Questions, Route, Session, 
 import { editRoutes } from './types.js';
 import type { ProgressEvent } from './display.js';
 import { Store } from './store.js';
-import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot } from './tools.js';
-import { breakIndex, clip, clipEnds, evictBehind, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, shownLines, lineRanges, type FileContract } from './context.js';
+import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot, TreeHashes } from './tools.js';
+import { breakIndex, clip, clipEnds, lineDiff, evictBehind, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, shownLines, lineRanges, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
-import { generationFacts, missingRelativeModules, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, syntaxCheck, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
+import { generationFacts, missingRelativeModules, parseFact, parseInProcess, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
 import { orient } from './orient.js';
 import { observeResult, observerFor } from './observe.js';
 import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
@@ -43,9 +43,12 @@ export class Agent {
   private citing: string[] = [];
   // Whether the last refusal was of a request already made (the same arguments on the same state), not a new fact.
   private duplicate = false;
+  // The tree's content hashes by file signature: what a shell command did to a file's content, not only to its modification time.
+  private treeHashes = new TreeHashes();
   constructor(readonly config: Config, readonly store: Store, readonly jev: JevLike, readonly bonsai: BonsaiLike, root: string, readonly log: (line: string) => void, readonly observe: (e: ProgressEvent) => void) {
     this.tools = new ToolBox(root, store.artifacts, config, (path, text) => store.snapshot(this.current, path, text));
     this.tools.commandPrefix = () => shellPrefixFor(root);
+    this.tools.parse = (path, text) => parseInProcess(root, path, text).then(r => r ?? [], () => []);
   }
   // A project's manifests' state: what its install was made from.
   private async manifestKey(p: Project): Promise<string> {
@@ -176,13 +179,16 @@ export class Agent {
     let result: ToolResult;
     // What a shell command changed is read from the tree, never guessed from the command.
     const before = route === 'bash' ? await treeSnapshot(this.tools.root).catch(() => null) : null;
+    // The content the command's files have before it runs (the check's writes are not edits; nothing is compared for it).
+    if (before && args.check !== true) await this.treeHashes.fill(this.tools.root, before).catch(() => {});
+    // The text an edit replaces, so a parse problem it leaves can be compared with the one it had.
+    const replaced = new Map<string, string | null>(); if (editRoutes.includes(route)) for (const p of Agent.targets(route, args)) replaced.set(p, await readIfPresent(this.tools.root, p).catch(() => null));
     this.tools.step = s.step;
     try { result = await this.tools.execute(route, args); } catch (e) { result = { ok: false, text: `Tool error: ${(e as Error).message}` }; }
     if (route === 'bash') await this.commandEffects(s, args, result, before);
     // A written file that does not parse is a fact the worker sees at once, by the language's own tool.
     if (result.ok && editRoutes.includes(route) && result.changed?.length) {
-      const facts: string[] = [];
-      for (const p of result.changed) { const text = await readIfPresent(this.tools.root, p); if (text === null) continue; const problems = await syntaxCheck(this.tools.root, p, text).catch(() => [] as string[]); if (problems.length) facts.push(`${p} does not parse: ${problems.slice(0, 4).join('; ')}`); }
+      const facts = await this.parseFacts(result.changed, replaced);
       if (facts.length) result.text += `\nHarness: ${facts.join(' | ')}`;
     }
     s.lastRoute = route; s.lastResultOk = result.ok;
@@ -195,21 +201,51 @@ export class Agent {
   // Every file a command created, modified or deleted is an edit of this step,
   // except what the check of record writes (a build's output is not an edit it
   // must be run again for). The file list follows the tree either way.
+  // A file the command wrote with the content it already had is not an edit (its
+  // reads stand, nothing is due to run again for it) and is said to be one written
+  // unchanged. A written file that does not parse is said as for an edit.
   private async commandEffects(s: Session, args: Record<string, any>, result: ToolResult, before: Awaited<ReturnType<typeof treeSnapshot>>): Promise<void> {
     const after = before ? await treeSnapshot(this.tools.root).catch(() => null) : null;
     if (!before || !after) { s.knownFiles = await listRepoFiles(s.root).catch(() => s.knownFiles); return; }
-    const { changed, created, deleted } = await treeChanges(this.tools.root, before, after);
-    if (!changed.length) return;
+    const { changed: touched, created, deleted } = await treeChanges(this.tools.root, before, after);
+    if (!touched.length) return;
     s.knownFiles = [...s.knownFiles.filter(p => !deleted.includes(p)), ...created.filter(p => !s.knownFiles.includes(p))].sort();
     for (const p of deleted) { delete s.hashes[p]; delete s.coverage[p]; delete s.readHashes[p]; }
     if (args.check === true) return;
+    const modified = touched.filter(p => !created.includes(p) && !deleted.includes(p));
+    const was = new Map(modified.map(p => [p, this.treeHashes.at(p, before.get(p))]));
+    await this.treeHashes.fill(this.tools.root, new Map(modified.map(p => [p, after.get(p)!]))).catch(() => {});
+    const size = (sig: string | undefined) => sig?.slice(0, sig.indexOf(':'));
+    // Equal sizes too: the text hashed is decoded, and a byte-order mark is not part of it.
+    const unchanged = modified.filter(p => was.get(p) && size(before.get(p)) === size(after.get(p)) && this.treeHashes.at(p, after.get(p)) === was.get(p));
+    const changed = touched.filter(p => !unchanged.includes(p));
     const present = changed.filter(p => !deleted.includes(p));
-    const now = await sourceHashes(s.root, present.slice(0, 40));
-    result.changed = [...new Set([...(result.changed ?? []), ...changed])];
-    result.hashes = { ...(result.hashes ?? {}), ...Object.fromEntries(Object.entries(now).filter(([, h]) => h !== 'unavailable')) };
-    const counts = [created.length ? `created ${created.length}` : '', present.length - created.length ? `modified ${present.length - created.length}` : '', deleted.length ? `deleted ${deleted.length}` : ''].filter(Boolean).join(', ');
-    result.text += `\nHarness: the command changed files (${counts}): ${clip(changed.slice(0, 30).join(', ') + (changed.length > 30 ? `, +${changed.length - 30} more` : ''), 900)}`;
-    await this.store.log('bash-edit', { step: s.step, files: changed.slice(0, 200), command: clip(String(args.command ?? ''), 200) });
+    if (changed.length) {
+      const now = await sourceHashes(s.root, present.slice(0, 40));
+      result.changed = [...new Set([...(result.changed ?? []), ...changed])];
+      result.hashes = { ...(result.hashes ?? {}), ...Object.fromEntries(Object.entries(now).filter(([, h]) => h !== 'unavailable')) };
+      const counts = [created.length ? `created ${created.length}` : '', present.length - created.length ? `modified ${present.length - created.length}` : '', deleted.length ? `deleted ${deleted.length}` : ''].filter(Boolean).join(', ');
+      result.text += `\nHarness: the command changed files (${counts}): ${clip(changed.slice(0, 30).join(', ') + (changed.length > 30 ? `, +${changed.length - 30} more` : ''), 900)}`;
+      await this.store.log('bash-edit', { step: s.step, files: changed.slice(0, 200), command: clip(String(args.command ?? ''), 200) });
+    }
+    if (unchanged.length) {
+      result.hashes = { ...(result.hashes ?? {}), ...Object.fromEntries(unchanged.map(p => [p, was.get(p)!])) };
+      const one = unchanged.length === 1;
+      // The hash where the session has one to compare it with (a file it read or wrote); the path alone otherwise.
+      const seen = (p: string) => p in s.hashes || p in s.readHashes;
+      result.text += `\nHarness: the command left ${one ? 'a file' : `${unchanged.length} files`} with the content ${one ? 'it' : 'they'} had before (the modification time changed, the content did not): ${clip(unchanged.slice(0, 30).map(p => seen(p) ? `${p} sha256=${was.get(p)}` : p).join(', ') + (unchanged.length > 30 ? `, +${unchanged.length - 30} more` : ''), 900)}`;
+      await this.store.log('bash-unchanged', { step: s.step, files: unchanged.slice(0, 200), command: clip(String(args.command ?? ''), 200) });
+    }
+    // What a shell command replaced is not kept (only its hash), so no problem is compared with one it had.
+    const facts = await this.parseFacts([...present, ...unchanged].slice(0, 20), new Map());
+    if (facts.length) result.text += `\nHarness: ${facts.join(' | ')}`;
+  }
+  // A written file that does not parse, by the language's own parser: a fact the worker sees at once,
+  // with the problems the text it replaced (when known) had on the same lines.
+  private async parseFacts(paths: string[], replaced: Map<string, string | null>): Promise<string[]> {
+    const facts: string[] = [];
+    for (const p of paths) { const text = await readIfPresent(this.tools.root, p); if (text === null) continue; const fact = await parseFact(this.tools.root, p, replaced.get(p) ?? null, text).catch(() => null); if (fact) facts.push(fact); }
+    return facts;
   }
 
   // ---- installs: mechanics the worker cannot do for itself -----------------
@@ -290,10 +326,17 @@ export class Agent {
     this.observe({ kind: 'generated', step: s.step, route, meta: this.bonsai.lastMeta ?? null, args });
     return args;
   }
-  private async generateCode(s: Session, route: Route, builds: (() => Message[])[], budget: number, fence: string): Promise<{ code: string; finish: string; cut?: GenerationCut }> {
+  // With what the generation cost (its milliseconds and completion tokens, when the client reports
+  // them). `chosen` is told the request as it will be sent before anything is generated: the hash
+  // of the prompt's last two messages (the notes, file list and check state, and the file's own
+  // request: its content, purpose, lines, modules and packages) with the sampling settings. Only
+  // the earlier steps in front of them are left out. It may throw to generate nothing.
+  private async generateCode(s: Session, route: Route, builds: (() => Message[])[], budget: number, fence: string, chosen?: (request: string) => void): Promise<{ code: string; finish: string; cut?: GenerationCut; ms?: number; tokens?: number; request: string }> {
     let prompt = builds[0]!(); let counted = await this.bonsai.count(prompt);
     for (const smaller of builds.slice(1)) { if (counted.tokens <= this.config.workingTokens) break; prompt = smaller(); counted = await this.bonsai.count(prompt); }
     if (counted.tokens > this.config.workingTokens) { const fitted = await this.fit(s, builds.at(-1)!); prompt = fitted.prompt; counted = { tokens: fitted.tokens, mode: 'fit' }; }
+    const request = hash(JSON.stringify({ tail: prompt.slice(-2), temperature: this.config.codeTemperature, minP: this.config.codeMinP, budget }));
+    chosen?.(request);
     s.lastPromptTokens = counted.tokens;
     this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
     await this.logPrompt(s, route, prompt, counted.tokens);
@@ -303,10 +346,10 @@ export class Agent {
       const run = fence.match(/^`+/)?.[0].length ?? 3; const opened = g.text.match(/^\s*(`{3,})[^\n]*\n/);
       // A cut keeps whole lines only; the kept text ends at the start of the cut line.
       const code = opened && opened[1]!.length >= run ? extractCode(g.text) : g.cut ? g.text : g.text.replace(/\s+$/, '') + '\n';
-      return { code, finish: g.finish, ...(g.cut ? { cut: g.cut } : {}) };
+      return { code, finish: g.finish, ...(g.cut ? { cut: g.cut } : {}), ...cost(g.meta), request };
     }
     const raw = await this.bonsai.generate(prompt, { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false }, this.config.codeTemperature, { step: s.step, route }, budget);
-    return { code: extractCode(String(raw.content ?? '')), finish: 'stop' };
+    return { code: extractCode(String(raw.content ?? '')), finish: 'stop', ...cost(this.bonsai.lastMeta), request };
   }
   // The modules a file names in its purpose, thought or notes, as real signatures.
   private async contractsFor(s: Session, path: string, text: string): Promise<FileContract[]> {
@@ -321,9 +364,12 @@ export class Agent {
   }
   // A file's whole content generated as code: a new file, or an existing one
   // rewritten with its current content in front of the worker.
-  private async createFile(s: Session, path: string, purpose: string, thought: string, rewrite = false, range?: { start?: unknown; end?: unknown }): Promise<void> {
+  private async createFile(s: Session, path: string, purpose: string, thought: string, rewrite = false, range?: { start?: unknown; end?: unknown }, exact?: string): Promise<void> {
     let current: string | undefined;
-    try { current = await readFile(await safePath(this.tools.root, path, true), 'utf8'); } catch { current = undefined; }
+    // Read as the edit tools read it (a byte-order mark is not part of the text), so the hash a
+    // rewrite carries is the one the write checks; a missing file is one to create.
+    try { current = await boundedRead(await safePath(this.tools.root, path, true)); }
+    catch (e: any) { if (e?.code === 'ENOENT' || e?.code === 'ENOTDIR') current = undefined; else throw new Error(`${path} cannot be read as text: ${e?.message ?? e}`); }
     if (current !== undefined && !rewrite) throw new Error(`${path} already exists; use rewrite_file to replace its whole content, or replace_lines for a small edit`);
     if (current === undefined && rewrite) throw new Error(`${path} does not exist; use create_file`);
     // A block of the file: lines start..end regenerated and spliced in, the rest untouched.
@@ -342,7 +388,21 @@ export class Agent {
     // What the repository says this kind of file is written against (the profiles decide which facts apply).
     const markup = await generationFacts(this.tools.root, path, current, s.knownFiles).catch(() => ({} as Record<string, unknown>));
     const builds = region ? [0, 1].map(k => () => regionMessages(s, path, purpose, current!, region.start, region.end, contracts, declared, k, markup)) : [0, 1].map(k => () => newFileMessages(s, path, purpose, contracts, declared, k, current, markup));
-    const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', builds, this.config.createTokens, fenceFor(path));
+    // A rewrite whose exact arguments already reproduced this very content, from the same request
+    // in front of the generation (only the earlier steps differ), is not generated again: code is
+    // sampled at a low temperature, and across 73 recorded runs every repeat of the same request on
+    // the same content returned the same text byte for byte (run 71, steps 34, 36 and 37: 1452
+    // tokens three times, from prompts of 29k and 15k tokens whose last two messages were
+    // identical). A check that ran since, a module or package that changed, other notes: another
+    // request, which is generated.
+    const sha = current === undefined ? undefined : hash(current);
+    const known = rewrite && exact ? s.reproduced?.[exact] : undefined;
+    const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', builds, this.config.createTokens, fenceFor(path), request => {
+      if (!known || known.sha !== sha || known.request !== request) return;
+      const was = known.ms === undefined ? '' : ` (${known.tokens !== undefined ? `${known.tokens} tokens, ` : ''}${(known.ms / 1000).toFixed(1)} s)`;
+      const shown = s.entries.some(e => e.step === known.step && e.kind !== 'turn') ? `e${known.step}` : 'its result has left the evidence';
+      throw Object.assign(new Error(`this exact ${Agent.describe('rewrite_file', { path, ...(region ? { start: range!.start, end: range!.end } : {}) })} reproduced the file unchanged at step ${known.step}${was} from the same request as now (sha256=${sha}, and the same purpose, lines, notes, check state, modules and packages; only earlier steps differ); it was not generated again (${shown}). ${Agent.provenance(s, path, sha!, exact)}`), { duplicate: true });
+    });
     const finish = generated.finish; let code = generated.code; const cut = generated.cut;
     let blockCount = 0; let echoedAfter = false;
     if (region) {
@@ -371,7 +431,16 @@ export class Agent {
       : `the file holds lines 1..${written} as generated; nothing from line ${at} on was written`;
     const ended = cut ? `${cutLine}: ${kept}` : finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : finish === 'repetition' ? 'started repeating itself and was cut at the repeat' : finish === 'eos' ? 'ended before the file was complete (the model stopped without closing the code block)' : '';
     if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
-    if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, '')) throw new Error(`the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}; nothing was written. Say in purpose exactly what must differ, or edit the lines that are wrong with replace_lines`);
+    // What the generation cost, as the client measured it.
+    const spent = generated.ms === undefined ? '' : ` (${generated.tokens !== undefined ? `${generated.tokens} tokens, ` : ''}${(generated.ms / 1000).toFixed(1)} s)`;
+    // A rewrite that reproduced the file is stated with where the file's content came from
+    // and whether the last check has seen it: the facts a request to change it was made on.
+    if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, '')) {
+      if (exact) { (s.reproduced ??= {})[exact] = { step: s.step, sha: sha!, request: generated.request, ...(generated.ms !== undefined ? { ms: generated.ms } : {}), ...(generated.tokens !== undefined ? { tokens: generated.tokens } : {}) }; for (const old of Object.keys(s.reproduced).slice(0, -20)) delete s.reproduced[old]; }
+      // Equal once trailing whitespace is set aside: said as equal only when it is byte for byte.
+      const equal = code === current ? (region ? 'equal them' : 'equals') : region ? 'differ from them only in trailing whitespace' : 'differs only in trailing whitespace from';
+      throw new Error(`the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}: ${region ? `the generated lines ${region.start}..${region.end}${spent} ${equal}` : `the generated file${spent} ${equal} ${path}`} as it is (sha256=${sha}); nothing was written. ${Agent.provenance(s, path, sha!, exact)}`);
+    }
     const result = rewrite
       ? await this.execute(s, 'write', { path, expectedHash: hash(current!), oldText: current!, newText: code, wholeFile: true, ...(region ? { region } : {}) }, 'rewrite')
       : await this.execute(s, 'create_file', { path, content: code }, 'create');
@@ -387,6 +456,31 @@ export class Agent {
     // errors are in what was written, not in a cut, so the worker is told which.
     else if (/does not parse/.test(result.text)) facts.unshift(`the generation of ${path} ran to its end (${code.split('\n').length} lines, not cut off); the parse errors are in the written content`);
     if (facts.length) { const e = s.entries.at(-1); if (e) e.text += `\nHarness: ${facts.join(' | ')}`; s.lastError = facts.join(' | '); }
+    // A whole-file rewrite generates every line: how many of them differ from the content it
+    // replaced, and what generating them cost, is a fact about the write (region rewrites and
+    // creations generate only what is new).
+    if (rewrite && !region) {
+      const { removed, added, exact: counted } = lineDiff(current!, code); const total = code === '' ? 0 : code.replace(/\n$/, '').split('\n').length;
+      // Lines are compared without their endings: a CRLF file rewritten with LF endings is said so once.
+      const endings = /\r\n/.test(current!) && !/\r\n/.test(code) ? ` (compared without line endings: its CRLF line endings were written as LF)` : '';
+      const most = counted ? '' : 'at most '; const least = counted ? '' : 'at least ';
+      const e = s.entries.at(-1); if (e?.kind === 'write') e.text += `\nHarness: the rewrite generated every line of ${path}${spent}; compared with the content it replaced${endings}, ${most}${nLines(removed)} went, ${most}${nLines(added)} came and ${least}${nLines(total - added)} stayed as ${total - added === 1 ? 'it was' : 'they were'}.`;
+    }
+  }
+  // Where a file's current content came from, and whether the last check has run on it:
+  // the step that last wrote it (and the action, when the harness recorded it; the same
+  // arguments as the request being answered, when they are), and the last check's step
+  // relative to that write, with the lines of the file it names when it ran after it.
+  static provenance(s: Session, path: string, sha: string, exact?: string): string {
+    const w = s.writeSteps[path];
+    const by = w === undefined ? undefined : [s.writers?.[path], ...Object.values(s.attempts ?? {}).filter(a => a.ok).map(a => ({ step: a.step, what: a.what, exact: a.exact, sha: a.after[path] }))].find(a => a && a.step === w && a.sha === sha);
+    const wrote = w === undefined ? `no write of ${path} is recorded in this session` : `${path} was last written at step ${w}${by ? exact !== undefined && by.exact === exact ? ' by a rewrite_file with these same arguments' : ` by the ${by.what}` : ''}`;
+    const c = s.lastCheck; const command = c?.command ?? s.lastCheckCommand ?? 'the check';
+    if (!c) return `${wrote}; no check has run yet.`;
+    // Strictly before, as the verification block's writtenSince reads it (a check's own writes are not edits).
+    if (w !== undefined && c.step < w) return `${wrote}; the last check (${command}, step ${c.step}) ran before that write and none has run since: its output describes the file as it was at step ${c.step}.`;
+    const named = Object.entries(c.summary.files).find(([f]) => f === path || f.endsWith(`/${path}`) || path.endsWith(`/${f}`))?.[1] ?? [];
+    return `${wrote}; the last check (${command}, step ${c.step}) ran on it as it is and ${c.ok ? 'passed' : 'failed'}, naming ${named.length ? `line${named.length > 1 ? 's' : ''} ${named.join(', ')} of ${path}` : `no line of ${path}`}.`;
   }
 
   // ---- completion --------------------------------------------------------------
@@ -595,7 +689,11 @@ export class Agent {
     const outcome = await this.act(s, route, args, thought);
     // Recorded after it ran, with what it found and what it left; a refusal inside the
     // action (a generation that failed, a create over an existing file) is a failed run.
-    if (paths.length && outcome !== 'stop') (s.attempts ??= {})[exact] = { step, ok: outcome === 'ok', exact, what, ...(typeof args.expectedHash === 'string' ? { sent: args.expectedHash } : {}), ...(outcome === 'ok' ? {} : { error: (s.lastError ?? '').split('\n')[0]!.replace(/^(Tool error|No action executed): /, '') }), before: now, after: await this.diskHashes(paths) };
+    if (paths.length && outcome !== 'stop') {
+      const attempt: EditAttempt = { step, ok: outcome === 'ok', exact, what, ...(typeof args.expectedHash === 'string' ? { sent: args.expectedHash } : {}), ...(outcome === 'ok' ? {} : { error: (s.lastError ?? '').split('\n')[0]!.replace(/^(Tool error|No action executed): /, '') }), before: now, after: await this.diskHashes(paths) };
+      (s.attempts ??= {})[exact] = attempt;
+      if (attempt.ok) for (const p of paths) if (attempt.after[p] !== attempt.before[p]) (s.writers ??= {})[p] = { step, what, exact, sha: attempt.after[p] ?? null };
+    }
     return outcome;
   }
   // A read or a search asked again while its answer is still in the evidence has no side
@@ -706,8 +804,8 @@ export class Agent {
       await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text }); return 'failed';
     }
     if (route === 'create_file' || route === 'rewrite_file') {
-      try { if (route === 'create_file' && typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought, route === 'rewrite_file', { start: args.start, end: args.end }); }
-      catch (e) { return refuse((e as Error).message); }
+      try { if (route === 'create_file' && typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought, route === 'rewrite_file', { start: args.start, end: args.end }, Agent.actionKey(s, route, args, true)); }
+      catch (e) { return refuse((e as Error).message, (e as { duplicate?: boolean }).duplicate === true); }
       return s.lastResultOk ? 'ok' : 'failed';
     }
     // A command the worker marks as its verification is the check of record from then on; its result is judged like any check.
@@ -747,6 +845,9 @@ export class Agent {
     this.observe({ kind: 'jev', step: s.step, ms: performance.now() - t0, questions: 6, stateBytes: 0, route: [], nouls: { progress: reading.progress, stuck: reading.stuck, same_failure: reading.sameFailure, objective: reading.objective, needs_user: reading.needsUser, in_scope: reading.inScope } });
   }
 }
+const nLines = (n: number) => `${n} line${n === 1 ? '' : 's'}`;
+// What a generation cost, from the client's metadata.
+const cost = (meta: { ms?: number; usage?: { completion_tokens?: number } } | null | undefined): { ms?: number; tokens?: number } => ({ ...(typeof meta?.ms === 'number' ? { ms: meta.ms } : {}), ...(typeof meta?.usage?.completion_tokens === 'number' ? { tokens: meta.usage.completion_tokens } : {}) });
 // Edit failures that depend only on the arguments and the target file's text: with the
 // same arguments and the file unchanged, the tool refuses them again.
 const textFailure = /Stale file hash|oldText must match|would no longer parse|unmatched '|already contains|produced no change|Range \d+\.\.\d+ (must|exceeds)|Ranges \d+\.\.\d+ and \d+\.\.\d+ overlap|already exists|does not exist: write replaces|does not exist; use destinationHash|exists: read it and use its sha256|produced no content|is not a hash|already starts with|is blank; prepend|is an insertion/;

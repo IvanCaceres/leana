@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +9,7 @@ import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults };
 import { Bonsai, Jev, cyclingLine, lineCut, periodic, periodicStart, postJson, requestTimeoutMs, repetitionStart, validateAnswers } from '../src/clients.js';
-import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds } from '../src/context.js';
+import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds, lineDiff } from '../src/context.js';
 import { namedFiles, pinReferences, referenceContext } from '../src/references.js';
 import { objectiveClauses } from '../src/control.js';
 import { newSession } from '../src/agent.js';
@@ -18,8 +18,8 @@ import { extractCode, focusedEditSchema, samplingSchema, schemas, validate } fro
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
-import { commandWords, configFile, declaredName, lockfiles, manifestOf, shellPrefixFor, undeclaredPackages, unresolvedImports, detectProjects, projectFor, ecosystems, importSpelling, importsFor, languageFor, moduleCandidates, regexDeclarations, signaturesFor, sourceFile, syntaxCheck, verificationClass } from '../src/profiles.js';
-import { manifestFailures, installCommand, repositoryStatus, solutionTsconfigReferences, checkUnusable, checkAdvice, assertBalancePreserved, completionSource, hash, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, syntaxErrors, assertNoBulkDuplication, treeChanges, treeSnapshot, dropDuplicateImports, exportedSignatures, importCandidates, relativeImports, statementBounds } from '../src/tools.js';
+import { commandWords, configFile, declaredName, lockfiles, manifestOf, shellPrefixFor, undeclaredPackages, unresolvedImports, detectProjects, projectFor, ecosystems, importSpelling, importsFor, languageFor, moduleCandidates, regexDeclarations, signaturesFor, sourceFile, syntaxCheck, verificationClass, blockBalance, componentFormats, componentProblems, parseFact, parseInProcess } from '../src/profiles.js';
+import { manifestFailures, installCommand, repositoryStatus, solutionTsconfigReferences, checkUnusable, checkAdvice, assertBalancePreserved, completionSource, hash, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, syntaxErrors, describeProcesses, groupProcesses, assertNoBulkDuplication, treeChanges, treeSnapshot, TreeHashes, dropDuplicateImports, exportedSignatures, importCandidates, problemAt, problemKey, relativeImports, statementBounds } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -467,6 +467,31 @@ test('What a command changed is read from the tree: created, modified and delete
   }
 });
 
+test('A file\'s content hash is known by its size and modification time: rewritten with the same bytes it hashes the same under a new signature; a signature not hashed is unknown, never guessed', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-treehash-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'same.svelte'), '{@each pets as pet}\n'); await writeFile(join(root, 'src', 'other.ts'), 'a\n'); await writeFile(join(root, 'big.bin'), Buffer.alloc(1024 * 1024 + 1));
+  const past = new Date(Date.now() - 60000); for (const f of ['src/same.svelte', 'src/other.ts']) await utimes(join(root, f), past, past);
+  const hashes = new TreeHashes(); const before = (await treeSnapshot(root))!;
+  await hashes.fill(root, before);
+  assert.equal(hashes.at('src/same.svelte', before.get('src/same.svelte')), hash('{@each pets as pet}\n'), 'the hash read_files shows');
+  assert.equal(hashes.at('big.bin', before.get('big.bin')), null, 'past the read limit: not known');
+  const r = await runCommand('bash', ['-c', "cat > src/same.svelte <<'EOF'\n{@each pets as pet}\nEOF\nprintf 'b\\n' > src/other.ts"], root, 10000); assert.equal(r.code, 0);
+  const after = (await treeSnapshot(root))!;
+  assert.notEqual(after.get('src/same.svelte'), before.get('src/same.svelte'), 'the write moved the modification time');
+  assert.equal(hashes.at('src/same.svelte', after.get('src/same.svelte')), null, 'a signature not hashed yet is not known');
+  await hashes.fill(root, new Map(['src/same.svelte', 'src/other.ts'].map(p => [p, after.get(p)!])));
+  assert.equal(hashes.at('src/same.svelte', after.get('src/same.svelte')), hash('{@each pets as pet}\n'), 'same bytes, same hash');
+  assert.equal(hashes.at('src/other.ts', after.get('src/other.ts')), hash('b\n'));
+  assert.equal(hashes.at('src/same.svelte', before.get('src/same.svelte')), null, 'only the signature last hashed is answered');
+  // A signature the file no longer has (it changed after the snapshot) is not recorded against that snapshot.
+  const stale = (await treeSnapshot(root))!; await writeFile(join(root, 'src', 'other.ts'), 'changed since the snapshot\n');
+  await hashes.fill(root, new Map([['src/other.ts', stale.get('src/other.ts')!]]));
+  assert.equal(hashes.at('src/other.ts', stale.get('src/other.ts')), hash('b\n'), 'already hashed at that signature: not read again');
+  await hashes.fill(root, new Map([['src/other.ts', '2:1']]));
+  assert.equal(hashes.at('src/other.ts', '2:1'), null, 'the file on disk does not have that signature');
+});
+
 test('Every ecosystem in every manifest directory is a project: a JavaScript frontend beside a Python backend', async t => {
   const root = await mkdtemp(join(tmpdir(), 'leana-projects-')); t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, 'web', 'src'), { recursive: true }); await mkdir(join(root, 'api', 'app'), { recursive: true }); await mkdir(join(root, 'web', 'node_modules', 'dep'), { recursive: true });
@@ -530,6 +555,146 @@ test('a refused replace_lines states the facts of the edit: the lines it drops, 
   assert.equal(await readFile(join(root, 'src', 'main.tsx'), 'utf8'), main, 'nothing was written');
 });
 
+// Run 63, step 41: HomeView.vue as it was before the edit (its first thirteen
+// lines from the artifact, the template shortened).
+const homeView = "<script setup>\nimport { computed } from 'vue'\nimport { useRouter } from 'vue-router'\nimport { useNewsStore } from '../stores/news.js'\nimport { categories } from '../data/categories.js'\n\nconst router = useRouter()\nconst newsStore = useNewsStore()\n\nconst featuredArticles = computed(() => newsStore.featuredArticles)\nconst latestArticles = computed(() => newsStore.latestArticles)\nconst trendingArticles = computed(() => newsStore.trendingArticles)\n</script>\n\n<template>\n  <div class=\"home\">\n    <section class=\"hero\">\n      <h1 class=\"hero-title\">The Daily Chronicle</h1>\n    </section>\n  </div>\n</template>\n";
+const step41 = [{ start: 2, end: 2, newText: "import { computed, ref } from 'vue'", prepend: '' }, { start: 13, end: 13, newText: "const email = ref('')\n\nfunction handleNewsletter() {\n  console.log('Newsletter subscribed:', email.value)\n  email.value = ''\n}\n", prepend: '' }];
+const format = (path: string) => componentFormats.find(f => f.extension.test(path))!;
+
+test('A component file without its compiler installed is judged by its top-level block balance: valid layouts pass, an unclosed or unopened block is named with its line', () => {
+  const valid: [string, string][] = [
+    ['a.vue', homeView],
+    ['a.vue', '<!-- a comment with <template> in it -->\n<script>\nexport default { name: "A" }\n</script>\n<script setup lang="ts">\nconst open: string = "<template>"\nif (1 < 2 && open) {}\n</script>\n<template>\n  <template v-if="a > b"><p>x</p></template>\n  <template #item="{ row }">{{ row.a<row.b }}</template>\n  <Comp />\n  <template v-slot:empty />\n</template>\n<style scoped lang="scss">\n.a { .b { color: red } }\n</style>\n<i18n lang="json">\n{ "en": { "hi": "<template>" } }\n</i18n>\n'],
+    ['a.vue', '<template lang="pug">\ndiv\n  p hello\n</template>\n'],
+    ['a.vue', '<script>\nexport default {}\n</script>\n\n\n'],
+    ['a.svelte', '<script context="module">\n  export const prerender = true\n</script>\n<script lang="ts">\n  let count: number = 0\n  const s = "</style>"\n</script>\n\n<svelte:head><title>x</title></svelte:head>\n{#if count > 1}\n  <p>many</p>\n{:else}\n  <p>few</p>\n{/if}\n<button on:click={() => count++}>+</button>\n\n<style>\n  p { color: red }\n</style>\n'],
+    ['a.svelte', '<h1>Hello</h1>\n<p>no script at all</p>\n'],
+    ['a.astro', '---\nimport Layout from "../layouts/Layout.astro"\nconst tag = "<script>"\n---\n<Layout title="x">\n  <main><h1>{tag}</h1></main>\n  <script>\n    console.log("</div>")\n  </script>\n</Layout>\n<style>\n  h1 { color: red }\n</style>\n'],
+    // Tags inside an expression or a text-only element are strings, not blocks.
+    ['a.vue', "<template>\n  <p>{{ '<template>' }} {{ \"</template>\" }}</p>\n  <textarea><template></textarea>\n  <textarea v-model=\"a\" />\n</template>\n"],
+    ['a.svelte', "<p>{'<style>'} {\"</style>\"} {a > 0 ? '<script>' : `</script>${'{'}`}</p>\n{#each items as i}<li>{i}</li>{/each}\n<textarea><style></textarea>\n"],
+    ['a.astro', "\n---\nconst a = 1\n---\n<p>{a > 0 ? '<style>' : ''}</p>\n<ul>{[1, 2].map(i => <li>{i}</li>)}</ul>\n"],
+  ];
+  for (const [path, text] of valid) assert.deepEqual(blockBalance(text, format(path)), [], `${path}: ${text.slice(0, 40)}`);
+  const broken = homeView.split('\n'); broken.splice(12, 1, "const email = ref('')");
+  assert.deepEqual(blockBalance(broken.join('\n'), format('a.vue')), ['line 1: "<script setup>" opens a <script> block that no </script> closes before the file ends']);
+  assert.deepEqual(blockBalance('<template>\n  <div class="not-found">\n    <div class="not-found-container">\n', format('a.vue')), ['line 1: "<template>" opens a <template> block that no </template> closes before the file ends'], 'run 63, step 15: a generation cut after five lines');
+  assert.deepEqual(blockBalance('<template>\n  <div />\n</template>\n</script>\n', format('a.vue')), ['line 4: "</script>" ends a <script> block that is not open']);
+  assert.deepEqual(blockBalance('<script>\n  let a = 1\n</script>\n<main />\n<style>\n  p {}\n', format('a.svelte')), ['line 5: "<style>" opens a <style> block that no </style> closes before the file ends']);
+  assert.deepEqual(blockBalance('<main>\n  <p>hi</p>\n</section>\n', format('a.svelte')), [], 'Svelte markup outside script and style is not a block: its elements are the compiler\'s to judge');
+  assert.deepEqual(blockBalance('---\nconst a = 1\n<main />\n', format('a.astro')), ['line 1: the frontmatter fence --- is not closed by a second --- line']);
+  assert.deepEqual(blockBalance('\n---\nconst a = 1\n<main />\n', format('a.astro')), ['line 2: the frontmatter fence --- is not closed by a second --- line'], 'the fence is the first line that is not blank');
+  assert.deepEqual(blockBalance("<p>{a('}</p>\n<style>\n  p {}\n", format('a.svelte')), ['line 2: "<style>" opens a <style> block that no </style> closes before the file ends'], 'an expression that never closes is not skipped: the tags after it are judged');
+  assert.deepEqual(blockBalance("<template>\n  <p>{{ a }}</p>\n</template>\n<script>\nexport default {}\n", format('a.vue')), ['line 4: "<script>" opens a <script> block that no </script> closes before the file ends']);
+  // Linear on hostile input: tens of thousands of stray end tags or unclosed expressions.
+  let t0 = performance.now(); blockBalance('</div>\n'.repeat(40000), format('a.vue')); blockBalance('{ \'\n<style>\n'.repeat(20000), format('a.svelte')); blockBalance('<template>\n' + '  <p>{{ a\n'.repeat(20000), format('a.vue'));
+  assert(performance.now() - t0 < 1000, `block balance took ${Math.round(performance.now() - t0)} ms`);
+});
+
+test('A component file is judged by the compiler its project installed, resolved from the file\'s own project; a compiler whose parse is not the known one leaves the block balance', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-sfc-')); t.after(() => rm(root, { recursive: true, force: true }));
+  // A stand-in for @vue/compiler-sfc in a nested project: parse(source, { filename }) returns { errors } with loc.start.line.
+  const vue = join(root, 'web', 'node_modules', '@vue', 'compiler-sfc'); await mkdir(vue, { recursive: true });
+  await writeFile(join(vue, 'package.json'), JSON.stringify({ name: '@vue/compiler-sfc', main: 'index.cjs' }));
+  await writeFile(join(vue, 'index.cjs'), 'exports.parse = (source, o) => ({ descriptor: {}, errors: source.split("\\n").flatMap((l, i) => /BROKEN/.test(l) ? [{ message: "Element is missing end tag.", loc: { start: { line: i + 1 } } }] : []), filename: o.filename });\n');
+  assert.deepEqual(await componentProblems(root, 'web/src/A.vue', '<template>\n  <div BROKEN>\n</template>\n'), ['line 2: Element is missing end tag: "<div BROKEN>"'], 'the compiler\'s message, with the line it names');
+  assert.deepEqual(await componentProblems(root, 'web/src/A.vue', '<template>\n  <div />\n</template>\n'), []);
+  assert.deepEqual(await componentProblems(root, 'other/A.vue', '<template>\n  <div BROKEN>\n</template>\n'), [], 'a file outside that project does not resolve its compiler: block balance, which sees nothing wrong at the top level');
+  assert.deepEqual(await parseInProcess(root, 'web/src/A.vue', '<template>\n<div BROKEN>\n</template>\n'), ['line 2: Element is missing end tag: "<div BROKEN>"']);
+  // pnpm does not hoist @vue/compiler-sfc: vue/compiler-sfc, which the Vite plugin loads, is resolved first.
+  const pn = join(root, 'pn', 'node_modules', 'vue'); await mkdir(join(pn, 'compiler-sfc'), { recursive: true });
+  await writeFile(join(pn, 'package.json'), JSON.stringify({ name: 'vue', exports: { './compiler-sfc': { require: './compiler-sfc/index.cjs' } } }));
+  await writeFile(join(pn, 'compiler-sfc', 'index.cjs'), 'exports.parse = source => ({ descriptor: {}, errors: /<div>\\n<\\/template>/.test(source) ? [{ message: "Element is missing end tag.", loc: { start: { line: 2 } } }] : [] });\n');
+  assert.deepEqual(await componentProblems(root, 'pn/src/A.vue', '<template>\n<div>\n</template>\n'), ['line 2: Element is missing end tag: "<div>"'], 'an unclosed element inside the template, which block balance does not judge');
+  // svelte/compiler: parse throws an error with start.line; script content in a preprocessor's language is not given to it.
+  const svelte = join(root, 'node_modules', 'svelte'); await mkdir(join(svelte, 'compiler'), { recursive: true });
+  await writeFile(join(svelte, 'package.json'), JSON.stringify({ name: 'svelte', exports: { './compiler': { require: './compiler/index.cjs' } } }));
+  await writeFile(join(svelte, 'compiler', 'index.cjs'), 'exports.parse = source => { const i = source.split("\\n").findIndex(l => /BROKEN|: number/.test(l)); if (i >= 0) throw Object.assign(new Error("Expected token >\\nhttps://svelte.dev/e/expected_token"), { start: { line: i + 1, column: 0 } }); return { html: {} }; };\n');
+  assert.deepEqual(await componentProblems(root, 'src/A.svelte', '<script lang="ts">\n  let count: number = 0\n</script>\n<p>{count}</p>\n'), [], 'TypeScript in <script lang="ts"> is blanked, lines kept');
+  assert.deepEqual(await componentProblems(root, 'src/A.svelte', '<script>\n  let count = 0\n</script>\n<p BROKEN\n'), ['line 4: Expected token >: "<p BROKEN"']);
+  // A package of that name without the known parse (another major's API) is not trusted for a verdict.
+  const odd = join(root, 'odd', 'node_modules', '@vue', 'compiler-sfc'); await mkdir(odd, { recursive: true });
+  await writeFile(join(odd, 'package.json'), JSON.stringify({ name: '@vue/compiler-sfc', main: 'index.cjs' })); await writeFile(join(odd, 'index.cjs'), 'exports.parse = o => { if (typeof o !== "object") throw new TypeError("options"); return {}; };\n');
+  assert.deepEqual(await componentProblems(root, 'odd/A.vue', '<script>\nexport default {}\n'), ['line 1: "<script>" opens a <script> block that no </script> closes before the file ends']);
+  assert.equal(await parseInProcess(root, 'index.html', '<html><body></div>'), null, 'HTML has no parser here: the browser recovers, the page observation is its check');
+  assert.deepEqual(await syntaxCheck(root, 'src/B.vue', '<template>\n<p>x</p>\n'), ['line 1: "<template>" opens a <template> block that no </template> closes before the file ends'], 'the fact after a write comes from the same parser');
+});
+
+// Run 67, steps 11-15: `{@each ...}` where Svelte's block is `{#each ...}`; the compiler stops at "each" (0-based column 6, offset in the file).
+const run67Page = (indent: string, above = '') => `<script lang="ts">\n${indent}let pets: { emoji: string }[] = $state([{ emoji: "🐕" }]);\n</script>\n${above}\n<div class="grid">\n${indent}${indent}{@each pets as pet}\n${indent}${indent}${indent}<span>{pet.emoji}</span>\n${indent}${indent}{/@each}\n</div>\n`;
+async function svelteStandIn(root: string): Promise<void> {
+  // A stand-in for svelte/compiler: parse throws, as Svelte 5 does, an error whose position is an offset into the text it was given, less a leading byte-order mark.
+  const svelte = join(root, 'node_modules', 'svelte'); await mkdir(join(svelte, 'compiler'), { recursive: true });
+  await writeFile(join(svelte, 'package.json'), JSON.stringify({ name: 'svelte', exports: { './compiler': { require: './compiler/index.cjs' } } }));
+  await writeFile(join(svelte, 'compiler', 'index.cjs'), 'exports.parse = source => { source = source.replace(/^\\ufeff/, ""); const i = source.indexOf("{@"); if (i < 0) return { html: {} }; const at = i + 2; const line = source.slice(0, at).split("\\n").length; throw Object.assign(new Error("Expected \'html\', \'render\', \'attach\', \'const\', or \'debug\'\\nhttps://svelte.dev/e/expected_tag"), { position: [at, at], start: { line, column: at - source.lastIndexOf("\\n", at - 1) - 1, character: at } }); };\n');
+}
+
+test('A parse problem names its line, the column the parser gives and the text that starts there, and the line\'s text: TypeScript, a Svelte compiler\'s offset (run 67), a Vue compiler\'s 1-based column', async t => {
+  assert.deepEqual(await syntaxErrors('a.ts', 'const a = 1;\nconst b = foo(;\n'), ['line 2, column 15 (at ";" of "foo(;"): \')\' expected: "const b = foo(;"']);
+  assert.deepEqual(await syntaxErrors('a.ts', 'const x = {\n  a: 1\n'), ["line 3, column 1 (at the end of the file): '}' expected"], 'a position past the last text is the end of the file, and an empty line is not quoted');
+  assert.deepEqual(await syntaxErrors('a.json', '{"a": 1,, }'), ['line 1, column 9 (at "," of "1,,"): Property assignment expected: "{\\"a\\": 1,, }"']);
+  assert.equal(problemAt('a\nb\n', 'm.', { offset: 0, line: 2 }), 'line 2: m: "b"', 'an offset that is not on the line the parser names is not used');
+  assert.equal(problemAt('a\n', 'm', {}), 'm');
+  for (let k = 20; k < 40; k++) assert.doesNotMatch(problemAt(`${'🐶'.repeat(30)}\n`, 'm', { line: 1, column: k }), /\\ud[89a-f]/i, 'the quoted run never splits a character outside the basic plane');
+  assert.doesNotMatch(problemAt(`x${'🐶'.repeat(60)}\n`, 'm', { line: 1 }), /\\ud[89a-f]/i, 'nor the quoted line');
+  assert.equal(problemKey('line 160, column 7 (at "each" of "{@each"): E: "{@each pets as pet}"'), problemKey('line 167, column 5 (at "each" of "{@each"): E: "{@each pets as pet}"'), 'the same message at the same text, wherever the lines moved');
+  const root = await mkdtemp(join(tmpdir(), 'leana-at-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await svelteStandIn(root);
+  // The script is TypeScript, blanked before the compiler reads it: offsets after it are kept (the emoji is two UTF-16 units, blanked as two).
+  assert.deepEqual(await componentProblems(root, 'src/routes/+page.svelte', run67Page('  ')), ['line 6, column 7 (at "each" of "{@each"): Expected \'html\', \'render\', \'attach\', \'const\', or \'debug\': "{@each pets as pet}"']);
+  assert.deepEqual(await componentProblems(root, 'src/routes/+page.svelte', '\ufeff' + run67Page('  ')), await componentProblems(root, 'src/routes/+page.svelte', run67Page('  ')), 'a leading byte-order mark, which Svelte drops before it places its errors, does not move the column');
+  const vue = join(root, 'web', 'node_modules', '@vue', 'compiler-sfc'); await mkdir(vue, { recursive: true });
+  await writeFile(join(vue, 'package.json'), JSON.stringify({ name: '@vue/compiler-sfc', main: 'index.cjs' }));
+  await writeFile(join(vue, 'index.cjs'), 'exports.parse = source => { const offset = source.indexOf("{{ x }<"); if (offset < 0) return { descriptor: {}, errors: [] }; const line = source.slice(0, offset).split("\\n").length; return { descriptor: {}, errors: [{ message: "Interpolation end sign was not found.", loc: { start: { offset, line, column: offset - source.lastIndexOf("\\n", offset - 1) } } }] }; };\n');
+  assert.deepEqual(await componentProblems(root, 'web/src/A.vue', '<template>\n  <p>{{ x }</p>\n</template>\n'), ['line 2, column 6 (at "{{" of "<p>{{"): Interpolation end sign was not found: "<p>{{ x }</p>"']);
+});
+
+test('Run 67, steps 13-15: a write that leaves the file with the problem the replaced text had, the same message at the same text, is told so with both lines; a new problem, a new file or the end of the file is not', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-same-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await svelteStandIn(root);
+  const path = 'src/routes/+page.svelte';
+  // The regeneration reindented the file and added lines above the loop: the problem moved from line 6 to line 7, at the same text.
+  const fact = await parseFact(root, path, run67Page('  '), run67Page('\t', '<h1>Pets</h1>\n<p>for sale</p>'));
+  assert.equal(fact, `${path} does not parse: line 7, column 5 (at "each" of "{@each"): Expected 'html', 'render', 'attach', 'const', or 'debug': "{@each pets as pet}". Same problem as before this write, at the same text: line 7 (was line 6); that text did not change`);
+  assert.equal(await parseFact(root, path, null, run67Page('  ')), `${path} does not parse: line 6, column 7 (at "each" of "{@each"): Expected 'html', 'render', 'attach', 'const', or 'debug': "{@each pets as pet}"`, 'a created file has nothing it replaced');
+  assert.doesNotMatch((await parseFact(root, path, run67Page('  '), run67Page('  ').replace('{@each pets as pet}', '{@each pets as p}')))!, /Same problem/, 'the same message at different text is a different problem');
+  assert.equal(await parseFact(root, path, run67Page('  '), run67Page('  ').replace('{@each', '{#each').replace('{/@each', '{/each')), null, 'a file that parses has no fact');
+  assert.doesNotMatch((await parseFact(root, 'a.ts', 'const x = {\n  a: 1\n', 'const x = {\n  b: 2\n'))!, /Same problem/, 'a problem at the end of the file names no text');
+  assert.match((await parseFact(root, 'a.ts', 'const b = foo(;\n', '// two\nconst b = foo(;\n'))!, /: "const b = foo\(;"\. Same problem as before this write, at the same text: line 2 \(was line 1\); that text did not change$/);
+});
+
+test('A problem at text that another line also reads is not the same problem: the first of two identical broken lines fixed, a stray brace deleted in one place and added in another', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-same2-')); t.after(() => rm(root, { recursive: true, force: true }));
+  // Two identical broken lines, the first fixed: the second is the same problem at its own line, never the fixed one's.
+  const two = (a: string) => `function f() {\n  ${a}\n}\nfunction g() {\n  foo(;\n}\n`;
+  const fixedFirst = await parseFact(root, 'a.ts', two('foo(;'), two('foo();'));
+  assert.match(fixedFirst!, /line 5, column 7 [^|]*Same problem as before this write, at the same text: line 5 \(was line 5\); that text did not change$/, 'TypeScript reported both; the second is unchanged');
+  const moved = await parseFact(root, 'a.ts', 'function a() {\n  return 1;\n}\n}\nfunction b() {\n  return 2;\n}\n', 'function a() {\n  return 1;\n}\nfunction b() {\n  return 2;\n}\n}\nexport {}\n');
+  assert.match(moved!, /line 7, column 1 \(at "}"\): Declaration or statement expected/); assert.doesNotMatch(moved!, /Same problem/, 'the brace at line 7 is new text');
+});
+
+test('Run 63, step 41: a replace_lines that overwrites the </script> closing <script setup> is refused with the line it drops; a repair of a file already broken is not blocked', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-sfc-edit-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src', 'views'), { recursive: true });
+  await writeFile(join(root, 'src', 'views', 'HomeView.vue'), homeView);
+  const tools = new ToolBox(root, join(root, '.leana'), { ...defaults, allowWrite: true });
+  tools.parse = (path, text) => parseInProcess(root, path, text).then(r => r ?? []);
+  await assert.rejects(tools.execute('replace_lines', { path: 'src/views/HomeView.vue', expectedHash: hash(homeView), edits: step41 }),
+    /^Error: Edit refused: src\/views\/HomeView\.vue would no longer parse \(line 1: "<script setup>" opens a <script> block that no <\/script> closes before the file ends\)\.[\s\S]*held line\(s\) the new text does not contain: 2: import \{ computed \} from 'vue'; 13: <\/script>\.$/);
+  assert.equal(await readFile(join(root, 'src', 'views', 'HomeView.vue'), 'utf8'), homeView, 'nothing was written');
+  // The edit it meant: insert before line 13.
+  const r = await tools.execute('replace_lines', { path: 'src/views/HomeView.vue', expectedHash: hash(homeView), edits: [step41[0], { ...step41[1], end: 12 }] });
+  assert.equal(r.ok, true); const fixed = await readFile(join(root, 'src', 'views', 'HomeView.vue'), 'utf8');
+  assert.match(fixed, /email\.value = ''\n\}\n<\/script>\n/);
+  // Already broken (the state after step 41): an edit that leaves it no worse lands, so the repair is never blocked.
+  const broken = homeView.split('\n'); broken.splice(12, 1, "const email = ref('')"); await writeFile(join(root, 'src', 'views', 'HomeView.vue'), broken.join('\n'));
+  const repair = await tools.execute('replace_lines', { path: 'src/views/HomeView.vue', expectedHash: hash(broken.join('\n')), edits: [{ start: 2, end: 2, newText: "import { computed, ref } from 'vue'" }] });
+  assert.equal(repair.ok, true);
+  // A ToolBox without the profiles' parser keeps the TypeScript-only gate: the loop is what wires the component parser in.
+  const plain = new ToolBox(root, join(root, '.leana'), { ...defaults, allowWrite: true }); await writeFile(join(root, 'src', 'views', 'HomeView.vue'), homeView);
+  assert.equal((await plain.execute('replace_lines', { path: 'src/views/HomeView.vue', expectedHash: hash(homeView), edits: step41 })).ok, true);
+});
+
 test('Shell command output reaches the harness without colour or hyperlink sequences; content ESC bytes elsewhere are kept', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'leana-plain-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const tools = new ToolBox(dir, join(dir, '.leana'), { ...defaults, allowBash: true });
@@ -539,4 +704,40 @@ test('Shell command output reaches the harness without colour or hyperlink seque
   assert.equal(raw.output, 'RESET = "\u001bc"\n', 'a command run for its content (a search, a program) keeps its bytes');
   const { plainText } = await import('../src/tools.js');
   assert.equal(plainText('SAVE = "\u001b7"; RED = "\u001b[31m"'), 'SAVE = "\u001b7"; RED = ""', 'only CSI and OSC sequences are removed');
+});
+
+test('The processes a command left running are described by what it started, and what those started is counted', () => {
+  assert.equal(describeProcesses([{ pid: 10, ppid: 1, args: 'npm run dev' }, { pid: 11, ppid: 10, args: 'sh -c vite' }, { pid: 12, ppid: 11, args: 'node vite' }]), '"npm run dev" (pid 10) and 2 processes started by it');
+  assert.equal(describeProcesses([{ pid: 10, ppid: 1, args: 'a' }, { pid: 20, ppid: 1, args: 'b' }]), '"a" (pid 10), "b" (pid 20)');
+  assert.equal(describeProcesses([{ pid: 10, ppid: 1, args: 'a' }, { pid: 20, ppid: 1, args: 'b' }, { pid: 21, ppid: 20, args: 'c' }]), '"a" (pid 10), "b" (pid 20) and 1 process started by them');
+});
+
+test('A process group is read from the process table (/proc or ps): its live members with their command lines; an empty group is empty', async () => {
+  const { spawn } = await import('node:child_process');
+  const child = spawn('bash', ['-c', 'sleep 30 & sleep 30'], { detached: true, stdio: 'ignore' });
+  try {
+    await new Promise(r => setTimeout(r, 300));
+    const found = await groupProcesses(child.pid!);
+    assert.deepEqual(found.map(p => p.args).sort(), ['bash -c sleep 30 & sleep 30', 'sleep 30', 'sleep 30']);
+    assert(found.filter(p => p.args === 'sleep 30').every(p => p.ppid === child.pid));
+    // The ps table (macOS, the BSDs) reads the same.
+    assert.deepEqual(await groupProcesses(child.pid!, 'ps'), found);
+  } finally { process.kill(-child.pid!, 'SIGKILL'); }
+  await new Promise(r => setTimeout(r, 200));
+  assert.deepEqual(await groupProcesses(child.pid!), []);
+});
+
+test('lineDiff counts the lines each text has that the other does not, by a longest common subsequence after the common ends', () => {
+  assert.deepEqual(lineDiff('a\nb\nc\n', 'a\nb\nc\n'), { removed: 0, added: 0, exact: true });
+  assert.deepEqual(lineDiff('a\nb\nc\n', 'a\nB\nc\n'), { removed: 1, added: 1, exact: true });
+  assert.deepEqual(lineDiff('import x;\na\nb\nc\n', 'a\nb\nc\nd\n'), { removed: 1, added: 1, exact: true }, 'a line dropped at the top, one added at the end');
+  assert.deepEqual(lineDiff('a\nb\n', 'b\na\n'), { removed: 1, added: 1, exact: true }, 'a swap keeps one line');
+  assert.deepEqual(lineDiff('', 'a\nb\n'), { removed: 0, added: 2, exact: true });
+  assert.deepEqual(lineDiff('a\nb', 'a\nb\n'), { removed: 0, added: 0, exact: true }, 'a final line break is not a line');
+});
+
+test('lineDiff (review): CRLF endings are not line changes, and a middle too large to compare is not stated as exact', () => {
+  assert.deepEqual(lineDiff('a\r\nb\r\nc\r\n', 'a\nB\nc\n'), { removed: 1, added: 1, exact: true });
+  const big = (n: number, p: string) => Array.from({ length: n }, (_, i) => `${p}${i}`).join('\n') + '\n';
+  assert.equal(lineDiff(big(2100, 'x'), big(2100, 'y')).exact, false);
 });

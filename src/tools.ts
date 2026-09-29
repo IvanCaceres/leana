@@ -368,6 +368,43 @@ export function manifestFailures(output: string): { name: string; kind: 'notarge
 // An edit that leaves a TypeScript or JavaScript file unparseable is refused
 // with the parser's own message: cheaper than a lint, a rollback and a rejected
 // edit, and it names the exact line. Uses the harness's TypeScript when present.
+// A parse problem as the harness states it: the line the parser names, and the
+// column with the text that starts there within its whitespace-delimited run
+// when the parser gives a position; the parser's own message (its first line);
+// and the text of that line when it has any. The position is an offset into the text or a line
+// and 1-based column; an offset that does not fall on the line given is not used.
+export function problemAt(text: string, message: string, at: { offset?: number; line?: number; column?: number }): string {
+  const said = (message.split('\n')[0] ?? '').trim().replace(/\.$/, '');
+  let line = at.line; let column = at.column;
+  if (!(line && column) && typeof at.offset === 'number' && at.offset >= 0 && at.offset <= text.length) {
+    const before = text.slice(0, at.offset); const n = before.split('\n').length;
+    if (!line || line === n) { line = n; column = at.offset - before.lastIndexOf('\n'); }
+  }
+  const lines = line ? text.split('\n') : []; const src = lines[line ? line - 1 : -1];
+  if (!line || src === undefined) return line ? `line ${line}: ${said}` : said;
+  const line80 = src.trim(); const cut = line80.length > 80 && /[\ud800-\udbff]/.test(line80[79]!) ? 79 : 80;
+  const quoted = line80 ? `: ${JSON.stringify(line80.slice(0, cut))}` : '';
+  if (!column) return `line ${line}: ${said}${quoted}`;
+  const i = column - 1; const content = src.replace(/\s+$/, '');
+  let where: string;
+  if (i >= content.length) where = lines.slice(line).some(l => l.trim()) ? 'at the end of the line' : 'at the end of the file';
+  else if (/\s/.test(src[i]!)) where = 'at whitespace';
+  else {
+    let s = i; while (s > 0 && !/\s/.test(src[s - 1]!)) s--;
+    let e = i; while (e < src.length && !/\s/.test(src[e]!)) e++;
+    // Bounds that never split a surrogate pair (a character outside the basic plane is two UTF-16 units).
+    const low = (k: number) => /[\udc00-\udfff]/.test(src[k] ?? '');
+    let from = Math.max(s, i - 24); if (from > s && low(from)) from--;
+    let to = Math.min(e, i + 24); if (to < e && low(to)) to++;
+    const at = i > s && low(i) ? i - 1 : i; const rest = src.slice(at, to); const run = src.slice(from, to);
+    where = `at ${JSON.stringify(rest)}${run === rest ? '' : ` of ${JSON.stringify(run)}`}`;
+  }
+  return `line ${line}, column ${column} (${where}): ${said}${quoted}`;
+}
+// What names a problem across versions of a file: all of it but its line and
+// column numbers (the message, the text at the column and the line's text), so a
+// problem an edit moved without changing is the same problem.
+export const problemKey = (problem: string): string => problem.replace(/^line \d+(?:, column \d+)?/, '');
 const parseable = /\.(?:[cm]?[jt]sx?)$/i;
 let tsModule: any | null | undefined;
 export async function syntaxErrors(path: string, text: string): Promise<string[]> {
@@ -376,17 +413,16 @@ export async function syntaxErrors(path: string, text: string): Promise<string[]
   if (tsModule === undefined) { try { const m: any = await import('typescript'); tsModule = m.default ?? m; } catch { tsModule = null; } }
   if (!tsModule) { if (json) { try { JSON.parse(text); return []; } catch (e) { return [`invalid JSON: ${(e as Error).message}`]; } } return []; }
   const ts = tsModule;
-  const where = (d: any) => d.file && d.start !== undefined ? d.file.getLineAndCharacterOfPosition(d.start) : null;
-  const message = (d: any) => { const w = where(d); return `${w ? `line ${w.line + 1}: ` : ''}${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`; };
+  const message = (d: any) => problemAt(text, ts.flattenDiagnosticMessageText(d.messageText, ' '), d.file && typeof d.start === 'number' ? { offset: d.start } : {});
   // JSON with the parser tsconfig uses: comments and trailing commas allowed.
   if (json) return (ts.parseJsonText(path, text).parseDiagnostics ?? []).slice(0, 5).map(message);
   const out = ts.transpileModule(text, { reportDiagnostics: true, fileName: path, compilerOptions: { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.Preserve, allowJs: true } });
   return (out.diagnostics ?? []).slice(0, 5).map(message);
 }
-export async function assertParses(path: string, before: string, after: string): Promise<void> {
-  const problems = await syntaxErrors(path, after);
+export async function assertParses(path: string, before: string, after: string, parse: (path: string, text: string) => Promise<string[]> = syntaxErrors): Promise<void> {
+  const problems = await parse(path, after);
   if (!problems.length) return;
-  const had = await syntaxErrors(path, before);
+  const had = await parse(path, before);
   if (had.length && had.length >= problems.length) return; // already broken; do not block repairs
   throw new Error(`Edit refused: ${path} would no longer parse (${problems.join('; ')}). Re-read the lines around the error and cover whole statements; a missing import is added at the top of the file, never by overwriting the line that uses the name.`);
 }
@@ -456,6 +492,25 @@ export async function treeChanges(root: string, before: TreeSnapshot, after: Tre
   const keep = new Set(all);
   return { changed: all, created: created.filter(p => keep.has(p)), deleted: deleted.filter(p => keep.has(p)) };
 }
+// Files' content hashes (as read_files shows them) by the signature a tree snapshot
+// records (size and modification time): a file is read only when its signature has
+// not been hashed yet, so what a command did to content costs the files it touched.
+// A file whose signature moved while it was read is not recorded, nor one past the
+// read limit or the budget: for those the content before or after is not known.
+export class TreeHashes {
+  private known = new Map<string, { sig: string; hash: string }>();
+  at(path: string, sig: string | undefined): string | null { const k = this.known.get(path); return k && sig !== undefined && k.sig === sig ? k.hash : null; }
+  async fill(root: string, files: TreeSnapshot, budget = 32 * 1024 * 1024): Promise<void> {
+    let spent = 0;
+    for (const [p, sig] of files) {
+      if (this.known.get(p)?.sig === sig) continue;
+      this.known.delete(p);
+      const size = Number(sig.slice(0, sig.indexOf(':'))); if (!(size <= 1024 * 1024) || spent + size > budget) continue; spent += size;
+      const path = resolve(root, p);
+      try { const text = await boundedRead(path); const s = await stat(path); if (`${s.size}:${s.mtimeMs}` === sig) this.known.set(p, { sig, hash: hash(text) }); } catch { /* gone, or not readable */ }
+    }
+  }
+}
 export const within = (root: string, path: string): boolean => {
   const rel = relative(root, path);
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -486,7 +541,61 @@ export async function safePath(root: string, name: string, create = false): Prom
 // from its line number. Only these: an ESC that is content (a file shown by cat, a
 // search hit) is left alone.
 export const plainText = (text: string): string => text.replace(/\u001b\[[0-?]*[ -\/]*[@-~]|\u009b[0-?]*[ -\/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '');
-export async function runCommand(command: string, args: string[], cwd: string, timeout: number, limit = 1024 * 1024, settle?: (output: string, quietMs: number) => string | null): Promise<{ stoppedEarly?: string; output: string; code: number | null; truncated: boolean; timedOut: boolean }> {
+// A process still alive in a command's process group: its id, its parent's, and its command line.
+export interface GroupProcess { pid: number; ppid: number; args: string }
+// The live processes of a process group (zombies left out), read from the process
+// table: Linux's /proc, ps elsewhere (macOS, the BSDs, whose /proc differs or is absent)
+// and wherever /proc cannot be read. An empty group is known without reading the
+// table: signal 0 to it fails.
+export async function groupProcesses(pgid: number, via: 'proc' | 'ps' = process.platform === 'linux' ? 'proc' : 'ps'): Promise<GroupProcess[]> {
+  if (process.platform === 'win32' || !(pgid > 0)) return [];
+  try { process.kill(-pgid, 0); } catch { return []; }
+  const found: GroupProcess[] = [];
+  const pids = via === 'proc' ? await readdir('/proc').then(names => names.filter(n => /^\d+$/.test(n)), () => null) : null;
+  if (pids) {
+    await Promise.all(pids.map(async pid => {
+      const stat = await readFile(`/proc/${pid}/stat`, 'utf8').catch(() => ''); const close = stat.lastIndexOf(')');
+      if (close < 0) return;
+      // After the command name: state, ppid, pgrp.
+      const [state, ppid, pgrp] = stat.slice(close + 2).split(' ');
+      if (Number(pgrp) !== pgid || state === 'Z' || state === 'X') return;
+      const cmdline = (await readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => '')).split('\0').filter(Boolean).join(' ');
+      found.push({ pid: Number(pid), ppid: Number(ppid), args: cmdline || stat.slice(stat.indexOf('(') + 1, close) });
+    }));
+  } else {
+    const table = await new Promise<string>(done => {
+      const ps = spawn('ps', ['-A', '-o', 'pid=,ppid=,pgid=,stat=,args='], { stdio: ['ignore', 'pipe', 'ignore'] }); const out: Buffer[] = [];
+      ps.stdout.on('data', d => out.push(d)); ps.on('error', () => done('')); ps.on('close', () => done(Buffer.concat(out).toString('utf8')));
+    });
+    for (const line of table.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+      if (m && Number(m[3]) === pgid && !m[4]!.startsWith('Z')) found.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[5]!.trim() });
+    }
+  }
+  return found.sort((a, b) => a.pid - b.pid);
+}
+// The shell a command runs in, as the process table shows it: a subshell the
+// command forked keeps this command line, which is the harness's, not the worker's.
+export const commandShell = ['bash', '--noprofile', '--norc', '-o', 'pipefail', '-c'];
+// What a command left running, in words: the processes whose parent is not among
+// them (what the command itself started), and how many those started in turn.
+export function describeProcesses(procs: GroupProcess[]): string {
+  const pids = new Set(procs.map(p => p.pid));
+  const roots = procs.filter(p => !pids.has(p.ppid));
+  const shell = commandShell.join(' ') + ' ';
+  const named = roots.slice(0, 4).map(p => p.args.replace(/^\S*\/(?=bash )/, '').startsWith(shell) ? `a subshell of this command (pid ${p.pid})` : `"${clip(p.args, 160)}" (pid ${p.pid})`).join(', ');
+  const rest = procs.length - Math.min(roots.length, 4);
+  return `${named}${rest ? ` and ${rest} process${rest === 1 ? '' : 'es'} ${roots.length > 4 ? 'more' : `started by ${roots.length === 1 ? 'it' : 'them'}`}` : ''}`;
+}
+const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+// A command has ended when the process it ran exits. Its output is read until
+// its streams close, or for a short drain when something it started in the
+// background still holds them (a server would otherwise hold the command to its
+// timeout; output a background job writes after the drain is lost, and the job
+// is named as stopped). Whatever of its process group is still alive then (after
+// a moment for processes already on their way out) is stopped with it, and
+// returned as leftRunning, so the caller can say what was stopped.
+export async function runCommand(command: string, args: string[], cwd: string, timeout: number, limit = 1024 * 1024, settle?: (output: string, quietMs: number) => string | null): Promise<{ stoppedEarly?: string; leftRunning?: GroupProcess[]; output: string; code: number | null; truncated: boolean; timedOut: boolean }> {
   return new Promise((resolveResult, reject) => {
     const env: NodeJS.ProcessEnv = {};
     for (const key of ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM'])
@@ -499,6 +608,7 @@ export async function runCommand(command: string, args: string[], cwd: string, t
     Object.assign(env, { CI: '1', FORCE_COLOR: '0', NO_COLOR: '1', npm_config_yes: 'true', DEBIAN_FRONTEND: 'noninteractive' });
     const child = spawn(command, args, { cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = []; let size = 0; let truncated = false; let timedOut = false; let lastOutput = Date.now(); let stoppedEarly: string | undefined;
+    let exitCode: number | null = null; let finished = false; let drain: NodeJS.Timeout | null = null;
     const kill = () => {
       if (!child.pid) return;
       try { if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { /* already exited */ }
@@ -514,15 +624,27 @@ export async function runCommand(command: string, args: string[], cwd: string, t
     };
     child.stdout.on('data', collect); child.stderr.on('data', collect);
     child.on('error', (e: NodeJS.ErrnoException) => {
-      clearTimeout(timer);
+      clearTimeout(timer); if (watch) clearInterval(watch); if (drain) clearTimeout(drain);
       reject(e.code === 'ENOENT' && command === 'rg'
         ? new Error('ripgrep (rg) was not found in PATH. Install ripgrep, confirm rg --version works in this terminal, then retry.')
         : e);
     });
-    child.on('close', code => {
-      clearTimeout(timer); if (watch) clearInterval(watch); kill();
-      resolveResult({ output: Buffer.concat(chunks).toString('utf8'), code, truncated, timedOut, ...(stoppedEarly ? { stoppedEarly } : {}) });
-    });
+    const finish = async () => {
+      if (finished) return; finished = true;
+      clearTimeout(timer); if (watch) clearInterval(watch); if (drain) clearTimeout(drain);
+      // Stopped by the harness (timeout, a server, too much output): the group was killed on purpose, and that is the fact already.
+      let leftRunning: GroupProcess[] = [];
+      if (child.pid && !timedOut && !stoppedEarly && !truncated) {
+        const first = await groupProcesses(child.pid).catch(() => []);
+        if (first.length) { await pause(250); leftRunning = await groupProcesses(child.pid).catch(() => []); }
+      }
+      kill();
+      // Stopped means gone: a killed process holds its ports until it has exited, so what was named is waited for (briefly).
+      for (let i = 0; leftRunning.length && i < 40 && (await groupProcesses(child.pid!).catch(() => [])).length; i++) await pause(50);
+      resolveResult({ output: Buffer.concat(chunks).toString('utf8'), code: exitCode, truncated, timedOut, ...(stoppedEarly ? { stoppedEarly } : {}), ...(leftRunning.length ? { leftRunning } : {}) });
+    };
+    child.on('exit', code => { exitCode = code; drain = setTimeout(() => { void finish(); }, 1500); });
+    child.on('close', code => { exitCode = code; void finish(); });
   });
 }
 export async function boundedRead(path: string, limit = 1024 * 1024): Promise<string> {
@@ -540,6 +662,10 @@ export class ToolBox {
   // What the repository's ecosystem prefixes every command with (its
   // environment's tools on the path), set by the loop from the profiles.
   commandPrefix: (() => Promise<string>) | null = null;
+  // The in-process parser an edit is judged by before it lands, set by the loop
+  // from the language profiles (a component file by its project's compiler);
+  // the harness's TypeScript alone otherwise.
+  parse: (path: string, text: string) => Promise<string[]> = syntaxErrors;
   // The edits of the running batch, in order (the loop starts a new list per
   // batch; null records nothing): every action of one batch was named from the
   // same evidence, so an edit carrying a hash from before an earlier edit of its
@@ -662,7 +788,7 @@ export class ToolBox {
       // refused. The shape guards are for anchor edits, which splice into a file.
       if (!a.wholeFile) {
         assertBalancePreserved(original, updated, a.path);
-        await assertParses(a.path, original, updated);
+        await assertParses(a.path, original, updated, this.parse);
         assertNoBulkDuplication(original.replace(a.oldText, ''), kept, a.path);
       }
       const temp = `${path}.leana-${randomUUID()}.tmp`;
@@ -768,7 +894,7 @@ export class ToolBox {
       const updated = result.join('\n');
       // A refusal names the lines the ranges held that the new text drops: the
       // cause of an unclosed tag or brace, not only where the parser noticed it.
-      try { assertBalancePreserved(original, updated, a.path); await assertParses(a.path, original, updated); }
+      try { assertBalancePreserved(original, updated, a.path); await assertParses(a.path, original, updated, this.parse); }
       catch (e) { const gone = droppedLines(lines, edits.filter(x => !x.prepend), rendered); throw new Error(gone.length ? `${(e as Error).message} The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.` : (e as Error).message); }
       // Retyping a range in place is a rewrite, not a paste: judge the inserted
       // lines against the file without the ranges they replace.
@@ -848,14 +974,16 @@ export class ToolBox {
       // A command that announces a local address and then goes quiet while still running is a
       // server: a shell step cannot keep it alive, so it is stopped and said to be one. Never a check.
       const settle = a.check === true ? undefined : (output: string, quietMs: number) => { const at = localAddresses(output); return at.length && quietMs >= 5000 ? `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.` : null; };
-      const ran = await runCommand('bash', ['--noprofile', '--norc', '-o', 'pipefail', '-c', `${prefix}${a.command}`], this.root, this.config.commandTimeoutMs, undefined, settle);
-      const r = { ...ran, output: plainText(ran.output) };
+      const ran = await runCommand(commandShell[0]!, [...commandShell.slice(1), `${prefix}${a.command}`], this.root, this.config.commandTimeoutMs, undefined, settle);
+      const { leftRunning, ...r } = { ...ran, output: plainText(ran.output) };
+      // What the command started and left running when it ended was stopped with it: said, with what it was.
+      const stoppedAtEnd = leftRunning?.length ? `When this command ended, ${leftRunning.length === 1 ? 'a process it started was' : `${leftRunning.length} processes it started were`} still running, and ${leftRunning.length === 1 ? 'it was' : 'they were'} stopped: ${describeProcesses(leftRunning)}. A shell step cannot keep a process alive: whatever it starts is stopped when it ends. The start command of an observe runs for the length of that observation.` : undefined;
       // With a configured check command, only that command is verification; the
       // command words of the profiles are a fallback for sessions that did not declare one.
       // A command is verification when the worker says so, or when it is the configured check; never by its words.
       const looksLikeCheck = a.check === true || Boolean(this.config.checkCommand && a.command.trim() === this.config.checkCommand.trim());
       return { ok: r.code === 0 && !r.truncated && !r.timedOut, check: looksLikeCheck && r.code === 0 && !r.truncated && !r.timedOut, verification: looksLikeCheck,
-        text: JSON.stringify({ command: a.command, purpose: a.purpose, ...(r.stoppedEarly ? { stoppedEarly: r.stoppedEarly } : {}), ...r }) };
+        text: JSON.stringify({ command: a.command, purpose: a.purpose, ...(r.stoppedEarly ? { stoppedEarly: r.stoppedEarly } : {}), ...(stoppedAtEnd ? { stoppedAtEnd } : {}), ...r }) };
     }
     throw new Error(`Not an executable filesystem tool: ${route}`);
   }

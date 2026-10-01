@@ -10,15 +10,15 @@ import type { Answers, Config, EditAttempt, Message, Questions, Route, Session, 
 import { editRoutes } from './types.js';
 import type { ProgressEvent } from './display.js';
 import { Store } from './store.js';
-import { ToolBox, boundedRead, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot, TreeHashes } from './tools.js';
-import { breakIndex, clip, clipEnds, lineDiff, evictBehind, evictOne, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, shownLines, lineRanges, type FileContract } from './context.js';
+import { ToolBox, boundedRead, droppedLines, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot, TreeHashes } from './tools.js';
+import { breakIndex, clip, clipEnds, lineDiff, evictBehind, evictOne, evictStaleBehind, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, shownLines, lineRanges, volatile, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
 import { extractCode, schemas, stepSchema, actions } from './schema.js';
 import { generationFacts, missingRelativeModules, parseFact, parseInProcess, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
 import { orient } from './orient.js';
 import { observeResult, observerFor } from './observe.js';
 import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
-import type { Bonsai, GenerationCut } from './clients.js';
+import type { Around, Bonsai, Echo, GenerationCut } from './clients.js';
 
 // A repository file's text, or null when it cannot be read: missing (the worker
 // may delete any file it wrote), outside the root, or not text. Never throws.
@@ -91,7 +91,7 @@ export class Agent {
     const artifact = await this.store.artifact(s.step, result.text);
     const limit = kind === 'repeat' ? result.text.length : kind === 'read_files' || kind === 'observe' ? this.config.toolChars : kind === 'bash' ? Math.min(this.config.toolChars, 2500) : kind === 'search_codebase' ? Math.min(this.config.toolChars, 1500) : Math.min(this.config.toolChars, 600);
     if (kind === 'read_files' && result.ok && args) {
-      for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && !this.citing.includes(e.id) && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) { e.stale = `superseded by the read at step ${s.step}`; e.relevance = .1; }
+      for (const f of args.files as { path: string; start: number }[]) for (const e of s.entries) if (e.kind === 'read_files' && !e.stale && !this.citing.includes(e.id) && new RegExp(`(^|\\n\\n)${f.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} sha256=\\w+ totalLines=\\d+ shown=${f.start}\\.\\.`).test(e.text)) e.stale = `superseded by the read at step ${s.step}`;
     }
     s.entries.push({ id: `e${s.step}`, step: s.step, kind, artifact, ...(s.currentTurn ? { turn: s.currentTurn } : {}), ...(this.citing.length ? { cites: [...this.citing] } : {}), text: clip(result.text, limit), relevance: result.ok ? .5 : .9, verification: result.verification });
     if (result.ok && result.changed?.length && editRoutes.includes(kind as Route)) rememberEdit(s, s.step, kind, result.changed, artifact, result.text, result.applied ?? args);
@@ -123,7 +123,7 @@ export class Agent {
       s.lastWriteStep = s.step; s.writeSteps[changed] = s.step; delete s.coverage[changed]; delete s.readHashes[changed];
       for (const key of Object.keys(s.searches)) { const at = key.slice(key.lastIndexOf(' in ') + 4); if (at === '.' || at === changed || changed.startsWith(at.replace(/\/?$/, '/'))) delete s.searches[key]; }
       const header = `${changed} sha256=`;
-      for (const e of s.entries) if (e.kind === 'read_files' && e.step < s.step && !e.stale && (e.text.startsWith(header) || e.text.includes(`\n\n${header}`))) { e.stale = `edited at step ${s.step}: text and line numbers no longer match ${changed}`; e.relevance = Math.min(e.relevance, .1); }
+      for (const e of s.entries) if (e.kind === 'read_files' && e.step < s.step && !e.stale && (e.text.startsWith(header) || e.text.includes(`\n\n${header}`))) e.stale = `edited at step ${s.step}: text and line numbers no longer match ${changed}`;
     }
     if (result.check) s.lastCheckStep = s.step;
     if (result.verification) {
@@ -168,7 +168,11 @@ export class Agent {
     // the evidence is let grow to a share of the working budget and then cut well
     // below it at once, which buys several steps of a stable prefix for one reprocessing.
     let evicted = 0;
-    if (evidenceTokens(s) > this.config.workingTokens * evictAt) while (evidenceTokens(s) > this.config.workingTokens * evictTo && evictOne(s)) evicted++;
+    if (evidenceTokens(s) > this.config.workingTokens * evictAt) {
+      const before = Agent.shape(s);
+      while (evidenceTokens(s) > this.config.workingTokens * evictTo && evictOne(s)) evicted++;
+      if (evicted) evicted += evictStaleBehind(s, breakIndex(before, s) ?? 0).length;
+    }
     if (evicted) await this.store.log('compact', { step: s.step, removed: evicted, reason: 'evidence-share', retained: s.entries.length, trail: s.trail?.length ?? 0 });
   }
   // Execute an action, the worker's or the harness's, with the same bookkeeping.
@@ -311,10 +315,11 @@ export class Agent {
   // A removal (a reset, a forced eviction) already makes the prompt change at one
   // point, and the server reprocesses everything after it. What the next batched
   // eviction would take first is taken now when it lies behind that point, so its
-  // reprocessing is not paid a second time; nothing else is taken (evictBehind).
+  // reprocessing is not paid a second time (evictBehind); so are the stale entries behind
+  // it that hold nothing current (evictStaleBehind). Nothing else is taken.
   private async compactBehind(s: Session, before: { ids: string[]; trail: string[] }, reason: string): Promise<number> {
     const at = breakIndex(before, s); if (at === null) return 0;
-    const removed = evictBehind(s, at, this.config.workingTokens * evictTo).length;
+    const removed = evictBehind(s, at, this.config.workingTokens * evictTo).length + evictStaleBehind(s, at).length;
     if (removed) await this.store.log('compact', { step: s.step, removed, reason: `with-${reason}`, at, retained: s.entries.length, trail: s.trail?.length ?? 0 });
     return removed;
   }
@@ -330,18 +335,21 @@ export class Agent {
   // them). `chosen` is told the request as it will be sent before anything is generated: the hash
   // of the prompt's last two messages (the notes, file list and check state, and the file's own
   // request: its content, purpose, lines, modules and packages) with the sampling settings. Only
-  // the earlier steps in front of them are left out. It may throw to generate nothing.
-  private async generateCode(s: Session, route: Route, builds: (() => Message[])[], budget: number, fence: string, chosen?: (request: string) => void): Promise<{ code: string; finish: string; cut?: GenerationCut; ms?: number; tokens?: number; request: string }> {
+  // the earlier steps in front of them are left out, and the check's output is read restated where
+  // the prompt names the entry that shows it: an eviction of that entry moves the output into the
+  // tail, which changes where it is shown, not what is asked. It may throw to generate nothing.
+  // around: the file before, in and after a region whose block is generated.
+  private async generateCode(s: Session, route: Route, builds: (() => Message[])[], budget: number, fence: string, chosen?: (request: string) => void, around?: Around): Promise<{ code: string; finish: string; cut?: GenerationCut; ms?: number; tokens?: number; request: string }> {
     let prompt = builds[0]!(); let counted = await this.bonsai.count(prompt);
     for (const smaller of builds.slice(1)) { if (counted.tokens <= this.config.workingTokens) break; prompt = smaller(); counted = await this.bonsai.count(prompt); }
     if (counted.tokens > this.config.workingTokens) { const fitted = await this.fit(s, builds.at(-1)!); prompt = fitted.prompt; counted = { tokens: fitted.tokens, mode: 'fit' }; }
-    const request = hash(JSON.stringify({ tail: prompt.slice(-2), temperature: this.config.codeTemperature, minP: this.config.codeMinP, budget }));
+    const request = hash(JSON.stringify({ tail: [...volatile(s, false), prompt.at(-1)], temperature: this.config.codeTemperature, minP: this.config.codeMinP, budget }));
     chosen?.(request);
     s.lastPromptTokens = counted.tokens;
     this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
     await this.logPrompt(s, route, prompt, counted.tokens);
     if (this.bonsai.generateText) {
-      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence });
+      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, ...(around ? { around } : {}) });
       this.observe({ kind: 'generated', step: s.step, route, meta: g.meta, args: { chars: g.text.length, finish: g.finish } });
       const run = fence.match(/^`+/)?.[0].length ?? 3; const opened = g.text.match(/^\s*(`{3,})[^\n]*\n/);
       // A cut keeps whole lines only; the kept text ends at the start of the cut line.
@@ -397,20 +405,23 @@ export class Agent {
     // request, which is generated.
     const sha = current === undefined ? undefined : hash(current);
     const known = rewrite && exact ? s.reproduced?.[exact] : undefined;
+    // The file around a region's block, all of it: a block may repeat any number of the lines that stay.
+    const around = region ? { before: lines.slice(0, region.start - 1).join('\n'), region: lines.slice(region.start - 1, region.end).join('\n'), after: lines.slice(region.end).join('\n') } : undefined;
     const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', builds, this.config.createTokens, fenceFor(path), request => {
       if (!known || known.sha !== sha || known.request !== request) return;
       const was = known.ms === undefined ? '' : ` (${known.tokens !== undefined ? `${known.tokens} tokens, ` : ''}${(known.ms / 1000).toFixed(1)} s)`;
       const shown = s.entries.some(e => e.step === known.step && e.kind !== 'turn') ? `e${known.step}` : 'its result has left the evidence';
       throw Object.assign(new Error(`this exact ${Agent.describe('rewrite_file', { path, ...(region ? { start: range!.start, end: range!.end } : {}) })} reproduced the file unchanged at step ${known.step}${was} from the same request as now (sha256=${sha}, and the same purpose, lines, notes, check state, modules and packages; only earlier steps differ); it was not generated again (${shown}). ${Agent.provenance(s, path, sha!, exact)}`), { duplicate: true });
-    });
+    }, around && /\S/.test(around.after) ? around : undefined);
     const finish = generated.finish; let code = generated.code; const cut = generated.cut;
-    let blockCount = 0; let echoedAfter = false;
+    let blockCount = 0; let echo: Echo | null = null;
     if (region) {
-      // The block alone, without context lines the model repeated around it, spliced between the untouched lines.
-      const before = lines.slice(Math.max(0, region.start - 4), region.start - 1).join('\n'); const after = lines.slice(region.end, region.end + 3).join('\n');
-      const block = trimContext(code, before, after, Boolean(cut)).replace(/\n$/, '');
-      // A cut after the model wrote the block and repeated the lines that follow it: the block itself is whole.
-      echoedAfter = Boolean(cut) && trimContext(code, before, '', true).replace(/\n$/, '') !== block;
+      // The block alone, without lines around the region the model repeated, spliced between the untouched lines.
+      const trimmed = trimContext(code, around!, Boolean(cut));
+      // What the block repeated of the lines after the region: stopped there while it was generated, or trimmed once it ended.
+      // Either way the block before the repeat is whole: the model had moved on to the lines that follow it.
+      echo = cut?.kind === 'echo' ? { line: cut.line, echoed: cut.echoed!, diverged: Boolean(cut.diverged) } : trimmed.echo;
+      const block = trimmed.text.replace(/\n$/, '');
       const blockLines = block === '' ? [] : block.split('\n');
       code = [...lines.slice(0, region.start - 1), ...blockLines, ...lines.slice(region.end)].join('\n') + (current!.endsWith('\n') || !current ? '\n' : '');
       (region as any).lines = blockLines.length; blockCount = blockLines.length;
@@ -420,16 +431,23 @@ export class Agent {
     const written = region ? blockCount : code === '' ? 0 : code.replace(/\n$/, '').split('\n').length;
     const at = region ? region.start + written : written + 1;
     const opening = cut ? ` (\`${cut.opening}${cut.truncated ? '…' : ''}\`)` : '';
-    const where = echoedAfter ? 'after the block, once the lines that follow it had been repeated' : `inside line ${at}`;
-    const cutLine = !cut ? '' : cut.kind === 'cycle' ? `repeated itself ${where}${echoedAfter ? '' : opening}: that line reached ${cut.lineChars} characters without ending${cut.unit ? `, ending in one ${cut.unit}-character unit repeated verbatim` : ''}; it was cut at the start of that line`
-      : cut.kind === 'lines' ? `started repeating a block of lines ${echoedAfter ? where : `at line ${at}`}; it was cut there`
-      : `reached the ${this.config.createTokens}-token budget ${where}${echoedAfter ? '' : opening}, which had reached ${cut.lineChars} characters without ending; that line was cut`;
-    // A cut before any line was generated writes nothing: the file stays as it was.
-    if (cut && written === 0) throw new Error(`the generation of ${path} ${cutLine}; no line was generated before it, so nothing was written${current !== undefined ? ` and ${path} is unchanged` : ''}`);
+    // A repeat of the lines after the region is stated as the lines it repeated, which stay as they were.
+    const repeat = echo ? `lines ${region!.end + 1}..${region!.end + echo.echoed}, the lines after the region${echo.diverged ? ', then went on with other lines' : ''}` : '';
+    const where = echo ? `after the block and a repeat of ${repeat}` : `inside line ${at}`;
+    const cutLine = !cut ? '' : cut.kind === 'echo' ? `was stopped once it was repeating ${repeat}` : cut.kind === 'cycle' ? `repeated itself ${where}${echo ? '' : opening}: that line reached ${cut.lineChars} characters without ending${cut.unit ? `, ending in one ${cut.unit}-character unit repeated verbatim` : ''}; it was cut at the start of that line`
+      : cut.kind === 'lines' ? `started repeating a block of lines ${echo ? where : `at line ${at}`}; it was cut there`
+      : `reached the ${this.config.createTokens}-token budget ${where}${echo ? '' : opening}, which had reached ${cut.lineChars} characters without ending; that line was cut`;
+    const lead = cut ? cutLine : echo ? `${echo.diverged ? 'repeated' : 'ended with a repeat of'} ${repeat}` : '';
+    // A cut before any line was generated writes nothing: the file stays as it was. A block that was
+    // nothing but a repeat of the lines after the region empties it, which removes its lines; an
+    // insertion has none, so nothing changes.
+    if (written === 0 && (echo ? region!.end < region!.start : cut)) throw new Error(`the generation of ${path} ${lead}; no line was generated before it, so nothing was written${current !== undefined ? ` and ${path} is unchanged` : ''}`);
     const followed = !region || region.end >= lines.length ? '' : region.end === 0 ? `, and the file's original lines now start at line ${at}` : `, and the lines that followed line ${region.end} now start at line ${at}`;
-    const kept = !cut ? '' : region ? (echoedAfter ? `the block was generated in full as lines ${region.start}..${at - 1}` : `lines ${region.start}..${at - 1} hold the generated lines before it; the rest of the block was not written`) + followed
+    // An emptied region is stated with the lines it held, as replace_lines states the lines a replacement drops.
+    const kept = echo ? `the repeat${echo.diverged ? ' and what followed it were' : ' was'} not written; ${written ? `lines ${region!.start}..${at - 1} hold the generated block` : `no line was generated before it, so lines ${region!.start}..${region!.end} were removed (they held ${droppedLines(lines, [region!], () => []).join('; ')})`}${followed}`
+      : !cut ? '' : region ? `lines ${region.start}..${at - 1} hold the generated lines before it; the rest of the block was not written${followed}`
       : `the file holds lines 1..${written} as generated; nothing from line ${at} on was written`;
-    const ended = cut ? `${cutLine}: ${kept}` : finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : finish === 'repetition' ? 'started repeating itself and was cut at the repeat' : finish === 'eos' ? 'ended before the file was complete (the model stopped without closing the code block)' : '';
+    const ended = cut || echo ? `${lead}: ${kept}` : finish === 'length' ? `reached the ${this.config.createTokens}-token budget` : finish === 'repetition' ? 'started repeating itself and was cut at the repeat' : finish === 'eos' ? 'ended before the file was complete (the model stopped without closing the code block)' : '';
     if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
     // What the generation cost, as the client measured it.
     const spent = generated.ms === undefined ? '' : ` (${generated.tokens !== undefined ? `${generated.tokens} tokens, ` : ''}${(generated.ms / 1000).toFixed(1)} s)`;
@@ -451,10 +469,10 @@ export class Agent {
     const manifest = project ? project.eco.markers.map(m => inProject(project, m)) : [];
     const present = []; for (const m of manifest) if ((await readRepo(m)) !== null) present.push(m);
     if (present.length) { const missing = await undeclaredPackages(this.tools.root, path, code, readRepo).catch(() => [] as string[]); if (missing.length) facts.push(`${path} imports ${missing.join(', ')}, which ${present.join(' or ')} does not declare: declare them (the package manager chooses the version) so they can be installed`); }
-    if (ended) facts.unshift(cut ? `the generation of ${path} ${ended}` : `the generated content of ${path} ${ended}; check its end before relying on it`);
+    if (ended) facts.unshift(cut || echo ? `the generation of ${path} ${ended}` : `the generated content of ${path} ${ended}; check its end before relying on it`);
     // A file that does not parse after a generation that ran to its end: the
     // errors are in what was written, not in a cut, so the worker is told which.
-    else if (/does not parse/.test(result.text)) facts.unshift(`the generation of ${path} ran to its end (${code.split('\n').length} lines, not cut off); the parse errors are in the written content`);
+    if (!cut && finish === 'stop' && /does not parse/.test(result.text)) facts.splice(echo ? 1 : 0, 0, `the generation of ${path} ran to its end (${code.split('\n').length} lines, not cut off); the parse errors are in the written content`);
     if (facts.length) { const e = s.entries.at(-1); if (e) e.text += `\nHarness: ${facts.join(' | ')}`; s.lastError = facts.join(' | '); }
     // A whole-file rewrite generates every line: how many of them differ from the content it
     // replaced, and what generating them cost, is a fact about the write (region rewrites and
@@ -526,9 +544,10 @@ export class Agent {
           // Every earlier turn is dropped, the results kept: the facts stay, the
           // line of thought the worker would copy and anchor on goes (a turn
           // before the streak often holds the same reasoning).
-          const dropped = s.entries.filter(e => e.kind === 'turn'); const before = Agent.shape(s);
-          if (dropped.length) { s.entries = s.entries.filter(e => !dropped.includes(e)); await this.store.log('reasoning-reset', { step: s.step, turns: dropped.map(e => e.id) }); await this.compactBehind(s, before, 'reasoning-reset'); }
-          notes.push(`Jev reads no progress for ${s.watch.noProgress} steps (stuck ${last.stuck.toFixed(2)}).${dropped.length ? ' Your reasoning from those steps was set aside; their results are still shown.' : ''} Do not repeat what was tried; change the approach, or ask the user if only they can decide.`);
+          // The results the compaction riding on it takes are said, so the note stays a fact.
+          const dropped = s.entries.filter(e => e.kind === 'turn'); const before = Agent.shape(s); let removed = 0;
+          if (dropped.length) { s.entries = s.entries.filter(e => !dropped.includes(e)); await this.store.log('reasoning-reset', { step: s.step, turns: dropped.map(e => e.id) }); removed = await this.compactBehind(s, before, 'reasoning-reset'); }
+          notes.push(`Jev reads no progress for ${s.watch.noProgress} steps (stuck ${last.stuck.toFixed(2)}).${dropped.length ? ` Your reasoning from those steps was set aside; their results are still shown${removed ? `, except ${removed} that left the prompt at the same time` : ''}.` : ''} Do not repeat what was tried; change the approach, or ask the user if only they can decide.`);
           s.watch.noProgress = 0;
         }
         // Scope and completion, read by Jev, stated to the worker: work beyond the objective for a run of steps, or an objective that reads as satisfied.
@@ -585,21 +604,29 @@ export class Agent {
         // The turn enters the evidence before its actions run: the prefix only grows,
         // and a file generated inside the batch already sees the reasoning behind it.
         // Reasoning copied word for word from the previous turn is the worker anchoring on its
-        // own text: the earlier turns leave the prompt at once (results stay), without waiting
-        // for the watchdog to read the session as stuck. Whole-thought equality, as stored:
-        // turns that only open alike (a status sentence) are ordinary progress.
+        // own text, without waiting for the watchdog to read the session as stuck. Whole-thought
+        // equality, as stored: turns that only open alike (a status sentence) are ordinary progress.
+        // Whether the next thought repeats follows the copies the next prompt holds (runs to 76:
+        // none 1/51, one 20/42, two or more 11/12), so a repeat is not added: the previous turn stays
+        // and the prompt only grows. Removing the earlier copy left the same one copy and
+        // re-processed everything after it (runs 49-76: 26 resets of turns that ran an action,
+        // 44.6 s; run 73 step 30, 5,638 tokens). Its results follow as those of a turn that left.
         const turn = turnEntry(s.step, thought, batch);
         const said = (e: { text: string }) => String(JSON.parse(e.text).thought ?? '').replace(/\s+/g, ' ').trim();
         const previous = s.entries.filter(e => e.kind === 'turn').at(-1);
-        // Only the earlier copies go: they are what the worker copies from, and they sit
-        // late in the prompt, so the cache breaks near its end rather than at the top.
-        if (previous && said(turn).length >= 40 && said(previous) === said(turn)) {
-          const dropped = s.entries.filter(e => e.kind === 'turn' && said(e) === said(turn)); const before = Agent.shape(s);
-          s.entries = s.entries.filter(e => !dropped.includes(e));
+        const repeated = Boolean(previous && said(turn).length >= 40 && said(previous) === said(turn));
+        // The copies of the thought but kept leave the prompt (results stay). The copy kept is the previous
+        // turn, the last one in the prompt: it is the one the next thought is compared with, so a further
+        // repeat is caught. An earlier copy (the thought came back after another) goes.
+        const dropCopies = async (kept?: typeof turn) => {
+          const dropped = s.entries.filter(e => e.kind === 'turn' && e !== kept && said(e) === said(turn)); if (!dropped.length) return;
+          const before = Agent.shape(s); s.entries = s.entries.filter(e => !dropped.includes(e));
           await this.store.log('reasoning-reset', { step: s.step, reason: 'repeated', turns: dropped.map(e => e.id) });
           await this.compactBehind(s, before, 'reasoning-reset');
-        }
-        s.entries.push(turn); s.currentTurn = turn.id;
+        };
+        if (repeated) { await this.store.log('repeated-thought', { step: s.step, kept: previous!.id }); await dropCopies(previous); }
+        else s.entries.push(turn);
+        s.currentTurn = turn.id;
         // The batch's edits are recorded from its first action on: a later action of
         // the batch that carries a hash from before one of them is mapped through them.
         this.tools.journal = [];
@@ -622,7 +649,12 @@ export class Agent {
         // nothing and is a template the worker copies word for word: it leaves the prompt, the
         // refusals and the repeats' facts stay. A turn of repeats, and of a failure after them,
         // counts once toward the four in a row (a refusal among them has counted already).
-        if (outcomes.length && outcomes.every(o => o === 'refused' || o === 'repeated')) { s.entries = s.entries.filter(e => e !== turn); for (const e of s.entries) if (e.turn === turn.id) delete e.turn; }
+        // A repeat that changed nothing takes the earlier copies with it after its batch, so none is
+        // left (then the next thought differed 50 times in 51): the re-processing the reset still pays.
+        if (outcomes.length && outcomes.every(o => o === 'refused' || o === 'repeated')) {
+          s.entries = s.entries.filter(e => e !== turn); for (const e of s.entries) if (e.turn === turn.id) delete e.turn;
+          if (repeated) await dropCopies();
+        }
         // Judged as a whole, whatever the order: a turn whose repeats came with nothing but
         // failures and notes counts once from where the turn began (a plan or a failure inside
         // it does not reset the count).
@@ -854,6 +886,9 @@ const textFailure = /Stale file hash|oldText must match|would no longer parse|un
 // The evidence's share of the working budget that triggers a batched eviction, and the share it is cut to.
 // Each eviction reprocesses what it keeps, so the gap between the two sets how often that is paid:
 // replayed over 28 runs at 32k, .6 against .45 halves the evictions and keeps more evidence on average.
+// Cutting to .25 replayed 152 s shorter over runs 49-76 (0.8% of their time, inside the run-to-run
+// spread) and takes fresh evidence more often (22% of what it evicts at .2, against 9%), which the
+// replay cannot price: run 63 lost a render observation the model was acting on. So .3 stays.
 // A file request too large for the peak is fitted by a forced eviction, which cuts to evictTo as well.
 const evictAt = .6; const evictTo = .3;
 const failureKindText = (k: string): string => ({ code_bug: 'the code or configuration written is wrong', wrong_assumption: 'an assumption the output disproves', bad_command: 'the command itself', environment: 'a tool or service the machine lacks', dependency: 'a package missing, unresolvable or at a version that does not exist', permission: 'permission or credentials', transient: 'a network or timing failure', insufficient_context: 'acting without reading what was needed', unknown: 'unclear' } as Record<string, string>)[k] ?? k;

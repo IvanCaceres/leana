@@ -77,6 +77,72 @@ export function droppedLines(lines: string[], edits: { start: number; end: numbe
   }
   return out.length > limit ? [...out.slice(0, limit), `${out.length - limit} more`] : out;
 }
+// The lines at the start of a range's new text that are the lines just before the range as they
+// are, and those at its end that are the lines just after it: exact, with some text among them,
+// and never lines another range of the call replaces. In runs 49-76, 18 edits repeated a
+// neighbouring line and in none did the worker's thought ask for a second copy: 7 of the 8 that
+// landed left a duplicate (a CSS property, a wrapper div, 8 CSS rules, an object key, a
+// destructured name, a call), and 7 calls were refused.
+export function rangeEchoes(lines: string[], e: { start: number; end: number }, fresh: string[], taken: (n: number) => boolean = () => false): { head: number; tail: number } {
+  const last = Math.max(e.end, e.start - 1); // an insertion before line s sits between s - 1 and s
+  const repeats = (from: number, xs: string[]) => xs.some(l => l.trim()) && xs.every((l, i) => l === lines[from - 1 + i] && !taken(from + i));
+  let head = 0; for (let k = Math.min(fresh.length, e.start - 1); k > 0 && !head; k--) if (repeats(e.start - k, fresh.slice(0, k))) head = k;
+  let tail = 0; for (let k = Math.min(fresh.length - head, lines.length - last); k > 0 && !tail; k--) if (repeats(last + 1, fresh.slice(fresh.length - k))) tail = k;
+  return { head, tail };
+}
+const bracketPairs = [['{', '}'], ['(', ')'], ['[', ']']] as const;
+type Pair = readonly [string, string];
+// The brackets of one kind that code (literals and comments stripped) leaves unmatched: how many
+// opens it does not close and how many closes it does not open.
+function unmatched(code: string, [open, close]: Pair): { opens: number; closes: number } {
+  let opens = 0; let closes = 0;
+  for (const ch of code) if (ch === open) opens++; else if (ch === close) { if (opens) opens--; else closes++; }
+  return { opens, closes };
+}
+// The lines outside a range holding the brackets that match the ones it leaves unmatched: the
+// first ones of the other side not matched on the way, scanning away from the range.
+function matchingLines(stripped: string[], from: number, forward: boolean, [open, close]: Pair, count: number): number[] {
+  const out: number[] = []; let depth = 0; const [away, back] = forward ? [open, close] : [close, open];
+  for (let i = from; out.length < count && i >= 0 && i < stripped.length; i += forward ? 1 : -1)
+    for (const ch of forward ? stripped[i]! : [...stripped[i]!].reverse()) if (ch === away) depth++; else if (ch === back) { if (depth) depth--; else if (out.push(i + 1) === count) break; }
+  return out;
+}
+// A refused edit stated range by range: for the bracket kinds the refusal names, what the replaced
+// lines leave unmatched (with the line outside the range that matches it) against what the new
+// text does, and new text that repeats the lines around its range. Only ranges that change that
+// balance or repeat a neighbour are stated. Run 73 step 50's new text ended with line 38, the line
+// after its range; step 58's opened a '{' it never closed; both were told only that "the range cuts
+// through a declaration", and were redone by a whole-file rewrite (10.6 s) and a read and a region
+// rewrite (25.5 s).
+export function editFacts(lines: string[], edits: { label: string; start: number; end: number; fresh: string[] }[], kinds: readonly Pair[]): string[] {
+  const stripped = stripLiterals(lines.join('\n')).split('\n'); const out: string[] = [];
+  const count = (n: number, ch: string) => `${n} '${ch}'`; const by = (xs: number[], verb: string) => { const u = [...new Set(xs)]; return u.length > 1 ? `lines ${u.join(', ')} ${verb}` : `line ${u[0]} ${verb}s`; };
+  const quote = (l: string) => JSON.stringify(l.length > 80 ? `${l.slice(0, 80)}…` : l);
+  for (const e of edits) {
+    const taken = (n: number) => edits.some(x => x !== e && n >= x.start && n <= x.end);
+    const { head, tail } = rangeEchoes(lines, e, e.fresh, taken); const last = Math.max(e.end, e.start - 1);
+    const was = kinds.map(k => unmatched(e.end >= e.start ? stripped.slice(e.start - 1, e.end).join('\n') : '', k)); const now = kinds.map(k => unmatched(stripLiterals(e.fresh.join('\n')), k));
+    const changed = kinds.filter((_, i) => was[i]!.opens - was[i]!.closes !== now[i]!.opens - now[i]!.closes);
+    if (!changed.length && !head && !tail) continue;
+    const old = changed.flatMap(k => { const w = was[kinds.indexOf(k)]!; const after = matchingLines(stripped, e.end, true, k, w.opens); const before = matchingLines(stripped, e.start - 2, false, k, w.closes);
+      return [...(w.opens ? [`open ${count(w.opens, k[0])}${after.length ? ` that ${by(after, 'close')}` : ''}`] : []), ...(w.closes ? [`close ${count(w.closes, k[1])}${before.length ? ` that ${by(before, 'open')}` : ''}`] : [])]; });
+    const fresh = changed.flatMap(k => { const w = now[kinds.indexOf(k)]!; return [...(w.opens ? [`opens ${count(w.opens, k[0])} it does not close`] : []), ...(w.closes ? [`closes ${count(w.closes, k[1])} it does not open`] : [])]; });
+    const none = `no unmatched ${changed.flatMap(k => [`'${k[0]}'`, `'${k[1]}'`]).join(', ').replace(/, ([^,]+)$/, ' or $1')}`;
+    const echo = [...(head ? [`${head === e.fresh.length ? 'is' : 'starts with'} ${head === 1 ? `${quote(e.fresh[0]!)}, which is line ${e.start - 1} as it is, the line before the range` : `lines ${e.start - head}..${e.start - 1} as they are, the lines before the range`}`] : []),
+      ...(tail ? [`${tail === e.fresh.length ? 'is' : 'ends with'} ${tail === 1 ? `${quote(e.fresh.at(-1)!)}, which is line ${last + 1} as it is, the line after the range` : `lines ${last + 1}..${last + tail} as they are, the lines after the range`}`] : [])];
+    const replaced = !changed.length || e.end < e.start ? '' : `the replaced lines ${old.length ? old.join(' and ') : `have ${none}`}; `;
+    const text = [...(changed.length ? [fresh.length ? fresh.join(' and ') : `has ${none}`] : []), ...echo].join(', and ');
+    out.push(`${e.label[0]!.toUpperCase()}${e.label.slice(1)}: ${replaced}its new text ${text}.`);
+  }
+  return out;
+}
+// Facts in the room a refusal has: the evidence entry of a failed edit keeps 600 characters
+// (agent.ts), so whole facts are kept while they fit, the first always, and the rest are counted.
+export function factsInRoom(facts: string[], room: number): string {
+  const kept: string[] = []; let used = 0;
+  for (const [i, f] of facts.entries()) { if (kept.length && used + f.length + 1 + (i < facts.length - 1 ? 40 : 0) > room) break; kept.push(f); used += f.length + 1; }
+  return `${kept.join(' ')}${kept.length < facts.length ? ` (${facts.length - kept.length} more range(s) left out for room.)` : ''}`;
+}
 // A large range whose new text mostly equals the old is a retype. The lines
 // that differ are the change the worker meant, so the edit is applied and the
 // note names them; refusing it would only discard the generation.
@@ -363,8 +429,8 @@ export function manifestFailures(output: string): { name: string; kind: 'notarge
 }
 // Bracket balance of code, ignoring string literals and comments so an ANSI
 // escape such as "\u001B[?25l" or a "{" in a comment does not skew the count.
-// An edit that leaves a file with more unmatched brackets than before has cut
-// through a declaration or statement; refuse it before it lands on disk.
+// An edit that leaves a file with more unmatched brackets than before is refused
+// before it lands on disk; its caller states what each range does to them (editFacts).
 // An edit that leaves a TypeScript or JavaScript file unparseable is refused
 // with the parser's own message: cheaper than a lint, a rollback and a rejected
 // edit, and it names the exact line. Uses the harness's TypeScript when present.
@@ -426,15 +492,22 @@ export async function assertParses(path: string, before: string, after: string, 
   if (had.length && had.length >= problems.length) return; // already broken; do not block repairs
   throw new Error(`Edit refused: ${path} would no longer parse (${problems.join('; ')}). Re-read the lines around the error and cover whole statements; a missing import is added at the top of the file, never by overwriting the line that uses the name.`);
 }
-export function assertBalancePreserved(before: string, after: string, label: string): void {
+// The bracket kinds an edit leaves with more unmatched brackets than before, as a refusal names them.
+export function worseBrackets(before: string, after: string): { pair: Pair; said: string }[] {
   const count = (text: string, ch: string): number => text.split(ch).length - 1;
   const b = stripLiterals(before); const a = stripLiterals(after);
-  const worse = ([open, close]: readonly [string, string]) => {
-    const was = count(b, open) - count(b, close); const now = count(a, open) - count(a, close);
-    return Math.abs(now) > Math.abs(was) ? `${Math.abs(now)} unmatched '${now > 0 ? open : close}' (was ${Math.abs(was)})` : null;
-  };
-  const problems = ([['{', '}'], ['(', ')'], ['[', ']']] as const).map(worse).filter(Boolean);
-  if (problems.length) throw new Error(`Edit refused: it would leave ${label} with ${problems.join(', ')}. The range cuts through a declaration or statement; cover whole statements or blocks.`);
+  return bracketPairs.flatMap(pair => {
+    const [open, close] = pair; const was = count(b, open) - count(b, close); const now = count(a, open) - count(a, close);
+    return Math.abs(now) > Math.abs(was) ? [{ pair, said: `${Math.abs(now)} unmatched '${now > 0 ? open : close}' (was ${Math.abs(was)})` }] : [];
+  });
+}
+// With the ranges of the edit, the refusal states their facts (editFacts) in the room the error
+// entry leaves after the reserved characters.
+export function assertBalancePreserved(before: string, after: string, label: string, edits: { label: string; start: number; end: number; fresh: string[] }[] = [], reserved = 0): void {
+  const worse = worseBrackets(before, after); if (!worse.length) return;
+  const head = `Edit refused: it would leave ${label} with ${worse.map(w => w.said).join(', ')}.`;
+  const facts = edits.length ? factsInRoom(editFacts(before.split('\n'), edits, worse.map(w => w.pair)), 600 - 'Tool error: '.length - head.length - 1 - reserved) : '';
+  throw new Error(facts ? `${head} ${facts}` : head);
 }
 export function stripLiterals(code: string): string {
   return code.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|`(?:\\[\s\S]|[^`\\])*`|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/g, m => m.replace(/[^\n]/g, ' '));
@@ -787,7 +860,9 @@ export class ToolBox {
       // created file it lands as written and its parse state is reported, never
       // refused. The shape guards are for anchor edits, which splice into a file.
       if (!a.wholeFile) {
-        assertBalancePreserved(original, updated, a.path);
+        // A refused anchor is stated as the lines it spans, as replace_lines states its ranges.
+        const at = original.split(a.oldText)[0]!.split('\n').length; const end = at + String(a.oldText).split('\n').length - 1;
+        assertBalancePreserved(original, updated, a.path, [{ label: `the anchor (lines ${at}..${end})`, start: at, end, fresh: updated.split('\n').slice(at - 1, end + updated.split('\n').length - original.split('\n').length) }]);
         await assertParses(a.path, original, updated, this.parse);
         assertNoBulkDuplication(original.replace(a.oldText, ''), kept, a.path);
       }
@@ -840,9 +915,11 @@ export class ToolBox {
       const trailing = lines.length > 1 && lines.at(-1) === '';
       // At an equal start a replacement is taken before an insertion: inserting before line k
       // and replacing k..m do not overlap, whatever order they were sent in.
-      const all = [...requested]
-        .map(e => trailing && e.end === e.start - 1 && e.start === lines.length + 1 ? { ...e, start: lines.length, end: lines.length - 1 } : e)
-        .sort((x, y) => y.start - x.start || Number(x.end === x.start - 1) - Number(y.end === y.start - 1));
+      // n: the edit's place in the call, as the worker numbered it.
+      const bottomUp = (x: { start: number; end: number }, y: { start: number; end: number }) => y.start - x.start || Number(x.end === x.start - 1) - Number(y.end === y.start - 1);
+      const all = requested
+        .map((e, i) => ({ ...e, n: i + 1, ...(trailing && e.end === e.start - 1 && e.start === lines.length + 1 ? { start: lines.length, end: lines.length - 1 } : {}) }))
+        .sort(bottomUp);
       for (const [i, e] of all.entries()) {
         // end = start - 1 is an insertion before start (start = totalLines + 1 appends).
         const insert = e.end === e.start - 1;
@@ -876,26 +953,86 @@ export class ToolBox {
       const same = (x: string[], y: string[]) => x.length === y.length && x.every((l, i) => l === y[i]);
       // A deletion is never a no-op; a rewrite is one only when every line is unchanged.
       const skipped = all.filter(e => e.end >= e.start && !(e.newText === '' && !e.prepend) && same(lines.slice(e.start - 1, e.end), rendered(e)));
-      const edits = all.filter(e => !skipped.includes(e) && !(e.end < e.start && rendered(e).length === 0));
+      let edits = all.filter(e => !skipped.includes(e) && !(e.end < e.start && rendered(e).length === 0));
       if (!edits.length) throw new Error(droppedImports.length ? `replace_lines produced no change: the only new lines were imports ${a.path} already has (${droppedImports.map(l => l.trim()).join('; ')})` : `replace_lines produced no change: every newText equals the current lines (${all.map(e => `${e.start}..${e.end}`).join(', ')})`);
       // A harness-chosen rewrite (a region the code picked, validated before
       // it got here) is applied as it is: the paste and retype rules are for
       // the worker's own line edits.
       const harness = a.harness === true;
+      const splice = (xs: typeof edits) => {
+        let out = lines; let shift = 0;
+        for (const e of xs) { const fresh = rendered(e); const removed = Math.max(0, e.end - e.start + 1); out = [...out.slice(0, e.start - 1), ...fresh, ...out.slice(e.start - 1 + removed)]; shift += fresh.length - removed; }
+        return { text: out.join('\n'), delta: shift };
+      };
+      let { text: updated, delta } = splice(edits);
+      const passes = async (text: string) => { try { assertBalancePreserved(original, text, a.path); await assertParses(a.path, original, text, this.parse); return true; } catch { return false; } };
+      const described = (xs: typeof edits) => xs.filter(e => !e.prepend).map(e => ({ label: `edit ${e.n} (${e.end < e.start ? `insert before line ${e.start}` : `lines ${e.start}..${e.end}`})`, start: e.start, end: e.end, fresh: rendered(e) }));
+      let repaired = ''; let applied: typeof requested | null = null;
+      if (!await passes(updated)) {
+        // New text that repeats the lines just outside its range is the range drawn too
+        // small, or the text drawn too large: the file is the same either way, so when
+        // the repeat alone breaks it (without it the brackets match and the file parses)
+        // and no range moved by the repeat fits (below), it is not written, as a region
+        // rewrite's repeat is not. Of the 7 refusals in runs 49-76 with such a repeat, this
+        // writes 3: run 73 step 50 (its new text ended with line 38, the line after its
+        // range; redone by a 10.6 s whole-file rewrite),
+        // run 62 step 35 (redone by a rewrite to the same code) and run 49 step 34. The
+        // other 4 break the file without the repeat too and are refused with the facts.
+        // A trailing blank line is kept as one (newText drops a final line break).
+        const cut = new Map<number, { head: number; tail: number }>();
+        const trimmed = harness ? edits : edits.map(e => {
+          if (e.prepend || e.newText === '') return e;
+          const fresh = rendered(e); const echo = rangeEchoes(lines, e, fresh, n => edits.some(x => x !== e && n >= x.start && n <= x.end));
+          if (!echo.head && !echo.tail) return e;
+          const kept = fresh.slice(echo.head, fresh.length - echo.tail);
+          cut.set(e.n, echo); return { ...e, newText: `${kept.join('\n')}${kept.at(-1) === '' ? '\n' : ''}` };
+        }).filter(e => !(e.end < e.start && rendered(e).length === 0));
+        const again = cut.size ? splice(trimmed) : null;
+        // The same repeat is what a range drawn k lines off shows (line numbers from an older
+        // read: run 76 step 10 sent line 6 for line 7): the text is then meant for the range
+        // moved k lines, which keeps the line the sent range loses at its other end. When that
+        // edit changes lines and passes the checks too, the two readings are two files, and the
+        // edit is refused with its facts. Moved one line down, run 73 step 50's text would follow
+        // the setValue line it rewrites, and 1 '{' would be unmatched: one reading.
+        const moved = async (xs: typeof edits, text: string) => {
+          for (const [n, c] of cut) for (const k of [-c.head, c.tail].filter(Boolean)) {
+            const e = edits.find(x => x.n === n)!; const m = { ...e, start: e.start + k, end: e.end + k }; const end = Math.max(m.end, m.start - 1); const others = xs.filter(x => x.n !== n);
+            if (m.start < 1 || end > lines.length || (m.end >= m.start && same(lines.slice(m.start - 1, m.end), rendered(m))) || others.some(x => x.start <= end && m.start <= Math.max(x.end, x.start - 1))) continue;
+            const alt = splice([...others, m].sort(bottomUp)).text;
+            if (alt !== text && alt !== original && await passes(alt)) return true;
+          }
+          return false;
+        };
+        if (again && again.text !== original && await passes(again.text) && !await moved(trimmed, again.text)) {
+          const worse = worseBrackets(original, updated).map(w => w.said);
+          repaired = ` ${editFacts(lines, described([...edits].sort((x, y) => x.n - y.n)), []).map((f, i) => `${i ? f[0]!.toLowerCase() : f[0]}${f.slice(1, -1)}`).join('; ')}; ${[...cut.values()].reduce((k, c) => k + c.head + c.tail, 0) > 1 ? 'those lines were not written, since with them' : 'that line was not written, since with it'} ${a.path} would ${worse.length ? `have ${worse.join(', ')}` : 'no longer parse'}.`;
+          applied = requested.map((r, i) => { const t = trimmed.find(e => e.n === i + 1); return cut.has(i + 1) ? { ...r, newText: t ? t.newText : '' } : r; });
+          edits = trimmed; ({ text: updated, delta } = again);
+        } else {
+          // A refusal states each range's facts. For the brackets: what the replaced lines leave
+          // unmatched against what the new text does, and new text repeating the lines around its
+          // range, fitted to the error entry with the mapping this message may end with. For the
+          // parser: the lines the ranges held that the new text drops, the cause of an unclosed
+          // tag, not only where the parser noticed it; then new text repeating the lines around its
+          // range (run 72 step 20's edit 3 ended with line 33), last, where an entry already over its
+          // 600 characters keeps it; one that fits is not pushed over (run 57 step 52's, 562, whose
+          // dropped "5: <Layout>" is the opener of the "</Layout>" the parser names).
+          const told = described([...edits].sort((x, y) => x.n - y.n)); const reserved = mapped ? mapped.length + 90 : 0; const room = 600 - 'Tool error: '.length - reserved;
+          const gone = droppedLines(lines, edits.filter(x => !x.prepend), rendered);
+          // The lines dropped follow the bracket facts while they fit: run 76 step 10's cause was the
+          // dropped "6: export default defineConfig({", which the balance alone does not quote.
+          try { assertBalancePreserved(original, updated, a.path, told, reserved); }
+          catch (e) { const more = gone.length ? ` The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.` : ''; throw new Error((e as Error).message.length + more.length <= room ? `${(e as Error).message}${more}` : (e as Error).message); }
+          try { await assertParses(a.path, original, updated, this.parse); }
+          catch (e) {
+            const echoes = editFacts(lines, told, []).map(f => ` ${f}`).join('');
+            const said = gone.length ? `${(e as Error).message} The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.` : (e as Error).message;
+            throw new Error(said.length + echoes.length <= room || said.length > room ? `${said}${echoes}` : said);
+          }
+        }
+      }
       const retypes: string[] = [];
       if (!harness) for (const e of edits) if (!e.prepend && e.end >= e.start) { const why = nearRetype(lines.slice(e.start - 1, e.end), rendered(e), e.start); if (why) retypes.push(why); }
-      let result = lines; let delta = 0;
-      for (const e of edits) {
-        const fresh = rendered(e);
-        const removed = Math.max(0, e.end - e.start + 1);
-        result = [...result.slice(0, e.start - 1), ...fresh, ...result.slice(e.start - 1 + removed)];
-        delta += fresh.length - removed;
-      }
-      const updated = result.join('\n');
-      // A refusal names the lines the ranges held that the new text drops: the
-      // cause of an unclosed tag or brace, not only where the parser noticed it.
-      try { assertBalancePreserved(original, updated, a.path); await assertParses(a.path, original, updated, this.parse); }
-      catch (e) { const gone = droppedLines(lines, edits.filter(x => !x.prepend), rendered); throw new Error(gone.length ? `${(e as Error).message} The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.` : (e as Error).message); }
       // Retyping a range in place is a rewrite, not a paste: judge the inserted
       // lines against the file without the ranges they replace.
       const outside = lines.filter((_, i) => !edits.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end)).join('\n');
@@ -917,10 +1054,12 @@ export class ToolBox {
       const summary = edits.map(e => `${e.start}..${e.end}`).reverse().join(', ');
       const newLines = updated.split('\n'); const lo = Math.max(1, Math.min(...edits.map(e => e.start)) - 3); const hi = Math.min(newLines.length, Math.max(...edits.map(e => e.end)) + delta + 3);
       const region = hi >= lo && hi - lo < 120 ? `\nThe file now reads, lines ${lo}..${hi}:\n${newLines.slice(lo - 1, hi).map((l, i) => `${lo + i}: ${l}`).join('\n')}` : '';
-      const note = [skipped.length ? ` Skipped ${skipped.length} unchanged range(s): ${skipped.map(e => `${e.start}..${e.end}`).reverse().join(', ')}.` : '',
+      // Lines not written come first: the entry keeps this result's first 389 characters (run 49 step 34's
+      // note, after the skipped and dropped ones, was cut at "since wi").
+      const note = [repaired, skipped.length ? ` Skipped ${skipped.length} unchanged range(s): ${skipped.map(e => `${e.start}..${e.end}`).reverse().join(', ')}.` : '',
         droppedImports.length ? ` Dropped ${droppedImports.length} import line(s) the file already had.` : '', retypes.length ? ` Note: ${retypes.join('; ')}.` : ''].join('');
       this.record(a.path, 'replace_lines', base, hash(updated), edits.map(e => ({ start: e.start, end: Math.max(e.end, e.start - 1), count: rendered(e).length })));
-      return { ok: true, changed: [a.path], hashes: { [a.path]: hash(updated) }, snapshots, ...(mapped ? { applied: { ...a, edits: requested } } : {}),
+      return { ok: true, changed: [a.path], hashes: { [a.path]: hash(updated) }, snapshots, ...(mapped || applied ? { applied: { ...a, edits: applied ?? requested } } : {}),
         text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${mapped}${note} Line numbers below the first edit shifted by ${delta} in total.${region} Run focused validation.` };
       } catch (e) { if (mapped && e instanceof Error && !(e instanceof StaleWriteError)) e.message = `${e.message}${mapped} Line numbers in this message are those of the current text, sha256=${base}.`; throw e; }
     }

@@ -8,8 +8,8 @@ import { createServer } from 'node:http';
 import { defaults as baseDefaults, loadConfig } from '../src/config.js';
 // The onset ledger makes a generation the older call-order stubs do not expect; tests enable it explicitly.
 const defaults = { ...baseDefaults };
-import { Bonsai, Jev, cyclingLine, lineCut, periodic, periodicStart, postJson, requestTimeoutMs, repetitionStart, validateAnswers } from '../src/clients.js';
-import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clipEnds, lineDiff } from '../src/context.js';
+import { Bonsai, Jev, cyclingLine, echoOf, lineCut, periodic, periodicStart, postJson, requestTimeoutMs, repetitionStart, validateAnswers } from '../src/clients.js';
+import { fenceFor, trimContext, confidentChoice, evictOne, mergeCoverage, relevantFiles, repoOverview, staleFor, clip, clipEnds, lineDiff, shownIn } from '../src/context.js';
 import { namedFiles, pinReferences, referenceContext } from '../src/references.js';
 import { objectiveClauses } from '../src/control.js';
 import { newSession } from '../src/agent.js';
@@ -19,7 +19,7 @@ import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
 import { Display, describe, generationSpeed } from '../src/display.js';
 import { commandWords, configFile, declaredName, lockfiles, manifestOf, shellPrefixFor, undeclaredPackages, unresolvedImports, detectProjects, projectFor, ecosystems, importSpelling, importsFor, languageFor, moduleCandidates, regexDeclarations, signaturesFor, sourceFile, syntaxCheck, verificationClass, blockBalance, componentFormats, componentProblems, parseFact, parseInProcess } from '../src/profiles.js';
-import { manifestFailures, installCommand, repositoryStatus, solutionTsconfigReferences, checkUnusable, checkAdvice, assertBalancePreserved, completionSource, hash, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, syntaxErrors, describeProcesses, groupProcesses, assertNoBulkDuplication, treeChanges, treeSnapshot, TreeHashes, dropDuplicateImports, exportedSignatures, importCandidates, problemAt, problemKey, relativeImports, statementBounds } from '../src/tools.js';
+import { manifestFailures, installCommand, repositoryStatus, solutionTsconfigReferences, checkUnusable, checkAdvice, assertBalancePreserved, completionSource, hash, runCommand, safePath, sourceHashes, StaleWriteError, stripLiterals, ToolBox, summarizeCheck, syntaxErrors, describeProcesses, groupProcesses, assertNoBulkDuplication, treeChanges, treeSnapshot, TreeHashes, dropDuplicateImports, exportedSignatures, importCandidates, problemAt, problemKey, rangeEchoes, relativeImports, statementBounds } from '../src/tools.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -295,6 +295,11 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   const rendered = '<|im_start|>system\nS<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n```ts\n';
   assert.deepEqual(requests[0].prompt, [...rendered].map(c => c.codePointAt(0)), 'the opening fence is part of the prompt'); assert.deepEqual(requests[0].stop, ['\n```']); assert.equal(requests[0].n_predict, 64); assert.equal(requests[0].cache_prompt, true); assert.equal(requests[0].dry_multiplier, undefined, 'no repetition penalty on code');
   assert.deepEqual(requests[1].prompt, [...requests[0].prompt, ...[...'const a = 1;\n'].map(c => c.codePointAt(0))], 'the continuation is the same ids plus the ones generated, never a re-tokenized string');
+  // A closing fence split across two chunks (its line break ends one, its backticks start the next) is not
+  // seen by the server, which matches a stop word within one request: the text ends where the fence starts.
+  script = [{ content: 'const a = 1;\n', stop_type: 'limit' }, { content: '```\n\nThat is the file.', stop_type: 'eos' }];
+  const split = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```ts' });
+  assert.deepEqual({ text: split.text, finish: split.finish, left: script.length }, { text: 'const a = 1;', finish: 'stop', left: 0 });
   // A chunk that loops is cut at the first repeat and reported as such; no continuation is spent on it.
   const loop = Array.from({ length: 6 }, () => ['<div className="feature">', '  <h3>Fast</h3>', '  <p>Really fast builds.</p>', '</div>']).flat().join('\n');
   script = [{ content: `const b = 2;\n${loop}\n`, stop_type: 'limit' }];
@@ -349,6 +354,111 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   script = Array.from({ length: 6 }, () => ({ content: 'x'.repeat(64), stop_type: 'limit' }));
   const l = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: null, budgetTokens: 200 });
   assert.equal(l.finish, 'length'); assert(l.text.length >= 200 && l.text.length <= 256, `generated ${l.text.length} characters`);
+  // A region's block is checked every 128 tokens for a repeat of the lines after the region, and stopped at it:
+  // the kept text ends where the repeat starts, and nothing more is asked for.
+  const wide = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 8192, createTokens: 12000, contextWindow: 64000, workingTokens: 32000, safetyTokens: 100 }, 'local', noop);
+  const around = { before: 'import { x } from "./x"\n\nexport function a() {', region: '  return x(0)', after: '}\n\nexport function b(n: number) {\n  return x(n) * 2\n}\n\nexport const c = b(3)\nexport const d = 4\nexport const e = 5\nexport const f = 6\nexport const g = 7\nexport const h = 8\nexport const i = 9' };
+  script = [{ content: '  return x(1)\n}\n\nexport function b(n: number) {\n', stop_type: 'limit' }, { content: '  return x(n) * 2\n}\n\nexport const c = b(3)\nexport const d = 4\nexport const e = 5\nexport const f = 6\nexport const g = 7\nexport const h = 8\nexport const i = 90\nexport', stop_type: 'limit' }];
+  const ec = await wide.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', around });
+  assert.deepEqual(requests.slice(-2).map(r => r.n_predict), [128, 128]); assert.equal(script.length, 0, 'stopped: no third chunk');
+  assert.equal(ec.finish, 'repetition'); assert.equal(ec.text, '  return x(1)\n');
+  assert.deepEqual({ kind: ec.cut?.kind, line: ec.cut?.line, echoed: ec.cut?.echoed, diverged: ec.cut?.diverged }, { kind: 'echo', line: 2, echoed: 12, diverged: true }, 'lines 1..12 after the region, then other text');
+  // Four lines of it and the closing fence: not stopped (the end of the block is for trimContext to judge); without a region, chunks of 1024.
+  script = [{ content: '  return x(1)\n}\n\nexport function b(n: number) {\n  return x(n) * 2\n}', stop_type: 'word' }];
+  const four = await wide.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', around });
+  assert.equal(four.finish, 'stop'); assert.equal(four.cut, undefined);
+  // A block that starts with the repeat, blank line first: nothing is kept, and the cut is at line 1.
+  script = [{ content: '\n}\n\nexport function b(n: number) {\n  return x(n) * 2\n}\n\nexport const c = b(3)\nexport const d = 4\nexport const e = 5\nexport const f = 6\nexport const g = 7\nexport const h = 8\n', stop_type: 'limit' }];
+  const whole = await wide.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', around: { ...around, after: `\n${around.after}` } });
+  assert.equal(whole.text, ''); assert.deepEqual({ kind: whole.cut?.kind, line: whole.cut?.line, echoed: whole.cut?.echoed }, { kind: 'echo', line: 1, echoed: 13 });
+  script = [{ content: 'const a = 1', stop_type: 'word' }]; await wide.generateText([{ role: 'system', content: 'S' }], { fence: '```ts' }); assert.equal(requests.at(-1).n_predict, 1024);
+});
+test('A code generation sends the user-message delimiter of the server\'s template, found from the server\'s rendering, so its prompt is checkpointed where a chat request of it would be', async t => {
+  // A mock llama-server with a ChatML template (as this model's): tokens are character codes. mode 'folded' renders
+  // the system message into the first user message, and 'down' fails the probe once.
+  const completions: any[] = []; const probes: any[] = []; let mode = 'chatml'; const logged: [string, any][] = [];
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk; const b = body ? JSON.parse(body) : {};
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/apply-template') {
+      if (b.add_generation_prompt === false) { probes.push(b); if (mode === 'down') { mode = 'chatml'; res.statusCode = 500; return res.end('{}'); } }
+      const ms: any[] = b.messages; const gen = b.add_generation_prompt === false ? '' : '<|im_start|>assistant\n<think>\n\n</think>\n\n';
+      if (mode === 'folded') return res.end(JSON.stringify({ prompt: `<start_of_turn>user\n${ms.map(m => m.content).join('\n\n')}<end_of_turn>\n${gen}` }));
+      return res.end(JSON.stringify({ prompt: ms.map(m => `<|im_start|>${m.role}\n${m.content}<|im_end|>\n`).join('') + gen }));
+    }
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    if (req.url === '/completion') { completions.push(b); const stop = completions.length % 2 ? 'limit' : 'word'; return res.end(JSON.stringify({ content: 'const a = 1;\n', tokens: [...'const a = 1;\n'].map(c => c.codePointAt(0)), stop_type: stop, tokens_predicted: 13, timings: {} })); }
+    res.statusCode = 404; res.end('{}');
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => server.once('listening', resolve)); t.after(() => server.close());
+  const config = { ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 };
+  const bonsai = new Bonsai(config, 'local', async (type, data) => { logged.push([type, data]); });
+  const messages = [{ role: 'system' as const, content: 'S' }, { role: 'user' as const, content: '{"objective":"o"}' }, { role: 'assistant' as const, content: '{"thought":"t"}' }, { role: 'user' as const, content: '{"notes":"n"}' }, { role: 'user' as const, content: '{"role":"Write the file"}' }];
+  await bonsai.generateText(messages, { fence: '```ts' });
+  assert.equal(completions.length, 2, 'a chunk and its continuation');
+  for (const c of completions) assert.deepEqual(c.message_delimiters, [{ role: 'user', delimiter: '<|im_start|>user' }], 'the continuation carries it too');
+  // The server matches the delimiter's tokens in the prompt: they stand at the start of each user message and nowhere else.
+  const sent = String.fromCodePoint(...completions[0].prompt); const at = (x: string) => { const out: number[] = []; for (let i = sent.indexOf(x); i >= 0; i = sent.indexOf(x, i + 1)) out.push(i); return out; };
+  assert.deepEqual(at('<|im_start|>user'), at('<|im_start|>').filter((_, k) => messages[k]?.role === 'user'));
+  assert.equal(logged.find(([type]) => type === 'bonsai-request')![1].userStart, '<|im_start|>user');
+  await bonsai.generateText(messages, { fence: '```ts' });
+  assert.equal(probes.length, 1, 'found once'); assert.deepEqual(probes[0].messages.map((m: any) => m.role), ['system', 'user']);
+  // A template that shows no user-message start of its own (the system message folded into the first user message): no delimiters, as before.
+  mode = 'folded'; completions.length = 0;
+  await new Bonsai(config, 'local', noop).generateText(messages, { fence: '```ts' });
+  assert(completions.every(c => !('message_delimiters' in c)));
+  // A probe that fails sends none and is asked again at the next generation.
+  mode = 'down'; completions.length = 0; const again = new Bonsai(config, 'local', noop);
+  await again.generateText(messages, { fence: '```ts' }); assert(completions.every(c => !('message_delimiters' in c)));
+  await again.generateText(messages, { fence: '```ts' }); assert.deepEqual(completions.at(-1).message_delimiters, [{ role: 'user', delimiter: '<|im_start|>user' }]);
+});
+test('A prompt counted to fit it is not rendered and tokenized again when it is sent; a code-generation prompt counted first is rendered once', async t => {
+  const calls: Record<string, number> = {};
+  const server = createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk; const b = body ? JSON.parse(body) : {};
+    res.setHeader('Content-Type', 'application/json'); calls[req.url!] = (calls[req.url!] ?? 0) + 1;
+    if (req.url === '/apply-template') return res.end(JSON.stringify({ prompt: b.messages.map((m: any) => `<|im_start|>${m.role}\n${m.content}<|im_end|>\n`).join('') + (b.add_generation_prompt === false ? '' : '<|im_start|>assistant\n') }));
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    if (req.url === '/v1/chat/completions') return res.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{"command":"pwd","purpose":"p","check":false}' } }] }));
+    if (req.url === '/completion') return res.end(JSON.stringify({ content: 'x', tokens: [120], stop_type: 'word', tokens_predicted: 1, timings: {} }));
+    res.statusCode = 404; res.end('{}');
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => server.once('listening', resolve)); t.after(() => server.close());
+  const logged: [string, any][] = [];
+  const bonsai = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1` }, 'local', async (type, data) => { logged.push([type, data]); });
+  const a = [{ role: 'system' as const, content: 'S' }, { role: 'user' as const, content: 'step a' }]; const b = [{ role: 'system' as const, content: 'S' }, { role: 'user' as const, content: 'step b' }];
+  const counted = await bonsai.count(a); await bonsai.generate(a, schemas.bash);
+  assert.deepEqual([calls['/apply-template'], calls['/tokenize']], [1, 1], 'counted once for the fit and the request');
+  assert.deepEqual(logged.find(([type]) => type === 'bonsai-request')![1].prompt, counted);
+  // Only the latest prompt is held: an equal copy of it is not counted again, a different one is, and so is an older one after it.
+  await bonsai.count(JSON.parse(JSON.stringify(a))); await bonsai.count(b); await bonsai.count(a);
+  assert.deepEqual([calls['/apply-template'], calls['/tokenize']], [3, 3]);
+  // A prompt edited in place after its count is a different prompt.
+  b[1]!.content = 'step b, edited'; await bonsai.count(b); assert.deepEqual([calls['/apply-template'], calls['/tokenize']], [4, 4]);
+  // A code-generation prompt: counted, then tokenized with its fence for the ids, rendered once (plus the delimiter's probe, once).
+  await bonsai.count(a); await bonsai.generateText(a, { fence: '```ts' });
+  assert.deepEqual([calls['/apply-template'], calls['/tokenize']], [5 + 1, 6]);
+});
+test('echoOf and trimContext: a block repeating the lines after its region, compared without blank lines, is cut where the repeat starts; single bracket lines and runs the file holds twice are not taken', () => {
+  const echoes = new URL('../../test/fixtures/echo/', import.meta.url).pathname;
+  const old = readFileSync(`${echoes}react-demo-73-step70-old.tsx.txt`, 'utf8').replace(/\n$/, '').split('\n'); const block = readFileSync(`${echoes}react-demo-73-step70-block.tsx.txt`, 'utf8');
+  const around = { before: old.slice(0, 84).join('\n'), region: old.slice(84, 100).join('\n'), after: old.slice(100).join('\n') };
+  // Run 73 step 70: old lines 102..244 without blank lines 101 and 115; line for line only its first line matches.
+  assert.deepEqual(trimContext(block, around), { text: '', echo: { line: 1, echoed: 144, diverged: false } }, 'nothing but the repeat: the region is emptied');
+  const lines = block.split('\n');
+  assert.equal(echoOf(lines.slice(0, 10).join('\n') + '\n', around, false), null, 'while generating: nine lines with content are not enough');
+  assert.deepEqual(echoOf(lines.slice(0, 11).join('\n') + '\n', around, false), { line: 1, echoed: 12, diverged: false }, 'ten are (block line 5 is blank)');
+  // The recorded one-line repeats stay: `return (` across a blank line (react-demo-43 step 18) and `</html>` (react-demo-42 step 33).
+  assert.equal(trimContext('export default function Footer() {\n  return (\n', { before: 'import x from "./x"', region: 'export default function Footer() {', after: '\n  return (\n    <footer>\n    </footer>\n  )\n}' }).echo, null);
+  assert.equal(trimContext('<body>\n</body>\n</html>\n', { before: '<html>', region: '<body></body>', after: '</html>' }).echo, null);
+  // Context lines repeated before the region go, with the blank line after them; two closing lines at the end go too (two lines are not ambiguous).
+  assert.deepEqual(trimContext('  const a = compute(1)\n\n  const b = 2\n    </div>\n  </div>\n', { before: 'function f() {\n  const a = compute(1)', region: '  const b = 1', after: '    </div>\n  </div>\n)' }), { text: '  const b = 2\n', echo: { line: 2, echoed: 2, diverged: false } });
+  // A region of closing lines regenerated as it is, before the same closing lines: emptying the block would remove the region, so it stays.
+  assert.deepEqual(trimContext('    </div>\n  </div>\n', { before: '<div>\n  <div>\n    <div>\n      <p>hi</p>', region: '    </div>\n  </div>', after: '  </div>\n</div>\n)' }), { text: '    </div>\n  </div>\n', echo: null });
+  // The ten first lines after the region, when the file holds them twice (repeated markup: here in the region too), are not a repeat while generating.
+  const item = '<li className="card">\n  <h3>Fast builds</h3>\n  <p>Seconds, not minutes.</p>\n  <a href="/docs">Docs</a>\n  <span>New</span>\n  <img src="/fast.png" alt="" />\n  <small>Since 2026</small>\n  <em>Beta</em>\n  <b>Free</b>\n</li>';
+  assert.equal(echoOf(`<ul>\n${item}\n<li className="card">\n`, { before: '<section>', region: `<ul>\n${item}`, after: `${item}\n</ul>\n</section>` }, false), null);
+  assert.equal(echoOf(`<ul>\n${item}\n<li className="card">\n`, { before: '<section>', region: '<ul>', after: `${item}\n</ul>\n</section>` }, false)?.line, 2, 'held once: it is');
 });
 test('Profiles carry the ecosystem, language and stack knowledge: detected from the repository, never named by the loop', async t => {
   const root = await mkdtemp(join(tmpdir(), 'leana-profiles-')); t.after(() => rm(root, { recursive: true, force: true }));
@@ -555,6 +665,96 @@ test('a refused replace_lines states the facts of the edit: the lines it drops, 
   assert.equal(await readFile(join(root, 'src', 'main.tsx'), 'utf8'), main, 'nothing was written');
 });
 
+// Run 73: useLocalStorage.ts before step 50, and Testimonials.tsx's fetch effect before step 58
+// (its lines 85..104, numbered from 1 here).
+const storage73 = "import { useEffect, useState } from 'react'\n\ninterface UseLocalStorageOptions<T> {\n  key: string\n  defaultValue: T\n  storage?: Storage\n}\n\nexport function useLocalStorage<T>(\n  key: string,\n  defaultValue: T,\n  options?: UseLocalStorageOptions<T>,\n): [T, (value: T | ((prev: T) => T)) => void] {\n  const storage = options?.storage ?? window.localStorage\n  const [state, setState] = useState<T>(defaultValue)\n\n  useEffect(() => {\n    try {\n      const stored = storage.getItem(key)\n      if (stored !== null) {\n        setState(JSON.parse(stored) as T)\n      }\n    } catch {\n      // Ignore parse errors and fall back to default\n    }\n  }, [key, storage])\n\n  const setValue = (value: T | ((prev: T) => T)) => {\n    setState((prev) => {\n      const next = typeof value === 'function' ? value(prev) : value\n      try {\n        storage.setItem(key, JSON.stringify(next))\n      } catch {\n        // Ignore storage errors\n      }\n      return next\n    })\n  }\n\n  return [state, setValue]\n}\n";
+const setValue73 = "  const setValue = (value: T | ((prev: T) => T)) => {\n    setState((prev) => {\n      const next = (typeof value === 'function' ? (value as (prev: T) => T)(prev) : value) as T\n      try {\n        storage.setItem(key, JSON.stringify(next))\n      } catch {\n        // Ignore storage errors\n      }\n      return next\n    })\n  }";
+const effect73 = ['  useEffect(() => {', '    // Fetch fresh testimonials from API (non-blocking)', '    let cancelled = false', '    setLoading(true)', "    get<Testimonial[]>('/testimonials')", '      .then((res) => {', '        if (!cancelled && res.data.length > 0) {', '          setTestimonials(res.data)', '        }', '      })', '      .catch(() => {', '        // Silently fall back to defaults', '      })', '      .finally(() => {', '        if (!cancelled) setLoading(false)', '      })', '    return () => {', '      cancelled = true', '    }', '  }, [])', ''].join('\n');
+
+test('A bracket refusal states each range\'s facts: what its replaced lines leave unmatched and the line outside that matches it, what its new text leaves unmatched, and a neighbouring line the new text repeats; never a cause nobody measured', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-brackets-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true });
+  const tools = new ToolBox(root, join(root, '.leana'), { ...defaults, allowWrite: true });
+  const refusal = async (path: string, text: string, args: Record<string, any>, route: 'replace_lines' | 'write' = 'replace_lines') => {
+    await writeFile(join(root, path), text);
+    const e = await tools.execute(route, { path, expectedHash: hash(text), ...args }).then(() => null, (x: Error) => x);
+    assert(e, `${path}: refused`); assert.equal(await readFile(join(root, path), 'utf8'), text, 'nothing was written');
+    assert(`Tool error: ${e.message}`.length <= 600, 'the whole refusal fits the error entry'); assert.doesNotMatch(e.message, /cuts through|cover whole/);
+    return e.message;
+  };
+  // Run 73 step 58: the replaced line closed what it opened; the new text opens a brace it never closes.
+  assert.equal(await refusal('src/effect.tsx', effect73, { edits: [{ start: 4, end: 4, newText: '' }, { start: 15, end: 15, newText: '         if (!cancelled) {\n' }] }),
+    "Edit refused: it would leave src/effect.tsx with 1 unmatched '{' (was 0). Edit 2 (lines 15..15): the replaced lines have no unmatched '{' or '}'; its new text opens 1 '{' it does not close. The replaced range(s) held line(s) the new text does not contain: 4: setLoading(true); 15: if (!cancelled) setLoading(false).");
+  // Run 66 step 22: the new entries dropped the "];" that closed the array line 1 opens (the lines it lists all changed).
+  const authors = "const authors = [\n  { id: 1, name: 'Sarah Mitchell' },\n  { id: 2, name: 'James Chen' },\n];\n\nconst articles = [];\n";
+  assert.equal(await refusal('src/mockData.js', authors, { edits: [{ start: 2, end: 4, newText: "  { id: 1, name: 'Sarah Mitchell', avatar: 'a.png' },\n  { id: 2, name: 'James Chen', avatar: 'b.png' },\n" }] }),
+    "Edit refused: it would leave src/mockData.js with 1 unmatched '[' (was 0). Edit 1 (lines 2..4): the replaced lines close 1 ']' that line 1 opens; its new text has no unmatched '[' or ']'. The replaced range(s) held line(s) the new text does not contain: 2: { id: 1, name: 'Sarah Mitchell' },; 3: { id: 2, name: 'James Chen' },; 4: ];.");
+  // Run 76 step 10: line numbers from before step 7; the new text of 6..6 is line 7 as it is (and edit 1 only adds an import line 3 already has).
+  const vite = "import react from '@vitejs/plugin-react'\nimport { defineConfig } from 'vite'\nimport tailwindcss from '@tailwindcss/vite'\n\n// https://vite.dev/config/\nexport default defineConfig({\n  plugins: [react(), tailwindcss()],\n})\n";
+  assert.equal(await refusal('vite.config.ts', vite, { edits: [{ start: 1, end: 2, newText: "import react from '@vitejs/plugin-react'\nimport { defineConfig } from 'vite'\nimport tailwindcss from '@tailwindcss/vite'" }, { start: 6, end: 6, newText: '  plugins: [react(), tailwindcss()],' }] }),
+    "Edit refused: it would leave vite.config.ts with 1 unmatched '}' (was 0), 1 unmatched ')' (was 0). Edit 2 (lines 6..6): the replaced lines open 1 '{' that line 8 closes and open 1 '(' that line 8 closes; its new text has no unmatched '{', '}', '(' or ')', and is \"  plugins: [react(), tailwindcss()],\", which is line 7 as it is, the line after the range. The replaced range(s) held line(s) the new text does not contain: 6: export default defineConfig({.");
+  // Run 52 step 35: an insertion replaces nothing; the rule it restores lost its closing brace as well.
+  assert.equal(await refusal('src/Hero.css', '.hero {\n  position: relative;\n}\n\n  max-width: 1200px;\n  margin: 0 auto;\n\n.hero__content {\n  z-index: 2;\n}\n', { edits: [{ start: 5, end: 4, newText: '.hero__container {\n' }] }),
+    "Edit refused: it would leave src/Hero.css with 1 unmatched '{' (was 0). Edit 1 (insert before line 5): its new text opens 1 '{' it does not close.");
+  // Run 50 step 22: an anchor's new text ending in stray brackets, stated as the lines the anchor spans.
+  assert.equal(await refusal('index.html', '<!doctype html>\n<html>\n  <head>\n    <title>demo</title>\n  </head>\n</html>\n', { oldText: '    <title>demo</title>', newText: '    <title>Nova</title>\n    <meta name="description" content="Nova"}}},{' }, 'write'),
+    "Edit refused: it would leave index.html with 2 unmatched '}' (was 0). The anchor (lines 4..4): the replaced lines have no unmatched '{' or '}'; its new text opens 1 '{' it does not close and closes 3 '}' it does not open.");
+});
+
+test('New text that repeats the lines just outside its range is written without the repeat when the repeat alone breaks the file and the range moved by the repeat does not also fit; one that breaks it anyway is refused, one that passes is written as sent', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-echo-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'src'), { recursive: true });
+  const tools = new ToolBox(root, join(root, '.leana'), { ...defaults, allowWrite: true });
+  // Run 73 step 50: the new text of 28..37 ends with "  }", line 38, which stays: the range drawn one line
+  // short or the text one line long, the same file either way. Recorded: refused, then a 10.6 s whole-file rewrite.
+  await writeFile(join(root, 'src', 'useLocalStorage.ts'), storage73);
+  const r = await tools.execute('replace_lines', { path: 'src/useLocalStorage.ts', expectedHash: hash(storage73), edits: [{ start: 28, end: 37, newText: setValue73 }] });
+  assert.equal(r.ok, true);
+  const lines = storage73.split('\n');
+  assert.equal(await readFile(join(root, 'src', 'useLocalStorage.ts'), 'utf8'), [...lines.slice(0, 27), ...setValue73.split('\n').slice(0, -1), ...lines.slice(37)].join('\n'), 'lines 28..37 hold the new text without its last line; line 38 closes it as before');
+  assert.match(r.text, /^Replaced 1 range\(s\) 28\.\.37 of src\/useLocalStorage\.ts; sha256=\w+ totalLines=42\. Edit 1 \(lines 28\.\.37\): its new text ends with "  \}", which is line 38 as it is, the line after the range; that line was not written, since with it src\/useLocalStorage\.ts would have 1 unmatched '\}' \(was 0\)\. /);
+  assert.deepEqual(r.applied?.edits, [{ start: 28, end: 37, newText: setValue73.split('\n').slice(0, -1).join('\n') }], 'the edit is recorded as written');
+  // Run 62 step 35 (a parse refusal): one range starts with the line before it, another ends with the line after
+  // it; without them both ranges are deletions, which is what the worker's rewrite at step 36 then did.
+  const app = 'import { BrowserRouter, Routes, Route } from "react-router-dom";\nimport Navbar from "./components/Navbar";\n\nexport default function App() {\n  return (\n    <BrowserRouter>\n      <div className="app">\n        <Navbar />\n        <Routes />\n      </div>\n    </BrowserRouter>\n  );\n}\n';
+  await writeFile(join(root, 'src', 'App.tsx'), app);
+  const p = await tools.execute('replace_lines', { path: 'src/App.tsx', expectedHash: hash(app), edits: [{ start: 1, end: 1, newText: 'import { Routes, Route } from "react-router-dom";' }, { start: 6, end: 6, newText: '  return (' }, { start: 11, end: 11, newText: '  );' }] });
+  assert.equal(p.ok, true);
+  assert.equal(await readFile(join(root, 'src', 'App.tsx'), 'utf8'), app.replace('BrowserRouter, ', '').replace('    <BrowserRouter>\n', '').replace('    </BrowserRouter>\n', ''));
+  assert.match(p.text, /Edit 2 \(lines 6\.\.6\): its new text is "  return \(", which is line 5 as it is, the line before the range; edit 3 \(lines 11\.\.11\): its new text is "  \);", which is line 12 as it is, the line after the range; those lines were not written, since with them src\/App\.tsx would no longer parse\./);
+  // A repeat that is not what breaks the file stays in the refusal's facts (run 76 step 10, above); one in an
+  // edit that passes both checks is written as sent (run 71 step 41 duplicated "subtitle,"): the checks decide.
+  const hero = 'export function Hero({\n  title,\n  subtitle,\n}: Props) {\n  return subtitle\n}\n';
+  await writeFile(join(root, 'src', 'Hero.tsx'), hero);
+  const h = await tools.execute('replace_lines', { path: 'src/Hero.tsx', expectedHash: hash(hero), edits: [{ start: 2, end: 2, newText: '  subtitle,' }] });
+  assert.equal(await readFile(join(root, 'src', 'Hero.tsx'), 'utf8'), hero.replace('  title,', '  subtitle,')); assert.doesNotMatch(h.text, /not written/);
+  // Line numbers one too high (as run 76 step 10's were): the text starts with line 3 because it is meant for 3..5.
+  // Without the repeat the brackets match and the file parses, but "return sum" is gone; the text on 3..5
+  // passes too. Two files, so the edit is refused with its facts.
+  const total = 'export function total(items: number[]) {\n  let sum = 0\n  for (const n of items) {\n    sum += n\n  }\n  return sum\n}\n';
+  await writeFile(join(root, 'src', 'total.ts'), total);
+  const off = await tools.execute('replace_lines', { path: 'src/total.ts', expectedHash: hash(total), edits: [{ start: 4, end: 6, newText: '  for (const n of items) {\n    sum += n * 2\n  }' }] }).then(() => null, (e: Error) => e.message);
+  assert.equal(off, "Edit refused: it would leave src/total.ts with 1 unmatched '{' (was 0). Edit 1 (lines 4..6): the replaced lines close 1 '}' that line 3 opens; its new text has no unmatched '{' or '}', and starts with \"  for (const n of items) {\", which is line 3 as it is, the line before the range. The replaced range(s) held line(s) the new text does not contain: 4: sum += n; 6: return sum.");
+  assert.equal(await readFile(join(root, 'src', 'total.ts'), 'utf8'), total);
+  // "<b>c</b>" can replace line 3 or follow it, and both parse: a parse refusal states the repeat too, last, when it has room.
+  const para = 'export const P = () => (\n  <p>\n    <b>a</b>\n  </p>\n)\n';
+  await writeFile(join(root, 'src', 'p.tsx'), para);
+  const q = await tools.execute('replace_lines', { path: 'src/p.tsx', expectedHash: hash(para), edits: [{ start: 3, end: 3, newText: '    <b>c</b>\n  </p>' }] }).then(() => '', (e: Error) => e.message);
+  assert.match(q, /^Edit refused: src\/p\.tsx would no longer parse \(.* The replaced range\(s\) held line\(s\) the new text does not contain: 3: <b>a<\/b>\. Edit 1 \(lines 3\.\.3\): its new text ends with " {2}<\/p>", which is line 4 as it is, the line after the range\.$/);
+  assert.equal(await readFile(join(root, 'src', 'p.tsx'), 'utf8'), para);
+  // Moved one line down, this text would follow "if (x) {": one reading, written with the blank line it ends with.
+  const gate = 'export function f() {\n  if (x) {\n    go()\n  }\n}\n';
+  await writeFile(join(root, 'src', 'gate.ts'), gate);
+  assert.equal((await tools.execute('replace_lines', { path: 'src/gate.ts', expectedHash: hash(gate), edits: [{ start: 2, end: 3, newText: '  if (y) {\n    go()\n\n  }' }] })).ok, true);
+  assert.equal(await readFile(join(root, 'src', 'gate.ts'), 'utf8'), 'export function f() {\n  if (y) {\n    go()\n\n  }\n}\n');
+  // The repeat is exact and has some text, and never lines another range of the call replaces.
+  assert.deepEqual(rangeEchoes(['a', '}', '}'], { start: 2, end: 1 }, ['x', '}']), { head: 0, tail: 1 }, 'an insertion before line 2 sits between lines 1 and 2');
+  assert.deepEqual(rangeEchoes(['a', '', 'b'], { start: 1, end: 1 }, ['c', '']), { head: 0, tail: 0 }, 'a blank line is no repeat');
+  assert.deepEqual(rangeEchoes(['a', 'b', '  }'], { start: 2, end: 2 }, ['b2', '}']), { head: 0, tail: 0 }, 'compared as they are, indentation included');
+  assert.deepEqual(rangeEchoes(['a', 'b', 'c', 'd'], { start: 2, end: 2 }, ['a', 'B', 'c']), { head: 1, tail: 1 });
+  assert.deepEqual(rangeEchoes(['a', 'b', 'c', 'd'], { start: 2, end: 2 }, ['a', 'B', 'c'], n => n === 3), { head: 1, tail: 0 }, 'line 3 belongs to another range');
+});
+
 // Run 63, step 41: HomeView.vue as it was before the edit (its first thirteen
 // lines from the artifact, the template shortened).
 const homeView = "<script setup>\nimport { computed } from 'vue'\nimport { useRouter } from 'vue-router'\nimport { useNewsStore } from '../stores/news.js'\nimport { categories } from '../data/categories.js'\n\nconst router = useRouter()\nconst newsStore = useNewsStore()\n\nconst featuredArticles = computed(() => newsStore.featuredArticles)\nconst latestArticles = computed(() => newsStore.latestArticles)\nconst trendingArticles = computed(() => newsStore.trendingArticles)\n</script>\n\n<template>\n  <div class=\"home\">\n    <section class=\"hero\">\n      <h1 class=\"hero-title\">The Daily Chronicle</h1>\n    </section>\n  </div>\n</template>\n";
@@ -727,6 +927,17 @@ test('A process group is read from the process table (/proc or ps): its live mem
   assert.deepEqual(await groupProcesses(child.pid!), []);
 });
 
+test('shownIn names the newest entry that shows every part a clip kept, as written or inside a JSON string; none when a part is shown nowhere', () => {
+  const e = (id: string, text: string, kind = 'bash') => ({ id, step: 1, kind, text, artifact: '', relevance: .5 });
+  const out = 'src/a.ts(1,1): error "one"\n' + 'x'.repeat(2000) + '\nFound 1 error.\n'; const field = clipEnds(out, 1200);
+  assert.equal(shownIn([e('e1', JSON.stringify({ command: 'tsc', output: out }))], field), 'e1', 'a command\'s output sits escaped in its result\'s JSON');
+  assert.equal(shownIn([e('e1', out), e('e2', out)], field), 'e2', 'the newest');
+  assert.equal(shownIn([e('e1', 'other'), e('e2', out), e('e2', 'other')], field), undefined, 'an id two entries carry says neither');
+  assert.equal(shownIn([e('t3', out, 'turn')], field), undefined, 'a turn is not evidence');
+  assert.equal(shownIn([e('e1', clip(out, 600))], field), undefined, 'a shorter clip leaves a kept part unshown');
+  assert.equal(shownIn([e('e1', clip(out, 1500))], clip(out, 700)), 'e1', 'a longer clip shows both parts of a shorter one');
+  assert.equal(shownIn([e('e1', 'other')], 'short error'), undefined);
+});
 test('lineDiff counts the lines each text has that the other does not, by a longest common subsequence after the common ends', () => {
   assert.deepEqual(lineDiff('a\nb\nc\n', 'a\nb\nc\n'), { removed: 0, added: 0, exact: true });
   assert.deepEqual(lineDiff('a\nb\nc\n', 'a\nB\nc\n'), { removed: 1, added: 1, exact: true });

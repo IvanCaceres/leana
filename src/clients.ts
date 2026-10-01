@@ -72,7 +72,10 @@ export class Jev {
   }
 }
 export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'repetition' | 'eos'; meta: GenerationMeta; cut?: GenerationCut }
-export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number }
+// around: the generation is the block of a region of a file, which is as it is before the region,
+// in it and after it; a block that starts reproducing the lines after it is stopped (echoOf).
+export interface Around { before: string; region: string; after: string }
+export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number; around?: Around }
 // Sampling for code. The server's defaults (top_k 20, top_p 0.95) stay; the DRY
 // sampler penalises the verbatim repetition a 1-bit model falls into without
 // penalising the legitimate repeats code is made of.
@@ -118,6 +121,49 @@ export function periodic(text: string, span = 800): { start: number; unit: numbe
   return null;
 }
 export function periodicStart(text: string, span = 800): number { return periodic(text, span)?.start ?? -1; }
+// The lines of a text that hold anything, trimmed, with each one's index among all its lines.
+export function contentLines(text: string): { t: string; i: number }[] {
+  const out: { t: string; i: number }[] = []; text.split('\n').forEach((l, i) => { const t = l.trim(); if (t) out.push({ t, i }); }); return out;
+}
+// A line that says something beyond brackets and separators: a single matching line of
+// brackets or a few characters is ambiguous (a block's own closing brace looks like the next one).
+export const substantive = (line: string) => line.trim().replace(/[{}()[\];,]/g, '').length >= 8;
+// A block generated for a region of a file that reproduces the lines after the region, which stay
+// in the file. Lines are compared trimmed and without blank lines, as a copy is made: run 73 step
+// 70 was to delete lines 85..100 and generated lines 102..244 instead (1510 tokens, 44 s), leaving
+// out blank lines 101 and 115, which a line-for-line comparison never matches.
+// A repeat is the first ten lines after the region, one of them substantive, in order anywhere
+// in the block, when the file holds that run only once. Measured with the first five: none of the
+// 928 changed hunks of the recorded whole-file rewrites, replayed as region rewrites of the old
+// file (with 0, 3 or 10 unchanged lines around them), holds them, and none of the six recorded
+// region blocks that have lines after them; taking every line boundary of 712 real files as a
+// block end, a block of 10 lines holds them 0.03% of the time and one of 80 lines 0.81%, each
+// time a run the file holds twice (in the block and after it), which the once-only condition
+// excludes. The first three lines instead: one hunk (0.11%) and 0.27% to 2.64% of those blocks.
+// Ten rather than five: a block that legitimately opens like the lines after it (a card given its
+// sibling's icon, an effect moved above the handlers) would otherwise be taken for a repeat and
+// its region removed; run 73's repeat had 16 such lines in its first 128 tokens. A shorter repeat
+// is judged once the generation has ended, at the block's end. The three recorded repeats all
+// start with lines the file holds once.
+// Once the generation has ended (ended), a repeat at the block's end counts at any length when
+// it is two or more lines or one substantive line, as for context repeated around a region;
+// one that is the whole block needs a substantive line, since emptying the block removes the
+// region: a region of closing lines regenerated as it is, before the same closing lines, stays.
+// Returns the block line (1-based) the repeat starts at, taking the blank lines before it with
+// it, how many of the lines after the region, from the first, it reproduced, and
+// whether the block went on past them with other lines.
+export interface Echo { line: number; echoed: number; diverged: boolean }
+export function echoOf(block: string, around: Around, ended = true): Echo | null {
+  const g = contentLines(block); const f = contentLines(around.after); if (!g.length || !f.length) return null;
+  const gt = g.map(x => x.t); const ft = f.map(x => x.t); const run = 10; const key = ft.slice(0, run);
+  const file = contentLines(`${around.before}\n${around.region}\n${around.after}`).map(x => x.t); let times = 0;
+  for (let i = 0; i + run <= file.length && times < 2; i++) if (key.every((t, k) => file[i + k] === t)) times++;
+  let at = key.length === run && key.some(substantive) && times === 1 ? gt.findIndex((_, p) => key.every((t, k) => gt[p + k] === t)) : -1;
+  if (at < 0 && ended) for (let n = Math.min(gt.length, ft.length); n > 0; n--) if (gt.slice(-n).every((t, k) => t === ft[k]) && (n >= 2 || substantive(gt.at(-1)!)) && (n < gt.length || gt.some(substantive))) { at = gt.length - n; break; }
+  if (at < 0) return null;
+  let m = 0; while (at + m < gt.length && m < ft.length && gt[at + m] === ft[m]) m++;
+  return { line: at ? g[at - 1]!.i + 2 : 1, echoed: f[m - 1]!.i + 1, diverged: at + m < gt.length };
+}
 // A loop inside one line with a longer unit: the recorded in-line loops (an SVG
 // path, a number array) drift for a few hundred characters, then repeat one unit
 // of 19 to 1,875 characters verbatim until the budget. The current line ends in
@@ -145,10 +191,12 @@ export function cyclingLine(text: string, maxPeriod = 2000, span = 3000): { star
 // model copies it back into the same loop).
 // opening is the line without its indentation, at most 60 characters (truncated
 // when there is more); kind 'lines' is a repeat of whole lines, 'cycle' one inside
-// a single line, 'budget' an unfinished line at the token budget.
-export interface GenerationCut { kind: 'cycle' | 'lines' | 'budget'; line: number; opening: string; truncated?: true; lineChars: number; unit?: number }
+// a single line, 'budget' an unfinished line at the token budget, 'echo' a region's
+// block reproducing the lines after the region (echoed and diverged as echoOf says).
+export interface GenerationCut { kind: 'cycle' | 'lines' | 'budget' | 'echo'; line: number; opening: string; truncated?: true; lineChars: number; unit?: number; echoed?: number; diverged?: true }
 export function lineCut(body: string, at: number, kind: GenerationCut['kind'], unit?: number): { kept: string; cut: GenerationCut } {
-  const ls = body.lastIndexOf('\n', at - 1) + 1; const le = body.indexOf('\n', ls);
+  // At 0 the cut line is the first (lastIndexOf from -1 would find a line break at 0 and keep it).
+  const ls = at ? body.lastIndexOf('\n', at - 1) + 1 : 0; const le = body.indexOf('\n', ls);
   const line = body.slice(ls, le < 0 ? body.length : le); const trimmed = line.trimStart();
   return { kept: body.slice(0, ls), cut: { kind, line: body.slice(0, ls).split('\n').length, opening: trimmed.slice(0, 60), ...(trimmed.length > 60 ? { truncated: true as const } : {}), lineChars: line.length, ...(unit ? { unit } : {}) } };
 }
@@ -166,16 +214,38 @@ export class Bonsai {
   lastMeta: GenerationMeta | null = null;
   // The generation speed last observed, for request timeouts that fit the model.
   private tokensPerSecond = 20;
+  // The latest prompt rendered, with its token count once counted, by the messages it renders: a step
+  // prompt is counted to fit it and was counted again when sent, an /apply-template and a /tokenize
+  // round trip (30 ms on average over 791 step requests of runs 49-76; 1.4 s of run 73, 2.0 s of run
+  // 76), and a code-generation prompt is counted, then rendered again for its ids.
+  private rendered: { key: string; prompt: string; tokens?: number } | null = null;
+  // The text that opens a user message in the server's chat template, once found (userDelimiter).
+  private userStart?: Promise<string | null>;
   constructor(readonly config: Config, private key: string, private log: Log) {}
   private get root(): string { return this.config.baseUrl.replace(/\/v1\/?$/, '').replace(/\/$/, ''); }
   // The prompt exactly as the server's chat template renders it, ending with the
   // assistant prefix, so a raw completion can continue it.
-  private async render(messages: Message[], thinking = false): Promise<string> {
+  private async render(messages: Message[], thinking = false): Promise<{ key: string; prompt: string; tokens?: number }> {
+    const key = JSON.stringify([thinking, messages]); if (this.rendered?.key === key) return this.rendered;
     const applied = await postJson(`${this.root}/apply-template`, {
       messages, add_generation_prompt: true, chat_template_kwargs: { enable_thinking: thinking },
     }, this.key, 10000, 0);
     if (typeof applied.prompt !== 'string') throw new Error('Missing rendered prompt');
-    return applied.prompt;
+    return this.rendered = { key, prompt: applied.prompt };
+  }
+  // The text that opens a user message: what a rendered user message has before its content once the
+  // system message before it has ended, trimmed (the server's autoparser takes its own the same way after
+  // an assistant message, detect_user_start_marker in common/chat-diff-analyzer.cpp). For this model's
+  // template that is '<|im_start|>user', the delimiter the server's chat path sends itself from a fixed
+  // list (common/chat.cpp:1192). Null when the rendering does not show it (a template that folds the
+  // system message into the first user message); generations then go without.
+  private userDelimiter(): Promise<string | null> {
+    const system = 'LEANA-SYSTEM-MARK'; const user = 'LEANA-USER-MARK';
+    return this.userStart ??= postJson(`${this.root}/apply-template`, { messages: [{ role: 'system', content: system }, { role: 'user', content: user }], add_generation_prompt: false }, this.key, 10000, 0).then(r => {
+      const p = r?.prompt; if (typeof p !== 'string') return null; const i = p.indexOf(system); const j = p.indexOf(user); if (i < 0 || j < i) return null;
+      const end = p.slice(j + user.length); const between = p.slice(i + system.length, j);
+      return end.trim() && between.startsWith(end) ? between.slice(end.length).trim() || null : null;
+    }, () => { this.userStart = undefined; return null; });
   }
   private async tokenize(text: string): Promise<number[]> {
     const result = await postJson(`${this.root}/tokenize`, { content: text, add_special: true }, this.key, 10000, 0);
@@ -189,7 +259,8 @@ export class Bonsai {
   }
   async count(messages: Message[]): Promise<{ tokens: number; mode: string }> {
     try {
-      return { tokens: (await this.tokenize(await this.render(messages))).length, mode: 'llama-tokenizer' };
+      const r = await this.render(messages); r.tokens ??= (await this.tokenize(r.prompt)).length;
+      return { tokens: r.tokens, mode: 'llama-tokenizer' };
     } catch {
       // Conservative fallback for byte-level tokenizers; safetyTokens reserves template overhead.
       return { tokens: Buffer.byteLength(JSON.stringify(messages)), mode: 'utf8-byte-upper-bound' };
@@ -241,13 +312,34 @@ export class Bonsai {
     const requestId = randomUUID();
     const start = performance.now();
     let prompt: number[]; let promptTokens: number;
-    try { prompt = await this.tokenize(await this.render(messages, thinking) + (fence && !thinking ? `${fence}\n` : '')); promptTokens = prompt.length; }
+    try { prompt = await this.tokenize((await this.render(messages, thinking)).prompt + (fence && !thinking ? `${fence}\n` : '')); promptTokens = prompt.length; }
     catch (e) { await this.log('bonsai-error', { requestId, ...context, ms: 0, error: `render: ${(e as Error).message}` }); throw new Error(`The server could not render the prompt: ${(e as Error).message}`); }
     if (promptTokens > this.config.workingTokens || promptTokens + Math.min(budget, this.config.maxTokens) + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
-    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking });
-    // Chunks are where a loop is checked for; a continuation reuses the cached ids, so a small one costs little.
-    const chunk = Math.min(this.config.maxTokens, 1024);
+    // The server checkpoints this hybrid model's recurrent state, the only points a later request can
+    // resume from, at each user-message start it processes and 516 and 4 tokens before the prompt end
+    // (server-context.cpp 3433-3519, with --checkpoint-min-step 0). A chat request finds those starts by
+    // the delimiters of its template; a raw completion only by the message_delimiters it is sent
+    // (4175-4193). Without them the request after a code generation resumed at the step request's
+    // checkpoint and processed the batch's earlier results again: 107k tokens over runs 49-76 by a
+    // replay of the server's checkpoint logic (6.7k in run 73, 2.2k in run 76, 16.4k in run 51, whose
+    // compaction was processed twice). Only user starts are checkpointed (is_user_start,
+    // common/chat.h:173), so the user delimiter alone gives a code-generation prompt the checkpoints a
+    // chat request of it gets. Each costs about 98 ms (a 150 MiB state copy and the batch break before
+    // it, fitted over 1,044 logged requests) and 541 more are made: 139 s saved, 53 s spent, 40 s of it
+    // on the 411 at a code request's own start, which the server always makes and no later request
+    // resumes from, the next one diverging before it (0 of 779 for a step request's own). At most 94
+    // are alive at once (88 without), under the cap of 128, so the cap still never drops the low restore
+    // points an eviction falls back to.
+    const userStart = await this.userDelimiter();
+    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking, userStart });
+    // Chunks are where a loop is checked for; a continuation reuses the cached ids, so a small one costs little
+    // (one token to process: 124 ms, the median of 263 recorded continuations). A region's block is checked
+    // every 128 tokens (about 2.7 s of generation, so about 5% more time) for a repeat of the lines after it,
+    // which otherwise runs on to the file's end (run 73 step 70: 1510 tokens, 44 s, stopped after 128). Each
+    // continuation also leaves a server checkpoint of the recurrent state (149.6 MiB of host memory, one of
+    // at most 128), which the next request drops as it diverges before it.
+    const chunk = Math.min(this.config.maxTokens, options.around ? 128 : 1024);
     let cutFrom = ''; let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = ''; let cut: GenerationCut | undefined; let lastStop = ''; let lastIds: number[] = []; let lastContent = '';
     // The closing fence is the backtick run alone, whatever language opened it.
     const stopWords = fence ? [`\n${fence.match(/^`+/)?.[0] ?? '```'}`] : [];
@@ -257,7 +349,7 @@ export class Bonsai {
         const n = Math.min(chunk, budget - generated, room - generated);
         if (n <= 0) { finish = 'length'; break; }
         const timeout = requestTimeoutMs(continuations === 0 ? promptTokens : 0, n, this.tokensPerSecond);
-        const r = await postJson(`${this.root}/completion`, { prompt, n_predict: n, temperature, ...codeSampling, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, stream: false, ...(thoughtClosed ? { stop: stopWords } : {}) }, this.key, timeout, 0);
+        const prior = text.length; const r = await postJson(`${this.root}/completion`, { prompt, n_predict: n, temperature, ...codeSampling, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, stream: false, ...(thoughtClosed ? { stop: stopWords } : {}), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, timeout, 0);
         if (typeof r.content !== 'string') throw new Error('Bonsai returned no content');
         const ids: number[] = Array.isArray(r.tokens) ? r.tokens : [];
         text += r.content; timings = r.timings; prompt = [...prompt, ...ids];
@@ -267,6 +359,11 @@ export class Bonsai {
         const stop: string = r.stop_type ?? (r.stopped_limit ? 'limit' : r.stopped_word ? 'word' : r.stopped_eos ? 'eos' : 'none');
         lastStop = stop; lastIds = ids; lastContent = r.content;
         if (stop === 'word' && typeof r.stopping_word === 'string') stoppingWord = r.stopping_word;
+        // The server matches a stop word within one request: a closing fence whose line break ended the
+        // previous chunk (the recorded fences are two tokens, the line break then the backticks) and whose
+        // backticks start this one is not seen, and what the model wrote after it would be written too.
+        const split = thoughtClosed && prior && stopWords[0] ? text.indexOf(stopWords[0], prior - stopWords[0].length + 1) : -1;
+        if (split >= 0 && split < prior) { text = text.slice(0, split); finish = 'stop'; broken = false; break; }
         if (r.truncated) { finish = 'length'; break; }
         if (!thoughtClosed) {
           if (text.includes('</think>')) thoughtClosed = true;
@@ -287,8 +384,12 @@ export class Bonsai {
           const judged = body.replace(/\uFFFD+$/, '');
           const at = repetitionStart(judged);
           // A periodic run whose unit holds a line end repeats whole short lines (closing brackets, blank lines), not one line.
-          const hit = at >= 0 ? { start: at ? judged.split('\n').slice(0, at).join('\n').length + 1 : 0, kind: 'lines' as const, unit: undefined }
+          const lineStart = (n: number) => n ? judged.split('\n').slice(0, n).join('\n').length + 1 : 0;
+          const hit = at >= 0 ? { start: lineStart(at), kind: 'lines' as const, unit: undefined }
             : (() => { const h = periodic(judged) ?? cyclingLine(judged); return !h ? null : judged.slice(h.start).includes('\n') ? { start: h.start, kind: 'lines' as const, unit: undefined } : { ...h, kind: 'cycle' as const }; })();
+          // A block that has started reproducing the lines after its region, judged on its whole lines, is cut where the repeat starts.
+          const echo = options.around ? echoOf(judged.slice(0, judged.lastIndexOf('\n') + 1), options.around, false) : null;
+          if (echo && (!hit || lineStart(echo.line - 1) <= hit.start)) { const c = lineCut(body, lineStart(echo.line - 1), 'echo'); cutFrom = uncut; text = text.slice(0, bodyStart) + c.kept; cut = { ...c.cut, echoed: echo.echoed, ...(echo.diverged ? { diverged: true as const } : {}) }; finish = 'repetition'; break; }
           if (hit) { const c = lineCut(body, hit.start, hit.kind, hit.unit); cutFrom = uncut; text = text.slice(0, bodyStart) + c.kept; cut = c.cut; finish = 'repetition'; break; }
         }
         if (generated >= budget) { finish = 'length'; break; }

@@ -106,9 +106,12 @@ test('A completion Jev does not accept comes back as feedback; one it routes to 
   const s = await newSession(root, 'Do the thing');
   let result = await new Agent({ ...config, maxSteps: 2 }, store, jev, bonsai, root, () => {}, () => {}).run(s);
   assert.equal(result.status, 'paused'); assert(result.completionFeedback && !result.completionFeedback.addressed && /not accepted/.test(result.completionFeedback.text), 'the rejection is pinned for the worker');
-  const jev2 = jevOf({ gate: { verification_needed: 'human' } });
-  result = await new Agent({ ...config, maxSteps: 1 }, store, jev2, bonsai, root, () => {}, () => {}).run({ ...result, status: 'running' } as any);
+  const jev2 = jevOf({ gate: { verification_needed: 'human' } }); const prompts: Message[][] = []; const feedback = result.completionFeedback.text;
+  result = await new Agent({ ...config, maxSteps: 1 }, store, jev2, { ...bonsai, generate: async (m: Message[], schema: any) => { prompts.push(m); return bonsai.generate(m, schema); } }, root, () => {}, () => {}).run({ ...result, status: 'running' } as any);
   assert.equal(result.status, 'paused'); assert.match(result.stopReason, /routes it to the user/);
+  const request = JSON.parse(prompts[0]!.at(-1)!.content);
+  assert(request.harnessNote.includes(feedback) && !('completionFeedback' in request), 'the rejection is stated once, in the note');
+  assert.equal(request.lastError, 'shown in evidence e2', 'the failed finish is the entry right above the tail');
 });
 
 test('The watchdog ends a stuck attempt: no progress for a run of steps with a high stuck reading first warns the worker, then pauses with the reason', async t => {
@@ -246,7 +249,7 @@ test('An edit answers with the region as it now reads, so the next edit needs no
   const entry = result.entries.find(e => e.kind === 'replace_lines')!;
   assert.match(entry.text, /The file now reads, lines 1\.\.[67]:\n1: line1\n2: line2\n3: three\n4: three-b\n5: line4\n6: line5/, entry.text);
   const pinned = JSON.parse(prompts[0][1].content); const request = JSON.parse(prompts[0].at(-1).content);
-  assert(pinned.actions?.replace_lines?.argumentSchema && Array.isArray(request.allowedActions) && !request.actions, 'schemas sit in the cached pinned block; the request names the allowed actions only');
+  assert(pinned.actions?.replace_lines?.argumentSchema && !('allowedActions' in request) && !request.actions && /from the pinned block's actions/.test(request.role), 'schemas sit in the cached pinned block; the request neither repeats them nor restates their names');
   const roles = prompts[0].map((m: Message) => Object.keys(JSON.parse(m.content.startsWith('{') ? m.content : '{}'))[0] ?? 'system');
   assert.deepEqual(roles.slice(0, 2), ['system', 'objective'], `the stable blocks lead: ${roles}`); assert.equal(roles.at(-2), 'notes', 'notes, files and the check state sit just before the request, after the evidence');
 });
@@ -683,23 +686,77 @@ test('A repeat followed by a failure in the same turn is not progress: such turn
   assert.match(result.stopReason, /four turns in a row could not be executed or only repeated earlier requests/);
 });
 
-test('Reasoning copied word for word from the previous turn drops the earlier copy at once; turns that only open alike are kept', async t => {
+// Whether the next thought repeats follows the copies of it the next prompt holds (runs to 76: none left
+// 1/51, one 20/42, two or more 11/12). Removing the earlier copy when the repeat ran an action left one copy
+// all the same and re-processed everything after the removed turn (runs 49-76: 26 such resets, 44.6 s of
+// prompt processing; run 73 step 30, 5,638 tokens). Keeping the earlier copy and not adding the repeat leaves
+// the same one copy and the prompt only grows. A repeat that changed nothing still leaves no copy.
+test('Reasoning copied word for word from the previous turn is not added: the earlier copy stays and the prompt only grows; a repeat that changed nothing takes the earlier copy with it; turns that only open alike are kept', async t => {
   const { root, store } = await repo(t);
   const same = 'The build passes and the page renders. The render shows class names without CSS. Let me read the stylesheet to see what exists.';
+  const bash = (command: string) => ({ action: 'bash', args: { command, purpose: 'look', check: false } });
   const steps = [
-    { thought: 'Start by looking around the repository to see what is there already.', action: 'bash', args: { command: 'echo a', purpose: 'look', check: false } },
-    { thought: `${same} First the top part.`, action: 'bash', args: { command: 'echo b', purpose: 'look', check: false } },
-    { thought: `${same} Now the bottom part.`, action: 'bash', args: { command: 'echo c', purpose: 'look', check: false } },
-    { thought: `${same} Now the bottom part.`, action: 'bash', args: { command: 'echo d', purpose: 'look', check: false } },
+    { thought: 'Start by looking around the repository to see what is there already.', ...bash('echo a') },
+    { thought: `${same} First the top part.`, ...bash('echo b') },
+    { thought: `${same} Now the bottom part.`, ...bash('echo c') },
+    { thought: `${same} Now the bottom part.`, ...bash('echo d') },
+    // The same command again with nothing written since is refused: the turn changed nothing.
+    { thought: `${same} Now the bottom part.`, ...bash('echo d') },
+    { thought: 'The stylesheet is empty, so the classes have no rules; write them next.', ...bash('echo e') },
   ];
   const prompts: Message[][] = []; const bonsai = bonsaiOf({ steps });
   const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); } };
-  const result = await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
-  const resets = (await events(store)).filter(e => e.type === 'reasoning-reset');
-  assert.equal(resets.length, 1, 'only the word-for-word repeat resets, not the turn that merely opens alike');
-  assert.deepEqual([resets[0].data.step, resets[0].data.reason, resets[0].data.turns], [4, 'repeated', ['t3']], 'only the earlier copy goes, so the cache breaks near the end of the prompt');
-  assert.deepEqual(result.entries.filter(e => e.kind === 'turn').map(e => e.id), ['t1', 't2', 't4']);
-  assert.equal(result.entries.filter(e => e.kind === 'bash').length, 4, 'the results stay');
+  const result = await new Agent({ ...config, maxSteps: 6 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const ev = await events(store);
+  const copies = (m: Message[]) => m.filter(x => x.role === 'assistant' && x.content.includes('Now the bottom part')).length;
+  assert.deepEqual(ev.filter(e => e.type === 'repeated-thought').map(e => [e.data.step, e.data.kept]), [[4, 't3'], [5, 't3']], 'only the word-for-word repeats, not the turn that merely opens alike');
+  assert.equal(copies(prompts[4]!), 1, 'after the repeat that ran: one copy, the earlier one');
+  assert.deepEqual(prompts[4]!.slice(0, prompts[3]!.length - 2), prompts[3]!.slice(0, -2), 'nothing before the new results changed: the server re-processes only them and the tail');
+  assert.deepEqual(ev.filter(e => e.type === 'reasoning-reset').map(e => [e.data.step, e.data.reason, e.data.turns]), [[5, 'repeated', ['t3']]], 'the repeat that changed nothing takes the earlier copy');
+  assert.equal(copies(prompts[5]!), 0);
+  assert.deepEqual(result.entries.filter(e => e.kind === 'turn').map(e => e.id), ['t1', 't2', 't6']);
+  assert.equal(result.entries.filter(e => e.kind === 'bash').length, 5, 'the results stay');
+});
+
+// The repeat check compares with the last turn in the prompt, so the copy kept must be that turn: keeping an
+// earlier copy (the thought came back after another) would let the next repeat through as a new turn, and the
+// prompt after it would hold two copies (then the next thought was equal 11 times in 12).
+test('A thought that came back after another and then repeats keeps the latest copy: every further repeat is still caught and no prompt holds two copies after it', async t => {
+  const { root, store } = await repo(t);
+  const x = 'The page renders but the hero image is missing. Let me look at how the public folder is served.';
+  const bash = (command: string) => ({ action: 'bash', args: { command, purpose: 'look', check: false } });
+  const steps = [
+    { thought: x, ...bash('echo a') },
+    { thought: 'The public folder is served from the root; check the image path in the component next.', ...bash('echo b') },
+    { thought: x, ...bash('echo c') },
+    { thought: x, ...bash('echo d') },
+    { thought: x, ...bash('echo e') },
+    { thought: x, ...bash('echo f') },
+    { thought: 'The image path was wrong; fix it in the component and build.', ...bash('echo g') },
+  ];
+  const prompts: Message[][] = []; const bonsai = bonsaiOf({ steps });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); } };
+  const result = await new Agent({ ...config, maxSteps: 7 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const ev = await events(store);
+  const copies = (m: Message[]) => m.filter(y => y.role === 'assistant' && y.content.includes('hero image is missing')).length;
+  assert.deepEqual(ev.filter(e => e.type === 'repeated-thought').map(e => [e.data.step, e.data.kept]), [[4, 't3'], [5, 't3'], [6, 't3']], 'the thought that came back after another is not a repeat; each one after it is');
+  assert.deepEqual(ev.filter(e => e.type === 'reasoning-reset').map(e => [e.data.step, e.data.reason, e.data.turns]), [[4, 'repeated', ['t1']]], 'the earlier copy goes once');
+  assert.deepEqual(prompts.map(copies), [0, 1, 1, 2, 1, 1, 1]);
+  assert.deepEqual(prompts[5]!.slice(0, prompts[4]!.length - 2), prompts[4]!.slice(0, -2), 'a caught repeat only appends');
+  assert.deepEqual(result.entries.filter(e => e.kind === 'turn').map(e => e.id), ['t2', 't3', 't7']);
+  assert.equal(result.entries.filter(e => e.kind === 'bash').length, 7, 'the results stay');
+});
+
+test('A file generated inside a repeat\'s batch sees the reasoning once, through the turn kept, and its prompt extends the step\'s', async t => {
+  const { root, store } = await repo(t);
+  const x = 'The components are written; the page still needs its sections, so write the next one as planned.';
+  const steps = [{ thought: x, action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } }, { thought: x, action: 'create_file', args: { path: 'src/b.ts', purpose: 'b' } }];
+  const prompts: Message[][] = []; const bonsai = bonsaiOf({ steps });
+  const spy = { ...bonsai, generate: async (m: Message[], s: any) => { prompts.push(m); return bonsai.generate(m, s); }, generateText: async (m: Message[]) => { prompts.push(m); return bonsai.generateText(m); } };
+  await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const generated = prompts.find(m => JSON.parse(m.at(-1)!.content).file === 'src/b.ts')!; const step = prompts[prompts.indexOf(generated) - 1]!;
+  assert.deepEqual(generated.filter(m => m.role === 'assistant' && m.content.includes('write the next one as planned')).map(m => JSON.parse(m.content).actions[0].args.path), ['src/a.ts'], 'one copy: the turn kept');
+  assert.deepEqual(generated.slice(0, step.length - 2), step.slice(0, -2), 'nothing before the tail changed');
 });
 
 test('earlierSteps sits before the evidence: it changes only when evidence is evicted, so it is not reprocessed every step', async () => {
@@ -1039,11 +1096,79 @@ test('After edits, the last check\'s diagnostics about the edited files are with
   await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
   const tail = (m: Message[]) => Object.assign({}, ...m.slice(-2).map(x => JSON.parse(x.content)));
   const before = tail(prompts[1]!).verification; const after = tail(prompts[2]!).verification;
-  assert(before.output && Object.keys(before.files).length === 2, 'right after the check: its output and both files');
+  assert(before.output === 'shown in evidence e1' && Object.keys(before.files).length === 2, 'right after the check: the entry that shows its output, and both files');
   assert.deepEqual(Object.keys(after.files), ['src/b.ts'], 'errors in the untouched file stay; those about the edited one are withheld');
   assert.equal(after.output, undefined); assert.match(after.outputWithheld, /files were edited after this check ran \(src\/a\.ts\)/);
   const stale = tail(prompts[2]!).staleEvidence as Record<string, string>;
   assert(Object.values(stale).some(v => /files edited since this check \(src\/a\.ts\)/.test(v)), JSON.stringify(stale));
+});
+test('The tail names the entry that shows the check\'s output and the last error while it is in the prompt, restates them once it has left, and sends allowedActions only when a step allows fewer actions than the pinned block lists', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'a.ts'), 'export const a: number = "x";\n');
+  await writeFile(join(root, 'check.mjs'), 'console.log("src/a.ts(1,14): error TS2322: Type string is not assignable to type number."); process.exit(2);\n');
+  const { stepMessages, regionMessages, clipEnds } = await import('../src/context.js');
+  const bonsai = bonsaiOf({ steps: [{ thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } }] });
+  const s = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const tail = (m: Message[]) => Object.assign({}, ...m.slice(-2).map(x => JSON.parse(x.content)));
+  const allowed = s.allowedActions!; const now = tail(stepMessages(s, allowed));
+  assert.equal(now.verification.output, 'shown in evidence e1'); assert.equal(now.lastError, 'shown in evidence e1');
+  assert(now.verification.ok === false && now.verification.exitCode === 2 && JSON.stringify(now.verification.files) === '{"src/a.ts":[1]}', 'pass/fail and the files and lines stay in the tail');
+  assert.match(s.entries.find(e => e.id === 'e1')!.text, /error TS2322/, 'the entry named shows the diagnostics');
+  assert(!('allowedActions' in now) && /from the pinned block's actions/.test(now.role), 'the pinned block lists the same actions');
+  // A code generation shares the prefix: the entry is in front of it as well.
+  const gen = regionMessages(s, 'src/a.ts', 'a is a number', 'export const a: number = "x";\n', 1, 1, [], []);
+  assert(JSON.parse(gen.at(-2)!.content).verification.output === 'shown in evidence e1' && gen.some(m => m.content.startsWith('{"evidence":{"id":"e1"')));
+  // Once the entry has left the prompt, the tail is the only place that shows them.
+  const later = tail(stepMessages({ ...s, entries: s.entries.filter(e => e.id !== 'e1') }, allowed));
+  assert.equal(later.verification.output, clipEnds(s.lastCheck!.text, 1200)); assert.match(later.verification.output, /error TS2322/); assert.match(later.lastError, /error TS2322/);
+  assert.equal(tail(stepMessages({ ...s, entries: [] }, allowed, `Rejected: ${s.lastError}`)).lastError, 'stated in harnessNote', 'a note that states the error whole');
+  const fewer = tail(stepMessages(s, allowed.filter(a => a !== 'bash')));
+  assert(fewer.allowedActions.join() === allowed.filter(a => a !== 'bash').join() && /from allowedActions/.test(fewer.role), 'a narrower step names what it allows');
+});
+test('An output the check\'s entry does not show in full is restated: JSON escapes leave the entry\'s clipped end shorter than the field\'s', async t => {
+  const { root, store } = await repo(t);
+  // The entry keeps the last 736 characters of the result's JSON, about 340 escaped quotes; the field keeps the last 537 of the output.
+  await writeFile(join(root, 'check.mjs'), 'console.log("x".repeat(3000) + "\\n" + \'"\'.repeat(600)); process.exit(2);\n');
+  const { stepMessages, clipEnds } = await import('../src/context.js');
+  const bonsai = bonsaiOf({ steps: [{ thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } }] });
+  const s = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const tail = Object.assign({}, ...stepMessages(s, s.allowedActions!).slice(-2).map(x => JSON.parse(x.content)));
+  assert(s.entries.some(e => e.id === 'e1'), 'the entry is in the prompt');
+  assert.equal(tail.verification.output, clipEnds(s.lastCheck!.text, 1200), 'but it does not show the whole of what the field keeps');
+  assert.equal(tail.lastError, 'shown in evidence e1', 'the error\'s shorter clip it does show');
+});
+test('A check retried at its own step leaves two entries e1, so its output is restated; an output shorter than a pointer to it is kept as it is', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'check.mjs'), 'import { existsSync, writeFileSync } from "node:fs"; if (!existsSync(".ran")) { writeFileSync(".ran", ""); console.log("ECONNRESET while fetching the registry index"); process.exit(1); } console.log("checked: no problems found in the sources"); process.exit(0);\n');
+  const { stepMessages } = await import('../src/context.js');
+  const bonsai = bonsaiOf({ steps: [{ thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } }] });
+  const s = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({ triage: 'transient' }), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const tail = (x: typeof s) => Object.assign({}, ...stepMessages(x, x.allowedActions!).slice(-2).map(m => JSON.parse(m.content)));
+  assert.deepEqual(s.entries.filter(e => e.kind !== 'turn').map(e => e.id), ['e1', 'e1'], 'the failed run and its retry');
+  assert.equal(tail(s).verification.output, 'checked: no problems found in the sources\n', '"e1" would not say which of the two shows it');
+  const one = { ...s, entries: s.entries.filter((e, i) => e.kind === 'turn' || i === s.entries.length - 1) };
+  assert.equal(tail(one).verification.output, 'shown in evidence e1', 'with the retry alone, the entry is named');
+  const short = { ...one, lastCheck: { ...s.lastCheck!, text: 'ok\n' }, entries: one.entries.map(e => e.kind === 'turn' ? e : { ...e, text: '{"output":"ok\\n"}' }) };
+  assert.equal(tail(short).verification.output, 'ok\n', 'a pointer longer than the output costs more than it saves');
+});
+test('A rewrite that reproduced its file is not generated again from the same request after an eviction took the check\'s entry: the request is keyed on the check\'s output, wherever the prompt shows it', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  const content = 'export const cx = (...a: string[]) => a.join(" ");\n';
+  await writeFile(join(root, 'src', 'utils.ts'), content);
+  await writeFile(join(root, 'src', 'big.ts'), Array.from({ length: 300 }, (_, i) => `export const value${i} = "${'v'.repeat(30)}";`).join('\n') + '\n');
+  await writeFile(join(root, 'check.mjs'), 'console.log("checked 2 files: " + "no problems found. ".repeat(4)); process.exit(0);\n');
+  const rewrite = { thought: 'Rewrite cx.', action: 'rewrite_file', args: { path: 'src/utils.ts', purpose: 'cx joins with spaces' } };
+  const base = bonsaiOf({ steps: [{ thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } }, rewrite,
+    { thought: 'read', action: 'read_files', args: { files: [{ path: 'src/big.ts', start: 1, end: 300 }] } }, rewrite] });
+  const outputs: string[] = [];
+  // The server's count is small, so only the batched eviction (on the evidence's share) takes entries.
+  const bonsai = { ...base, count: async (m: Message[]) => ({ tokens: Math.ceil(m.reduce((n, x) => n + x.content.length, 0) / 40), mode: 'test' }),
+    generateText: async (m: Message[]) => { outputs.push(JSON.parse(m.at(-2)!.content).verification.output); return { text: content, finish: 'stop' as const, meta: { ms: 20000, promptTokens: 1, usage: { completion_tokens: 900 } } }; } };
+  const s = await new Agent({ ...config, maxSteps: 4, workingTokens: 3000 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.deepEqual(outputs, ['shown in evidence e1'], 'generated once, with the check\'s entry in front of it');
+  assert(!s.entries.some(e => e.id === 'e1') && (await events(store)).some(e => e.type === 'compact' && e.data.step === 3), 'the read at step 3 made the eviction take e1');
+  assert.match(s.entries.find(e => e.step === 4 && e.kind !== 'turn')!.text, /reproduced the file unchanged at step 2 .* it was not generated again/);
 });
 
 test('A stuck streak sets its reasoning aside and keeps its results: the turns of the no-progress steps leave the prompt, the worker is told', async t => {
@@ -1345,11 +1470,70 @@ test('An eviction bounded by a break point never touches the prompt before it: e
   assert.equal(breakIndex({ ids: s.entries.map(e => e.id), trail: [] }, s), null, 'nothing removed, nothing changed');
 });
 
+test('A stale entry that is still the only place something is shown as it is goes as the result it is: a read with an unchanged file, the last check after edits (run 56, steps 36-38)', async () => {
+  const { evictOne } = await import('../src/context.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-held-')), 'x');
+  const read = (id: string, files: string[], stale?: string, shown = '1..2') => ({ id, step: Number(id.slice(1)), kind: 'read_files', text: files.map(f => `${f} sha256=abc totalLines=2 shown=${shown}\n1: a${shown === '1..2' ? '\n2: b' : ''}`).join('\n\n'), artifact: '', relevance: .5, ...(stale ? { stale } : {}) });
+  const check = (id: string, stale?: string) => ({ id, step: Number(id.slice(1)), kind: 'bash', text: '{"command":"npm run build","output":"src/b.ts(1,1): error"}', artifact: '', relevance: .9, verification: true, ...(stale ? { stale } : {}) });
+  const fresh = (id: string) => ({ id, step: Number(id.slice(1)), kind: 'bash', text: 'out', artifact: '', relevance: .5 });
+  // e2 read a.ts and b.ts; a.ts was edited at step 9, b.ts never: e2 is stale, yet the only read of b.ts as it is.
+  // e3 read c.ts, edited since; e5 is a check superseded by e8, and e8 was followed by an edit but by no other check.
+  const lastCheck = (files: string[]) => ({ step: 8, ok: false, text: '', summary: { code: 2, files: Object.fromEntries(files.map(f => [f, [1]])) }, fileHashes: {} });
+  s.writeSteps = { 'src/a.ts': 9, 'src/c.ts': 6 }; s.lastCheck = lastCheck(['src/b.ts']); s.lastWriteStep = 9;
+  s.entries = [read('e2', ['src/a.ts', 'src/b.ts'], 'edited at step 9'), read('e3', ['src/c.ts'], 'edited at step 6'), fresh('e4'), check('e5'), check('e8'), fresh('e10')];
+  const order = Array.from({ length: 5 }, () => evictOne(s)!.id);
+  assert.deepEqual(order, ['e3', 'e5', 'e2', 'e4', 'e8'], 'what holds nothing current first, oldest first; then by relevance and age, the failed check last');
+  // The last check names only a.ts, edited since: its errors describe nothing as it is, and it goes with the stale entries.
+  s.lastCheck = lastCheck(['src/a.ts']);
+  s.entries = [read('e2', ['src/a.ts', 'src/b.ts'], 'edited at step 9'), read('e3', ['src/c.ts'], 'edited at step 6'), fresh('e4'), check('e5'), check('e8'), fresh('e10')];
+  assert.deepEqual(Array.from({ length: 3 }, () => evictOne(s)!.id), ['e3', 'e5', 'e8']);
+  // Read again from the same line by a later read in the prompt, b.ts is shown there: e2 holds nothing and goes before the older e1.
+  s.entries = [fresh('e1'), read('e2', ['src/a.ts', 'src/b.ts'], 'edited at step 9'), read('e11', ['src/b.ts']), fresh('e12')];
+  assert.equal(evictOne(s)!.id, 'e2');
+  // A narrower read from the same line (run 73: Testimonials.tsx 1..142, then 1..15) leaves line 2 of b.ts in e2 alone: e2 goes by its age.
+  s.entries = [fresh('e1'), read('e2', ['src/a.ts', 'src/b.ts'], 'edited at step 9'), read('e11', ['src/b.ts'], undefined, '1..1'), fresh('e12')];
+  assert.equal(evictOne(s)!.id, 'e1');
+});
+
+test('An eviction takes the stale entries behind the point the prompt already changes at, only those holding nothing current, and never one in front of it or one that would add a trail line', async () => {
+  const { evictStaleBehind, turnEntry } = await import('../src/context.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-stale-behind-')), 'x');
+  const entry = (id: string, turn: string | undefined, stale?: string, text = 'x') => ({ id, step: Number(id.slice(1)), kind: 'read_files', text, artifact: '', relevance: .5, ...(turn ? { turn } : {}), ...(stale ? { stale } : {}) });
+  const t5 = turnEntry(5, 'read', [{ action: 'read_files', args: {} }, { action: 'read_files', args: {} }]);
+  const t8 = turnEntry(8, 'read', [{ action: 'read_files', args: {} }]);
+  s.writeSteps = { 'src/a.ts': 9 };
+  s.entries = [entry('e1', undefined, 'superseded'), t5, entry('e5', 't5', 'superseded'), entry('e6', 't5'), entry('e7', undefined, 'edited at step 9', 'src/a.ts sha256=abc totalLines=1 shown=1..1\n1: a\n\nsrc/b.ts sha256=def totalLines=1 shown=1..1\n1: b'), t8, entry('e8', 't8', 'superseded'), entry('e9', undefined)];
+  // The change is at index 2 (e5): e1 in front of it stays; e5 goes (e6 keeps t5); e7 still shows b.ts as it is; e8 would take t8 with it.
+  assert.deepEqual(evictStaleBehind(s, 2).map(e => e.id), ['e5']);
+  assert.deepEqual(s.entries.map(e => e.id), ['e1', 't5', 'e6', 'e7', 't8', 'e8', 'e9']); assert.equal(s.trail, undefined);
+  // With the trail already changed (index 0), every stale entry holding nothing current goes, a turn with its last result.
+  assert.deepEqual(evictStaleBehind(s, 0).map(e => e.id), ['e1', 'e8']);
+  assert.deepEqual(s.entries.map(e => e.id), ['t5', 'e6', 'e7', 'e9']); assert.deepEqual(s.trail, ['step 8: read_files -> no result']);
+});
+
+test('A batched eviction also takes the stale entries behind its own break that hold nothing current: reads of files edited since go, the fresh outputs stay', async t => {
+  const { root, store } = await repo(t);
+  // Three reads of about 6 KB (the read budget) and a small one, all edited since by a command; then 2 KB outputs until the evidence passes its share.
+  for (const f of ['a', 'b', 'c']) await writeFile(join(root, `${f}.txt`), Array.from({ length: 250 }, (_, i) => `${String(i).padStart(4, '0')} ${'x'.repeat(40)}`).join('\n') + '\n');
+  await writeFile(join(root, 'd.txt'), 'd\n');
+  const read = (f: string, end: number) => ({ thought: `read ${f}`, action: 'read_files', args: { files: [{ path: `${f}.txt`, start: 1, end }] } });
+  const steps = [read('a', 250), read('b', 250), read('c', 250), read('d', 1), { thought: 'edit', action: 'bash', args: { command: `node -e "for (const f of ['a','b','c','d']) require('fs').appendFileSync(f + '.txt', 'y\\n')"`, purpose: 'edit', check: false } },
+    ...Array.from({ length: 5 }, (_, i) => ({ thought: `look ${i}`, action: 'bash', args: { command: `node -e "console.log('${i}'.repeat(2000))"`, purpose: 'look', check: false } }))];
+  const result = await new Agent({ ...config, maxSteps: steps.length, workingTokens: 12000 }, store, jevOf({}), bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const compaction = (await events(store)).find(e => e.type === 'compact' && e.data.reason === 'evidence-share');
+  assert(compaction, 'the evidence passed its share');
+  assert.equal(compaction.data.removed, 4, 'a.txt, b.txt and c.txt reach the share; d.txt, stale behind the break, goes with them');
+  assert.deepEqual(result.entries.filter(e => e.kind === 'read_files').map(e => e.id), []);
+  assert(result.entries.filter(e => e.kind === 'bash').length >= 3, 'the fresh outputs stay');
+});
+
 test('A stuck reset that already reprocesses the prompt from its first turn carries the pending compaction with it, instead of a second reprocessing some steps later', async t => {
   const { root, store } = await repo(t);
   // About 2.5 KB of evidence per step: after a dozen steps the evidence is above the share an eviction cuts to, below the one that triggers it.
   const steps = Array.from({ length: 14 }, (_, i) => ({ thought: `look ${i}`, action: 'bash', args: { command: `node -e "console.log('${i}'.repeat(2400))"`, purpose: 'look', check: false } }));
-  await new Agent({ ...config, maxSteps: 14, workingTokens: 20000 }, store, jevOf({ watch: n => n <= 10 ? { progress: .8, stuck: .1 } : { progress: .1, stuck: .95 } }), bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const prompts: Message[][] = []; const bonsai = bonsaiOf({ steps });
+  const spy = { ...bonsai, generate: async (m: Message[], sc: any) => { prompts.push(m); return bonsai.generate(m, sc); } };
+  await new Agent({ ...config, maxSteps: 14, workingTokens: 20000 }, store, jevOf({ watch: n => n <= 10 ? { progress: .8, stuck: .1 } : { progress: .1, stuck: .95 } }), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
   const log = await events(store);
   const reset = log.find(e => e.type === 'reasoning-reset' && !e.data.reason);
   assert(reset, 'the stuck streak reset the reasoning');
@@ -1358,6 +1542,8 @@ test('A stuck reset that already reprocesses the prompt from its first turn carr
   assert.equal(carried.data.step, reset.data.step); assert.equal(carried.data.at, 0, 'the reset changed the prompt from its first entry, so every eviction behind it is free');
   assert(carried.data.removed >= 1);
   assert.equal(log.filter(e => e.type === 'compact' && e.data.reason === 'evidence-share').length, 0, 'no separate compaction follows');
+  const told = prompts.map(m => m.at(-1)!.content).find(c => /set aside/.test(c));
+  assert(told?.includes(`their results are still shown, except ${carried.data.removed} that left the prompt at the same time`), 'the worker is told how many results left with its reasoning, not that all stay');
 });
 
 test('An eviction riding on a late change takes only what the planned order takes first: a fresh read after the change stays while stale entries sit before it (run 52, step 44)', async t => {
@@ -1442,6 +1628,66 @@ test('A cut that leaves no line writes nothing, a region cut after echoed contex
   assert.match(said, /inside line 2 \(`return x`\), which had reached 12 characters without ending; that line was cut: lines 1\.\.1 hold the generated lines before it; the rest of the block was not written, and the file's original lines now start at line 2/, 'no ellipsis on a short indented line; no "line 0"');
 });
 
+// Run 73 step 70, as recorded: the old file is the write's oldText, the generated block new lines 85..226.
+const echoFixtures = new URL('../../test/fixtures/echo/', import.meta.url).pathname;
+test('A region block that repeats the lines after the region is not written twice: a block of nothing but that repeat removes the region, and the facts say what was generated, dropped and kept (run 73 step 70)', async t => {
+  const { root, store } = await repo(t);
+  const old = await readFile(join(echoFixtures, 'react-demo-73-step70-old.tsx.txt'), 'utf8'); const block = await readFile(join(echoFixtures, 'react-demo-73-step70-block.tsx.txt'), 'utf8');
+  const ol = old.replace(/\n$/, '').split('\n'); const deleted = [...ol.slice(0, 84), ...ol.slice(100)].join('\n') + '\n';
+  assert.equal(block, ol.slice(101).filter((_, i) => i !== 13).join('\n') + '\n', 'the scenario: the block is old lines 102..244 without blank line 115');
+  await mkdir(join(root, 'src'), { recursive: true });
+  for (const f of ['a', 'b']) await writeFile(join(root, 'src', `${f}.tsx`), old);
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: ['a', 'b'].map(f => ({ path: `src/${f}.tsx`, start: 1, end: 244 })) } },
+    { thought: 'remove the fetch', action: 'rewrite_file', args: { path: 'src/a.tsx', purpose: 'Remove the API fetch useEffect block', start: 85, end: 100 } },
+    { thought: 'remove the fetch', action: 'rewrite_file', args: { path: 'src/b.tsx', purpose: 'Remove the API fetch useEffect block', start: 85, end: 100 } },
+  ] });
+  // a: the generation ran to its closing fence, as recorded (the repeat is trimmed); b: it was stopped at the repeat while generating.
+  const outputs = [{ text: block, finish: 'stop' as const }, { text: '', finish: 'repetition' as const, cut: { kind: 'echo' as const, line: 1, opening: 'const handleDotClick = (index: number) => {', lineChars: 45, echoed: 19 } }];
+  const options: any[] = []; let calls = 0;
+  const spy = { ...bonsai, generateText: async (m: Message[], o: any) => { options.push(o); return { ...outputs[calls++]!, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Agent({ ...config, maxSteps: 3 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.deepEqual(options[0].around, { before: ol.slice(0, 84).join('\n'), region: ol.slice(84, 100).join('\n'), after: ol.slice(100).join('\n') }, 'the generation is given the whole file around its block');
+  const held = `\\(they held 85: useEffect\\(\\(\\) => \\{; 86: // Fetch fresh testimonials from API \\(non-blocking\\); 87: let cancelled = false; 88: get<Testimonial\\[\\]>\\('/testimonials'\\); 89: \\.then\\(\\(res\\) => \\{; 90: if \\(!cancelled && res\\.data\\.length > 0\\) \\{; 10 more\\), and the lines that followed line 100 now start at line 85`;
+  for (const [f, lead] of [['a', 'ended with a repeat of lines 101\\.\\.244'], ['b', 'was stopped once it was repeating lines 101\\.\\.119']] as const) {
+    assert.equal(await readFile(join(root, 'src', `${f}.tsx`), 'utf8'), deleted, `${f}: lines 85..100 removed, the rest as it was`);
+    const e = result.entries.find(x => x.kind === 'write' && x.text.includes(`src/${f}.tsx`))!;
+    assert.match(e.text, /Replaced lines 85\.\.100 of src\/\w\.tsx with 0 generated line\(s\); the file now has 228 lines/);
+    assert.match(e.text, new RegExp(`Harness: the generation of src/${f}\\.tsx ${lead}, the lines after the region: the repeat was not written; no line was generated before it, so lines 85\\.\\.100 were removed ${held}`));
+    assert.doesNotMatch(e.text, /does not parse/);
+  }
+});
+
+test('A block that repeats the lines after its region and goes on past them is written up to the repeat; an insertion of nothing but the repeat writes nothing; a block ending in one closing line like the next is kept', async t => {
+  const { root, store } = await repo(t);
+  const file = ['export function a() {', '  return 1', '}', '', 'export function b(x: number) {', '  const y = x * 2', '  return y + 1', '}', '', 'export const c = 3', 'export const d = 4', 'export const e = 5', 'export const f = 6', 'export const g = 7', 'export const h = 8', 'export const i = 9', ''].join('\n');
+  await mkdir(join(root, 'src'), { recursive: true });
+  for (const f of ['d', 'i', 'k']) await writeFile(join(root, 'src', `${f}.ts`), file);
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'read', action: 'read_files', args: { files: ['d', 'i', 'k'].map(f => ({ path: `src/${f}.ts`, start: 1, end: 11 })) } },
+    { thought: 'a returns 2', action: 'rewrite_file', args: { path: 'src/d.ts', purpose: 'a returns 2', start: 1, end: 3 } },
+    { thought: 'insert', action: 'rewrite_file', args: { path: 'src/i.ts', purpose: 'insert', start: 4, end: 3 } },
+    { thought: 'a returns 4', action: 'rewrite_file', args: { path: 'src/k.ts', purpose: 'a returns 4', start: 1, end: 2 } },
+  ] });
+  const outputs = [
+    // The new a, then lines 4..15 as they are and line 16 changed: a rewrite of lines outside the region.
+    'export function a() {\n  return 2\n}\n\nexport function b(x: number) {\n  const y = x * 2\n  return y + 1\n}\n\nexport const c = 3\nexport const d = 4\nexport const e = 5\nexport const f = 6\nexport const g = 7\nexport const h = 8\nexport const i = 90\n',
+    // Nothing but lines 4..11 as they are, into an insertion: nothing to remove.
+    '\nexport function b(x: number) {\n  const y = x * 2\n  return y + 1\n}\n\nexport const c = 3\nexport const d = 4\n',
+    // Lines 1..2 rewritten, ending with a closing brace: line 3 is one too, but a single bracket line is not taken as a repeat.
+    'export function a() {\n  return 4\n}\n',
+  ];
+  let calls = 0; const spy = { ...bonsai, generateText: async () => ({ text: outputs[calls++]!, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }) };
+  const result = await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), spy as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const said = result.entries.map(e => e.text).join('\n');
+  assert.equal(await readFile(join(root, 'src', 'd.ts'), 'utf8'), file.replace('return 1', 'return 2'), 'the block up to the repeat; lines 4..16 stay as they were');
+  assert.match(said, /the generation of src\/d\.ts repeated lines 4\.\.15, the lines after the region, then went on with other lines: the repeat and what followed it were not written; lines 1\.\.3 hold the generated block, and the lines that followed line 3 now start at line 4/);
+  assert.equal(await readFile(join(root, 'src', 'i.ts'), 'utf8'), file, 'an insertion that was nothing but the repeat changes nothing');
+  assert.match(said, /the generation of src\/i\.ts ended with a repeat of lines 4\.\.11, the lines after the region; no line was generated before it, so nothing was written and src\/i\.ts is unchanged/);
+  assert.equal(await readFile(join(root, 'src', 'k.ts'), 'utf8'), file.replace('return 1\n}', 'return 4\n}\n}'), 'one closing line equal to the next is written as generated (it may close the block\'s own opening)');
+  assert.doesNotMatch(said, /src\/k\.ts (ended with|repeated)/);
+});
+
 test('A batch that edits one file twice from one read lands both edits in one generation; the next batch starts a new record (run 56 Footer, steps 45-46)', async t => {
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
@@ -1463,6 +1709,32 @@ test('A batch that edits one file twice from one read lands both edits in one ge
   assert.deepEqual(ev.filter(e => e.type === 'result').slice(0, 2).map(e => e.data.ok), [true, true], 'both edits of the batch landed');
   assert(result.entries.some(e => /mapped to the current text: 5\.\.5 -> 6\.\.6/.test(e.text)));
   assert(result.entries.some(e => /^Tool error: Stale file hash for src\/f\.ts: read the file again/.test(e.text)), 'a hash from an earlier batch is not mapped');
+});
+
+// ---- run 73: bracket refusals (steps 48-50 and 58) ----
+const storage73 = "import { useEffect, useState } from 'react'\n\ninterface UseLocalStorageOptions<T> {\n  key: string\n  defaultValue: T\n  storage?: Storage\n}\n\nexport function useLocalStorage<T>(\n  key: string,\n  defaultValue: T,\n  options?: UseLocalStorageOptions<T>,\n): [T, (value: T | ((prev: T) => T)) => void] {\n  const storage = options?.storage ?? window.localStorage\n  const [state, setState] = useState<T>(defaultValue)\n\n  useEffect(() => {\n    try {\n      const stored = storage.getItem(key)\n      if (stored !== null) {\n        setState(JSON.parse(stored) as T)\n      }\n    } catch {\n      // Ignore parse errors and fall back to default\n    }\n  }, [key, storage])\n\n  const setValue = (value: T | ((prev: T) => T)) => {\n    setState((prev) => {\n      const next = typeof value === 'function' ? value(prev) : value\n      try {\n        storage.setItem(key, JSON.stringify(next))\n      } catch {\n        // Ignore storage errors\n      }\n      return next\n    })\n  }\n\n  return [state, setValue]\n}\n";
+const setValue73 = "  const setValue = (value: T | ((prev: T) => T)) => {\n    setState((prev) => {\n      const next = (typeof value === 'function' ? (value as (prev: T) => T)(prev) : value) as T\n      try {\n        storage.setItem(key, JSON.stringify(next))\n      } catch {\n        // Ignore storage errors\n      }\n      return next\n    })\n  }";
+const effect73 = ['  useEffect(() => {', '    // Fetch fresh testimonials from API (non-blocking)', '    let cancelled = false', '    setLoading(true)', "    get<Testimonial[]>('/testimonials')", '      .then((res) => {', '        if (!cancelled && res.data.length > 0) {', '          setTestimonials(res.data)', '        }', '      })', '      .catch(() => {', '        // Silently fall back to defaults', '      })', '      .finally(() => {', '        if (!cancelled) setLoading(false)', '      })', '    return () => {', '      cancelled = true', '    }', '  }, [])', ''].join('\n');
+
+test('Run 73 steps 48-50 and 58: an edit written without the line it repeated lets its batch go on; a bracket refusal is stated whole in its entry, and the identical call on the unchanged file is refused without running', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'useLocalStorage.ts'), storage73); await writeFile(join(root, 'src', 'effect.tsx'), effect73);
+  const { hash } = await import('../src/tools.js');
+  const unclosed = { action: 'replace_lines', args: { path: 'src/effect.tsx', expectedHash: 'FILL', edits: [{ start: 15, end: 15, newText: '        if (!cancelled) {\n' }] } };
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'fix the setter, then note it', action: 'plan', batch: [{ action: 'replace_lines', args: { path: 'src/useLocalStorage.ts', expectedHash: 'FILL', edits: [{ start: 28, end: 37, newText: setValue73 }] } }, { action: 'plan', args: { notes: 'after' } }] },
+    { thought: 'drop setLoading', ...unclosed },
+    { thought: 'drop setLoading', ...unclosed },
+  ] });
+  const result = await new Agent({ ...config, maxSteps: 4 }, store, jevOf({}), filling(bonsai, async p => hash(await readFile(join(root, p), 'utf8'))), root, () => {}, () => {}).run(await newSession(root, 'x'));
+  const ev = await events(store);
+  assert.deepEqual(ev.filter(e => e.type === 'result').map(e => [e.data.step, e.data.ok]), [[1, true], [3, false]], 'the retry did not run');
+  assert.equal(result.notes, 'after', 'the batch went on after the repaired edit');
+  assert.equal(await readFile(join(root, 'src', 'useLocalStorage.ts'), 'utf8'), [...storage73.split('\n').slice(0, 27), ...setValue73.split('\n').slice(0, -1), ...storage73.split('\n').slice(37)].join('\n'), 'written without the repeat of line 38');
+  const refusal = result.entries.find(e => e.step === 3 && e.kind !== 'turn')!.text;
+  assert.equal(refusal, "Tool error: Edit refused: it would leave src/effect.tsx with 1 unmatched '{' (was 0). Edit 1 (lines 15..15): the replaced lines have no unmatched '{' or '}'; its new text opens 1 '{' it does not close. The replaced range(s) held line(s) the new text does not contain: 15: if (!cancelled) setLoading(false).", 'the entry holds the whole refusal');
+  assert.match(result.entries.find(e => e.step === 4 && e.kind !== 'turn')!.text, /^No action executed: this exact replace_lines of src\/effect\.tsx \(lines 15\.\.15\) ran at step 3 and failed \(Edit refused: it would leave src\/effect\.tsx with 1 unmatched '\{' \(was 0\)\. Edit 1 \(lines 15\.\.15\)[\s\S]*; src\/effect\.tsx is unchanged since \(src\/effect\.tsx sha256=\w{16}\), so the same arguments would fail the same way$/, 'a bracket refusal is an edit failure the same arguments repeat (textFailure)');
+  assert.equal(await readFile(join(root, 'src', 'effect.tsx'), 'utf8'), effect73);
 });
 
 // ---- run 56: repeats, retries and stale hashes (synthesized design) ----

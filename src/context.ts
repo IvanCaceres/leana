@@ -4,6 +4,7 @@ import { focusedEditSchema, schemas } from './schema.js';
 import { referenceContext } from './references.js';
 import { sourceFile } from './profiles.js';
 import { observerCatalog } from './observe-catalog.js';
+import { contentLines, echoOf, substantive, type Around, type Echo } from './clients.js';
 // A tool's output kept from both ends: a runner's verdict is its last lines,
 // a compiler's first diagnostics its first.
 export function clipEnds(text: string, limit: number): string {
@@ -11,12 +12,26 @@ export function clipEnds(text: string, limit: number): string {
   const head = Math.floor(limit * 0.55); const tail = limit - head - 3;
   return `${text.slice(0, head)}\n…\n${text.slice(text.length - tail)}`;
 }
+const clipMarker = '\n[…truncated; use a narrower read or query…]\n';
 export function clip(text: string, limit: number): string {
   if (text.length <= limit) return text;
-  const marker = '\n[…truncated; use a narrower read or query…]\n';
-  const room = Math.max(0, limit - marker.length);
-  return text.slice(0, Math.ceil(room * .7)) + marker + text.slice(-Math.floor(room * .3));
+  const room = Math.max(0, limit - clipMarker.length);
+  return text.slice(0, Math.ceil(room * .7)) + clipMarker + text.slice(-Math.floor(room * .3));
 }
+// The entry, newest first, that shows every part of text a clip kept (clipEnds and clip cut at
+// their markers), as written or as the content of a JSON string (a command's output sits in its
+// result's JSON). A tail field that restates it names the entry instead: the tail is processed
+// again on every request, the entry once. When no entry shows every part the field stays: in runs
+// 49-51 coloured output (6 JSON characters per escape) left the end of the check's entry short of
+// the field's, and a refusal's entry keeps 600 characters where lastError keeps 700. An id two entries
+// carry names neither: a command retried at its own step (a failure Jev reads as transient) leaves the failed
+// run and the retry both as e<step> (run 60 step 43, npm run dev), and 3 lastErrors of runs 49-76 would have named such an id.
+export function shownIn(entries: { id: string; kind?: string; text: string }[], text: string): string | undefined {
+  const parts = text.split('\n…\n').flatMap(p => p.split(clipMarker));
+  return [...entries].reverse().find(e => e.kind !== 'turn' && entries.filter(x => x.id === e.id).length === 1 && parts.every(p => e.text.includes(p) || e.text.includes(JSON.stringify(p).slice(1, -1))))?.id;
+}
+// What a tail field carries: where the prompt shows text, when saying so is the shorter (a check that prints "ok").
+const named = (text: string, at: string | undefined): string => { const p = at === 'harnessNote' ? 'stated in harnessNote' : `shown in evidence ${at}`; return at && p.length < text.length ? p : text; };
 export const routeDescriptions: Record<Route, string> = {
   rewrite_file: 'Regenerate an existing file, or one block of it, as code: name its path and what must change. With start and end only lines start..end are generated anew and spliced in (end = start - 1 inserts before line start; start = totalLines + 1 appends), so adding or replacing a block costs only that block; without them the whole file is regenerated. The current content is in front of you either way. For any change larger than a few lines.',
   plan: 'Replace your running notes: the plan, what is done, what is known, what is next.',
@@ -83,7 +98,8 @@ export function compactSearched(s: Session, limit: number): Record<string, strin
   return Object.fromEntries(Object.entries(s.searches).slice(-limit).map(([k, v]) => [clip(k, 80), clip(v, 100)]));
 }
 // Old checks and failed generation attempts are history, not current blockers.
-// Keep their text unchanged for prompt caching, but retire their eviction priority.
+// Keep their text unchanged for prompt caching, but mark them stale: evictOne takes them first
+// unless they still hold something current (holdsCurrent).
 // This also handles checkpoints written before entries carried verification metadata.
 export function retireEvidence(s: Session): void {
   for (const e of s.entries) {
@@ -99,7 +115,6 @@ export function retireEvidence(s: Session): void {
     const editedAfter = verification && !supersededCheck ? Object.entries(s.writeSteps).filter(([, step]) => step > e.step).map(([p]) => p) : [];
     if (!e.stale && (supersededCheck || historicalAttempt || editedAfter.length)) {
       e.stale = supersededCheck ? `superseded by verification at step ${s.lastCheck!.step}` : editedAfter.length ? `files edited since this check (${editedAfter.slice(0, 6).join(', ')}): its errors describe them as they were` : e.kind === 'repeat' ? 'stated before later edits or verification ran' : 'historical generation attempt; later edits or verification have run';
-      e.relevance = .1;
     }
   }
 }
@@ -186,15 +201,45 @@ export function evictOne(s: Session, from = 0, only?: string, allowCited = false
   const pick = () => s.entries.filter((e, i) => (only === undefined || e.id === only) && i >= from && !(from > 0 && endsTurn(e)) && (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
   let candidates = pick();
   if (!candidates.length && allowCited && s.entries.at(-1)?.cites?.length) { protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]); candidates = pick(); }
-  // Stale entries go first, then the least relevant, then the oldest.
-  const candidate = [...candidates].sort((a, b) => Number(Boolean(b.stale)) - Number(Boolean(a.stale)) || a.relevance - b.relevance || a.step - b.step)[0];
+  // Stale entries that hold nothing current go first, oldest first; then the least relevant, then the oldest.
+  const gone = new Map(candidates.map(e => [e, Boolean(e.stale) && !holdsCurrent(s, e)]));
+  const candidate = [...candidates].sort((a, b) => Number(gone.get(b)) - Number(gone.get(a)) || (gone.get(a) ? 0 : a.relevance - b.relevance) || a.step - b.step)[0];
   if (!candidate) return undefined;
   s.entries = s.entries.filter(e => e !== candidate);
   // A repeat's answer that names the entry no longer describes the prompt: it is marked, not removed (nothing before it changes).
-  for (const e of s.entries) if (e.kind === 'repeat' && !e.stale && e.cites?.includes(candidate.id)) { e.stale = `names ${candidate.id}, which has left the prompt`; e.relevance = .1; }
+  for (const e of s.entries) if (e.kind === 'repeat' && !e.stale && e.cites?.includes(candidate.id)) e.stale = `names ${candidate.id}, which has left the prompt`;
   const turn = candidate.kind === 'turn' ? candidate : s.entries.find(e => e.kind === 'turn' && e.id === candidate.turn);
   if (turn && !hasResults(turn) && turn.id !== s.currentTurn) { s.entries = s.entries.filter(e => e !== turn); s.trail = [...(s.trail ?? []), trailLine(turn)].sort((a, b) => Number(a.match(/^step (\d+)/)?.[1]) - Number(b.match(/^step (\d+)/)?.[1])).slice(-12); }
   return candidate;
+}
+// A stale entry can still be the only place something is shown as it is. A read goes stale when
+// any one of its files is edited or read again from the same line, while its other files stay as
+// they are: in the replay of runs 49-76, 18 of the 85 stale reads evicted still showed such a file,
+// and after run 56's reset took one at step 36 the next line edits went without it and step 38 read
+// it again. A later read covers a block only when it shows all of its lines: one from the same line
+// can be narrower (run 73 read Testimonials.tsx 1..142 at step 28, then 1..15 at step 40).
+// The last check, followed by edits but by no other check, is the only place its errors are shown
+// (the verification block names their files and lines, not what they say), while it failed and names
+// a file not edited since, or none. Such an entry is evicted as the result it is.
+function holdsCurrent(s: Session, e: Entry): boolean {
+  if (e.verification) {
+    if (!s.lastCheck) return true; if (e.step < s.lastCheck.step) return false;
+    const since = staleFor(s); const files = Object.keys(s.lastCheck.summary.files);
+    return !s.lastCheck.ok && (!files.length || files.some(f => !since.some(w => w === f || w.endsWith(`/${f}`) || f.endsWith(`/${w}`))));
+  }
+  if (e.kind !== 'read_files') return false;
+  const blocks = (x: Entry) => [...x.text.matchAll(/(?:^|\n\n)(\S+) sha256=\w+ totalLines=\d+ shown=(\d+)\.\.(\d+)/g)].map(m => ({ path: m[1]!, start: Number(m[2]), end: Number(m[3]) }));
+  const later = s.entries.filter(x => x !== e && x.kind === 'read_files' && x.step > e.step).flatMap(blocks);
+  return blocks(e).some(b => !((s.writeSteps[b.path] ?? -1) > e.step) && !later.some(l => l.path === b.path && l.start <= b.start && l.end >= b.end));
+}
+// Once the prompt changes at index at, every entry behind it is reprocessed anyway: the stale
+// entries there that hold nothing current go too, at no cost of their own, and each later step
+// is that much shorter. Nothing in front of at is touched, and no trail line is added unless
+// the trail already changed (at 0).
+export function evictStaleBehind(s: Session, at: number): Entry[] {
+  const out: Entry[] = [];
+  for (const e of s.entries.slice(at)) if (s.entries.includes(e) && e.stale && !holdsCurrent(s, e)) { const x = evictOne(s, at, e.id); if (x) out.push(x); }
+  return out;
 }
 // The entries the next batched eviction would take, in its order, down to target
 // tokens: evictOne's own global order, run on a copy of the session.
@@ -276,20 +321,23 @@ export const fenceFor = (path: string): string => /\.(md|mdx|markdown)$/i.test(p
 // it from and its exported surface (parsed from the file when it exists, from
 // the design when it is still planned), and who will import this file.
 export interface FileContract { path: string; importPath: string; status: 'exists' | 'planned'; exports: string[] }
-// A rewritten region that repeats the context lines shown around it is trimmed
-// to the region: the worker's intent is unambiguous, so the output is repaired.
-// cut: the output was cut at a loop, so it may consist of nothing but echoed
-// context (every one of its lines may be taken as repeated context).
-export function trimContext(output: string, before: string, after: string, cut = false): string {
-  let lines = output.replace(/\n$/, '').split('\n');
-  const b = before ? before.split('\n') : []; const a = after ? after.split('\n') : [];
-  // A single matching line of brackets or a few characters is ambiguous (the
-  // region's own closing brace looks like the context's): only a run of two or
-  // more lines, or one substantive line, is taken as repeated context.
-  const substantive = (l: string) => l.trim().replace(/[{}()[\];,]/g, '').length >= 8;
-  for (let n = Math.min(b.length, lines.length - (cut ? 0 : 1)); n > 0; n--) if (b.slice(-n).every((l, i) => l.trim() === lines[i]!.trim()) && (n >= 2 || substantive(lines[0]!))) { lines = lines.slice(n); break; }
-  for (let n = Math.min(a.length, lines.length - 1); n > 0; n--) if (a.slice(0, n).every((l, i) => l.trim() === lines[lines.length - n + i]!.trim()) && (n >= 2 || substantive(lines[lines.length - 1]!))) { lines = lines.slice(0, lines.length - n); break; }
-  return lines.length ? `${lines.join('\n')}\n` : '';
+// A rewritten region that repeats lines around it is trimmed to the region: the
+// worker's intent is unambiguous, so the output is repaired. Lines are compared
+// trimmed and without blank lines, as a copy is made, and a repeat takes the blank
+// lines next to it. At the start, a repeat of the lines just before the region; one
+// line of the block is kept unless cut: the output was cut at a loop, so it may be
+// nothing but repeated context. At the end, a repeat of the lines after the region,
+// as far as it goes (echoOf): a block that is nothing but that repeat is empty, which
+// removes the region, and one that reproduces the first lines after the region and
+// goes on past them is cut where the repeat starts, since what it wrote there lies
+// outside the region. Only a run of two or more lines, or one substantive line, is
+// taken as repeated context.
+export function trimContext(output: string, around: Around, cut = false): { text: string; echo: Echo | null } {
+  let lines = output === '' ? [] : output.replace(/\n$/, '').split('\n');
+  const b = contentLines(around.before).map(x => x.t); const g = contentLines(lines.join('\n'));
+  for (let n = Math.min(b.length, g.length - (cut ? 0 : 1)); n > 0; n--) if (g.slice(0, n).every((x, i) => x.t === b[b.length - n + i]) && (n >= 2 || substantive(g[0]!.t))) { lines = lines.slice(n < g.length ? g[n]!.i : lines.length); break; }
+  const text = lines.length ? `${lines.join('\n')}\n` : ''; const echo = echoOf(text, around);
+  return { text: !echo ? text : echo.line > 1 ? `${lines.slice(0, echo.line - 1).join('\n')}\n` : '', echo };
 }
 // Every field of the prompt merged into one object, for inspection and tests.
 export function promptFields(prompt: Message[]): Record<string, any> {
@@ -314,26 +362,37 @@ export function orientationBlock(s: Session, allowed?: string[]): Record<string,
   return { objective: s.objective, repositoryInstructions: s.instructions || undefined, orientation: s.orientation ?? undefined,
     ...(allowed ? { actions: Object.fromEntries(allowed.map(a => [a, { description: routeDescriptions[a as Route], instructions: details[a as Route], argumentSchema: schemas[a as Route] }])) } : {}) };
 }
-export function agentRequestBase(s: Session): Record<string, unknown> {
+// note: the request's harnessNote. The loop's notes state unaddressed completion feedback every step, so
+// the field would be a second copy of it (runs 49-76: in 43 of 43 step prompts; 3.6k tokens in run 76).
+export function agentRequestBase(s: Session, note = ''): Record<string, unknown> {
   const staleEvidence = Object.fromEntries(s.entries.filter(e => e.stale).map(e => [e.id, e.stale]));
+  // The failed result the error comes from is the freshest entry, right above the tail (runs 49-76: shown in it
+  // in 201 of 214 step prompts). A rejected finish is clipped there to 600 characters, and harnessNote states it whole (9 of the 13).
+  const lastError = s.lastError && clip(s.lastError, 700); const errorAt = lastError ? shownIn([{ id: 'harnessNote', text: note }, ...s.entries], lastError) : undefined;
   return {
     changedFiles: s.writes.slice(-30), fileCount: s.knownFiles.length, staleEvidence,
     ...(s.referenceEvidence.length ? { referenceEvidence: referenceContext(s, 3000) } : {}),
-    ...(s.completionFeedback && !s.completionFeedback.addressed ? { completionFeedback: s.completionFeedback.text } : {}),
+    ...(s.completionFeedback && !s.completionFeedback.addressed && !note.includes(s.completionFeedback.text) ? { completionFeedback: s.completionFeedback.text } : {}),
     readCoverage: coverageSummary(s, 12), searched: compactSearched(s, 8), fileHashes: Object.fromEntries(Object.entries(s.hashes).slice(-12)),
     rejectedEdits: compactRejected(s, 3),
-    lastError: s.lastError && clip(s.lastError, 700),
+    lastError: lastError && named(lastError, errorAt),
   };
 }
 // Message boundaries are cache checkpoints: the notes change rarely, the
 // file list changes when files are created, the check state changes when the
 // check runs; each sits in its own message so a step re-processes only what
 // changed after the last unchanged boundary.
-export function verificationBlock(s: Session): Record<string, unknown> {
+// point: false restates the output where it would be named, as the key of a code request reads it (agent.ts).
+export function verificationBlock(s: Session, point = true): Record<string, unknown> {
   // Files written after the check ran: its output describes them as they were, not as they are.
   const since = staleFor(s);
   const edited = (f: string) => since.some(w => w === f || w.endsWith(`/${f}`) || f.endsWith(`/${w}`));
-  return { verification: s.lastCheck ? { command: s.lastCheck.command ?? s.lastCheckCommand, step: s.lastCheck.step, ok: s.lastCheck.ok, exitCode: s.lastCheck.summary.code, ...(since.length ? { writtenSince: since } : {}), files: Object.fromEntries(Object.entries(s.lastCheck.summary.files).filter(([f]) => !edited(f)).slice(0, 8)), ...(since.length ? { outputWithheld: `files were edited after this check ran (${since.join(', ')}); what it said about them no longer describes them, so it is not shown: run the check again to see them as they are` } : { output: clipEnds(s.lastCheck.text, 1200) }) } : { command: s.lastCheckCommand, step: null, ok: null } };
+  // While the check's own entry shows the output, the output is named, not restated: the step prompts of runs 49-76
+  // carried it 349 times, with that entry in the prompt every time (holdsCurrent keeps a failed check of record) and showing all of it in 336.
+  // The entries of the check's step are its own (ids are e<step>): a retry at that step leaves two, and it is restated.
+  const c = s.lastCheck; const output = c && !since.length ? clipEnds(c.text, 1200) : '';
+  const at = output && point ? shownIn(s.entries.filter(e => e.step === c!.step), output) : undefined;
+  return { verification: c ? { command: c.command ?? s.lastCheckCommand, step: c.step, ok: c.ok, exitCode: c.summary.code, ...(since.length ? { writtenSince: since } : {}), files: Object.fromEntries(Object.entries(c.summary.files).filter(([f]) => !edited(f)).slice(0, 8)), ...(since.length ? { outputWithheld: `files were edited after this check ran (${since.join(', ')}); what it said about them no longer describes them, so it is not shown: run the check again to see them as they are` } : { output: named(output, at) }) } : { command: s.lastCheckCommand, step: null, ok: null } };
 }
 // The prompt is ordered by how often each part changes, because the server
 // reuses its cache only up to the first changed message: the system message and
@@ -352,12 +411,15 @@ function agentPrefix(s: Session): Message[] {
     ...s.entries.map(e => e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : { role: 'user' as const, content: JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } }) }),
   ];
 }
-function volatile(s: Session): Message[] {
-  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s) }) }];
+export function volatile(s: Session, point = true): Message[] {
+  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s, point) }) }];
 }
 export function stepMessages(s: Session, allowed: string[], note?: string): Message[] {
-  const request = { role: 'Reason, then act. Write thought: one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then actions: an ordered list of one to eight actions (each an action name from allowedActions with its args under that action\'s schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one action when its result decides what comes next.',
-    ...agentRequestBase(s), allowedActions: allowed, ...(note ? { harnessNote: note } : {}) };
+  // The pinned block lists the session's actions: allowedActions is sent only when a step allows fewer
+  // (runs 49-76: equal in 729 of 729 prompts), and the request then names it.
+  const pinned = agentAllowed(s) ?? []; const narrowed = allowed.length !== pinned.length || allowed.some(a => !pinned.includes(a));
+  const request = { role: `Reason, then act. Write thought: one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then actions: an ordered list of one to eight actions (each an action name from ${narrowed ? 'allowedActions' : 'the pinned block\'s actions'} with its args under that action's schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one action when its result decides what comes next.`,
+    ...agentRequestBase(s, note), ...(narrowed ? { allowedActions: allowed } : {}), ...(note ? { harnessNote: note } : {}) };
   return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify({ ...request, verificationAfterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep) }) }];
 }
 // One block of an existing file, written as code: the block as it is now, the

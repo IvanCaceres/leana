@@ -1,0 +1,142 @@
+  const handleDotClick = (index: number) => {
+    setActiveIndex(index)
+    setIsPaused(true)
+  }
+
+  const handleArrow = (direction: 'prev' | 'next') => {
+    setIsPaused(true)
+    setActiveIndex((prev) => {
+      const len = testimonials.length
+      if (direction === 'next') return (prev + 1) % len
+      return (prev - 1 + len) % len
+    })
+  }
+
+  if (testimonials.length === 0) {
+    return null
+  }
+
+  return (
+    <section id={id} className="py-20 md:py-28 bg-slate-50 dark:bg-slate-900/50">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-3xl text-center mb-12">
+          <h2 className="text-3xl md:text-4xl font-bold text-slate-900 dark:text-white tracking-tight">
+            {title}
+          </h2>
+          <p className="mt-3 text-lg text-slate-600 dark:text-slate-400">
+            {subtitle}
+          </p>
+        </div>
+
+        <div
+          ref={carouselRef}
+          className="relative"
+          onMouseEnter={() => setIsPaused(true)}
+          onMouseLeave={() => setIsPaused(false)}
+        >
+          {/* Carousel content */}
+          <div className="relative min-h-[280px] md:min-h-[320px]">
+            {testimonials.map((t, i) => (
+              <div
+                key={t.id}
+                className={`absolute inset-0 transition-all duration-700 ease-in-out ${
+                  i === debouncedIndex
+                    ? 'opacity-100 scale-100'
+                    : 'opacity-0 scale-105 pointer-events-none'
+                }`}
+              >
+                <div className="mx-auto max-w-2xl text-center">
+                  <div className="flex items-center justify-center gap-1 mb-4">
+                    {Array.from({ length: 5 }).map((_, star) => (
+                      <span
+                        key={star}
+                        className={`text-2xl transition-colors ${
+                          star < t.rating
+                            ? 'text-amber-400'
+                            : 'text-slate-300 dark:text-slate-700'
+                        }`}
+                      >
+                        ★
+                      </span>
+                    ))}
+                  </div>
+                  <blockquote className="text-xl md:text-2xl font-medium text-slate-800 dark:text-slate-200 leading-relaxed mb-6">
+                    &ldquo;{truncate(t.quote, 200)}&rdquo;
+                  </blockquote>
+                  <div className="flex items-center justify-center gap-3">
+                    <img
+                      src={t.avatar}
+                      alt={t.name}
+                      className="h-14 w-14 rounded-full object-cover ring-2 ring-slate-200 dark:ring-slate-700"
+                      loading="lazy"
+                    />
+                    <div className="text-left">
+                      <p className="font-semibold text-slate-900 dark:text-white">
+                        {t.name}
+                      </p>
+                      <p className="text-sm text-slate-500 dark:text-slate-400">
+                        {t.role}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Navigation arrows */}
+          <button
+            onClick={() => handleArrow('prev')}
+            aria-label="Previous testimonial"
+            className="absolute top-1/2 -translate-y-1/2 left-4 md:left-8 z-10 h-10 w-10 rounded-full bg-white/80 dark:bg-slate-800/80 backdrop-blur-sm border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 transition-colors"
+          >
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              viewBox="0 0 24 24"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
+          <button
+            onClick={() => handleArrow('next')}
+            aria-label="Next testimonial"
+            className="absolute top-1/2 -translate-y-1/2 right-4 md:right-8 z-10 h-10 w-10 rounded-full bg-white/80 dark:bg-slate-800/80 backdrop-blur-sm border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 transition-colors"
+          >
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              viewBox="0 0 24 24"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
+
+          {/* Dot indicators */}
+          <div className="flex justify-center gap-2 mt-8">
+            {testimonials.map((t, i) => (
+              <button
+                key={t.id}
+                onClick={() => handleDotClick(i)}
+                aria-label={`Go to testimonial ${i + 1}`}
+                className={`h-2.5 w-2.5 rounded-full transition-all duration-300 ${
+                  i === debouncedIndex
+                    ? 'bg-indigo-600 dark:bg-indigo-400 scale-125'
+                    : 'bg-slate-300 dark:bg-slate-700 hover:bg-slate-400 dark:hover:bg-slate-500'
+                }`}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}

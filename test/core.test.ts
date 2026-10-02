@@ -173,11 +173,11 @@ test('The panel never fills the last column, so redraws do not leak lines', () =
   assert(lines.every(l => l.length <= 79), `longest ${Math.max(...lines.map(l => l.length))}`); assert.equal(lines[0]!.length, 79);
 });
 
-test('Panel lines are flattened to one ASCII row each', () => {
+test('Panel lines are flattened to one row each, counting any non-ASCII character as two cells', () => {
   const out: string[] = [];
   const d = new Display({ write: (s: string) => out.push(s), isTTY: true, columns: 100 }, { objective: 'x', session: 's', verbose: false });
-  d.update({ kind: 'generated', step: 1, route: 'bash', meta: null, args: { command: 'grep' + '\n[' + '…' + 'truncated' + '…' + ']\n' + 'x'.repeat(200) } } as any);
-  for (const l of d.panel()) { assert(!l.includes('\n')); assert(l.length <= 99); assert(/^[\x20-\x7e]*$/.test(l), l); }
+  d.update({ kind: 'generated', step: 1, route: 'bash', meta: null, args: { command: 'grep' + '\n[' + '…' + 'truncated' + '…' + ']\n' + '修'.repeat(200) } } as any);
+  for (const l of d.panel()) { assert(!/[\x00-\x1f\x7f-\x9f]/.test(l), l); assert([...l].reduce((n, c) => n + (c < '\x7f' ? 1 : 2), 0) <= 99, l); }
 });
 
 test('Creation names only the path; content is generated as code and never validated for length', () => {

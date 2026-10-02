@@ -8,7 +8,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Answers, Config, EditAttempt, Message, Questions, Route, Session, ToolResult } from './types.js';
 import { editRoutes } from './types.js';
-import type { ProgressEvent } from './display.js';
+import { liveHeight, partialJson, tailLines, type ProgressEvent } from './display.js';
 import { Store } from './store.js';
 import { ToolBox, boundedRead, droppedLines, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot, TreeHashes } from './tools.js';
 import { breakIndex, clip, clipEnds, lineDiff, evictBehind, evictOne, evictStaleBehind, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, shownLines, lineRanges, volatile, type FileContract } from './context.js';
@@ -18,7 +18,7 @@ import { generationFacts, missingRelativeModules, parseFact, parseInProcess, det
 import { orient } from './orient.js';
 import { observeResult, observerFor } from './observe.js';
 import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
-import type { Around, Bonsai, Echo, GenerationCut } from './clients.js';
+import type { Around, Bonsai, Echo, GenerationCut, StreamProgress } from './clients.js';
 
 // A repository file's text, or null when it cannot be read: missing (the worker
 // may delete any file it wrote), outside the root, or not text. Never throws.
@@ -327,7 +327,13 @@ export class Agent {
     const { prompt, tokens } = await this.fit(s, build);
     this.observe({ kind: 'route', step: s.step, route, tokens, entries: s.entries.length });
     await this.logPrompt(s, route, prompt, tokens);
-    const args = await this.bonsai.generate(prompt, schema, temperature, { step: s.step, route });
+    this.observe({ kind: 'generating', step: s.step, route, attempt: 1 });
+    // As it streams: how far the prompt has been read, then a step's thought and actions so far; any other reply only its token count.
+    const args = await this.bonsai.generate(prompt, schema, temperature, { step: s.step, route }, undefined, every(100, (p: StreamProgress) => {
+      const reply = route === 'step' && !p.prompt ? partialJson(p.text) : undefined;
+      this.observe(typeof reply?.thought === 'string' ? { kind: 'thinking', step: s.step, text: reply.thought, tokens: p.tokens, ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}) }
+        : { kind: 'generating', step: s.step, route, attempt: 1, ...(p.prompt ? { prompt: p.prompt } : { tokens: p.tokens }) });
+    }));
     this.observe({ kind: 'generated', step: s.step, route, meta: this.bonsai.lastMeta ?? null, args });
     return args;
   }
@@ -338,8 +344,9 @@ export class Agent {
   // the earlier steps in front of them are left out, and the check's output is read restated where
   // the prompt names the entry that shows it: an eviction of that entry moves the output into the
   // tail, which changes where it is shown, not what is asked. It may throw to generate nothing.
-  // around: the file before, in and after a region whose block is generated.
-  private async generateCode(s: Session, route: Route, builds: (() => Message[])[], budget: number, fence: string, chosen?: (request: string) => void, around?: Around): Promise<{ code: string; finish: string; cut?: GenerationCut; ms?: number; tokens?: number; request: string }> {
+  // around: the file before, in and after a region whose block is generated. path and from (the file line
+  // the generated lines start at) name what is being written, for live progress only.
+  private async generateCode(s: Session, route: Route, path: string, from: number, builds: (() => Message[])[], budget: number, fence: string, chosen?: (request: string) => void, around?: Around): Promise<{ code: string; finish: string; cut?: GenerationCut; ms?: number; tokens?: number; request: string }> {
     let prompt = builds[0]!(); let counted = await this.bonsai.count(prompt);
     for (const smaller of builds.slice(1)) { if (counted.tokens <= this.config.workingTokens) break; prompt = smaller(); counted = await this.bonsai.count(prompt); }
     if (counted.tokens > this.config.workingTokens) { const fitted = await this.fit(s, builds.at(-1)!); prompt = fitted.prompt; counted = { tokens: fitted.tokens, mode: 'fit' }; }
@@ -348,15 +355,19 @@ export class Agent {
     s.lastPromptTokens = counted.tokens;
     this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
     await this.logPrompt(s, route, prompt, counted.tokens);
+    this.observe({ kind: 'generating', step: s.step, route, attempt: 1 });
+    // As it is written: how far the prompt has been read, then the file's lines so far and the last of them.
+    const progress = every(100, (p: StreamProgress) => this.observe(p.prompt ? { kind: 'generating', step: s.step, route, attempt: 1, prompt: p.prompt }
+      : { kind: 'writing', step: s.step, route, path, from, ...tailLines(p.text, liveHeight), tokens: p.tokens, ...(p.perSecond ? { perSecond: p.perSecond } : {}) }));
     if (this.bonsai.generateText) {
-      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, ...(around ? { around } : {}) });
-      this.observe({ kind: 'generated', step: s.step, route, meta: g.meta, args: { chars: g.text.length, finish: g.finish } });
+      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, ...(around ? { around } : {}), progress });
+      this.observe({ kind: 'generated', step: s.step, route, meta: g.meta, args: { chars: g.text.length, finish: g.finish }, file: { path, from, lines: tailLines(g.text, 0).lines } });
       const run = fence.match(/^`+/)?.[0].length ?? 3; const opened = g.text.match(/^\s*(`{3,})[^\n]*\n/);
       // A cut keeps whole lines only; the kept text ends at the start of the cut line.
       const code = opened && opened[1]!.length >= run ? extractCode(g.text) : g.cut ? g.text : g.text.replace(/\s+$/, '') + '\n';
       return { code, finish: g.finish, ...(g.cut ? { cut: g.cut } : {}), ...cost(g.meta), request };
     }
-    const raw = await this.bonsai.generate(prompt, { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false }, this.config.codeTemperature, { step: s.step, route }, budget);
+    const raw = await this.bonsai.generate(prompt, { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false }, this.config.codeTemperature, { step: s.step, route }, budget, every(100, (p: StreamProgress) => this.observe({ kind: 'generating', step: s.step, route, attempt: 1, tokens: p.tokens })));
     return { code: extractCode(String(raw.content ?? '')), finish: 'stop', ...cost(this.bonsai.lastMeta), request };
   }
   // The modules a file names in its purpose, thought or notes, as real signatures.
@@ -407,7 +418,7 @@ export class Agent {
     const known = rewrite && exact ? s.reproduced?.[exact] : undefined;
     // The file around a region's block, all of it: a block may repeat any number of the lines that stay.
     const around = region ? { before: lines.slice(0, region.start - 1).join('\n'), region: lines.slice(region.start - 1, region.end).join('\n'), after: lines.slice(region.end).join('\n') } : undefined;
-    const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', builds, this.config.createTokens, fenceFor(path), request => {
+    const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', path, region?.start ?? 1, builds, this.config.createTokens, fenceFor(path), request => {
       if (!known || known.sha !== sha || known.request !== request) return;
       const was = known.ms === undefined ? '' : ` (${known.tokens !== undefined ? `${known.tokens} tokens, ` : ''}${(known.ms / 1000).toFixed(1)} s)`;
       const shown = s.entries.some(e => e.step === known.step && e.kind !== 'turn') ? `e${known.step}` : 'its result has left the evidence';
@@ -595,6 +606,7 @@ export class Agent {
           thought = String(gen.thought ?? '').trim(); batch = (gen.actions as any[]).map(a => ({ action: String(a.action) as Route, args: (a.args ?? {}) as Record<string, any> }));
           s.lastThought = thought;
           await this.store.log('thought', { step: s.step, thought: clip(thought, 2000), actions: batch.map(b => b.action), temperature });
+          this.observe({ kind: 'thought', step: s.step, thought, actions: batch });
         } catch (e) {
           if (++generationFailures >= 4) throw e;
           const cut = /\(length\)/.test((e as Error).message);
@@ -878,6 +890,8 @@ export class Agent {
   }
 }
 const nLines = (n: number) => `${n} line${n === 1 ? '' : 's'}`;
+// At most one call per ms milliseconds: a stream delivers 40 to 290 tokens a second, and each live event redraws the panel.
+const every = <T>(ms: number, f: (x: T) => void) => { let last = -Infinity; return (x: T) => { const now = performance.now(); if (now - last >= ms) { last = now; f(x); } }; };
 // What a generation cost, from the client's metadata.
 const cost = (meta: { ms?: number; usage?: { completion_tokens?: number } } | null | undefined): { ms?: number; tokens?: number } => ({ ...(typeof meta?.ms === 'number' ? { ms: meta.ms } : {}), ...(typeof meta?.usage?.completion_tokens === 'number' ? { tokens: meta.usage.completion_tokens } : {}) });
 // Edit failures that depend only on the arguments and the target file's text: with the

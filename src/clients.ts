@@ -3,13 +3,15 @@ import { randomUUID } from 'node:crypto';
 import type { Answers, Config, GenerationMeta, JsonSchema, Log, Message, Questions } from './types.js';
 import { samplingSchema, validate } from './schema.js';
 
-export async function postJson(url: string, body: unknown, key: string, timeoutMs = 30000, retries = 2): Promise<any> {
+// A POST whose successful reply is left to the caller to read (the timeout covers the reading too); the
+// transient statuses are retried before any of a reply is read. signal: the caller's own abort.
+export async function post(url: string, body: unknown, key: string, timeoutMs = 30000, retries = 2, signal?: AbortSignal): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
     const response = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify(body), signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
     });
-    if (response.ok) return response.json();
+    if (response.ok) return response;
     await response.body?.cancel();
     if (attempt < retries && [429, 500, 502, 503, 504, 529].includes(response.status)) {
       const header = response.headers.get('retry-after');
@@ -17,9 +19,77 @@ export async function postJson(url: string, body: unknown, key: string, timeoutM
       await sleep(Math.min(10000, Math.max(100, Number.isFinite(delay) ? delay : 500)));
       continue;
     }
-    // Do not echo server bodies, which can include prompts or credentials.
-    throw new Error(`HTTP ${response.status} from ${new URL(url).origin}`);
+    throw httpError(response.status, url);
   }
+}
+// Do not echo server bodies, which can include prompts or credentials.
+const httpError = (status: unknown, url: string) => new Error(`HTTP ${status} from ${new URL(url).origin}`);
+export async function postJson(url: string, body: unknown, key: string, timeoutMs = 30000, retries = 2): Promise<any> {
+  return (await post(url, body, key, timeoutMs, retries)).json();
+}
+// Whether a reply is a server-sent event stream; anything else (a server or mock that ignores `stream`) is read as JSON.
+const isEventStream = (r: Response) => /^text\/event-stream\b/i.test(r.headers.get('content-type') ?? '');
+// The data of each event of a server-sent event stream, as it arrives. A character split across reads is
+// decoded once whole and a line split across reads once ended; comments (llama-server's keep-alive pings)
+// and other fields are skipped, and an event the stream ends inside of is never delivered.
+export async function* sseData(body: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
+  const decoder = new TextDecoder(); let buffer = ''; let data: string[] = [];
+  for await (const bytes of body) {
+    buffer += decoder.decode(bytes, { stream: true });
+    for (let end = buffer.indexOf('\n'); end >= 0; end = buffer.indexOf('\n')) {
+      const line = buffer.slice(0, end).replace(/\r$/, ''); buffer = buffer.slice(end + 1);
+      if (!line) { if (data.length) yield data.join('\n'); data = []; }
+      else if (line.startsWith('data:')) data.push(line.slice(line[5] === ' ' ? 6 : 5));
+    }
+  }
+}
+// One event's JSON; an event that is not JSON fails without echoing it, and an error the server sends inside
+// the stream (after the headers, so with status 200) fails as the HTTP error it is unstreamed.
+function streamEvent(data: string, url: string): any {
+  let e: any; try { e = JSON.parse(data); } catch { throw new Error(`Bonsai sent a stream event that is not JSON (from ${new URL(url).origin})`); }
+  if (e?.error) throw httpError(e.error.code ?? 500, url);
+  return e;
+}
+// The events of a streamed reply as they come, until [DONE] or the end of the stream. The request's own
+// deadline covers the whole stream; each event also pushes back a shorter one, since a server whose decoding
+// hangs keeps sending its keep-alive comments every 30 s, which keep the read (and undici's idle timeout)
+// alive: the stream is aborted as a request is at its deadline (abort, the request's signal) when no event
+// has come for firstMs (the prompt's processing) and then for gapMs (a minute; a token takes 25 ms). A
+// connection that drops mid-stream fails as one that drops before its reply, the error an unstreamed request
+// gives a server that dies generating ('fetch failed'; undici says 'terminated' once the headers have come).
+export async function* streamEvents(response: Response, url: string, abort: AbortController, firstMs: number, gapMs = 60000): AsyncGenerator<any> {
+  let timer: NodeJS.Timeout | undefined;
+  const wait = (ms: number) => { clearTimeout(timer); timer = setTimeout(() => abort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), ms); timer.unref(); };
+  wait(firstMs);
+  try { for await (const data of sseData(response.body!)) { if (data === '[DONE]') return; wait(gapMs); yield streamEvent(data, url); } }
+  catch (e) { throw e instanceof TypeError && e.message === 'terminated' ? new TypeError('fetch failed', { cause: e }) : e; }
+  finally { clearTimeout(timer); }
+}
+// What a streamed generation has produced so far, for live progress: its text (the reply's JSON for a
+// structured generation, the code for a raw one), its tokens, and the decoding speed when the server says it;
+// before the first token, how far the server has read the prompt (total and cached tokens, and those read so
+// far, the cached ones included), from the events return_progress asks for.
+export interface StreamProgress { text: string; tokens: number; perSecond?: number; prompt?: { total: number; cache: number; processed: number } }
+// A progress callback that cannot fail the generation it reports on: it only draws.
+const quietly = <T>(f?: (x: T) => void) => (x: T) => { try { f?.(x); } catch { /* a display error is not the generation's */ } };
+// A streamed chat completion rebuilt as the reply the server sends unstreamed: the content its deltas spell,
+// the finish reason, and the model, usage and timings its last events carry. A server that does not honour
+// stream_options sends no usage; it is made from the timings, as the server builds it (usage_json_oaicompat).
+// A stream that ends before its finish reason is a reply cut short, and fails before anything is logged of it.
+async function chatFromStream(response: Response, url: string, abort: AbortController, firstMs: number, progress: (p: StreamProgress) => void): Promise<any> {
+  let content = ''; let finish: string | undefined; let usage: any; let timings: any; let model: any; let deltas = 0;
+  for await (const e of streamEvents(response, url, abort, firstMs)) {
+    model ??= e.model; if (e.usage) usage = e.usage; if (e.timings) timings = e.timings;
+    if (e.prompt_progress) progress({ text: content, tokens: deltas, prompt: e.prompt_progress });
+    for (const c of e.choices ?? []) {
+      if (c.finish_reason) finish = c.finish_reason;
+      // Every token adds to the JSON text, so the deltas count the tokens.
+      if (typeof c.delta?.content === 'string' && c.delta.content) { content += c.delta.content; progress({ text: content, tokens: ++deltas }); }
+    }
+  }
+  if (!finish) throw new Error(`Bonsai's stream ended before the generation did (from ${new URL(url).origin})`);
+  usage ??= timings && { completion_tokens: timings.predicted_n, prompt_tokens: timings.cache_n + timings.prompt_n, total_tokens: timings.predicted_n + timings.cache_n + timings.prompt_n, prompt_tokens_details: { cached_tokens: timings.cache_n } };
+  return { model, choices: [{ finish_reason: finish, message: { content } }], usage, timings };
 }
 const probability = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
 export function validateAnswers(questions: Questions, raw: unknown): Answers {
@@ -75,7 +145,8 @@ export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'rep
 // around: the generation is the block of a region of a file, which is as it is before the region,
 // in it and after it; a block that starts reproducing the lines after it is stopped (echoOf).
 export interface Around { before: string; region: string; after: string }
-export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number; around?: Around }
+// progress: called as the text arrives (each token of a stream, each chunk otherwise); kept out of context, which is logged.
+export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number; around?: Around; progress?: (p: StreamProgress) => void }
 // Sampling for code. The server's defaults (top_k 20, top_p 0.95) stay; the DRY
 // sampler penalises the verbatim repetition a 1-bit model falls into without
 // penalising the legitimate repeats code is made of.
@@ -200,6 +271,42 @@ export function lineCut(body: string, at: number, kind: GenerationCut['kind'], u
   const line = body.slice(ls, le < 0 ? body.length : le); const trimmed = line.trimStart();
   return { kept: body.slice(0, ls), cut: { kind, line: body.slice(0, ls).split('\n').length, opening: trimmed.slice(0, 60), ...(trimmed.length > 60 ? { truncated: true as const } : {}), lineChars: line.length, ...(unit ? { unit } : {}) } };
 }
+// Where a generation that has started repeating itself is cut, judged on its text so far as at the end of a
+// chunk: a repeat of whole lines, a loop inside one line, or (around a region) a repeat of the lines after the
+// region, which wins when it starts no later. The kept text and the cut, or null. lines false leaves out
+// repeats of whole lines (repetitionStart's, and a periodic run across lines), for a stream judged between
+// chunk ends (streamCheck): only a loop inside the line being written, and an echo.
+export function repeatCut(body: string, around?: Around, lines = true): { kept: string; cut: GenerationCut } | null {
+  // A chunk that still ends inside a character is judged without it; the cut is at a line start anyway.
+  const judged = body.replace(/\uFFFD+$/, '');
+  const at = lines ? repetitionStart(judged) : -1;
+  // A periodic run whose unit holds a line end repeats whole short lines (closing brackets, blank lines), not one line.
+  const lineStart = (n: number) => n ? judged.split('\n').slice(0, n).join('\n').length + 1 : 0;
+  const loop = (h: { start: number; unit: number } | null) => !h ? null : !judged.slice(h.start).includes('\n') ? { ...h, kind: 'cycle' as const } : lines ? { start: h.start, kind: 'lines' as const, unit: undefined } : null;
+  const hit = at >= 0 ? { start: lineStart(at), kind: 'lines' as const, unit: undefined } : lines ? loop(periodic(judged) ?? cyclingLine(judged)) : loop(periodic(judged)) ?? loop(cyclingLine(judged));
+  // A block that has started reproducing the lines after its region, judged on its whole lines, is cut where the repeat starts.
+  const echo = around ? echoOf(judged.slice(0, judged.lastIndexOf('\n') + 1), around, false) : null;
+  if (echo && (!hit || lineStart(echo.line - 1) <= hit.start)) { const c = lineCut(body, lineStart(echo.line - 1), 'echo'); return { kept: c.kept, cut: { ...c.cut, echoed: echo.echoed, ...(echo.diverged ? { diverged: true as const } : {}) } }; }
+  return hit ? lineCut(body, hit.start, hit.kind, hit.unit) : null;
+}
+// One /completion reply, streamed or not: the text, the token ids, and the stop fields. exact is false when
+// the ids are not all there (a stream drops the id of a token that ends inside a character); aborted when the
+// client stopped the stream on a repeat.
+interface Completion { content: string; tokens: number[]; tokens_predicted?: number; stop_type?: string; stopped_limit?: boolean; stopped_word?: boolean; stopped_eos?: boolean; stopping_word?: string; truncated?: boolean; timings?: any; exact?: boolean; aborted?: boolean }
+// When a stream is judged for repeats (repeatCut): wholly where a chunk would have ended (the first event with
+// text at or past each chunk's worth of tokens), so it is stopped no later than the chunks would have stopped
+// it; and in between only for a loop inside the line being written or a region's echo, which stop it sooner,
+// at a line end once `tokens` tokens have come since the last judgement and inside a line each time it grows
+// by `chars` characters (a loop inside one line never ends it). Repeats of whole lines are left to the chunk
+// ends: one line six times in a row is also how a legitimate file can look (react-demo-40 step 6, eight
+// identical decorative <div> lines, which ended before its first chunk end), and judged at every line end it
+// is cut; a loop of whole lines runs on to the next chunk end, as it did. Replayed over 1,077 recorded
+// generations (the 77 region rewrites with the model's own ids, 999 files re-tokenized, a legitimate fixture),
+// streamed and chunked: 1,065 identical (text, finish, cut, usage, logged cut); the other 12 (11 loops inside
+// a line and run 73's echo) keep the same text and cut at the same line, stop sooner (5,863 tokens fewer in
+// all) and so report the shorter line or echo they reached; none stops later, no file is cut that the chunks
+// keep. 59,467 judgements over the 999: 0.01 ms each on average, 2.5 ms at most, 36 ms for the costliest file.
+const streamCheck = { tokens: 8, chars: 256 };
 // How long one generation request may take: a minute of slack, the prompt to
 // process when it is not cached (the first chunk; a cold 30k-token prompt takes
 // ~90 s at ~350 tok/s, so it is allowed at 150 tok/s), and the tokens to generate
@@ -221,6 +328,11 @@ export class Bonsai {
   private rendered: { key: string; prompt: string; tokens?: number } | null = null;
   // The text that opens a user message in the server's chat template, once found (userDelimiter).
   private userStart?: Promise<string | null>;
+  // Whether the server streams, once a step reply has shown it (an event stream, or JSON from a server or
+  // mock that ignores `stream`). A code generation is streamed only then: a stream cannot be continued by
+  // its token ids (it drops the id of a token that ends inside a character), so a streamed generation is one
+  // request to the budget, judged for repeats as it arrives; until then it is the chunked request it was.
+  streams?: boolean;
   constructor(readonly config: Config, private key: string, private log: Log) {}
   private get root(): string { return this.config.baseUrl.replace(/\/v1\/?$/, '').replace(/\/$/, ''); }
   // The prompt exactly as the server's chat template renders it, ending with the
@@ -252,10 +364,54 @@ export class Bonsai {
     if (!Array.isArray(result.tokens)) throw new Error('Missing tokens');
     return result.tokens as number[];
   }
-  private async detokenize(tokens: number[]): Promise<string> {
-    const result = await postJson(`${this.root}/detokenize`, { tokens }, this.key, 10000, 0);
+  private async detokenize(tokens: number[], retries = 0): Promise<string> {
+    const result = await postJson(`${this.root}/detokenize`, { tokens }, this.key, 10000, retries);
     if (typeof result.content !== 'string') throw new Error('Missing detokenized content');
     return result.content;
+  }
+  // One /completion request read as it streams, rebuilt as the reply the server sends unstreamed. The stream
+  // differs from that reply in two places (server-context.cpp process_token, send_final_response): a token
+  // that ends inside a character sends no event, so its id never comes (the next event carries the whole
+  // character but only its own id, and tokens_predicted counts the gap); and at a stop by the token limit the
+  // text held back as the start of the stop word (a line break before the closing fence) is never sent,
+  // though its ids were, so it is detokenized. repeated judges the text as if the request had stopped there
+  // (lines: wholly, at the first event with text at or past each `chunk` tokens; otherwise as streamCheck
+  // says); when it finds a repeat the request is aborted (the server cancels the slot's task at its next
+  // token) and the reply ends there, as at a limit. firstMs: how long the prompt may take (streamEvents).
+  private async completionStream(response: Response, url: string, abort: AbortController, firstMs: number, chunk: number, progress: (p: StreamProgress) => void, repeated: (text: string, lines: boolean) => boolean): Promise<Completion> {
+    let content = ''; const tokens: number[] = []; let n = 0; let held: number[] = []; let exact = true; let timings: any; let final: any;
+    let judgedAt = 0; let judgedLength = 0; let chunkEnd = chunk; let stopped = false;
+    for await (const e of streamEvents(response, url, abort, firstMs)) {
+      if (e.timings) timings = e.timings;
+      if (e.stop) { final = e; break; }
+      if (e.prompt_progress) { progress({ text: content, tokens: n, prompt: e.prompt_progress }); continue; } // its tokens are not generated ones
+      const ids: number[] = Array.isArray(e.tokens) ? e.tokens : []; const piece = typeof e.content === 'string' ? e.content : '';
+      const predicted = typeof e.tokens_predicted === 'number' ? e.tokens_predicted : n + ids.length;
+      if (predicted > n + ids.length) exact = false;
+      n = predicted; tokens.push(...ids);
+      if (piece) { content += piece; held = []; } else held.push(...ids);
+      progress({ text: content, tokens: n, ...(typeof e.timings?.predicted_per_second === 'number' ? { perSecond: e.timings.predicted_per_second } : {}) });
+      // Only text with nothing held back is judged: at a chunk's end it is the text its unstreamed reply has.
+      if (!piece) continue;
+      const lines = n >= chunkEnd;
+      if (lines || (piece.includes('\n') ? n - judgedAt >= streamCheck.tokens : content.length - Math.max(judgedLength, content.lastIndexOf('\n')) >= streamCheck.chars)) {
+        if (lines) chunkEnd = (Math.floor(n / chunk) + 1) * chunk;
+        judgedAt = n; judgedLength = content.length;
+        if (repeated(content, lines)) { stopped = true; break; }
+      }
+    }
+    // Leaving the loop cancels the reply; the abort makes sure its connection closes, which the server takes as a cancel.
+    if (stopped) { abort.abort(); return { content, tokens, tokens_predicted: n, stop_type: 'limit', timings, exact, aborted: true }; }
+    if (!final) throw new Error(`Bonsai's stream ended before the generation did (from ${new URL(url).origin})`);
+    // Tokens after the last event ended inside a character: the unstreamed text ends in a replacement character
+    // there (complete characters inside those tokens, if any, are not known). A held tail is detokenized as
+    // the unstreamed reply would show it. A server that cannot, even when asked again, leaves it out (as a
+    // failed detokenize leaves a chunk's concatenation): the last line, whole but without its line break, is
+    // then cut as unfinished at the budget, which keeps the generation rather than failing it.
+    const lost = typeof final.tokens_predicted === 'number' ? final.tokens_predicted - n : 0;
+    let tail = final.stop_type === 'limit' && held.length ? await this.detokenize(held, 2).catch(() => '') : '';
+    if (lost > 0) { exact = false; tail += '\uFFFD'; }
+    return { content: content + tail, tokens, tokens_predicted: final.tokens_predicted, stop_type: final.stop_type, stopping_word: final.stopping_word, truncated: final.truncated, timings: final.timings ?? timings, exact };
   }
   async count(messages: Message[]): Promise<{ tokens: number; mode: string }> {
     try {
@@ -268,7 +424,10 @@ export class Bonsai {
   }
   // A structured, grammar-constrained generation: short arguments and designs.
   // maxTokens raises the output budget for the few generations that need it.
-  async generate(messages: Message[], schema: JsonSchema, temperature = this.config.stepTemperature, context?: { step: number; route: string }, maxTokens = this.config.maxTokens): Promise<Record<string, any>> {
+  // Streamed: progress is called with the reply's JSON text as it arrives, and before it with the prompt's
+  // processing. stream, stream_options and return_progress are delivery options; the prompt, the grammar and
+  // the sampling are those of the unstreamed request.
+  async generate(messages: Message[], schema: JsonSchema, temperature = this.config.stepTemperature, context?: { step: number; route: string }, maxTokens = this.config.maxTokens, progress?: (p: StreamProgress) => void): Promise<Record<string, any>> {
     const count = await this.count(messages);
     if (count.tokens > this.config.workingTokens || count.tokens + maxTokens + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
@@ -276,11 +435,14 @@ export class Bonsai {
     await this.log('bonsai-request', { requestId, ...context, prompt: count, temperature, minP: this.config.stepMinP, maxTokens });
     const start = performance.now();
     try {
-    const result = await postJson(`${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+    const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`; const abort = new AbortController();
+    const response = await post(url, {
       model: this.config.model, messages, temperature, min_p: this.config.stepMinP, max_tokens: maxTokens,
-      stream: false, chat_template_kwargs: { enable_thinking: false },
+      stream: true, stream_options: { include_usage: true }, return_progress: true, chat_template_kwargs: { enable_thinking: false },
       response_format: { type: 'json_schema', json_schema: { name: 'arguments', strict: true, schema: samplingSchema(schema) } },
-    }, this.key, 60000 + maxTokens * 60, 0);
+    }, this.key, 60000 + maxTokens * 60, 0, abort.signal);
+    this.streams = isEventStream(response);
+    const result = this.streams ? await chatFromStream(response, url, abort, requestTimeoutMs(count.tokens, 0, this.tokensPerSecond), quietly(progress)) : await response.json();
     const choice = result.choices?.[0];
     this.lastMeta = { ms: performance.now() - start, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason, promptTokens: count.tokens };
     await this.log('bonsai', { requestId, ...context, model: result.model, ms: this.lastMeta.ms, prompt: count, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason });
@@ -339,8 +501,19 @@ export class Bonsai {
     // which otherwise runs on to the file's end (run 73 step 70: 1510 tokens, 44 s, stopped after 128). Each
     // continuation also leaves a server checkpoint of the recurrent state (149.6 MiB of host memory, one of
     // at most 128), which the next request drops as it diverges before it.
-    const chunk = Math.min(this.config.maxTokens, options.around ? 128 : 1024);
-    let cutFrom = ''; let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = ''; let cut: GenerationCut | undefined; let lastStop = ''; let lastIds: number[] = []; let lastContent = '';
+    // A streamed generation needs no chunks: it is judged as it arrives (where each chunk would have ended, and
+    // sooner for a loop inside a line or an echo, streamCheck) and stopped at a repeat, so it is one request to
+    // the budget, with no continuation to pay for and no ids to send back. Over the 1,077 recorded generations
+    // replayed: 1,941 requests become 1,077, and the 864 continuations and their checkpoints go (the 77 region
+    // rewrites alone, in 128-token chunks: 319 requests become 77). A chunked stream would have continued 2 of
+    // them from ids it never received. Thinking keeps its chunks: an overlong thought is closed between two. A stopped stream relies on the server cancelling the
+    // slot's task when its client goes (llama-server checks the connection before each write and cancels at
+    // the next token, ~50 ms); a proxy that kept the upstream connection open would let the slot run on to
+    // the budget, where a chunk ran on at most to its own end.
+    const live = this.streams === true && !thinking;
+    const step = Math.min(this.config.maxTokens, options.around ? 128 : 1024); const chunk = live ? Infinity : step;
+    const progress = quietly(options.progress);
+    let cutFrom = ''; let text = ''; let generated = 0; let continuations = 0; let finish: TextGeneration['finish'] = 'stop'; let timings: any; let broken = false; let thoughtClosed = !thinking; let stoppingWord = ''; let cut: GenerationCut | undefined; let lastStop = ''; let lastIds: number[] = []; let lastContent = ''; let exact = true;
     // The closing fence is the backtick run alone, whatever language opened it.
     const stopWords = fence ? [`\n${fence.match(/^`+/)?.[0] ?? '```'}`] : [];
     try {
@@ -348,13 +521,21 @@ export class Bonsai {
         const room = this.config.contextWindow - this.config.safetyTokens - promptTokens;
         const n = Math.min(chunk, budget - generated, room - generated);
         if (n <= 0) { finish = 'length'; break; }
-        const timeout = requestTimeoutMs(continuations === 0 ? promptTokens : 0, n, this.tokensPerSecond);
-        const prior = text.length; const r = await postJson(`${this.root}/completion`, { prompt, n_predict: n, temperature, ...codeSampling, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, stream: false, ...(thoughtClosed ? { stop: stopWords } : {}), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, timeout, 0);
+        // A streamed request has the time the chunks it replaces had together (a minute of slack each), so a
+        // generation slower than the last one is not lost to its deadline; a hang is caught by streamEvents.
+        const timeout = requestTimeoutMs(continuations === 0 ? promptTokens : 0, n, this.tokensPerSecond) + (live ? 60000 * (Math.ceil(n / step) - 1) : 0);
+        const prior = text.length; const url = `${this.root}/completion`; const abort = new AbortController();
+        const response = await post(url, { prompt, n_predict: n, temperature, ...codeSampling, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, ...(live ? { stream: true, timings_per_token: true, return_progress: true } : { stream: false }), ...(thoughtClosed ? { stop: stopWords } : {}), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, timeout, 0, abort.signal);
+        const streamed = isEventStream(response);
+        // A server that streams chat but answers this as JSON is not judged until the reply ends: later generations go back to chunks.
+        if (live && !streamed) this.streams = false;
+        const r: Completion = streamed ? await this.completionStream(response, url, abort, requestTimeoutMs(promptTokens, 0, this.tokensPerSecond), step, p => progress({ ...p, text: text + p.text, tokens: generated + p.tokens }), (t, lines) => repeatCut(text + t, options.around, lines) !== null) : await response.json();
         if (typeof r.content !== 'string') throw new Error('Bonsai returned no content');
         const ids: number[] = Array.isArray(r.tokens) ? r.tokens : [];
-        text += r.content; timings = r.timings; prompt = [...prompt, ...ids];
+        text += r.content; timings = r.timings; prompt = [...prompt, ...ids]; if (r.exact === false) exact = false;
         if (typeof r.timings?.predicted_per_second === 'number' && r.timings.predicted_per_second > 0) this.tokensPerSecond = r.timings.predicted_per_second;
         generated += typeof r.tokens_predicted === 'number' ? r.tokens_predicted : ids.length || n;
+        if (!streamed) progress({ text, tokens: generated, perSecond: r.timings?.predicted_per_second });
         if (r.content.endsWith('�')) broken = true;
         const stop: string = r.stop_type ?? (r.stopped_limit ? 'limit' : r.stopped_word ? 'word' : r.stopped_eos ? 'eos' : 'none');
         lastStop = stop; lastIds = ids; lastContent = r.content;
@@ -371,33 +552,26 @@ export class Bonsai {
         }
         // Ended by the model rather than by the closing fence: the file is not complete.
         if (stop === 'eos' && fence && thoughtClosed) { finish = 'eos'; break; }
+        // A stream stopped at a repeat ends as a chunk ends at its limit, and is judged and cut as one.
         if (stop !== 'limit') break;
         // A tail that repeats itself is wrong content, the one case to stop
         // generating: the text is cut at the start of the line the repeat begins
         // in and reported as such. The detectors judge the text the ids spell (a
         // chunk can end inside a character).
-        if (broken && thoughtClosed) { try { text = await this.detokenize(prompt.slice(promptTokens)); broken = text.endsWith('\uFFFD'); } catch { /* keep the concatenation */ } }
+        if (broken && exact && thoughtClosed) { try { text = await this.detokenize(prompt.slice(promptTokens)); broken = text.endsWith('\uFFFD'); } catch { /* keep the concatenation */ } }
         const bodyStart = thinking ? text.indexOf('</think>') + 8 : 0;
         const uncut = text; const body = text.slice(bodyStart);
-        if (thoughtClosed) {
-          // A chunk that still ends inside a character is judged without it; the cut is at a line start anyway.
-          const judged = body.replace(/\uFFFD+$/, '');
-          const at = repetitionStart(judged);
-          // A periodic run whose unit holds a line end repeats whole short lines (closing brackets, blank lines), not one line.
-          const lineStart = (n: number) => n ? judged.split('\n').slice(0, n).join('\n').length + 1 : 0;
-          const hit = at >= 0 ? { start: lineStart(at), kind: 'lines' as const, unit: undefined }
-            : (() => { const h = periodic(judged) ?? cyclingLine(judged); return !h ? null : judged.slice(h.start).includes('\n') ? { start: h.start, kind: 'lines' as const, unit: undefined } : { ...h, kind: 'cycle' as const }; })();
-          // A block that has started reproducing the lines after its region, judged on its whole lines, is cut where the repeat starts.
-          const echo = options.around ? echoOf(judged.slice(0, judged.lastIndexOf('\n') + 1), options.around, false) : null;
-          if (echo && (!hit || lineStart(echo.line - 1) <= hit.start)) { const c = lineCut(body, lineStart(echo.line - 1), 'echo'); cutFrom = uncut; text = text.slice(0, bodyStart) + c.kept; cut = { ...c.cut, echoed: echo.echoed, ...(echo.diverged ? { diverged: true as const } : {}) }; finish = 'repetition'; break; }
-          if (hit) { const c = lineCut(body, hit.start, hit.kind, hit.unit); cutFrom = uncut; text = text.slice(0, bodyStart) + c.kept; cut = c.cut; finish = 'repetition'; break; }
-        }
+        const repeat = thoughtClosed ? repeatCut(body, options.around) : null;
+        if (repeat) { cutFrom = uncut; text = text.slice(0, bodyStart) + repeat.kept; cut = repeat.cut; finish = 'repetition'; break; }
         if (generated >= budget) { finish = 'length'; break; }
+        // Continued by the ids generated, which a stream may not hold all of (a server that caps n_predict
+        // below the request's): what it generated is kept, as at the budget.
+        if (!exact || r.aborted) { finish = 'length'; break; }
         continuations++;
       }
       // The token ids of a stop on a word include that word; the text never does.
       // Never after a cut: the ids still spell what was cut.
-      if (broken && !cut) { try {
+      if (broken && exact && !cut) { try {
         text = await this.detokenize(prompt.slice(promptTokens)); if (stoppingWord && text.endsWith(stoppingWord)) text = text.slice(0, -stoppingWord.length);
         // The ids of an end-of-generation stop include the end token, which the content never shows.
         if (lastStop === 'eos' && lastIds.length) { const piece = await this.detokenize(lastIds.slice(-1)); if (piece && text.endsWith(piece) && !lastContent.endsWith(piece)) text = text.slice(0, -piece.length); }

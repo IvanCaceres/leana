@@ -265,7 +265,7 @@ export class Display {
       const shown = e.tail.slice(-height); const first = e.from + e.lines - shown.length;
       return shown.map((l, i) => `${label(i ? '' : 'Writing')}${String(first + i).padStart(5)} | ${fitTo(row(l.replace(/\t/g, '  ')), w - 8, e.open && i === shown.length - 1)}`);
     }
-    const actions = (e.actions ?? []).map((a: any, i) => `${label(`Action ${i + 1}`)}${fitTo(typeof a?.action === 'string' ? actionSummary(a.action, a.args && typeof a.args === 'object' ? a.args : {}) : plain(typeof a?.thought === 'string' ? a.thought : ''), w)}`).slice(-height);
+    const actions = (e.actions ?? []).map((a: any, i) => `${label(`Action ${i + 1}`)}${fitTo(typeof a?.action === 'string' ? actionSummary(a.action, a.args && typeof a.args === 'object' ? a.args : {}) : '', w)}`).slice(-height);
     const thought = e.text.trim() ? wrap(plain(e.text), w) : [];
     return thought.slice(thought.length - Math.min(thought.length, height - actions.length)).map((r, i) => `${label(i ? '' : 'Thinking')}${r}`).concat(actions);
   }

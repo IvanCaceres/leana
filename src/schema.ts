@@ -37,11 +37,10 @@ export const schemas: Record<Route, JsonSchema> = {
   // that starts what is observed (empty when none), target the URL or command.
   observe: obj({ kind: { type: 'string', enum: observerKinds }, start: str(500), target: str(1000) }),
 };
-// One step of the orient-reason-act loop: the worker reasons in a few
-// sentences, then names one action; the action's arguments are generated next
-// under that action's schema, with the reasoning in front of the worker.
+// One action of a step: its name, then its arguments under that action's schema. The step's
+// reasoning is its one thought, written before all its actions;
 export const actions = ['read_files', 'search_codebase', 'bash', 'create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines', 'plan', 'observe', 'finish', 'ask_user'] as const;
-export const stepSchema: JsonSchema = { anyOf: actions.map(a => obj({ thought: str(), action: { type: 'string', const: a, enum: [a] }, args: schemas[a] })) };
+export const stepSchema: JsonSchema = { anyOf: actions.map(a => obj({ action: { type: 'string', const: a, enum: [a] }, args: schemas[a] })) };
 // A decided edit of a known file: the harness fills path and expectedHash, so
 // the worker generates only the edits it was asked for.
 export const focusedEditSchema: JsonSchema = obj({ edits: schemas.replace_lines.properties!.edits! });

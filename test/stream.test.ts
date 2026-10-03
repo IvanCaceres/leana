@@ -119,7 +119,7 @@ test('partialJson reads a step reply from any prefix of its JSON: the thought as
 });
 
 test('A step reply is read as it streams: the thought grows in the progress, and the reply, usage, timings and finish are those of the unstreamed request', async t => {
-  const content = JSON.stringify({ thought: 'The build failed in src/App.tsx \u2014 caf\u00e9 \ud83d\ude80; read it first.', actions: [{ thought: 'look', action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }] });
+  const content = JSON.stringify({ thought: 'The build failed in src/App.tsx \u2014 caf\u00e9 \ud83d\ude80; read it first.', actions: [{ action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }] });
   // Pieces of three characters cut escapes and surrogate pairs anywhere; reads of five bytes cut characters and lines.
   const pieces = content.match(/[\s\S]{1,3}/g)!; let mode = 'ok'; const bodies: any[] = [];
   const url = await listen(t, async (req, res) => {
@@ -361,8 +361,8 @@ test('The display shows a step\'s thought and actions as they are written and pr
   let live = d.panel().slice(11); assert.equal(live.length, 7, 'the live rows take a fixed height');
   const rows = live.filter(Boolean); assert(rows.length >= 2 && rows.length <= 7 && rows[0]!.startsWith('Thinking   '), live.join('\n'));
   assert(thought.slice(0, 200).endsWith(rows.at(-1)!.trim()), 'the newest words show, a dash as a dash'); assert.equal(row('Now').slice(13), 'Bonsai thinking | 1 token');
-  both([{ kind: 'thinking', step: 2, text: thought, tokens: 61, actions: [{ thought: 'look', action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }, { thought: 'then build it ag' }] }]);
-  live = d.panel().slice(11).filter(Boolean); assert.deepEqual(live.slice(-2), ['Action 1   read_files src/App.tsx 1..40', 'Action 2   then build it ag'], 'each action as far as it has come, under the thought');
+  both([{ kind: 'thinking', step: 2, text: thought, tokens: 61, actions: [{ action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }, {}] }]);
+  live = d.panel().slice(11).filter(Boolean); assert.deepEqual(live.slice(-2), ['Action 1   read_files src/App.tsx 1..40', 'Action 2   '], 'each action as far as it has come, under the thought (one whose name has not come yet is an empty row)');
   assert(live[0]!.startsWith('Thinking   ') && live.length === 6 && live.slice(1, -2).every(l => /^ {11}\S/.test(l)), live.join('\n')); assert.equal(row('Now').slice(13), 'Bonsai choosing the actions | 61 tokens');
   both([{ kind: 'generated', step: 2, route: 'step', meta: null, args: {} },
     { kind: 'thought', step: 2, thought, actions: [{ action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }, { action: 'bash', args: { command: 'npm run build', purpose: 'p', check: true } }, { action: 'bash', args: { command: 'printf "\x1b[2J"; npx vitest run --reporter=verbose src/components/Hero.test.tsx', purpose: 'p', check: false } }] }]);
@@ -423,7 +423,7 @@ test('The panel fits the screen: on a short terminal the live rows take only the
 });
 
 test('A step and a file generation stream through the real Agent: the thought is shown as it comes (at most ten updates a second), printed once, and the file\'s lines are shown as they are written', async t => {
-  const reply = JSON.stringify({ thought: 'Create the greeting module: one exported function that formats a name, nothing else is needed yet.', actions: [{ thought: 'write it', action: 'create_file', args: { path: 'src/greet.ts', purpose: 'export greet(name) returning a greeting' } }] });
+  const reply = JSON.stringify({ thought: 'Create the greeting module: one exported function that formats a name, nothing else is needed yet.', actions: [{ action: 'create_file', args: { path: 'src/greet.ts', purpose: 'export greet(name) returning a greeting' } }] });
   const file = 'export function greet(name: string): string {\n  return `Hello, ${name}!`\n}\n';
   const url = await listen(t, async (req, res) => {
     const b = await body(req);

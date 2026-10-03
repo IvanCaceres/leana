@@ -69,7 +69,7 @@ export async function* streamEvents(response: Response, url: string, abort: Abor
 // structured generation, the code for a raw one), its tokens, and the decoding speed when the server says it;
 // before the first token, how far the server has read the prompt (total and cached tokens, and those read so
 // far, the cached ones included), from the events return_progress asks for.
-export interface StreamProgress { text: string; tokens: number; perSecond?: number; prompt?: { total: number; cache: number; processed: number } }
+export interface StreamProgress { text: string; tokens: number; perSecond?: number; prompt?: { total: number; cache: number; processed: number }; reasoning?: string }
 // A progress callback that cannot fail the generation it reports on: it only draws.
 const quietly = <T>(f?: (x: T) => void) => (x: T) => { try { f?.(x); } catch { /* a display error is not the generation's */ } };
 // A streamed chat completion rebuilt as the reply the server sends unstreamed: the content its deltas spell,
@@ -77,20 +77,25 @@ const quietly = <T>(f?: (x: T) => void) => (x: T) => { try { f?.(x); } catch { /
 // stream_options sends no usage; it is made from the timings, as the server builds it (usage_json_oaicompat).
 // A stream that ends before its finish reason is a reply cut short, and fails before anything is logged of it.
 async function chatFromStream(response: Response, url: string, abort: AbortController, firstMs: number, progress: (p: StreamProgress) => void): Promise<any> {
-  let content = ''; let finish: string | undefined; let usage: any; let timings: any; let model: any; let deltas = 0;
+  let content = ''; let reasoning = ''; let finish: string | undefined; let usage: any; let timings: any; let model: any; let deltas = 0;
   for await (const e of streamEvents(response, url, abort, firstMs)) {
     model ??= e.model; if (e.usage) usage = e.usage; if (e.timings) timings = e.timings;
     if (e.prompt_progress) progress({ text: content, tokens: deltas, prompt: e.prompt_progress });
     for (const c of e.choices ?? []) {
       if (c.finish_reason) finish = c.finish_reason;
       // Every token adds to the JSON text, so the deltas count the tokens.
-      if (typeof c.delta?.content === 'string' && c.delta.content) { content += c.delta.content; progress({ text: content, tokens: ++deltas }); }
+      if (typeof c.delta?.content === 'string' && c.delta.content) { content += c.delta.content; progress({ text: content, tokens: ++deltas, ...(reasoning ? { reasoning } : {}) }); }
+      // The model's own thinking, which the server parses out of the reply ahead of the content.
+      if (typeof c.delta?.reasoning_content === 'string' && c.delta.reasoning_content) { reasoning += c.delta.reasoning_content; progress({ text: content, tokens: ++deltas, reasoning }); }
     }
   }
   if (!finish) throw new Error(`Bonsai's stream ended before the generation did (from ${new URL(url).origin})`);
   usage ??= timings && { completion_tokens: timings.predicted_n, prompt_tokens: timings.cache_n + timings.prompt_n, total_tokens: timings.predicted_n + timings.cache_n + timings.prompt_n, prompt_tokens_details: { cached_tokens: timings.cache_n } };
-  return { model, choices: [{ finish_reason: finish, message: { content } }], usage, timings };
+  return { model, choices: [{ finish_reason: finish, message: { content, ...(reasoning ? { reasoning_content: reasoning } : {}) } }], usage, timings };
 }
+// Written into the thinking before the </think> the server forces at the budget, so the reply that follows is
+// read as the thinking's conclusion; also how a forced stop is recognised in the logs.
+export const thinkingBudgetMessage = '\n\nThe thinking budget is spent; the answer follows from the thinking so far.\n';
 const probability = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
 export function validateAnswers(questions: Questions, raw: unknown): Answers {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Jev: missing answers');
@@ -147,13 +152,10 @@ export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'rep
 export interface Around { before: string; region: string; after: string }
 // progress: called as the text arrives (each token of a stream, each chunk otherwise); kept out of context, which is logged.
 export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number; around?: Around; progress?: (p: StreamProgress) => void }
-// Sampling for code. The server's defaults (top_k 20, top_p 0.95) stay; the DRY
-// sampler penalises the verbatim repetition a 1-bit model falls into without
-// penalising the legitimate repeats code is made of.
+// Sampling for code: codeTemperature, codeTopP, codeTopK, codeMinP, sent with each request.
 // No repetition penalty: code repeats itself legitimately (similar blocks, a
 // rewrite that keeps most of a file), and a penalty on repeating pushes the model
 // to end the generation mid-line. A loop is caught by repetitionStart instead.
-export const codeSampling = { top_k: 20, top_p: .9 };
 // A generation that has started repeating itself: the same block of three or
 // more lines three times in a row in the recent tail, or one line six times in
 // a row. Only back-to-back repetition counts: a line that recurs across a file
@@ -427,25 +429,34 @@ export class Bonsai {
   // Streamed: progress is called with the reply's JSON text as it arrives, and before it with the prompt's
   // processing. stream, stream_options and return_progress are delivery options; the prompt, the grammar and
   // the sampling are those of the unstreamed request.
-  async generate(messages: Message[], schema: JsonSchema, temperature = this.config.stepTemperature, context?: { step: number; route: string }, maxTokens = this.config.maxTokens, progress?: (p: StreamProgress) => void): Promise<Record<string, any>> {
+  // thinking: the model's own reasoning before the reply, up to that many tokens (the step route only, see
+  // Agent.generateJson). The template opens <think> instead of pre-filling an empty block; the JSON grammar
+  // holds only after </think>, which the server forces at the budget (reasoning_budget_tokens, with
+  // reasoning_budget_message written before it); reasoning_format's default splits the thinking into
+  // reasoning_content. Effort medium: the template's default, xhigh, prepends a sentence to the system
+  // message, which would break the prefix cached for every other request; medium adds no text, and past
+  // turns render alike either way, so only the generation prompt differs.
+  async generate(messages: Message[], schema: JsonSchema, temperature = this.config.stepTemperature, context?: { step: number; route: string }, maxTokens = this.config.maxTokens, progress?: (p: StreamProgress) => void, thinking?: number): Promise<Record<string, any>> {
     const count = await this.count(messages);
     if (count.tokens > this.config.workingTokens || count.tokens + maxTokens + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
     const requestId = randomUUID();
-    await this.log('bonsai-request', { requestId, ...context, prompt: count, temperature, minP: this.config.stepMinP, maxTokens });
+    await this.log('bonsai-request', { requestId, ...context, prompt: count, temperature, topP: this.config.stepTopP, topK: this.config.stepTopK, minP: this.config.stepMinP, maxTokens, ...(thinking ? { thinking } : {}) });
     const start = performance.now();
     try {
     const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`; const abort = new AbortController();
     const response = await post(url, {
-      model: this.config.model, messages, temperature, min_p: this.config.stepMinP, max_tokens: maxTokens,
-      stream: true, stream_options: { include_usage: true }, return_progress: true, chat_template_kwargs: { enable_thinking: false },
+      model: this.config.model, messages, temperature, top_p: this.config.stepTopP, top_k: this.config.stepTopK, min_p: this.config.stepMinP, max_tokens: maxTokens,
+      stream: true, stream_options: { include_usage: true }, return_progress: true, chat_template_kwargs: { enable_thinking: Boolean(thinking) },
+      ...(thinking ? { reasoning_effort: 'medium', reasoning_budget_tokens: thinking, reasoning_budget_message: thinkingBudgetMessage } : {}),
       response_format: { type: 'json_schema', json_schema: { name: 'arguments', strict: true, schema: samplingSchema(schema) } },
     }, this.key, 60000 + maxTokens * 60, 0, abort.signal);
     this.streams = isEventStream(response);
     const result = this.streams ? await chatFromStream(response, url, abort, requestTimeoutMs(count.tokens, 0, this.tokensPerSecond), quietly(progress)) : await response.json();
     const choice = result.choices?.[0];
-    this.lastMeta = { ms: performance.now() - start, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason, promptTokens: count.tokens };
-    await this.log('bonsai', { requestId, ...context, model: result.model, ms: this.lastMeta.ms, prompt: count, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason });
+    const reasoning = typeof choice?.message?.reasoning_content === 'string' ? choice.message.reasoning_content.trim() : '';
+    this.lastMeta = { ms: performance.now() - start, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason, promptTokens: count.tokens, ...(thinking ? { reasoning } : {}) };
+    await this.log('bonsai', { requestId, ...context, model: result.model, ms: this.lastMeta.ms, prompt: count, usage: result.usage, timings: result.timings, finishReason: choice?.finish_reason, ...(thinking ? { reasoningChars: reasoning.length, reasoningForced: reasoning.includes(thinkingBudgetMessage.trim()) } : {}) });
     if (choice?.finish_reason !== 'stop' || typeof choice.message?.content !== 'string')
       throw new Error(`Bonsai did not finish a JSON argument object (${choice?.finish_reason ?? 'missing choice'})`);
     let args: unknown;
@@ -494,7 +505,7 @@ export class Bonsai {
     // are alive at once (88 without), under the cap of 128, so the cap still never drops the low restore
     // points an eviction falls back to.
     const userStart = await this.userDelimiter();
-    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking, userStart });
+    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, topP: this.config.codeTopP, topK: this.config.codeTopK, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking, userStart });
     // Chunks are where a loop is checked for; a continuation reuses the cached ids, so a small one costs little
     // (one token to process: 124 ms, the median of 263 recorded continuations). A region's block is checked
     // every 128 tokens (about 2.7 s of generation, so about 5% more time) for a repeat of the lines after it,
@@ -525,7 +536,7 @@ export class Bonsai {
         // generation slower than the last one is not lost to its deadline; a hang is caught by streamEvents.
         const timeout = requestTimeoutMs(continuations === 0 ? promptTokens : 0, n, this.tokensPerSecond) + (live ? 60000 * (Math.ceil(n / step) - 1) : 0);
         const prior = text.length; const url = `${this.root}/completion`; const abort = new AbortController();
-        const response = await post(url, { prompt, n_predict: n, temperature, ...codeSampling, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, ...(live ? { stream: true, timings_per_token: true, return_progress: true } : { stream: false }), ...(thoughtClosed ? { stop: stopWords } : {}), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, timeout, 0, abort.signal);
+        const response = await post(url, { prompt, n_predict: n, temperature, top_p: this.config.codeTopP, top_k: this.config.codeTopK, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, ...(live ? { stream: true, timings_per_token: true, return_progress: true } : { stream: false }), ...(thoughtClosed ? { stop: stopWords } : {}), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, timeout, 0, abort.signal);
         const streamed = isEventStream(response);
         // A server that streams chat but answers this as JSON is not judged until the reply ends: later generations go back to chunks.
         if (live && !streamed) this.streams = false;

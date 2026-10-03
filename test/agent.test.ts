@@ -54,7 +54,8 @@ async function repo(t: any) {
   return { root, store };
 }
 const events = async (store: Store) => (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
-const config = { ...defaults, allowWrite: true, allowBash: true, maxSteps: 12, workingTokens: 90000, contextWindow: 200000 };
+// Steps without thinking unless a test turns it on: the escalation tests are written against stepTemperature.
+const config = { ...defaults, allowWrite: true, allowBash: true, maxSteps: 12, workingTokens: 90000, contextWindow: 200000, stepThinking: false };
 
 test('Orientation is gathered by code before the first step: the tree, the manifests, the toolchains present, the verification the ecosystem offers', async t => {
   const { root } = await repo(t);
@@ -113,6 +114,26 @@ test('A finish while the check of record failed is refused before the gate, nami
   assert.match(refusals[0]!, /^finish was not judged: the check of record failed \(step 3, `node mock\.mjs`, exit 1\)\. Finish is judged once the check of record exits 0 after the last write \(step 1\); the check of record is the last bash command run with check: true, so each one replaces the one before\. The last check that exited 0 was step 2's `node ok\.mjs`, after that write; a later check replaced it\.$/);
   assert(refusals.slice(1).every(r => r.endsWith('This finish was refused at the same state before (nothing has been written or checked since).')));
   assert((await events(store)).some(e => e.type === 'sampling' && e.data.temperature > config.stepTemperature), 'repeated refusals raise the temperature');
+});
+
+test('Only the step route thinks, within stepThinkingBudget, at stepThinkingTemperature, and only when stepThinking is on; the thinking is logged, not added to the prompt', async t => {
+  for (const on of [true, false]) {
+    const { root, store } = await repo(t);
+    const bonsai = bonsaiOf({ steps: [{ thought: 'done', action: 'plan', args: { notes: 'n' } }] });
+    const budgets: unknown[] = []; const temps: unknown[] = []; let meta: any = null; const prompts: Message[][] = [];
+    const spy = { ...bonsai, get lastMeta() { return meta; }, generate: async (m: Message[], schema: any, temperature?: number, context?: any, max?: number, progress?: (p: any) => void, thinking?: number) => {
+      budgets.push(thinking); temps.push(temperature); prompts.push(m); if (thinking) { progress?.({ text: '', tokens: 3, reasoning: 'why' }); meta = { ms: 1, promptTokens: 1, reasoning: 'Because the notes are empty.' }; } else meta = { ms: 1, promptTokens: 1 };
+      return bonsai.generate(m, schema); } };
+    const shown: any[] = [];
+    await new Agent({ ...config, maxSteps: 1, stepThinking: on, stepThinkingBudget: 512 }, store, jevOf({}), spy as any, root, () => {}, e => shown.push(e)).run(await newSession(root, 'x'));
+    assert.deepEqual(budgets, [on ? 512 : undefined]);
+    assert.deepEqual(temps, [on ? defaults.stepThinkingTemperature : config.stepTemperature], 'a thinking step samples at the thinking-mode temperature');
+    const logged = (await events(store)).filter(e => e.type === 'reasoning');
+    assert.deepEqual(logged.map(e => e.data.text), on ? ['Because the notes are empty.'] : []);
+    assert.equal(shown.find(e => e.kind === 'thought')?.reasoning, on ? 'Because the notes are empty.' : undefined);
+    if (on) assert(shown.some(e => e.kind === 'reasoning'), 'shown live');
+    assert(!JSON.stringify(prompts).includes('Because the notes are empty'), 'never in a prompt');
+  }
 });
 
 test('A completion Jev does not accept comes back as feedback; one it routes to the user pauses the session', async t => {
@@ -1211,14 +1232,16 @@ test('A stuck streak sets its reasoning aside and keeps its results: the turns o
 
 test('The render action shows the worker what the user sees: errors, a broken image, overflow, the headings; and the gate is told when a page was never rendered', async t => {
   if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
-  const html = '<!doctype html><html><head><title>Demo</title><style>body{margin:0;font-family:sans-serif}.wide{width:2000px;height:20px;background:red}</style></head><body><header><nav><ul><li><a href="/a">A</a></li><li><a href="/b">B</a></li></ul></nav></header><main><h1>Hello there</h1><img src="/missing.png" alt="Logo"><div class="wide"></div><section id="empty" style="height:40px"></section><script>console.error("boom"); throw new Error("kaput")</script></main></body></html>';
+  const html = '<!doctype html><html><head><title>Demo</title><style>body{margin:0;font-family:sans-serif}.wide{width:2000px;height:20px;background:red}</style></head><body><header><nav><ul><li><a href="/a">A</a></li><li><a href="/b">B</a></li></ul></nav></header><main><h1>Hello there</h1><img src="/missing.png" alt="Logo"><div class="wide"></div><div class="drawer" style="position:fixed;top:0;left:100%;width:300px;height:100px"><p>Cart</p></div><img src="http://127.0.0.1:1/gone.png" alt="Gone"><section id="empty" style="height:40px"></section><script>console.error("boom"); throw new Error("kaput")</script></main></body></html>';
   const server = createServer((req, res) => { if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(html); } else { res.writeHead(404); res.end('no'); } });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r())); t.after(() => server.close());
   const port = (server.address() as any).port;
   const { root } = await repo(t);
   const r = await renderFacts(root, `http://127.0.0.1:${port}/`, undefined, join(root, 'shot.png'), 30000);
   assert.equal(r.ok, false);
-  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /overflowing the viewport horizontally: [^|]*div\.wide/); assert.match(r.text, /exceptions thrown in the page: .*kaput/); assert.match(r.text, /Console messages: .*boom/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
+  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /The page scrolls sideways: it is 2000px wide in a \d+px viewport\./); assert.match(r.text, /cut by the viewport's edge \(partly on screen\) in a \d+px viewport: [^|\n]*div\.wide spans 0\.\.2000px/);
+  assert.match(r.text, /Elements wholly outside the viewport \(not on screen where they are\): [^\n]*div\.drawer spans \d+\.\.\d+px/); assert.doesNotMatch(r.text, /> p spans/, 'a listed element\'s descendants are not listed again');
+  assert.match(r.text, /failed: net::ERR_[A-Z_]+ http:\/\/127\.0\.0\.1:1\/gone\.png/, 'a request that never completed is named by its URL'); assert.match(r.text, /exceptions thrown in the page: .*kaput/); assert.match(r.text, /Console messages: .*boom/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
   assert((await readFile(join(root, 'shot.png'))).length > 1000, 'a screenshot is kept for the report');
 });
 
@@ -1364,7 +1387,7 @@ test('A generation that ends without closing its code block is reported as incom
   const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
   assert(result.entries.some(e => /generated content of src\/B\.tsx ended before the file was complete/.test(e.text)), 'the truncated creation is named');
   assert(result.entries.some(e => /rewrite of src\/Hero\.tsx reproduced its current content unchanged and ended before the file was complete/.test(e.text)), 'the no-op rewrite is named with its cause');
-  const { codeSampling } = await import('../src/clients.js'); assert.equal((codeSampling as any).dry_multiplier, undefined, 'no repetition penalty on code');
+  assert(!Object.keys(defaults).some(k => /dry|penalty/i.test(k)), 'no repetition penalty on code');
 });
 
 // Every tool description is tested against the harness: a field the prose names

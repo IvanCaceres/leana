@@ -156,12 +156,19 @@ export interface Config {
   // mistakes); minP drops every token less likely than minP times the most
   // likely one. Reasoning turns (step) and file content (code) are set apart.
   stepTemperature: number; stepMinP: number; codeTemperature: number; codeMinP: number;
+  // Every sampling value is sent with each request, so the server's own flags never decide it. A step
+  // that thinks (stepThinking) samples at stepThinkingTemperature, the model's thinking-mode setting;
+  // stepTemperature is for steps that do not think. top_p and top_k apply to both kinds of step.
+  stepThinkingTemperature: number; stepTopP: number; stepTopK: number; codeTopP: number; codeTopK: number;
   // The temperatures of the steps that follow turns which changed nothing (every
   // action refused or repeated what the evidence shows, notes as they were): the
   // k-th such turn in a row samples the next step at the k-th value (the last one
   // from then on), never below stepTemperature; the first turn that changes
   // something returns to stepTemperature. Empty: always stepTemperature.
   stepTemperatureEscalation: number[];
+  // The model's own thinking before each step's reply (its template's <think> block at effort medium),
+  // capped at stepThinkingBudget tokens, where the server closes it. false: the empty block is pre-filled.
+  stepThinking: boolean; stepThinkingBudget: number;
   // The verification command. When set, it is run as a baseline before any edit and
   // after every edit; only this command counts as verification.
   checkCommand: string;
@@ -169,7 +176,7 @@ export interface Config {
   // rewrite (continued across chunks) and the design, which may think first.
   createTokens: number;
 }
-export interface GenerationMeta { ms: number; usage?: any; timings?: any; finishReason?: string; promptTokens: number; continuations?: number }
+export interface GenerationMeta { ms: number; usage?: any; timings?: any; finishReason?: string; promptTokens: number; continuations?: number; reasoning?: string }
 export interface Message { role: 'system' | 'user' | 'assistant'; content: string }
 export type JsonSchema = {
   anyOf?: JsonSchema[]; const?: string;

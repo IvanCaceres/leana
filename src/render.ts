@@ -23,7 +23,14 @@ const probe = `(() => {
   const path = e => { const parts = []; let n = e; while (n && n.nodeType === 1 && parts.length < 4) { parts.unshift(n.tagName.toLowerCase() + (n.id ? '#' + n.id : n.classList.length ? '.' + [...n.classList].slice(0, 2).join('.') : '')); n = n.parentElement; } return parts.join(' > '); };
   const headings = [...document.querySelectorAll('h1,h2,h3')].filter(vis).slice(0, 24).map(h => h.tagName.toLowerCase() + ': ' + (h.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80));
   const images = [...document.images].filter(i => i.complete && i.naturalWidth === 0).slice(0, 12).map(i => (i.getAttribute('src') || '(no src)').slice(0, 120) + (i.alt ? ' (alt "' + i.alt.slice(0, 40) + '")' : ''));
-  const overflow = [...document.querySelectorAll('body *')].filter(vis).filter(e => { const r = e.getBoundingClientRect(); return r.right > vw + 2 || r.left < -2; }).slice(0, 8).map(e => { const r = e.getBoundingClientRect(); return path(e) + ' spans ' + Math.round(r.left) + '..' + Math.round(r.right) + 'px of a ' + vw + 'px viewport'; });
+  // Horizontal overflow as a user meets it: whether the document scrolls sideways, the elements cut by the
+  // viewport's edge (partly on screen), and, apart, those wholly outside it, which no one sees where they are
+  // (a closed off-canvas drawer parks there: run react-demo-85 spent 200 s fixing one reported as overflowing).
+  // Each listed once, by its outermost element: the descendants of a listed one lie there too.
+  const placed = (keep) => { const out = []; for (const e of document.querySelectorAll('body *')) { if (!vis(e) || out.some(o => o.contains(e))) continue; const r = e.getBoundingClientRect(); if (keep(r)) out.push(e); } return out.slice(0, 8).map(e => { const r = e.getBoundingClientRect(); return path(e) + ' spans ' + Math.round(r.left) + '..' + Math.round(r.right) + 'px'; }); };
+  const overflow = placed(r => (r.right > vw + 2 && r.left < vw - 1) || (r.left < -2 && r.right > 1));
+  const offscreen = placed(r => r.left >= vw - 1 || r.right <= 1);
+  const scrollWidth = document.documentElement.scrollWidth;
   const empty = [...document.querySelectorAll('section, main, article, header, footer')].filter(vis).filter(e => (e.textContent || '').trim().length < 20 && !e.querySelector('img,svg,canvas,video')).slice(0, 6).map(path);
   const rules = [...document.styleSheets].reduce((n, s) => { try { return n + s.cssRules.length; } catch { return n; } }, 0);
   // Every class name a selector mentions, walking nested rules (@media, @supports, @layer).
@@ -36,10 +43,10 @@ const probe = `(() => {
   const body = getComputedStyle(document.body);
   const text = (document.body.innerText || '').replace(/\\s+/g, ' ').trim();
   const links = [...document.querySelectorAll('a[href]')].filter(vis).slice(0, 30).map(a => ((a.textContent || a.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 30) || '(no text)') + ' -> ' + (a.getAttribute('href') || '').slice(0, 60));
-  return { title: document.title, headings, images, overflow, empty, rules, classes, inline, shadow, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
+  return { title: document.title, headings, images, overflow, offscreen, scrollWidth, empty, rules, classes, inline, shadow, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
 })()`;
 
-interface Facts { title: string; headings: string[]; images: string[]; overflow: string[]; empty: string[]; rules: number; classes: { used: number; unmatched: number; elementsUnmatched: number; sample: string[]; all: string[] }; inline: number; shadow: number; font: string; background: string; textLength: number; textHead: string; links: string[]; docHeight: number; viewport: string }
+interface Facts { title: string; headings: string[]; images: string[]; overflow: string[]; offscreen: string[]; scrollWidth: number; empty: string[]; rules: number; classes: { used: number; unmatched: number; elementsUnmatched: number; sample: string[]; all: string[] }; inline: number; shadow: number; font: string; background: string; textLength: number; textHead: string; links: string[]; docHeight: number; viewport: string }
 class Cdp {
   private id = 0; private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>(); private buffer = '';
   readonly events: { method: string; params: any }[] = [];
@@ -89,7 +96,13 @@ export async function renderFacts(root: string, url: string, serve: string | und
       const consoleErrors = cdp.events.filter(e => e.method === 'Runtime.consoleAPICalled' && (e.params?.type === 'error' || e.params?.type === 'warning')).map(e => `${e.params.type}: ${(e.params.args ?? []).map((a: any) => a.value ?? a.description ?? '').join(' ').slice(0, 200)}`);
       const logErrors = cdp.events.filter(e => e.method === 'Log.entryAdded' && e.params?.entry?.level === 'error' && own(String(e.params.entry.url ?? ''))).map(e => String(e.params.entry.text ?? '').slice(0, 200));
       const failed = cdp.events.filter(e => e.method === 'Network.responseReceived' && (e.params?.response?.status ?? 0) >= 400 && own(String(e.params.response.url))).map(e => `${e.params.response.status} ${String(e.params.response.url).slice(0, 120)}`);
-      const notLoaded = cdp.events.filter(e => e.method === 'Network.loadingFailed').map(e => `failed: ${String(e.params?.errorText ?? '')} ${String(e.params?.requestId ?? '')}`.slice(0, 160));
+      // A request that never completed, by its URL (the requestId means nothing to the worker) and, when the
+      // response came before the browser refused it (ORB blocks a cross-origin "image" whose body is not one),
+      // its status and content type: an HTML 404 page served for an image URL reads as such.
+      const sent = new Map(cdp.events.filter(e => e.method === 'Network.requestWillBeSent').map(e => [e.params?.requestId, String(e.params?.request?.url ?? '')]));
+      const answered = new Map(cdp.events.filter(e => e.method === 'Network.responseReceived').map(e => [e.params?.requestId, e.params?.response]));
+      const notLoaded = cdp.events.filter(e => e.method === 'Network.loadingFailed').map(e => { const id = e.params?.requestId; const r = answered.get(id);
+        return `failed: ${String(e.params?.errorText ?? '')} ${(sent.get(id) || String(id ?? '')).slice(0, 120)}${r ? ` (response ${r.status}${r.mimeType ? ` ${r.mimeType}` : ''})` : ''}`; });
       if (!facts) return { ok: false, text: `Rendered ${url} but the page could not be inspected (no document).` };
       const messages = [...consoleErrors, ...logErrors].slice(0, 12); const requests = [...new Set([...failed, ...notLoaded])].slice(0, 12);
       const c = facts.classes;
@@ -104,7 +117,9 @@ export async function renderFacts(root: string, url: string, serve: string | und
         messages.length ? `Console messages: ${messages.join(' | ')}` : '',
         `Page: title "${facts.title}"; ${facts.viewport}, height ${facts.docHeight}px; body font ${facts.font}; background ${facts.background}; ${facts.textLength} characters of text.`,
         `Styling: ${facts.rules} CSS rules; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS selector${c.unmatched ? ` (without one: ${c.sample.join(', ')}${c.unmatched > c.sample.length ? ', …' : ''})` : ''}; ${facts.inline} elements with a style attribute; ${facts.shadow} shadow roots.`,
-        facts.overflow.length ? `Elements overflowing the viewport horizontally: ${facts.overflow.join(' | ')}` : '',
+        facts.scrollWidth > Number(facts.viewport.split('x')[0]) + 2 ? `The page scrolls sideways: it is ${facts.scrollWidth}px wide in a ${facts.viewport.split('x')[0]}px viewport.` : '',
+        facts.overflow.length ? `Elements cut by the viewport's edge (partly on screen) in a ${facts.viewport.split('x')[0]}px viewport: ${facts.overflow.join(' | ')}` : '',
+        facts.offscreen.length ? `Elements wholly outside the viewport (not on screen where they are)${facts.scrollWidth > Number(facts.viewport.split('x')[0]) + 2 ? '' : ', the page not scrolling to them'}: ${facts.offscreen.join(' | ')}` : '',
         `Headings: ${facts.headings.length ? facts.headings.join(' | ') : 'none'}`,
         facts.empty.length ? `Visible regions with no text or media: ${facts.empty.join(' | ')}` : '',
         `Links: ${facts.links.length ? facts.links.slice(0, 12).join(' | ') : 'none'}`,

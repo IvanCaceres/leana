@@ -150,7 +150,8 @@ test('A step reply is read as it streams: the thought grows in the progress, and
   const done = logged.find(([type]) => type === 'bonsai')![1]; assert.deepEqual([done.usage, done.timings, done.finishReason, done.model], [usage, timings, 'stop', 'bonsai-27b']);
   // Delivery options only: every other field is the unstreamed request's.
   const { stream, stream_options, return_progress, ...rest } = bodies[0]; assert.deepEqual([stream, stream_options, return_progress], [true, { include_usage: true }, true]);
-  assert.deepEqual(Object.keys(rest), ['model', 'messages', 'temperature', 'min_p', 'max_tokens', 'chat_template_kwargs', 'response_format']);
+  assert.deepEqual(Object.keys(rest), ['model', 'messages', 'temperature', 'top_p', 'top_k', 'min_p', 'max_tokens', 'chat_template_kwargs', 'response_format']);
+  assert.deepEqual([rest.top_p, rest.top_k], [.95, 20], 'top_p and top_k are sent, not left to the server flags');
   // A server that sends no usage: made from the timings, as the server builds it.
   mode = 'nousage'; await bonsai.generate([{ role: 'user', content: 'u' }], stepReply);
   assert.deepEqual(bonsai.lastMeta?.usage, { completion_tokens: pieces.length, prompt_tokens: 1000, total_tokens: 1000 + pieces.length, prompt_tokens_details: { cached_tokens: 900 } });
@@ -458,4 +459,38 @@ test('A step and a file generation stream through the real Agent: the thought is
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.every(e => !['thinking', 'writing', 'generating'].includes(e.type)), 'nothing display-only is logged');
   const raw = events.filter(e => e.type === 'bonsai' && e.data.raw).at(-1).data; assert.deepEqual([raw.finishReason, raw.continuations, raw.usage.completion_tokens], ['stop', 0, [...`${file}\`\`\``].length]);
+});
+
+test('With stepThinking the step request asks for the model\'s own thinking at effort medium within its budget; the thinking streams ahead of the reply, is kept in the meta and the log, and never enters the reply', async t => {
+  const reply = JSON.stringify({ thought: 'Read the config first.', actions: [{ action: 'read_files', args: { files: [{ path: 'vite.config.ts', start: 1, end: 40 }] } }] });
+  const reasoning = 'The build says the plugin is missing. Is it in the manifest? The config imports it, so read the config first.';
+  const bodies: any[] = []; const logs: [string, any][] = [];
+  const url = await listen(t, async (req, res) => {
+    const b = await body(req);
+    if (req.url === '/apply-template') return res.end(JSON.stringify({ prompt: chatml(b) }));
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    bodies.push(b);
+    const { events } = chat(reply.match(/[\s\S]{1,4}/g)!);
+    // The server parses the thinking out ahead of the content (reasoning_format deepseek): reasoning_content deltas first.
+    const thinking = reasoning.match(/[\s\S]{1,5}/g)!.map(p => ({ ...events[1], choices: [{ finish_reason: null, index: 0, delta: { reasoning_content: p } }] }));
+    await serve(res, [events[0], ...thinking, ...events.slice(1)], { done: true });
+  });
+  const bonsai = new Bonsai({ ...defaults, baseUrl: `${url}/v1` }, 'local', async (type, data) => { logs.push([type, data]); });
+  const seen: StreamProgress[] = [];
+  const args = await bonsai.generate([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], stepReply, .2, { step: 1, route: 'step' }, undefined, p => seen.push({ ...p }), 1024);
+  assert.deepEqual(args, JSON.parse(reply), 'the reply is the content alone');
+  assert.equal(bonsai.lastMeta?.reasoning, reasoning);
+  const b = bodies.at(-1);
+  assert.deepEqual([b.chat_template_kwargs, b.reasoning_effort, b.reasoning_budget_tokens, typeof b.reasoning_budget_message], [{ enable_thinking: true }, 'medium', 1024, 'string'], 'medium adds no text to the system message, so the cached prefix holds');
+  assert(seen.some(p => p.reasoning && !p.text) && seen.at(-1)!.reasoning === reasoning, 'the thinking is reported as it streams, before the reply');
+  const logged = logs.find(([type]) => type === 'bonsai')![1]; assert.deepEqual([logged.reasoningChars, logged.reasoningForced], [reasoning.length, false]);
+  // Without a budget the request is today's: the empty think block is pre-filled and no thinking field is sent.
+  await bonsai.generate([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], stepReply, .2, { step: 2, route: 'step' }, undefined, undefined);
+  assert.deepEqual([bodies.at(-1).chat_template_kwargs, 'reasoning_effort' in bodies.at(-1), 'reasoning_budget_tokens' in bodies.at(-1)], [{ enable_thinking: false }, false, false]);
+  assert.equal(bonsai.lastMeta?.reasoning, undefined);
+  // The display shows the thinking live by its last rows, then prints it whole above the thought.
+  assert.equal(describe({ kind: 'thought', step: 3, thought: 'Read the config first.', actions: [{ action: 'plan', args: { notes: 'n' } }], reasoning }, false)!.split('\n')[0], `[3] reasoning: ${reasoning}`);
+  const writes: string[] = []; const d = new Display({ isTTY: true, columns: 100, rows: 40, write: (x: string) => { writes.push(x); return true; } } as any, { objective: 'o', session: 's', verbose: false });
+  d.update({ kind: 'reasoning', step: 3, text: reasoning, tokens: 30 });
+  assert(d.panel().some(l => l.startsWith('Reasoning  ') && l.includes('The build says')), 'live under the panel'); d.close();
 });

@@ -330,11 +330,16 @@ export class Agent {
     await this.logPrompt(s, route, prompt, tokens);
     this.observe({ kind: 'generating', step: s.step, route, attempt: 1 });
     // As it streams: how far the prompt has been read, then a step's thought and actions so far; any other reply only its token count.
+    // The step's reply may follow the model's own thinking (stepThinking); no other route thinks.
+    const thinking = route === 'step' && this.config.stepThinking ? this.config.stepThinkingBudget : undefined;
     const args = await this.bonsai.generate(prompt, schema, temperature, { step: s.step, route }, undefined, every(100, (p: StreamProgress) => {
       const reply = route === 'step' && !p.prompt ? partialJson(p.text) : undefined;
-      this.observe(typeof reply?.thought === 'string' ? { kind: 'thinking', step: s.step, text: reply.thought, tokens: p.tokens, ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}) }
+      this.observe(p.reasoning && !p.text ? { kind: 'reasoning', step: s.step, text: p.reasoning, tokens: p.tokens } : typeof reply?.thought === 'string' ? { kind: 'thinking', step: s.step, text: reply.thought, tokens: p.tokens, ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}) }
         : { kind: 'generating', step: s.step, route, attempt: 1, ...(p.prompt ? { prompt: p.prompt } : { tokens: p.tokens }) });
-    }));
+    }), thinking);
+    // The thinking is kept in the log, not in the prompt: the turn holds the reply, whose thought is its summary.
+    const reasoning = this.bonsai.lastMeta?.reasoning;
+    if (reasoning) await this.store.log('reasoning', { step: s.step, chars: reasoning.length, text: clip(reasoning, 16000) });
     this.observe({ kind: 'generated', step: s.step, route, meta: this.bonsai.lastMeta ?? null, args });
     return args;
   }
@@ -599,15 +604,17 @@ export class Agent {
         // same 196 tokens at steps 54 and 55). Each further step of such a streak is sampled at
         // the next temperature of the escalation; a turn that changes something ends it.
         const streak = s.unchangedTurns ?? 0; const escalation = this.config.stepTemperatureEscalation ?? [];
-        const temperature = streak && escalation.length ? Math.max(this.config.stepTemperature, escalation[Math.min(streak, escalation.length) - 1]!) : this.config.stepTemperature;
-        if (temperature !== this.config.stepTemperature) await this.store.log('sampling', { step: s.step, unchangedTurns: streak, temperature });
+        // A step that thinks samples at the thinking-mode temperature; the escalation never goes below the base.
+        const base = this.config.stepThinking ? this.config.stepThinkingTemperature : this.config.stepTemperature;
+        const temperature = streak && escalation.length ? Math.max(base, escalation[Math.min(streak, escalation.length) - 1]!) : base;
+        if (temperature !== base) await this.store.log('sampling', { step: s.step, unchangedTurns: streak, temperature });
         try {
           const item = { anyOf: stepSchema.anyOf!.filter(alt => allowed.includes(alt.properties!.action!.const as Route)) };
           const gen = await this.generateJson(s, 'step', () => stepMessages(s, allowed, notes.join(' ') || undefined), { type: 'object', properties: { thought: { type: 'string' }, actions: { type: 'array', minItems: 1, maxItems: 8, items: item } }, required: ['thought', 'actions'], additionalProperties: false }, temperature);
           thought = String(gen.thought ?? '').trim(); batch = (gen.actions as any[]).map(a => ({ action: String(a.action) as Route, args: (a.args ?? {}) as Record<string, any> }));
           s.lastThought = thought;
           await this.store.log('thought', { step: s.step, thought: clip(thought, 2000), actions: batch.map(b => b.action), temperature });
-          this.observe({ kind: 'thought', step: s.step, thought, actions: batch });
+          this.observe({ kind: 'thought', step: s.step, thought, actions: batch, ...(this.bonsai.lastMeta?.reasoning ? { reasoning: this.bonsai.lastMeta.reasoning } : {}) });
         } catch (e) {
           if (++generationFailures >= 4) throw e;
           const cut = /\(length\)/.test((e as Error).message);

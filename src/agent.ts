@@ -130,6 +130,7 @@ export class Agent {
       s.previousCheck = s.lastCheck;
       let output = result.text; try { output = String(JSON.parse(result.text).output ?? result.text); } catch { /* plain text */ }
       s.lastCheck = { step: s.step, ok: result.ok, text: clipEnds(output, 1500), summary: await summarizeCheck(result.text, s.root, [...s.writes, ...s.knownFiles]), fileHashes: await sourceHashes(s.root, s.writes), ...(kind === 'bash' && typeof args?.command === 'string' ? { command: args.command.trim() } : {}) };
+      if (result.ok) s.lastPassedCheck = { step: s.step, ...(s.lastCheck.command ? { command: s.lastCheck.command } : {}) };
       if (!result.ok) {
         // Every line the output names, in every file it names, as the file reads now (read
         // as read_files and the edits read it, so its sha256 is the hash an edit carries):
@@ -837,6 +838,18 @@ export class Agent {
     if (route === 'ask_user') { s.status = 'paused'; s.stopReason = String(args.question ?? 'The worker needs a decision from the user.'); await this.store.log('ask', { step: s.step, question: s.stopReason }); return 'stop'; }
     if (route === 'finish') {
       if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1)) return refuse(`${s.lastCheckCommand} has not run since the last edit; run it, then finish.`);
+      // A check of record that failed after the last write, or none at all, is a rejection the gate
+      // makes from code whatever Jev reads, so it is stated before the gate runs, with what decides it:
+      // which command the check of record is and how it is replaced. The same finish on the same state
+      // is a duplicate, so a streak of them raises the sampling temperature and ends at four in a row.
+      // (Run dk-country-3: the check of record was a throwaway Node mock that failed; told only "the
+      // verification did not pass after the last edit", the worker finished the same way 40 times.)
+      if (!s.lastCheck || s.lastCheck.ok === false) {
+        const c = s.lastCheck; const quote = (x?: string) => `\`${clip((x ?? '').replace(/\s+/g, ' '), 120)}\``;
+        const passed = s.lastPassedCheck && s.lastPassedCheck.step > s.lastWriteStep && s.lastPassedCheck.step !== c?.step ? ` The last check that exited 0 was step ${s.lastPassedCheck.step}'s ${quote(s.lastPassedCheck.command)}, after that write; a later check replaced it.` : '';
+        const state = `${c?.step ?? -1}:${s.lastWriteStep}`; const again = s.finishRefused === state; s.finishRefused = state;
+        return refuse(`finish was not judged: the check of record ${c ? `failed (step ${c.step}, ${quote(c.command ?? s.lastCheckCommand ?? '')}, exit ${c.summary.code ?? 'unknown'})` : 'has never run: no bash command has been run with check: true in this session'}. Finish is judged once the check of record exits 0 after the last write${s.lastWriteStep >= 0 ? ` (step ${s.lastWriteStep})` : ''}; the check of record is the last bash command run with check: true, so each one replaces the one before.${passed}${again ? ` This finish was refused at the same state before (nothing has been written or checked since).` : ''}`, again);
+      }
       const facts = await this.completionFacts(s, String(args.summary ?? ''));
       await this.store.log('completion-facts', { step: s.step, facts: { ...facts, sources: Object.keys(facts.sources as object) } });
       const verdict = await evidenceGate(this.jev, s, facts);

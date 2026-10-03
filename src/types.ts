@@ -39,6 +39,8 @@ export interface Session {
   repetitions: Record<string, number>; coverage: Record<string, Coverage>;
   hashes: Record<string, string>; lastPromptTokens: number;
   lastCheck: CheckRecord | null; previousCheck: CheckRecord | null;
+  // The last check that exited 0, and the state a finish was last refused on (finishRefused, see Agent.act).
+  lastPassedCheck?: { step: number; command?: string }; finishRefused?: string;
   // Pre-edit snapshots of files edited since the previous check, and the set
   // offered for rollback once the next check has judged those edits.
   editSnapshots: Record<string, string>;

@@ -94,6 +94,27 @@ test('The loop: orient, reason then act, verify what the worker declared as its 
   assert.equal(jev.calls.filter(c => c.phase === 'watchdog').length, 6, 'one reading per batch, none after the accepted finish');
 });
 
+test('A finish while the check of record failed is refused before the gate, naming the check and the passing one it replaced; the same finish on the same state is a duplicate that raises the temperature and ends at four (run dk-country-3)', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'ok.mjs'), 'process.exit(0);\n'); await writeFile(join(root, 'mock.mjs'), 'process.exit(1);\n');
+  const finish = { thought: 'The mock is not a real check; the page rendered, so finish.', action: 'finish', args: { summary: 'built the game' } };
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'write it', action: 'create_file', args: { path: 'index.html', purpose: 'the game' } },
+    { thought: 'syntax', action: 'bash', args: { command: 'node ok.mjs', purpose: 'syntax check', check: true } },
+    { thought: 'mock', action: 'bash', args: { command: 'node mock.mjs', purpose: 'mock run', check: true } },
+    finish, finish, finish, finish, finish,
+  ] });
+  const jev = jevOf({});
+  const result = await new Agent({ ...config, maxSteps: 12 }, store, jev, bonsai, root, () => {}, () => {}).run(await newSession(root, 'Build the game'));
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /four (actions|turns) in a row/);
+  assert(!jev.calls.some(c => c.phase === 'evidence-gate'), 'the gate is never asked: the check decides it');
+  const refusals = (await events(store)).filter(e => e.type === 'refused' && e.data.route === 'finish').map(e => e.data.why as string);
+  assert.equal(refusals.length, 4);
+  assert.match(refusals[0]!, /^finish was not judged: the check of record failed \(step 3, `node mock\.mjs`, exit 1\)\. Finish is judged once the check of record exits 0 after the last write \(step 1\); the check of record is the last bash command run with check: true, so each one replaces the one before\. The last check that exited 0 was step 2's `node ok\.mjs`, after that write; a later check replaced it\.$/);
+  assert(refusals.slice(1).every(r => r.endsWith('This finish was refused at the same state before (nothing has been written or checked since).')));
+  assert((await events(store)).some(e => e.type === 'sampling' && e.data.temperature > config.stepTemperature), 'repeated refusals raise the temperature');
+});
+
 test('A completion Jev does not accept comes back as feedback; one it routes to the user pauses the session', async t => {
   const { root, store } = await repo(t);
   await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');

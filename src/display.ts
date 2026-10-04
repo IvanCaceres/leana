@@ -184,7 +184,7 @@ export class Display {
   // What is being generated, shown live under the panel: a step's thought, or a file's last lines. Once one
   // has been shown its rows stay (blank between generations), so the panel does not jump as they start and end.
   private live: Extract<ProgressEvent, { kind: 'reasoning' | 'thinking' | 'writing' }> | null = null; private liveShown = false;
-  constructor(private out: Stream, private opts: { objective: string; session: string; verbose: boolean }) {
+  constructor(private out: Stream, private opts: { objective: string; session: string; verbose: boolean; model?: string }) {
     if (out.isTTY) { this.timer = setInterval(() => this.render(), 1000); this.timer.unref?.(); }
   }
   private width(): number { return Math.max(20, Math.min(160, this.out.columns ?? 100)); }
@@ -244,7 +244,7 @@ export class Display {
     const avgTps = this.tps.length ? this.tps.reduce((a, b) => a + b, 0) / this.tps.length : null;
     const rows = [
       '-'.repeat(this.width() - 1),
-      `Leana | ${this.opts.session} | step ${this.step}${this.maxStep ? `/${this.maxStep}` : ''} | ${this.phase} | ${this.status} | ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')} elapsed`,
+      `Leana | ${this.opts.session}${this.opts.model ? ` | ${this.opts.model}` : ''} | step ${this.step}${this.maxStep ? `/${this.maxStep}` : ''} | ${this.phase} | ${this.status} | ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')} elapsed`,
       `Objective  ${this.opts.objective.replace(/\s+/g, ' ')}`,
       `Jev        ${this.lastJev || '-'}`,
       `           median ${secs(quantile(this.jevMs, .5))} | p95 ${secs(quantile(this.jevMs, .95))} | ${this.jevMs.length} calls`,

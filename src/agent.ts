@@ -36,9 +36,13 @@ export async function newSession(root: string, objective: string): Promise<Sessi
     notes: '', watch: { noProgress: 0, readings: [], escalations: 0 }, blockedActions: [] };
 }
 
-type BonsaiLike = Pick<Bonsai, 'count' | 'generate'> & { generateText?: Bonsai['generateText']; lastMeta?: Bonsai['lastMeta'] };
+// The model client: llama-server's (Bonsai) or OpenRouter's, which make the same calls.
+type BonsaiLike = Pick<Bonsai, 'count' | 'generate'> & { generateText?: Bonsai['generateText']; lastMeta?: Bonsai['lastMeta'] | null };
 export class Agent {
   readonly tools: ToolBox; private current = 0;
+  // Set by stop(): the run pauses before its next step (the step under way finishes; its result is kept).
+  private stopRequested = false;
+  stop(): void { this.stopRequested = true; }
   // The entries a harness statement being recorded names (see repeat): kept from supersession and eviction while it is the freshest entry.
   private citing: string[] = [];
   // Whether the last refusal was of a request already made (the same arguments on the same state), not a new fact.
@@ -553,6 +557,7 @@ export class Agent {
     s.unchangedTurns = 0;
     try {
       for (; s.step < endStep;) {
+        if (this.stopRequested) { s.status = 'paused'; s.stopReason = 'Stopped by the user; resume to continue.'; break; }
         s.step++; this.current = s.step; s.currentTurn = null;
         this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep });
         if (this.config.allowBash && await this.retrySetup(s)) { s.unchangedTurns = 0; await this.store.save(s); continue; }

@@ -28,7 +28,7 @@ export async function postJson(url: string, body: unknown, key: string, timeoutM
   return (await post(url, body, key, timeoutMs, retries)).json();
 }
 // Whether a reply is a server-sent event stream; anything else (a server or mock that ignores `stream`) is read as JSON.
-const isEventStream = (r: Response) => /^text\/event-stream\b/i.test(r.headers.get('content-type') ?? '');
+export const isEventStream = (r: Response) => /^text\/event-stream\b/i.test(r.headers.get('content-type') ?? '');
 // The data of each event of a server-sent event stream, as it arrives. A character split across reads is
 // decoded once whole and a line split across reads once ended; comments (llama-server's keep-alive pings)
 // and other fields are skipped, and an event the stream ends inside of is never delivered.
@@ -71,7 +71,7 @@ export async function* streamEvents(response: Response, url: string, abort: Abor
 // far, the cached ones included), from the events return_progress asks for.
 export interface StreamProgress { text: string; tokens: number; perSecond?: number; prompt?: { total: number; cache: number; processed: number }; reasoning?: string }
 // A progress callback that cannot fail the generation it reports on: it only draws.
-const quietly = <T>(f?: (x: T) => void) => (x: T) => { try { f?.(x); } catch { /* a display error is not the generation's */ } };
+export const quietly = <T>(f?: (x: T) => void) => (x: T) => { try { f?.(x); } catch { /* a display error is not the generation's */ } };
 // A streamed chat completion rebuilt as the reply the server sends unstreamed: the content its deltas spell,
 // the finish reason, and the model, usage and timings its last events carry. A server that does not honour
 // stream_options sends no usage; it is made from the timings, as the server builds it (usage_json_oaicompat).

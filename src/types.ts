@@ -146,6 +146,9 @@ export interface Session {
   unchangedTurns?: number;
 }
 export interface Config {
+  // The model's provider: llama (a llama-server at baseUrl) or openrouter (OpenRouter's API at openrouterUrl, its key in
+  // OPENROUTER_API_KEY or the file providerKeyFile). model is the model's id there.
+  provider: 'llama' | 'openrouter'; openrouterUrl: string; providerKeyFile: string;
   baseUrl: string; model: string; contextWindow: number; maxTokens: number;
   workingTokens: number; safetyTokens: number; jevUrl: string; jevModel: string;
   routeProbability: number; routeMargin: number; compactProbability: number;
@@ -172,7 +175,7 @@ export interface Config {
   // The model's own thinking before each file's code (create_file, rewrite_file), capped at codeThinkingBudget tokens.
   codeThinking: boolean; codeThinkingBudget: number;
   // The template's reasoning effort for every thinking request (one value: its sentence is in the shared system message).
-  thinkingEffort: 'xhigh' | 'medium' | 'low';
+  thinkingEffort: string;
   // The verification command. When set, it is run as a baseline before any edit and
   // after every edit; only this command counts as verification.
   checkCommand: string;

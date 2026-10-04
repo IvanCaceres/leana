@@ -1,6 +1,9 @@
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { Config } from './types.js';
 export const defaults: Config = {
+  provider: 'llama', openrouterUrl: 'https://openrouter.ai/api/v1', providerKeyFile: '',
   baseUrl: 'http://127.0.0.1:8080/v1', model: 'bonsai-27b', contextWindow: 48000,
   maxTokens: 8192, workingTokens: 12000, safetyTokens: 1024,
   jevUrl: 'https://api.typesafe.ai/v1/systemone', jevModel: 'jev-latest',
@@ -58,13 +61,32 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   for (const k of ['stepMinP', 'codeMinP'] as const) if (c[k] >= 1) throw new Error(`${k} must be between 0 and 1`);
   if (!Array.isArray(c.stepTemperatureEscalation) || c.stepTemperatureEscalation.length > 8 || c.stepTemperatureEscalation.some(t => typeof t !== 'number' || !Number.isFinite(t) || t <= 0 || t > 2))
     throw new Error('stepTemperatureEscalation must be a list of at most 8 temperatures, each above 0 and at most 2');
-  if (!['xhigh', 'medium', 'low'].includes(c.thinkingEffort)) throw new Error('thinkingEffort must be xhigh, medium or low');
+  if (!['llama', 'openrouter'].includes(c.provider)) throw new Error('provider must be llama or openrouter');
+  // Which efforts a model takes is the model's (models.ts); here only the shape.
+  if (!/^[a-z]+$/.test(c.thinkingEffort)) throw new Error('thinkingEffort must be one word, such as medium');
   if (!Number.isSafeInteger(c.codeThinkingBudget) || c.codeThinkingBudget > 8192) throw new Error('codeThinkingBudget must be an integer of at most 8192');
   if (!Number.isSafeInteger(c.stepThinkingBudget) || c.stepThinkingBudget >= c.maxTokens - 256) throw new Error('stepThinkingBudget must be an integer below maxTokens - 256 (the reply follows the thinking in the same output budget)');
   if (c.toolChars < 500 || c.toolChars > 20000) throw new Error('toolChars must be 500..20000');
-  for (const key of ['baseUrl', 'jevUrl'] as const) {
+  for (const key of ['baseUrl', 'jevUrl', 'openrouterUrl'] as const) {
     const u = new URL(c[key]);
     if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) throw new Error(`Invalid ${key}`);
   }
   return c;
+}
+
+// The choices made in the app (provider, model, reasoning, sampling, limits), kept between runs in the user's
+// config directory. Permissions are never kept: shell and write access are given per run.
+export const settingsPath = (): string => join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'leana', 'settings.json');
+const kept = new Set(['provider', 'model', 'openrouterUrl', 'providerKeyFile', 'baseUrl', 'stepThinking', 'codeThinking', 'thinkingEffort', 'stepThinkingBudget', 'codeThinkingBudget',
+  'stepTemperature', 'stepThinkingTemperature', 'codeTemperature', 'stepTopP', 'codeTopP', 'stepTopK', 'codeTopK', 'stepMinP', 'codeMinP', 'codePresencePenalty', 'maxTokens', 'workingTokens', 'maxSteps']);
+export interface Settings { config: Partial<Config>; repo?: string }
+export async function loadSettings(path = settingsPath()): Promise<Settings> {
+  let raw: any; try { raw = JSON.parse(await readFile(path, 'utf8')); } catch { return { config: {} }; }
+  const config = Object.fromEntries(Object.entries(raw?.config ?? {}).filter(([k]) => kept.has(k))) as Partial<Config>;
+  return { config, ...(typeof raw?.repo === 'string' ? { repo: raw.repo } : {}) };
+}
+export async function saveSettings(s: Settings, path = settingsPath()): Promise<void> {
+  const config = Object.fromEntries(Object.entries(s.config).filter(([k]) => kept.has(k)));
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify({ config, ...(s.repo ? { repo: s.repo } : {}) }, null, 2)}\n`, { mode: 0o600 });
 }

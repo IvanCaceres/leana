@@ -1,6 +1,6 @@
 import type { Deliverable, Answers, Config, Coverage, Entry, Message, Questions, Route, Session, SourceEvidence } from './types.js';
 import { editRoutes } from './types.js';
-import { focusedEditSchema, schemas } from './schema.js';
+import { focusedEditSchema, schemas, toolSchema } from './schema.js';
 import { referenceContext } from './references.js';
 import { sourceFile } from './profiles.js';
 import { observerCatalog } from './observe-catalog.js';
@@ -274,9 +274,11 @@ export function compactArgs(v: unknown): unknown {
 }
 // The worker's reasoning and actions for a batch, exactly in the shape it
 // generated them, recorded before the batch runs so that the prefix only grows.
-export function turnEntry(step: number, thought: string, batch: { action: string; args: Record<string, any> }[]): Entry {
+// whole: the calls as the model made them (the tools form, where a file's content is in its call and the
+// turn is how the model knows what it wrote), not compacted.
+export function turnEntry(step: number, thought: string, batch: { action: string; args: Record<string, any> }[], whole = false): Entry {
   return { id: `t${step}`, step, kind: 'turn', artifact: '', relevance: .5, outcomes: [],
-    text: JSON.stringify({ thought: cut(thought, 600), actions: batch.map(b => ({ action: b.action, args: compactArgs(b.args) })) }) };
+    text: JSON.stringify({ thought: whole ? thought : cut(thought, 600), actions: batch.map(b => ({ action: b.action, args: whole ? b.args : compactArgs(b.args) })) }) };
 }
 const cut = (text: string, n: number) => text.length > n ? `${text.slice(0, n - 1)}…` : text;
 function trailLine(turn: Entry): string {
@@ -357,7 +359,10 @@ export function promptFields(prompt: Message[]): Record<string, any> {
 // (objective, instructions, orientation), the evidence entries one per
 // message, and a last message stating the request: reason and name an action,
 // or produce the arguments of the action just chosen, or write a file.
-export const AGENT_SYSTEM = 'You are Bonsai, a coding agent working in a repository through tools. Each step you reason briefly about the objective, what you know and what you just observed, then name the actions to take. Your own earlier turns are the assistant messages, each followed by the results of its actions; steps whose evidence was dropped for room are summarised in earlierSteps. You decide what to read, what to run (scaffolders, package managers, checks), what to write and in what order; the harness executes your action, verifies what it can, and shows you what happened. Prefer acting on facts you have over reading what is already shown. Keep your notes current with the plan action.';
+// The agent's system message; named for the model when it has a name of its own here (Bonsai, served
+// locally), otherwise it is just the coding agent.
+export const agentSystem = (name?: string): string => `You are ${name ? `${name}, a` : 'a'} coding agent working in a repository through tools. Each step you reason briefly about the objective, what you know and what you just observed, then name the actions to take. Your own earlier turns are the assistant messages, each followed by the results of its actions; steps whose evidence was dropped for room are summarised in earlierSteps. You decide what to read, what to run (scaffolders, package managers, checks), what to write and in what order; the harness executes your action, verifies what it can, and shows you what happened. Prefer acting on facts you have over reading what is already shown. Keep your notes current with the plan action.`;
+export const AGENT_SYSTEM = agentSystem('Bonsai');
 export function orientationBlock(s: Session, allowed?: string[]): Record<string, unknown> {
   return { objective: s.objective, repositoryInstructions: s.instructions || undefined, orientation: s.orientation ?? undefined,
     ...(allowed ? { actions: Object.fromEntries(allowed.map(a => [a, { description: routeDescriptions[a as Route], instructions: details[a as Route], argumentSchema: schemas[a as Route] }])) } : {}) };
@@ -403,13 +408,57 @@ export function verificationBlock(s: Session, point = true): Record<string, unkn
 export function agentAllowed(s: Session): string[] | undefined { return s.allowedActions; }
 function agentPrefix(s: Session): Message[] {
   return [
-    { role: 'system', content: AGENT_SYSTEM },
-    { role: 'user', content: JSON.stringify(orientationBlock(s, s.allowedActions)) },
+    { role: 'system', content: s.form ? agentSystem() : AGENT_SYSTEM },
+    // Under the tools form the actions are the model's tools, each with its description, instructions and schema.
+    { role: 'user', content: JSON.stringify(orientationBlock(s, s.form === 'tools' ? undefined : s.allowedActions)) },
     // The trail changes only when evidence is evicted, which already reprocesses from the
     // oldest entry, so it sits before the evidence rather than being reprocessed every step.
     ...(s.trail?.length ? [{ role: 'user' as const, content: JSON.stringify({ earlierSteps: s.trail }) }] : []),
-    ...s.entries.map(e => e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : { role: 'user' as const, content: JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } }) }),
+    ...(s.form === 'tools' ? toolTranscript(s) : s.entries.map(e => e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : evidenceMessage(e))),
   ];
+}
+const evidenceContent = (e: Entry): string => JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } });
+const evidenceMessage = (e: Entry): Message => ({ role: 'user', content: evidenceContent(e) });
+// The file actions as the model's own tools: the content is written in the call (toolForms).
+const toolDescriptions: Partial<Record<Route, string>> = {
+  create_file: 'Create a file that does not exist yet, with its complete content.',
+  rewrite_file: 'Replace the whole content of an existing file, or one block of it (start and end). For any change larger than a few lines.',
+  write: 'Replace one exact piece of an existing file\'s text with new text: the way to change a few lines without retyping the file.',
+  replace_lines: 'Replace, delete or prefix up to 40 line ranges of an already-read file in one call, addressed by line numbers instead of exact text; the way to remove many unused-import lines at once, or to export many declarations at once (prepend).',
+};
+const toolDetails: Partial<Record<Route, string>> = {
+  create_file: 'path is the repository-relative path of a file that does not exist yet (an existing file is changed with rewrite_file or write). content is the whole file: working code with no placeholders, TODOs or omitted sections, importing repository modules by the names they export and packages the manifest declares. A large file goes in a call of its own: a reply is limited in length, and a call cut off by the limit is not run.',
+  rewrite_file: 'path is an existing file. Without start and end, content is its whole new content. With start and end (1-based, inclusive, numbered as in the latest read or edit result of the file), content is the new text of lines start..end only, and the rest of the file stays as it is (end = start - 1 inserts before line start; start = totalLines + 1 appends): give them whenever most of the file stays. Lines numbered from a version of the file you have not seen are refused.',
+  write: 'oldText is copied exactly from the file as you last read or wrote it and occurs in it once; newText replaces it and differs from it. expectedHash (optional) is the file\'s sha256 from fileHashes; without it the file as it is now is edited, and oldText must match it exactly. A new file is made with create_file.',
+};
+// An action as one of the model's tools (the tools form): its name, its description and instructions, its arguments' schema.
+export function actionTool(action: string): { type: 'function'; function: { name: string; description: string; parameters: Record<string, unknown> } } {
+  const a = action as Route;
+  return { type: 'function', function: { name: action, description: `${toolDescriptions[a] ?? routeDescriptions[a]} ${toolDetails[a] ?? details[a]}`, parameters: toolSchema(a) as unknown as Record<string, unknown> } };
+}
+// The evidence as the model's own tool-calling transcript: a turn is an assistant message, its thought as the
+// text and one call per action; right after it, one tool message per call. Action i of a turn ran at the turn's
+// step + i, so a call's result is the turn's entries of that step. A call with none says what is known of it:
+// it ran and its result has left the evidence; the batch stopped before it; or, while the batch runs (a file of
+// it is being written), it is the one the request is for, or it runs later. Entries of no turn shown, and the
+// results of a turn that left, stay user messages where they are.
+function toolTranscript(s: Session): Message[] {
+  const shown = new Set(s.entries.filter(e => e.kind === 'turn').map(e => e.id)); const out: Message[] = [];
+  for (const e of s.entries) {
+    if (e.kind !== 'turn') { if (!e.turn || !shown.has(e.turn)) out.push(evidenceMessage(e)); continue; }
+    let turn: { thought?: unknown; actions?: { action: string; args?: unknown }[] } = {}; try { turn = JSON.parse(e.text); } catch { /* not a turn */ }
+    const calls = (Array.isArray(turn.actions) ? turn.actions : []).map((a, i) => ({ id: `${e.id}_${i}`, type: 'function' as const, function: { name: String(a.action), arguments: JSON.stringify(a.args ?? {}) } }));
+    out.push({ role: 'assistant', content: String(turn.thought ?? ''), ...(calls.length ? { tool_calls: calls } : {}) });
+    const results = s.entries.filter(r => r.kind !== 'turn' && r.turn === e.id); const ran = e.outcomes?.length ?? 0;
+    const running = s.currentTurn === e.id ? s.step - e.step : -1;
+    calls.forEach((c, i) => {
+      const mine = results.filter(r => Math.min(Math.max(r.step - e.step, 0), calls.length - 1) === i);
+      const content = mine.length ? mine.map(evidenceContent).join('\n') : i === running ? 'Running: the request below is for this call.' : running >= 0 && i > running ? 'Not run yet: it runs after the calls before it.'
+        : i < ran ? 'Ran; its result has left the evidence (earlierSteps summarises it).' : 'Not run: the batch stopped at an earlier call.';
+      out.push({ role: 'tool', tool_call_id: c.id, content });
+    });
+  }
+  return out;
 }
 export function volatile(s: Session, point = true): Message[] {
   return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s, point) }) }];
@@ -418,10 +467,12 @@ export function stepMessages(s: Session, allowed: string[], note?: string): Mess
   // The pinned block lists the session's actions: allowedActions is sent only when a step allows fewer
   // (runs 49-76: equal in 729 of 729 prompts), and the request then names it.
   const pinned = agentAllowed(s) ?? []; const narrowed = allowed.length !== pinned.length || allowed.some(a => !pinned.includes(a));
-  const request = { role: `Reason, then act. Write thought: one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then actions: an ordered list of one to eight actions (each an action name from ${narrowed ? 'allowedActions' : 'the pinned block\'s actions'} with its args under that action's schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one action when its result decides what comes next.`,
-    ...agentRequestBase(s, note), ...(narrowed ? { allowedActions: allowed } : {}), ...(note ? { harnessNote: note } : {}) };
+  const request = { role: s.form === 'tools' ? `Reason, then act. Write one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then call the tools for one to eight actions, in order. The harness runs the calls in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one call when its result decides what comes next.` : `Reason, then act. Write thought: one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then actions: an ordered list of one to eight actions (each an action name from ${narrowed ? 'allowedActions' : 'the pinned block\'s actions'} with its args under that action's schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one action when its result decides what comes next.`,
+    ...agentRequestBase(s, note), ...(narrowed && s.form !== 'tools' ? { allowedActions: allowed } : {}), ...(note ? { harnessNote: note } : {}) };
   return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify({ ...request, verificationAfterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep) }) }];
 }
+// How the code is written: into the block the harness opened (Bonsai), or as the reply's one fenced code block.
+const opened = (s: Session, what: string): string => s.form ? `Reply with ${what} as one fenced code block and nothing outside it.` : `The harness has opened the code block; write only ${what} and close the block.`;
 // One block of an existing file, written as code: the block as it is now, the
 // lines around it, and the whole file when it is small enough to read cheaply.
 // Only the block is generated; the harness splices it in.
@@ -429,14 +480,14 @@ export function regionMessages(s: Session, path: string, purpose: string, curren
   const lines = (current.endsWith('\n') ? current.slice(0, -1) : current).split('\n');
   const total = current === '' ? 0 : lines.length; const window = shrink ? 20 : 40;
   const request = {
-    role: `Write the new content for lines ${start}..${end} of ${path} as code: only those lines, which replace the ones in region (${end < start ? 'an insertion: region is empty' : `${end - start + 1} line(s)`}). Everything outside them stays as it is. The harness has opened the code block; write only the new lines and close the block.`,
+    role: `Write the new content for lines ${start}..${end} of ${path} as code: only those lines, which replace the ones in region (${end < start ? 'an insertion: region is empty' : `${end - start + 1} line(s)`}). Everything outside them stays as it is. ${opened(s, 'the new lines')}`,
     file: path, purpose, lines: `${start}..${end} of ${total}`,
     before: lines.slice(Math.max(0, start - 1 - window), start - 1).join('\n'), region: lines.slice(start - 1, end).join('\n'), after: lines.slice(end, end + window).join('\n'),
     // The whole file only when before, region and after do not already show all of it.
     ...(!shrink && current.length <= 16000 && !(start - 1 - window <= 0 && end + window >= total) ? { currentContent: current } : {}),
     modules: contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
     declaredPackages: declared.slice(0, 60), ...markup,
-    rules: [`Write only the new lines ${start}..${end} of ${path}: working code with no placeholders, and nothing from before or after (they stay in the file).`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', 'Write the lines only, then the closing fence; no explanation before or after them.'],
+    rules: [`Write only the new lines ${start}..${end} of ${path}: working code with no placeholders, and nothing from before or after (they stay in the file).`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', s.form ? 'Reply with the lines in one fenced code block; no explanation before or after it.' : 'Write the lines only, then the closing fence; no explanation before or after them.'],
   };
   return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify(request) }];
 }
@@ -445,11 +496,11 @@ export function regionMessages(s: Session, path: string, purpose: string, curren
 // the manifest declares, so nothing is invented.
 export function newFileMessages(s: Session, path: string, purpose: string, contracts: FileContract[], declared: string[], shrink = 0, current?: string, markup: Record<string, unknown> = {}): Message[] {
   const request = {
-    role: current === undefined ? `Write the complete file ${path} as code. The harness has opened the code block; write only the file content and close the block.` : `Rewrite the complete file ${path} as code: its whole new content, keeping what should stay and changing what purpose asks. The harness has opened the code block; write only the file content and close the block.`,
+    role: current === undefined ? `Write the complete file ${path} as code. ${opened(s, 'the file content')}` : `Rewrite the complete file ${path} as code: its whole new content, keeping what should stay and changing what purpose asks. ${opened(s, 'the file content')}`,
     file: path, purpose, ...(current !== undefined ? { currentContent: shrink ? clip(current, 6000) : current } : {}),
     modules: contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
     declaredPackages: declared.slice(0, 60), ...markup,
-    rules: [`Write the complete content of ${path}: working code with no placeholders, TODOs or omitted sections.`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', 'Write the file content only, then the closing fence; no explanation before or after it.'],
+    rules: [`Write the complete content of ${path}: working code with no placeholders, TODOs or omitted sections.`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', s.form ? 'Reply with the file content in one fenced code block; no explanation before or after it.' : 'Write the file content only, then the closing fence; no explanation before or after it.'],
   };
   return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify(request) }];
 }

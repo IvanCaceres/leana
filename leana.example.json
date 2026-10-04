@@ -32,6 +32,6 @@
   "codePresencePenalty": 0,
   "codeTemperature": 0.3,
   "codeMinP": 0.05,
-  "allowWrite": false,
-  "allowBash": false
+  "allowWrite": true,
+  "allowBash": true
 }

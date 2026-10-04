@@ -3,7 +3,7 @@ import type { GenerationMeta, Phase } from './types.js';
 // Structured progress from the runner. The display turns it into a live panel
 // on a terminal, or plain lines when output is not a terminal.
 export type ProgressEvent =
-  | { kind: 'step'; step: number; phase: Phase; maxStep: number }
+  | { kind: 'step'; step: number; phase: Phase; maxStep: number; turn?: number; maxTurn?: number }
   | { kind: 'jev'; step: number; ms: number; questions: number; stateBytes: number; route: [string, number][]; nouls: Record<string, number> }
   | { kind: 'route'; step: number; route: string; tokens: number; entries: number }
   | { kind: 'context'; step: number; tokens: number; workingTokens: number; contextWindow: number; breakdown: Record<string, number>; entries: number }
@@ -178,13 +178,15 @@ export class Display {
   private started = Date.now();
   private jevMs: number[] = []; private tps: number[] = []; private promptTokens = 0; private generatedTokens = 0;
   private routes: Record<string, number> = {}; private edits = 0; private checks = 0; private failures = 0; private undos = 0;
-  private step = 0; private maxStep = 0; private phase = ''; private status = 'running';
+  private step = 0; private maxStep = 0; private turn = 0; private maxTurn = 0; private phase = ''; private status = 'running';
   private lastJev = ''; private context = ''; private contextFill = 0; private bonsai = ''; private now = 'starting'; private last = '';
   private panelLines = 0; private timer: NodeJS.Timeout | null = null;
   // What is being generated, shown live under the panel: a step's thought, or a file's last lines. Once one
   // has been shown its rows stay (blank between generations), so the panel does not jump as they start and end.
   private live: Extract<ProgressEvent, { kind: 'reasoning' | 'thinking' | 'writing' }> | null = null; private liveShown = false;
-  constructor(private out: Stream, private opts: { objective: string; session: string; verbose: boolean }) {
+  // The model's name in the panel: Bonsai's own, or the last part of another model's id.
+  private get who(): string { return this.opts.name ?? 'Bonsai'; }
+  constructor(private out: Stream, private opts: { objective: string; session: string; verbose: boolean; model?: string; name?: string }) {
     if (out.isTTY) { this.timer = setInterval(() => this.render(), 1000); this.timer.unref?.(); }
   }
   private width(): number { return Math.max(20, Math.min(160, this.out.columns ?? 100)); }
@@ -203,7 +205,7 @@ export class Display {
   }
   update(e: ProgressEvent): void {
     switch (e.kind) {
-      case 'step': this.step = e.step; this.maxStep = e.maxStep; this.phase = e.phase; this.now = 'asking Jev for the next action'; break;
+      case 'step': this.step = e.step; this.maxStep = e.maxStep; this.turn = e.turn ?? 0; this.maxTurn = e.maxTurn ?? 0; this.phase = e.phase; this.now = 'asking Jev for the next action'; break;
       case 'jev': this.jevMs.push(e.ms);
         this.lastJev = `${secs(e.ms)} | ${e.questions} q | state ${(e.stateBytes / 1000).toFixed(1)}k | ${e.route.slice(0, 3).map(([r, v]) => `${r} ${v.toFixed(2)}`).join(' | ')} | ${Object.entries(e.nouls).slice(0, 4).map(([n, v]) => `${n} ${v.toFixed(2)}`).join(' | ')}`; break;
       case 'route': this.routes[e.route] = (this.routes[e.route] ?? 0) + 1; this.now = `counting the ${e.route} prompt`; break;
@@ -211,12 +213,12 @@ export class Display {
         const top = Object.entries(e.breakdown).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, v]) => `${n} ${k(v)}`).join(' | ');
         this.context = `${k(e.tokens)} / ${k(e.workingTokens)} working (${Math.round(100 * this.contextFill)}%) | window ${k(e.contextWindow)} (${Math.round(100 * e.tokens / e.contextWindow)}%) | ${e.entries} entries | ${top}`; break; }
       case 'generating': { const p = e.prompt;
-        this.now = p ? `Bonsai reading the ${e.route} prompt | ${k(p.processed - p.cache)} / ${k(p.total - p.cache)} tokens${p.cache ? ` | ${k(p.cache)} cached` : ''}`
-          : `${e.route === 'create_file' || e.route === 'rewrite_file' ? 'Bonsai writing the file as code' : `Bonsai generating ${e.route} arguments${e.attempt > 1 ? ' (retry)' : ''}`}${e.tokens ? ` | ${plural(e.tokens, 'token')}` : ''}`; break; }
-      case 'reasoning': this.live = e; this.liveShown = true; this.now = `Bonsai reasoning | ${plural(e.tokens, 'token')}`; break;
-      case 'thinking': this.live = e; this.liveShown = true; this.now = `Bonsai ${e.actions ? 'choosing the actions' : 'thinking'} | ${plural(e.tokens, 'token')}`; break;
+        this.now = p ? `${this.who} reading the ${e.route} prompt | ${k(p.processed - p.cache)} / ${k(p.total - p.cache)} tokens${p.cache ? ` | ${k(p.cache)} cached` : ''}`
+          : `${e.route === 'create_file' || e.route === 'rewrite_file' ? `${this.who} writing the file as code` : `${this.who} generating ${e.route} arguments${e.attempt > 1 ? ' (retry)' : ''}`}${e.tokens ? ` | ${plural(e.tokens, 'token')}` : ''}`; break; }
+      case 'reasoning': this.live = e; this.liveShown = true; this.now = `${this.who} reasoning | ${plural(e.tokens, 'token')}`; break;
+      case 'thinking': this.live = e; this.liveShown = true; this.now = `${this.who} ${e.actions ? 'choosing the actions' : 'thinking'} | ${plural(e.tokens, 'token')}`; break;
       case 'writing': this.live = e; this.liveShown = true;
-        this.now = `Bonsai writing ${e.path}${e.from > 1 ? ` from line ${e.from}` : ''} | ${plural(e.lines, 'line')} | ${plural(e.tokens, 'token')}${e.perSecond ? ` | ${e.perSecond.toFixed(1)} tok/s` : ''}`; break;
+        this.now = `${this.who} writing ${e.path}${e.from > 1 ? ` from line ${e.from}` : ''} | ${plural(e.lines, 'line')} | ${plural(e.tokens, 'token')}${e.perSecond ? ` | ${e.perSecond.toFixed(1)} tok/s` : ''}`; break;
       case 'thought': this.live = null; break;
       case 'generated': { this.live = null; const s = generationSpeed(e.meta); if (s.perSecond) this.tps.push(s.perSecond); if (s.generated) this.generatedTokens += s.generated;
         this.bonsai = `${e.meta ? secs(e.meta.ms) : '-'} | ${s.generated ?? '?'} tokens${s.perSecond ? ` @ ${s.perSecond.toFixed(1)} tok/s` : ''}${s.promptPerSecond ? ` | prompt @ ${s.promptPerSecond.toFixed(0)} tok/s` : ''}${s.cached ? ` | ${s.cached} cached` : ''} | ${short(JSON.stringify(e.args), 90)}`;
@@ -244,12 +246,12 @@ export class Display {
     const avgTps = this.tps.length ? this.tps.reduce((a, b) => a + b, 0) / this.tps.length : null;
     const rows = [
       '-'.repeat(this.width() - 1),
-      `Leana | ${this.opts.session} | step ${this.step}${this.maxStep ? `/${this.maxStep}` : ''} | ${this.phase} | ${this.status} | ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')} elapsed`,
+      `Leana | ${this.opts.session}${this.opts.model ? ` | ${this.opts.model}` : ''} | ${this.maxTurn ? `turn ${this.turn}/${this.maxTurn} | step ${this.step}` : `step ${this.step}${this.maxStep ? `/${this.maxStep}` : ''}`} | ${this.phase} | ${this.status} | ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')} elapsed`,
       `Objective  ${this.opts.objective.replace(/\s+/g, ' ')}`,
       `Jev        ${this.lastJev || '-'}`,
       `           median ${secs(quantile(this.jevMs, .5))} | p95 ${secs(quantile(this.jevMs, .95))} | ${this.jevMs.length} calls`,
       `Context    ${this.bar(this.contextFill)} ${this.context || '-'}`,
-      `Bonsai     ${this.bonsai || '-'}`,
+      `${this.who.slice(0, 10).padEnd(11)}${this.bonsai || '-'}`,
       `           avg ${avgTps ? `${avgTps.toFixed(1)} tok/s` : '-'} | ${k(this.generatedTokens)} generated | ${k(this.promptTokens)} prompt tokens sent`,
       `Now        ${this.now === 'stopped' ? '' : `${spinner} `}${this.now}`,
       `Last       ${this.last || '-'}`,

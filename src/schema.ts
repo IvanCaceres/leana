@@ -97,3 +97,40 @@ export function extractCode(text: string): string {
   const body = close < 0 ? text.slice(start) : text.slice(start, close);
   return body.replace(/\s+$/, '') + '\n';
 }
+// The arguments a call may leave out under the tools form (Session.form), with what each means when left out.
+// A grammar has Bonsai write every field; a model's own tool calling sends what it decides and leaves out the
+// rest, as its tools' schemas allow (run 94, steps 39-42: a deletion refused four times over newText, then
+// prepend). at is where the fields are: the arguments themselves ([]) or each item of an array ('*').
+export const argDefaults: Partial<Record<Route, { at: string[]; values: Record<string, unknown> }[]>> = {
+  read_files: [{ at: ['files', '*'], values: { start: 1, end: 1000000 } }],
+  search_codebase: [{ at: [], values: { path: '.', mode: 'text' } }],
+  bash: [{ at: [], values: { purpose: '', check: false } }],
+  replace_lines: [{ at: ['edits', '*'], values: { newText: '', prepend: '' } }],
+  observe: [{ at: [], values: { start: '', inputs: [] } }, { at: ['inputs', '*'], values: { what: '', ms: 0 } }],
+};
+// The objects at a path of a value (or of a schema, by its properties and items).
+function objectsAt(v: any, at: string[], schema: boolean): any[] {
+  let found = [v];
+  for (const key of at) found = found.flatMap(x => !x || typeof x !== 'object' ? [] : key === '*' ? (schema ? (x.items ? [x.items] : []) : Array.isArray(x) ? x : []) : schema ? (x.properties?.[key] ? [x.properties[key]] : []) : [x[key]]);
+  return found.filter(x => x && typeof x === 'object' && !Array.isArray(x));
+}
+// The file actions as the model's own tools (the tools form): the model writes the content in its call, as it is
+// trained to, so it sees in its own turn what it wrote (run 93: about fifteen reads of files it had just had
+// generated in a request it never saw). write is an exact replacement whose anchor is the guard; its hash is optional.
+export const toolForms: Partial<Record<Route, JsonSchema>> = {
+  create_file: obj({ path: str(500), content: str() }),
+  rewrite_file: { type: 'object', properties: { path: str(500), content: str(), start: integer(1, 1000000), end: integer(0, 1000000) }, required: ['path', 'content'], additionalProperties: false },
+  write: { type: 'object', properties: { path: str(500), oldText: str(), newText: str(), expectedHash: str(16) }, required: ['path', 'oldText', 'newText'], additionalProperties: false },
+};
+// An action's arguments as one of the model's tools: its tools-form shape, the fields that have a default not required.
+export function toolSchema(route: Route): JsonSchema {
+  const copy = structuredClone(toolForms[route] ?? schemas[route]);
+  for (const d of argDefaults[route] ?? []) for (const o of objectsAt(copy, d.at, true)) if (Array.isArray(o.required)) o.required = o.required.filter((k: string) => !(k in d.values));
+  return copy;
+}
+// The arguments of a call with what it left out filled in by its defaults.
+export function withDefaults(route: string, args: Record<string, any>): Record<string, any> {
+  const copy = structuredClone(args);
+  for (const d of argDefaults[route as Route] ?? []) for (const o of objectsAt(copy, d.at, false)) for (const [k, v] of Object.entries(d.values)) if (o[k] === undefined) o[k] = structuredClone(v);
+  return copy;
+}

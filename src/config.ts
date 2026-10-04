@@ -1,12 +1,22 @@
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import type { Config } from './types.js';
 export const defaults: Config = {
+  provider: 'llama', openrouterUrl: 'https://openrouter.ai/api/v1', providerKeyFile: '',
   baseUrl: 'http://127.0.0.1:8080/v1', model: 'bonsai-27b', contextWindow: 48000,
   maxTokens: 8192, workingTokens: 12000, safetyTokens: 1024,
+  // The evidence budget of a model through OpenRouter: 0 fits it to the model (a quarter of its window, at most
+  // 64000 tokens); workingTokens is Bonsai's, sized for its window and its local prefill.
+  openrouterWorkingTokens: 0,
+  // The turns an invocation through OpenRouter may take (a turn runs one to eight actions); maxSteps is Bonsai's, in actions.
+  openrouterMaxTurns: 120,
+  // How the prompt is written (Session.form): json for Bonsai; fitted to an OpenRouter model, tools when it takes them, else text.
+  promptForm: 'json',
   jevUrl: 'https://api.typesafe.ai/v1/systemone', jevModel: 'jev-latest',
   routeProbability: .55, routeMargin: .12, compactProbability: .75, completeProbability: .9,
   compactCooldown: 4, maxSteps: 80, toolChars: 6000, commandTimeoutMs: 60000,
-  allowWrite: false, allowBash: false, verbose: false, checkCommand: '',
+  allowWrite: true, allowBash: true, verbose: false, checkCommand: '',
   createTokens: 12000,
   // The server's own min_p is 0.05, so these defaults change nothing it did before.
   stepTemperature: .2, stepMinP: .05,
@@ -30,7 +40,7 @@ export const defaults: Config = {
   stepThinking: false, stepThinkingBudget: 1024, thinkingEffort: 'medium',
   codeThinking: false, codeThinkingBudget: 1024,
 };
-const zeroable = new Set(['stepMinP', 'codeMinP', 'codePresencePenalty']);
+const zeroable = new Set(['stepMinP', 'codeMinP', 'codePresencePenalty', 'openrouterWorkingTokens']);
 export async function loadConfig(path?: string, overrides: Partial<Config> = {}): Promise<Config> {
   const input = path ? JSON.parse(await readFile(path, 'utf8')) : {};
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Config must be an object');
@@ -43,7 +53,7 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   }
   for (const k of ['routeProbability', 'routeMargin', 'compactProbability', 'completeProbability'] as const)
     if (c[k] >= 1) throw new Error(`${k} must be between 0 and 1`);
-  for (const k of ['contextWindow', 'maxTokens', 'workingTokens', 'safetyTokens', 'compactCooldown', 'maxSteps', 'toolChars', 'commandTimeoutMs', 'createTokens'] as const)
+  for (const k of ['contextWindow', 'maxTokens', 'workingTokens', 'safetyTokens', 'compactCooldown', 'maxSteps', 'openrouterMaxTurns', 'toolChars', 'commandTimeoutMs', 'createTokens'] as const)
     if (!Number.isSafeInteger(c[k])) throw new Error(`${k} must be an integer`);
   if (c.workingTokens < 2000 || c.workingTokens > c.contextWindow - c.maxTokens - c.safetyTokens)
     throw new Error('workingTokens must fit inside contextWindow minus output and safety reserves');
@@ -58,13 +68,34 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   for (const k of ['stepMinP', 'codeMinP'] as const) if (c[k] >= 1) throw new Error(`${k} must be between 0 and 1`);
   if (!Array.isArray(c.stepTemperatureEscalation) || c.stepTemperatureEscalation.length > 8 || c.stepTemperatureEscalation.some(t => typeof t !== 'number' || !Number.isFinite(t) || t <= 0 || t > 2))
     throw new Error('stepTemperatureEscalation must be a list of at most 8 temperatures, each above 0 and at most 2');
-  if (!['xhigh', 'medium', 'low'].includes(c.thinkingEffort)) throw new Error('thinkingEffort must be xhigh, medium or low');
+  if (!['llama', 'openrouter'].includes(c.provider)) throw new Error('provider must be llama or openrouter');
+  // Which efforts a model takes is the model's (models.ts); here only the shape.
+  if (!/^[a-z]+$/.test(c.thinkingEffort)) throw new Error('thinkingEffort must be one word, such as medium');
+  if (!['json', 'text', 'tools'].includes(c.promptForm)) throw new Error('promptForm must be json, text or tools');
+  if (!Number.isSafeInteger(c.openrouterWorkingTokens) || (c.openrouterWorkingTokens && c.openrouterWorkingTokens < 2000)) throw new Error('openrouterWorkingTokens must be 0 (fitted to the model) or an integer of at least 2000');
   if (!Number.isSafeInteger(c.codeThinkingBudget) || c.codeThinkingBudget > 8192) throw new Error('codeThinkingBudget must be an integer of at most 8192');
   if (!Number.isSafeInteger(c.stepThinkingBudget) || c.stepThinkingBudget >= c.maxTokens - 256) throw new Error('stepThinkingBudget must be an integer below maxTokens - 256 (the reply follows the thinking in the same output budget)');
   if (c.toolChars < 500 || c.toolChars > 20000) throw new Error('toolChars must be 500..20000');
-  for (const key of ['baseUrl', 'jevUrl'] as const) {
+  for (const key of ['baseUrl', 'jevUrl', 'openrouterUrl'] as const) {
     const u = new URL(c[key]);
     if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) throw new Error(`Invalid ${key}`);
   }
   return c;
+}
+
+// The choices made in the app (provider, model, reasoning, sampling, limits), kept between runs in the user's
+// config directory. Permissions are not kept: write and shell are on unless turned off for a run.
+export const settingsPath = (): string => join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'leana', 'settings.json');
+const kept = new Set(['provider', 'model', 'openrouterUrl', 'providerKeyFile', 'baseUrl', 'stepThinking', 'codeThinking', 'thinkingEffort', 'stepThinkingBudget', 'codeThinkingBudget',
+  'stepTemperature', 'stepThinkingTemperature', 'codeTemperature', 'stepTopP', 'codeTopP', 'stepTopK', 'codeTopK', 'stepMinP', 'codeMinP', 'codePresencePenalty', 'maxTokens', 'workingTokens', 'openrouterWorkingTokens', 'maxSteps', 'openrouterMaxTurns']);
+export interface Settings { config: Partial<Config>; repo?: string }
+export async function loadSettings(path = settingsPath()): Promise<Settings> {
+  let raw: any; try { raw = JSON.parse(await readFile(path, 'utf8')); } catch { return { config: {} }; }
+  const config = Object.fromEntries(Object.entries(raw?.config ?? {}).filter(([k]) => kept.has(k))) as Partial<Config>;
+  return { config, ...(typeof raw?.repo === 'string' ? { repo: raw.repo } : {}) };
+}
+export async function saveSettings(s: Settings, path = settingsPath()): Promise<void> {
+  const config = Object.fromEntries(Object.entries(s.config).filter(([k]) => kept.has(k)));
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify({ config, ...(s.repo ? { repo: s.repo } : {}) }, null, 2)}\n`, { mode: 0o600 });
 }

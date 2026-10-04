@@ -482,6 +482,8 @@ export async function syntaxErrors(path: string, text: string): Promise<string[]
   const message = (d: any) => problemAt(text, ts.flattenDiagnosticMessageText(d.messageText, ' '), d.file && typeof d.start === 'number' ? { offset: d.start } : {});
   // JSON with the parser tsconfig uses: comments and trailing commas allowed.
   if (json) return (ts.parseJsonText(path, text).parseDiagnostics ?? []).slice(0, 5).map(message);
+  // A declaration file has no output to transpile (transpileModule throws "Debug Failure. Output generation failed"): its parse is judged.
+  if (/\.d\.[cm]?ts$/i.test(path)) return (ts.createSourceFile(path, text, ts.ScriptTarget.ESNext, true).parseDiagnostics ?? []).slice(0, 5).map(message);
   const out = ts.transpileModule(text, { reportDiagnostics: true, fileName: path, compilerOptions: { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.Preserve, allowJs: true } });
   return (out.diagnostics ?? []).slice(0, 5).map(message);
 }

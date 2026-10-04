@@ -52,7 +52,7 @@ export class App {
     repo: { args: '[path]', help: 'show or set the repository runs work in', run: async a => this.setRepo(a[0]) },
     allow: { args: 'write|bash on|off', help: 'let runs edit files / run shell commands (unsandboxed, with your privileges)', run: async a => this.allow(a[0], a[1]) },
     check: { args: '<command>|off', help: 'the verification command (run as a baseline and after edits)', run: async a => { this.checkCommand = a[0] === 'off' ? '' : a.join(' '); this.write(`check: ${this.checkCommand || 'none (the model chooses its check)'}`); } },
-    steps: { args: '<n>', help: 'most steps a run takes', run: async a => { await this.remember({ maxSteps: Number(a[0]) }); this.write(`steps: ${a[0]}`); } },
+    steps: { args: '<n>', help: 'most steps a run takes (turns, through OpenRouter)', run: async a => { const or = (await this.config()).provider === 'openrouter'; await this.remember(or ? { openrouterMaxTurns: Number(a[0]) } : { maxSteps: Number(a[0]) }); this.write(`${or ? 'turns' : 'steps'}: ${a[0]}`); } },
     sessions: { args: '', help: 'the repository\'s sessions, newest first', run: async () => this.sessions() },
     resume: { args: '[n|path] [message]', help: 'resume a session (1 = newest), optionally with new guidance', run: async a => this.resume(a) },
     quit: { args: '', help: 'leave', run: async () => {} },
@@ -91,7 +91,7 @@ export class App {
     this.write(`provider   ${c.provider}${c.provider === 'openrouter' ? ` (${c.openrouterUrl})` : ` (${c.baseUrl})`}`);
     this.write(`model      ${c.model}`);
     this.write(`repository ${this.repo}`);
-    this.write(`permissions write ${this.allowWrite ? 'on' : 'off'}, shell ${this.allowBash ? 'on' : 'off'}${this.checkCommand ? `; check: ${this.checkCommand}` : ''}; up to ${c.maxSteps} steps`);
+    this.write(`permissions write ${this.allowWrite ? 'on' : 'off'}, shell ${this.allowBash ? 'on' : 'off'}${this.checkCommand ? `; check: ${this.checkCommand}` : ''}; up to ${c.provider === 'openrouter' ? `${c.openrouterMaxTurns} turns` : `${c.maxSteps} steps`}`);
     try { const m = await this.model(); const { config, notes } = forModel(c, m); for (const o of modelOptions(m)) this.write(`  ${o.name.padEnd(22)} ${o.get(config)}`); for (const n of notes) this.write(`note: ${n}`); }
     catch (e) { this.write(`model facts unavailable: ${(e as Error).message}`); }
   }
@@ -129,8 +129,8 @@ export class App {
   private async showOptions(): Promise<void> {
     const m = await this.model(); const c = forModel(await this.config(), m).config;
     this.write(`Options ${m.id} takes:`);
-    const options = modelOptions(m); const width = Math.max(...options.map(o => o.values.length)) + 2;
-    for (const o of options) this.write(`  ${o.name.padEnd(22)} ${o.get(c).padEnd(10)} ${o.values.padEnd(width)}${o.describe}`);
+    const options = modelOptions(m); const width = Math.max(...options.map(o => o.values.length)) + 2; const now = Math.max(10, ...options.map(o => o.get(c).length));
+    for (const o of options) this.write(`  ${o.name.padEnd(22)} ${o.get(c).padEnd(now)} ${o.values.padEnd(width)}${o.describe}`);
   }
   private async set(name?: string, value?: string): Promise<void> {
     if (!name || value === undefined || value === '') throw new Error('give an option and a value; /options lists what this model takes');

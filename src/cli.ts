@@ -15,7 +15,7 @@ export { readKey, dirtySessionConflict } from './session.js';
 const usage = `Leana — a coding agent: the model reasons and acts, Jev guards the loop
 
   leana                                   the app: type objectives, set provider, model and options in place (/help)
-  leana run "objective" --repo path [--allow-write] [--allow-bash]
+  leana run "objective" --repo path [--read-only] [--no-bash]
   leana resume session-directory [--message "new guidance"]
   leana models [words]                    the provider's models (OpenRouter: those matching every word)
   leana model [--model id]                what the model is and the options it takes
@@ -24,16 +24,16 @@ const usage = `Leana — a coding agent: the model reasons and acts, Jev guards 
 
 Model:   --provider llama|openrouter, --model ID, --reasoning on|off, --file-reasoning on|off,
          --effort LEVEL, --reasoning-budget N  (only what the model takes is accepted; see leana model)
-Other:   --key-file PATH (Jev), --env-file PATH, --config PATH, --max-steps N, --allow-dirty, --verbose,
+Other:   --key-file PATH (Jev), --env-file PATH, --config PATH, --max-steps N (turns through OpenRouter), --allow-dirty, --verbose,
          --check "command" (the verification; run as a baseline first and after every edit)
 Keys:    OpenRouter's from OPENROUTER_API_KEY or providerKeyFile in the config; Jev's from --key-file or TYPESAFE_API_KEY.
-Default: read-only tools; shell is disabled. --allow-bash permits unsandboxed commands with your user
-privileges, including file changes outside the repository. The app keeps its choices in ~/.config/leana/settings.json.`;
+Default: the model writes files and runs shell commands, unsandboxed with your user privileges (including
+file changes outside the repository). --no-bash turns the shell off; --read-only turns off writes and the shell. The app keeps its choices in ~/.config/leana/settings.json.`;
 const onOff = (v: string | undefined, flag: string): boolean | undefined => v === undefined ? undefined : /^(on|true|yes)$/i.test(v) ? true : /^(off|false|no)$/i.test(v) ? false : (() => { throw new Error(`${flag} takes on or off`); })();
 async function main(): Promise<void> {
   const { values: v, positionals } = parseArgs({ allowPositionals: true, options: {
     repo: { type: 'string' }, config: { type: 'string' }, 'key-file': { type: 'string' },
-    'env-file': { type: 'string' }, 'allow-write': { type: 'boolean' }, 'allow-bash': { type: 'boolean' },
+    'env-file': { type: 'string' }, 'allow-write': { type: 'boolean' }, 'allow-bash': { type: 'boolean' }, 'read-only': { type: 'boolean' }, 'no-bash': { type: 'boolean' },
     'max-steps': { type: 'string' }, message: { type: 'string' }, help: { type: 'boolean', short: 'h' }, 'allow-dirty': { type: 'boolean' },
     verbose: { type: 'boolean', short: 'v' }, follow: { type: 'boolean' }, check: { type: 'string' },
     provider: { type: 'string' }, model: { type: 'string' }, reasoning: { type: 'string' }, 'file-reasoning': { type: 'string' }, effort: { type: 'string' }, 'reasoning-budget': { type: 'string' },
@@ -62,7 +62,8 @@ async function main(): Promise<void> {
     ...(onOff(v['file-reasoning'], '--file-reasoning') !== undefined ? { codeThinking: onOff(v['file-reasoning'], '--file-reasoning')! } : {}),
     ...(v.effort ? { thinkingEffort: v.effort } : {}), ...(v['reasoning-budget'] ? { stepThinkingBudget: Number(v['reasoning-budget']), codeThinkingBudget: Number(v['reasoning-budget']) } : {}),
     ...(v['allow-write'] ? { allowWrite: true } : {}), ...(v['allow-bash'] ? { allowBash: true } : {}),
-    ...(v['max-steps'] ? { maxSteps: Number(v['max-steps']) } : {}), ...(v.verbose ? { verbose: true } : {}), ...(v.check ? { checkCommand: v.check } : {}),
+    ...(v['read-only'] ? { allowWrite: false, allowBash: false } : {}), ...(v['no-bash'] ? { allowBash: false } : {}),
+    ...(v['max-steps'] ? { maxSteps: Number(v['max-steps']), openrouterMaxTurns: Number(v['max-steps']) } : {}), ...(v.verbose ? { verbose: true } : {}), ...(v.check ? { checkCommand: v.check } : {}),
   };
   // A provider switched by flag starts from its own default model, unless one is named.
   const kept = flags.provider && flags.provider !== settings.config.provider && !flags.model ? { ...settings.config, model: flags.provider === 'llama' ? 'bonsai-27b' : settings.config.model } : settings.config;

@@ -834,6 +834,9 @@ async function svelteStandIn(root: string): Promise<void> {
 test('A parse problem names its line, the column the parser gives and the text that starts there, and the line\'s text: TypeScript, a Svelte compiler\'s offset (run 67), a Vue compiler\'s 1-based column', async t => {
   assert.deepEqual(await syntaxErrors('a.ts', 'const a = 1;\nconst b = foo(;\n'), ['line 2, column 15 (at ";" of "foo(;"): \')\' expected: "const b = foo(;"']);
   assert.deepEqual(await syntaxErrors('a.ts', 'const x = {\n  a: 1\n'), ["line 3, column 1 (at the end of the file): '}' expected"], 'a position past the last text is the end of the file, and an empty line is not quoted');
+  // Run 93 step 11: creating vitest-env.d.ts failed with TypeScript's "Debug Failure. Output generation failed".
+  assert.deepEqual(await syntaxErrors('vitest-env.d.ts', '/// <reference types="vite/client" />\ndeclare module \'*.css\'\n'), []);
+  assert.equal((await syntaxErrors('types.d.ts', 'declare const x: {\n')).length, 1, 'a broken declaration file is still judged');
   assert.deepEqual(await syntaxErrors('a.json', '{"a": 1,, }'), ['line 1, column 9 (at "," of "1,,"): Property assignment expected: "{\\"a\\": 1,, }"']);
   assert.equal(problemAt('a\nb\n', 'm.', { offset: 0, line: 2 }), 'line 2: m: "b"', 'an offset that is not on the line the parser names is not used');
   assert.equal(problemAt('a\n', 'm', {}), 'm');

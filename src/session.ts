@@ -108,9 +108,9 @@ export async function runSession(req: RunRequest): Promise<RunOutcome> {
     const client = modelClient(config, key, log);
     await store.log('start', { config: { ...config }, root: session.root, model: { provider: model.provider, id: model.id, contextLength: model.contextLength, maxOutput: model.maxOutput, reasoning: model.reasoning, params: model.params } });
     say(`Session: ${store.path}`);
-    say(`Model: ${model.provider} ${model.id} | reasoning ${config.stepThinking || model.reasoning.mandatory ? `on${effortsOf(model.reasoning).length ? ` (${config.thinkingEffort})` : ''}` : 'off'} | window ${config.contextWindow} tokens`);
+    say(`Model: ${model.provider} ${model.id} | reasoning ${config.stepThinking || model.reasoning.mandatory ? `on${effortsOf(model.reasoning).length ? ` (${config.thinkingEffort})` : ''}` : 'off'} | window ${config.contextWindow} tokens, working ${config.workingTokens}${config.promptForm === 'tools' ? ' | native tool calls' : config.promptForm === 'text' ? ' | JSON replies (no tools)' : ''}`);
     if (config.allowBash) say('Shell enabled: commands run unsandboxed with your user privileges.');
-    const display = new Display(process.stderr, { objective: session.objective, session: basename(store.path), verbose: config.verbose, model: `${model.provider}:${model.id}` });
+    const display = new Display(process.stderr, { objective: session.objective, session: basename(store.path), verbose: config.verbose, model: `${model.provider}:${model.id}`, name: model.provider === 'llama' ? 'Bonsai' : model.id.split('/').pop()! });
     const startedAt = Date.now(); const stepsBefore = session.step;
     const agent = new Agent(config, store, jev, client, session.root, line => display.log(line), e => display.update(e));
     req.started?.(agent);

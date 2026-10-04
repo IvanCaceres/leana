@@ -13,12 +13,13 @@ import { Store } from './store.js';
 import { ToolBox, boundedRead, droppedLines, hash, listRepoFiles, repositoryStatus, runCommand, safePath, sourceHashes, summarizeCheck, treeChanges, treeSnapshot, TreeHashes } from './tools.js';
 import { breakIndex, clip, clipEnds, lineDiff, evictBehind, evictOne, evictStaleBehind, evidenceTokens, turnEntry, fenceFor, regionMessages, trimContext, mergeCoverage, rememberEdit, retireEvidence, stepMessages, newFileMessages, shownLines, lineRanges, volatile, type FileContract } from './context.js';
 import { pinReferences, referenceContext } from './references.js';
-import { extractCode, schemas, stepSchema, actions } from './schema.js';
+import { extractCode, schemas, stepSchema, actions, validate, withDefaults, toolSchema } from './schema.js';
 import { generationFacts, missingRelativeModules, parseFact, parseInProcess, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
 import { orient } from './orient.js';
 import { observeResult, observerFor } from './observe.js';
 import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
 import type { Around, Bonsai, Echo, GenerationCut, StreamProgress } from './clients.js';
+import { repeatCut } from './clients.js';
 
 // A repository file's text, or null when it cannot be read: missing (the worker
 // may delete any file it wrote), outside the root, or not text. Never throws.
@@ -396,7 +397,8 @@ export class Agent {
   }
   // A file's whole content generated as code: a new file, or an existing one
   // rewritten with its current content in front of the worker.
-  private async createFile(s: Session, path: string, purpose: string, thought: string, rewrite = false, range?: { start?: unknown; end?: unknown }, exact?: string): Promise<void> {
+  // given: the content the model wrote in its call (the tools form), written instead of a generation; a repeat in it is cut as a generation's is.
+  private async createFile(s: Session, path: string, purpose: string, thought: string, rewrite = false, range?: { start?: unknown; end?: unknown }, exact?: string, given?: string): Promise<void> {
     let current: string | undefined;
     // Read as the edit tools read it (a byte-order mark is not part of the text), so the hash a
     // rewrite carries is the one the write checks; a missing file is one to create.
@@ -415,11 +417,14 @@ export class Agent {
       if (start <= lines.length && seen && seen !== hash(current!)) throw new Error(`${path} changed since the version you last saw, so lines ${start}..${end} may no longer be the lines you mean; read it again (or append with start = totalLines + 1)`);
       return { start, end };
     })() : null;
-    const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
-    const project = await projectFor(this.tools.root, path); const declared = project ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[]) : [];
-    // What the repository says this kind of file is written against (the profiles decide which facts apply).
-    const markup = await generationFacts(this.tools.root, path, current, s.knownFiles).catch(() => ({} as Record<string, unknown>));
-    const builds = region ? [0, 1].map(k => () => regionMessages(s, path, purpose, current!, region.start, region.end, contracts, declared, k, markup)) : [0, 1].map(k => () => newFileMessages(s, path, purpose, contracts, declared, k, current, markup));
+    const project = await projectFor(this.tools.root, path);
+    // The facts a generation is written against: the modules it names, the declared packages, what the repository says this kind of file is written against.
+    const request = async (): Promise<(() => Message[])[]> => {
+      const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
+      const declared = project ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[]) : [];
+      const markup = await generationFacts(this.tools.root, path, current, s.knownFiles).catch(() => ({} as Record<string, unknown>));
+      return region ? [0, 1].map(k => () => regionMessages(s, path, purpose, current!, region.start, region.end, contracts, declared, k, markup)) : [0, 1].map(k => () => newFileMessages(s, path, purpose, contracts, declared, k, current, markup));
+    };
     // A rewrite whose exact arguments already reproduced this very content, from the same request
     // in front of the generation (only the earlier steps differ), is not generated again: code is
     // sampled at a low temperature, and across 73 recorded runs every repeat of the same request on
@@ -434,7 +439,10 @@ export class Agent {
     const known = rewrite && exact && deterministic ? s.reproduced?.[exact] : undefined;
     // The file around a region's block, all of it: a block may repeat any number of the lines that stay.
     const around = region ? { before: lines.slice(0, region.start - 1).join('\n'), region: lines.slice(region.start - 1, region.end).join('\n'), after: lines.slice(region.end).join('\n') } : undefined;
-    const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', path, region?.start ?? 1, builds, this.config.createTokens, fenceFor(path), request => {
+    const looped = given === undefined ? null : repeatCut(given, around && /\S/.test(around.after) ? around : undefined);
+    const generated: { code: string; finish: string; cut?: GenerationCut; ms?: number; tokens?: number; request: string } = given !== undefined
+      ? { code: looped ? looped.kept : given, finish: looped ? 'repetition' : 'stop', ...(looped ? { cut: looped.cut } : {}), request: '' }
+      : await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', path, region?.start ?? 1, await request(), this.config.createTokens, fenceFor(path), request => {
       if (!known || known.sha !== sha || known.request !== request) return;
       const was = known.ms === undefined ? '' : ` (${known.tokens !== undefined ? `${known.tokens} tokens, ` : ''}${(known.ms / 1000).toFixed(1)} s)`;
       const shown = s.entries.some(e => e.step === known.step && e.kind !== 'turn') ? `e${known.step}` : 'its result has left the evidence';
@@ -481,10 +489,11 @@ export class Agent {
     // A rewrite that reproduced the file is stated with where the file's content came from
     // and whether the last check has seen it: the facts a request to change it was made on.
     if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, '')) {
-      if (exact) { (s.reproduced ??= {})[exact] = { step: s.step, sha: sha!, request: generated.request, ...(generated.ms !== undefined ? { ms: generated.ms } : {}), ...(generated.tokens !== undefined ? { tokens: generated.tokens } : {}) }; for (const old of Object.keys(s.reproduced).slice(0, -20)) delete s.reproduced[old]; }
+      if (exact && given === undefined) { (s.reproduced ??= {})[exact] = { step: s.step, sha: sha!, request: generated.request, ...(generated.ms !== undefined ? { ms: generated.ms } : {}), ...(generated.tokens !== undefined ? { tokens: generated.tokens } : {}) }; for (const old of Object.keys(s.reproduced).slice(0, -20)) delete s.reproduced[old]; }
       // Equal once trailing whitespace is set aside: said as equal only when it is byte for byte.
       const equal = code === current ? (region ? 'equal them' : 'equals') : region ? 'differ from them only in trailing whitespace' : 'differs only in trailing whitespace from';
-      throw new Error(`the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}: ${region ? `the generated lines ${region.start}..${region.end}${spent} ${equal}` : `the generated file${spent} ${equal} ${path}`} as it is (sha256=${sha}); nothing was written. ${Agent.provenance(s, path, sha!, exact)}`);
+      const made = given === undefined ? 'generated' : 'written';
+      throw new Error(`the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}: ${region ? `the ${made} lines ${region.start}..${region.end}${spent} ${equal}` : `the ${made} file${spent} ${equal} ${path}`} as it is (sha256=${sha}); nothing was written. ${Agent.provenance(s, path, sha!, exact)}`);
     }
     const result = rewrite
       ? await this.execute(s, 'write', { path, expectedHash: hash(current!), oldText: current!, newText: code, wholeFile: true, ...(region ? { region } : {}) }, 'rewrite')
@@ -546,20 +555,26 @@ export class Agent {
   // ---- the loop ----------------------------------------------------------------
   async run(s: Session): Promise<Session> {
     s.status = 'running'; s.stopReason = '';
+    // The prompt is written for this run's model (a session resumed with another model is shown to it in its form).
+    if (this.config.promptForm === 'json') delete s.form; else s.form = this.config.promptForm;
     s.watch ??= { noProgress: 0, readings: [], escalations: 0 }; s.blockedActions ??= []; s.notes ??= '';
     if (s.baselineStatus === null) s.baselineStatus = await repositoryStatus(this.tools.root).then(r => r.git ? r.changed : []).catch(() => []);
     if (!s.orientation) { s.orientation = await orient(this.tools.root) as unknown as Record<string, unknown>; await this.store.log('orientation', { step: s.step, orientation: s.orientation }); }
     if (this.config.checkCommand && !s.lastCheckCommand) s.lastCheckCommand = this.config.checkCommand;
     this.tools.config.checkCommand = s.lastCheckCommand ?? '';
-    const endStep = s.step + this.config.maxSteps;
+    // The limit of an invocation: Bonsai's counts actions (maxSteps); under the tools form it counts turns
+    // (openrouterMaxTurns), since a model that batches its calls runs several actions a turn.
+    const maxTurns = s.form === 'tools' ? this.config.openrouterMaxTurns : 0; let turns = 0;
+    const endStep = maxTurns ? Number.MAX_SAFE_INTEGER : s.step + this.config.maxSteps;
+    const counted = (): { maxStep: number; turn?: number; maxTurn?: number } => maxTurns ? { maxStep: 0, turn: turns, maxTurn: maxTurns } : { maxStep: endStep };
     let generationFailures = 0;
     // A new invocation starts from the base temperature, as the four in a row starts from zero.
     s.unchangedTurns = 0;
     try {
-      for (; s.step < endStep;) {
+      for (; maxTurns ? turns < maxTurns : s.step < endStep;) {
         if (this.stopRequested) { s.status = 'paused'; s.stopReason = 'Stopped by the user; resume to continue.'; break; }
-        s.step++; this.current = s.step; s.currentTurn = null;
-        this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep });
+        s.step++; this.current = s.step; s.currentTurn = null; turns++;
+        this.observe({ kind: 'step', step: s.step, phase: s.phase, ...counted() });
         if (this.config.allowBash && await this.retrySetup(s)) { s.unchangedTurns = 0; await this.store.save(s); continue; }
         // The files the objective names, pinned as read by the harness; a changed one is read and ranked again.
         const pinned = await pinReferences(s, this.tools.root, (query, chunks) => relevance(this.jev, s, query, chunks, 1200)).catch(() => [] as string[]);
@@ -608,7 +623,7 @@ export class Agent {
         // One reasoning per batch of actions, not per action: the worker names an
         // ordered list, the harness runs it back to back and stops at the first
         // failure, which is when reasoning is worth paying for again.
-        let thought = ''; let batch: { action: Route; args: Record<string, any> }[] = [];
+        let thought = ''; let batch: { action: Route; args: Record<string, any>; problem?: string }[] = [];
         // A turn that changed nothing leaves the state as it was: it leaves the prompt, and
         // only the harness's statements about it are added, so the prompt is (nearly) the one
         // that produced it, and near-greedy sampling of it returns that turn again (run 58: the
@@ -622,14 +637,15 @@ export class Agent {
         try {
           const item = { anyOf: stepSchema.anyOf!.filter(alt => allowed.includes(alt.properties!.action!.const as Route)) };
           const gen = await this.generateJson(s, 'step', () => stepMessages(s, allowed, notes.join(' ') || undefined), { type: 'object', properties: { thought: { type: 'string' }, actions: { type: 'array', minItems: 1, maxItems: 8, items: item } }, required: ['thought', 'actions'], additionalProperties: false }, temperature);
-          thought = String(gen.thought ?? '').trim(); batch = (gen.actions as any[]).map(a => ({ action: String(a.action) as Route, args: (a.args ?? {}) as Record<string, any> }));
+          thought = String(gen.thought ?? '').trim(); batch = (gen.actions as any[]).map(a => ({ action: String(a.action) as Route, args: (a.args ?? {}) as Record<string, any>, ...(typeof a.problem === 'string' ? { problem: a.problem } : {}) }));
           s.lastThought = thought;
           await this.store.log('thought', { step: s.step, thought: clip(thought, 2000), actions: batch.map(b => b.action), temperature });
           this.observe({ kind: 'thought', step: s.step, thought, actions: batch, ...(this.bonsai.lastMeta?.reasoning ? { reasoning: this.bonsai.lastMeta.reasoning } : {}) });
         } catch (e) {
           if (++generationFailures >= 4) throw e;
           const cut = /\(length\)/.test((e as Error).message);
-          const why = cut ? `your reply reached the ${this.config.maxTokens}-token limit before it closed, so nothing ran: file content inside the arguments (replace_lines or write with a large newText) does not fit. Use rewrite_file or create_file for large content, which generate it as code without that limit; keep the thought short.` : (e as Error).message;
+          const why = cut && s.form === 'tools' ? 'your reply reached its output limit before its first call was complete, so nothing ran: a large file goes in a call of its own, or in blocks (rewrite_file with start and end); keep the text before the calls short.'
+            : cut ? `your reply reached the ${this.config.maxTokens}-token limit before it closed, so nothing ran: file content inside the arguments (replace_lines or write with a large newText) does not fit. Use rewrite_file or create_file for large content, which generate it as code without that limit; keep the thought short.` : (e as Error).message;
           this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); await this.store.save(s); continue;
         }
         // The turn enters the evidence before its actions run: the prefix only grows,
@@ -642,7 +658,7 @@ export class Agent {
         // and the prompt only grows. Removing the earlier copy left the same one copy and
         // re-processed everything after it (runs 49-76: 26 resets of turns that ran an action,
         // 44.6 s; run 73 step 30, 5,638 tokens). Its results follow as those of a turn that left.
-        const turn = turnEntry(s.step, thought, batch);
+        const turn = turnEntry(s.step, thought, batch, s.form === 'tools');
         const said = (e: { text: string }) => String(JSON.parse(e.text).thought ?? '').replace(/\s+/g, ' ').trim();
         const previous = s.entries.filter(e => e.kind === 'turn').at(-1);
         const repeated = Boolean(previous && said(turn).length >= 40 && said(previous) === said(turn));
@@ -663,8 +679,12 @@ export class Agent {
         this.tools.journal = [];
         let halted = false; const outcomes: string[] = []; const duplicates: boolean[] = []; const startFailures = generationFailures; const notesBefore: string | undefined = s.notes;
         for (let i = 0; i < batch.length; i++) {
-          if (i > 0) { if (s.step >= endStep) break; s.step++; this.current = s.step; this.observe({ kind: 'step', step: s.step, phase: s.phase, maxStep: endStep }); }
-          this.duplicate = false; const outcome = await this.perform(s, batch[i]!.action, batch[i]!.args, thought); outcomes.push(outcome); duplicates.push(outcome === 'repeated' || (outcome === 'refused' && this.duplicate));
+          if (i > 0) { if (s.step >= endStep) break; s.step++; this.current = s.step; this.observe({ kind: 'step', step: s.step, phase: s.phase, ...counted() }); }
+          // Under the tools form a call may leave out the fields that have a default; they are filled in, then the call is checked alone.
+          const args = s.form === 'tools' ? withDefaults(batch[i]!.action, batch[i]!.args) : batch[i]!.args;
+          // A write without a hash edits the file as it is now (its exact anchor is the guard), or creates it when there is none.
+          if (s.form === 'tools' && batch[i]!.action === 'write' && args.expectedHash === undefined && typeof args.path === 'string') args.expectedHash = (await this.diskHashes([args.path]).catch(() => ({} as Record<string, string | null>)))[args.path] ?? 'new';
+          this.duplicate = false; const outcome = await this.perform(s, batch[i]!.action, args, thought, batch[i]!.problem ?? (s.form === 'tools' ? argsProblem(batch[i]!.action, args, allowed, s.hashes) : undefined)); outcomes.push(outcome); duplicates.push(outcome === 'repeated' || (outcome === 'refused' && this.duplicate));
           turn.outcomes!.push(`${batch[i]!.action} ${outcome}${outcome === 'failed' || outcome === 'refused' ? `: ${(s.lastError ?? '').split('\n')[0]!.slice(0, 90)}` : outcome === 'repeated' ? `: shown in ${s.entries.at(-1)?.cites?.join(', ') || 'no entry'}` : ''}`);
           // A refused action (blocked, malformed) counts toward the four in a row that
           // end the attempt; a command that ran and failed is a result, except after a
@@ -697,7 +717,7 @@ export class Agent {
         s.readOnlyTurns = batch.every(b => b.action === 'read_files' || b.action === 'search_codebase') ? (s.readOnlyTurns ?? 0) + 1 : 0;
         await this.watch(s); await this.store.save(s);
       }
-      if (s.status === 'running') { s.status = 'paused'; s.stopReason = `Reached the ${this.config.maxSteps}-step limit for this invocation`; }
+      if (s.status === 'running') { s.status = 'paused'; s.stopReason = maxTurns ? `Reached the ${maxTurns}-turn limit for this invocation` : `Reached the ${this.config.maxSteps}-step limit for this invocation`; }
     } catch (e) {
       s.status = 'paused'; s.stopReason = `Stopped: ${(e as Error).message}`;
     }
@@ -709,9 +729,12 @@ export class Agent {
 
   // Run one action with every check the harness can make around it. Returns
   // whether it succeeded, failed, or ended the session.
-  private async perform(s: Session, routeIn: Route, argsIn: Record<string, any>, thought: string): Promise<'ok' | 'failed' | 'refused' | 'repeated' | 'stop'> {
+  // problem: what is wrong with the call itself (an action that is not one, arguments its schema refuses). Under the
+  // tools form each call is checked alone, so one bad call is refused alone; any other reply was checked whole.
+  private async perform(s: Session, routeIn: Route, argsIn: Record<string, any>, thought: string, problem?: string): Promise<'ok' | 'failed' | 'refused' | 'repeated' | 'stop'> {
     let route = routeIn; let args = argsIn;
     const refuse = async (why: string, duplicate = false) => { this.duplicate = duplicate; this.observe({ kind: 'generation_error', step: s.step, message: why }); await this.store.log('refused', { step: s.step, route, args, why }); await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` }); return 'refused' as const; };
+    if (problem) return refuse(problem);
     if (route === 'write' && args.expectedHash === 'new' && typeof args.path === 'string' && !(await safePath(this.tools.root, args.path, true).then(f => stat(f)).then(() => true, () => false))) { route = 'create_file'; args = { path: args.path, purpose: thought, content: String(args.newText ?? '') }; }
     const key = Agent.actionKey(s, route, args); const exact = Agent.actionKey(s, route, args, true);
     const what = Agent.describe(route, args);
@@ -731,7 +754,7 @@ export class Agent {
     // the same way while the files are unchanged. Anything else runs: other arguments are
     // another request, a file restored to what the edit found takes it again, and a
     // generated file (create_file without content, rewrite_file) differs on every run.
-    const generated = (route === 'create_file' && !(typeof args.content === 'string' && args.content.trim())) || route === 'rewrite_file';
+    const generated = (route === 'create_file' && !(typeof args.content === 'string' && args.content.trim())) || (route === 'rewrite_file' && !(s.form === 'tools' && typeof args.content === 'string'));
     if (prior && !generated) {
       const files = paths.length > 1 ? 'these files' : paths[0]!;
       if (prior.ok && !same(now, prior.before)) {
@@ -880,7 +903,9 @@ export class Agent {
       await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text }); return 'failed';
     }
     if (route === 'create_file' || route === 'rewrite_file') {
-      try { if (route === 'create_file' && typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought, route === 'rewrite_file', { start: args.start, end: args.end }, Agent.actionKey(s, route, args, true)); }
+      // Under the tools form the content is the model's own, written in its call; it is written as generated content is, with the same facts.
+      const given = s.form === 'tools' && typeof args.content === 'string' ? args.content : undefined;
+      try { if (given === undefined && route === 'create_file' && typeof args.content === 'string' && args.content.trim()) await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create'); else await this.createFile(s, String(args.path), String(args.purpose ?? ''), thought, route === 'rewrite_file', { start: args.start, end: args.end }, Agent.actionKey(s, route, args, true), given); }
       catch (e) { return refuse((e as Error).message, (e as { duplicate?: boolean }).duplicate === true); }
       return s.lastResultOk ? 'ok' : 'failed';
     }
@@ -939,3 +964,15 @@ const textFailure = /Stale file hash|oldText must match|would no longer parse|un
 const evictAt = .6; const evictTo = .3;
 const failureKindText = (k: string): string => ({ code_bug: 'the code or configuration written is wrong', wrong_assumption: 'an assumption the output disproves', bad_command: 'the command itself', environment: 'a tool or service the machine lacks', dependency: 'a package missing, unresolvable or at a version that does not exist', permission: 'permission or credentials', transient: 'a network or timing failure', insufficient_context: 'acting without reading what was needed', unknown: 'unclear' } as Record<string, string>)[k] ?? k;
 export { boundedRead };
+// What is wrong with one call: an action that is not one of the step's, or arguments its schema refuses.
+// A missing hash says the one the file has as last reported (fileHashes), when there is one.
+export function argsProblem(action: string, args: Record<string, any>, allowed: readonly string[], hashes: Record<string, string> = {}): string | undefined {
+  const alt = stepSchema.anyOf!.find(a => a.properties!.action!.const === action);
+  if (!alt || !allowed.includes(action)) return `${action} is not an action of this step; the actions are ${allowed.join(', ')}`;
+  try { validate(toolSchema(action as Route), args, `${action} arguments`); } catch (e) {
+    const file = String(args.path ?? args.source ?? ''); const known = hashes[file];
+    const hint = /missing (expectedHash)$/.test((e as Error).message) ? ` (expectedHash is the sha256 of ${file || 'the file'} as last read or edited${known ? `: fileHashes has ${file} sha256=${known}` : '; read it first'})` : '';
+    return `${(e as Error).message}${hint}`;
+  }
+  return undefined;
+}

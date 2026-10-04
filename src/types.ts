@@ -140,6 +140,11 @@ export interface Session {
   lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string };
   // The actions this session may take, fixed at its start so the pinned block never changes.
   allowedActions?: string[];
+  // How the prompt is written for the model of the current run (Config.promptForm): undefined for Bonsai
+  // (one JSON reply per step under a grammar, files written into an opened code block); 'tools' for a model
+  // called through its own tool calling (a turn is its text and its calls, each result a tool message);
+  // 'text' for a model without tools (JSON replies). Under both, a file is replied as a fenced code block.
+  form?: 'tools' | 'text';
   // Consecutive turns that only read or searched.
   readOnlyTurns?: number;
   // Consecutive turns that changed nothing: every action refused or repeated what the evidence shows, the notes as they were.
@@ -148,7 +153,7 @@ export interface Session {
 export interface Config {
   // The model's provider: llama (a llama-server at baseUrl) or openrouter (OpenRouter's API at openrouterUrl, its key in
   // OPENROUTER_API_KEY or the file providerKeyFile). model is the model's id there.
-  provider: 'llama' | 'openrouter'; openrouterUrl: string; providerKeyFile: string;
+  provider: 'llama' | 'openrouter'; openrouterUrl: string; providerKeyFile: string; openrouterWorkingTokens: number; openrouterMaxTurns: number; promptForm: 'json' | 'text' | 'tools';
   baseUrl: string; model: string; contextWindow: number; maxTokens: number;
   workingTokens: number; safetyTokens: number; jevUrl: string; jevModel: string;
   routeProbability: number; routeMargin: number; compactProbability: number;
@@ -184,7 +189,10 @@ export interface Config {
   createTokens: number;
 }
 export interface GenerationMeta { ms: number; usage?: any; timings?: any; finishReason?: string; promptTokens: number; continuations?: number; reasoning?: string }
-export interface Message { role: 'system' | 'user' | 'assistant'; content: string }
+// A call of one of the model's tools, as an assistant message carries it, and its result as a tool message
+// (the tools form of the prompt; Session.form).
+export interface ToolCall { id: string; type: 'function'; function: { name: string; arguments: string } }
+export interface Message { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: ToolCall[]; tool_call_id?: string }
 export type JsonSchema = {
   anyOf?: JsonSchema[]; const?: string;
   type?: 'object' | 'array' | 'string' | 'integer' | 'boolean';

@@ -131,15 +131,20 @@ export function describeModel(config: Config, key: string): Promise<ModelInfo> {
 
 // The config fitted to the model: the window is the model's, the output limit at most what it can
 // write, and the working budget and file budget kept inside them (each request is checked against
-// these). A larger window than the model's is never assumed.
+// these). A larger window than the model's is never assumed. A model through OpenRouter has its own working
+// budget (openrouterWorkingTokens; 0 is a quarter of its window, at most 64000 tokens), and its prompt is
+// written in its own tool calling when it takes tools.
+export const fittedWorkingTokens = (m: ModelInfo): number => Math.min(64000, Math.floor(m.contextLength / 4));
 export function fitToModel(config: Config, m: ModelInfo): Config {
-  if (!m.contextLength) return config;
+  const promptForm = m.provider === 'llama' ? 'json' : m.params.includes('tools') ? 'tools' : 'text';
+  if (!m.contextLength) return { ...config, promptForm };
   const contextWindow = config.provider === 'llama' ? Math.min(config.contextWindow, m.contextLength) : m.contextLength;
   const maxTokens = Math.max(1024, Math.min(config.maxTokens, m.maxOutput || config.maxTokens, Math.floor(contextWindow / 4)));
-  const workingTokens = Math.max(2000, Math.min(config.workingTokens, contextWindow - maxTokens - config.safetyTokens));
+  const wanted = m.provider === 'llama' ? config.workingTokens : config.openrouterWorkingTokens || fittedWorkingTokens(m);
+  const workingTokens = Math.max(2000, Math.min(wanted, contextWindow - maxTokens - config.safetyTokens));
   const createTokens = Math.max(maxTokens, Math.min(config.createTokens, contextWindow - workingTokens - config.safetyTokens));
   const stepThinkingBudget = Math.min(config.stepThinkingBudget, Math.max(256, maxTokens - 512));
-  return { ...config, contextWindow, maxTokens, workingTokens, createTokens, stepThinkingBudget };
+  return { ...config, contextWindow, maxTokens, workingTokens, createTokens, stepThinkingBudget, promptForm };
 }
 
 // An option the app offers for the active model: its name, what it sets, the values it takes, and
@@ -186,7 +191,10 @@ export function modelOptions(m: ModelInfo): ModelOption[] {
   if (has('presence_penalty')) out.push({ name: 'code-presence-penalty', describe: 'penalty on file tokens already used', values: '0..2', get: c => String(c.codePresencePenalty), set: (_c, v) => ({ codePresencePenalty: num(0, 2)(v) }) });
   const out_ = Math.max(1024, Math.min(m.maxOutput || 65536, m.contextLength ? Math.floor(m.contextLength / 4) : 65536));
   out.push({ name: 'max-output', describe: 'most tokens one reply may have (the step reply and its reasoning)', values: `1024..${out_}`, get: c => String(c.maxTokens), set: (_c, v) => ({ maxTokens: num(1024, out_, true)(v) }) });
-  if (m.contextLength) out.push({ name: 'working-tokens', describe: 'most tokens of evidence a prompt carries before older evidence is dropped', values: `4000..${Math.floor(m.contextLength / 2)}`, get: c => String(c.workingTokens), set: (_c, v) => ({ workingTokens: num(4000, Math.floor(m.contextLength / 2), true)(v) }) });
+  const most = Math.floor(m.contextLength / 2); const working = 'most tokens of evidence a prompt carries before older evidence is dropped';
+  if (m.contextLength && m.provider === 'llama') out.push({ name: 'working-tokens', describe: working, values: `4000..${most}`, get: c => String(c.workingTokens), set: (_c, v) => ({ workingTokens: num(4000, most, true)(v) }) });
+  else if (m.contextLength) out.push({ name: 'working-tokens', describe: `${working} (auto: a quarter of the window, at most 64000)`, values: `auto | 4000..${most}`,
+    get: c => c.openrouterWorkingTokens ? String(c.openrouterWorkingTokens) : `auto (${fittedWorkingTokens(m)})`, set: (_c, v) => ({ openrouterWorkingTokens: /^(auto|0)$/i.test(v) ? 0 : num(4000, most, true)(v) }) });
   return out;
 }
 // The settings the active model does not take, as one line each: a config that sets them on another

@@ -19,15 +19,14 @@ node dist/src/cli.js doctor --key-file ~/.config/typesafe.key
 node dist/src/cli.js run "Find the cause of the failing parser test" \
   --repo /path/to/repository --key-file ~/.config/typesafe.key
 
-# Edits and tests, explicitly enabled
+# Edits and tests (write and shell are on by default; --no-bash or --read-only turns them off)
 node dist/src/cli.js run "Fix the failing parser test with a focused change and verify it" \
   --check "npm test" \
-  --repo /path/to/repository --key-file ~/.config/typesafe.key \
-  --allow-write --allow-bash
+  --repo /path/to/repository --key-file ~/.config/typesafe.key
 
-# Resume the exact session path printed by run; capabilities must be enabled again
+# Resume the exact session path printed by run
 node dist/src/cli.js resume /path/to/repository/.leana/runs/SESSION \
-  --key-file ~/.config/typesafe.key --allow-write --allow-bash \
+  --key-file ~/.config/typesafe.key \
   --message "Continue; the intended behavior is ..."
 ```
 
@@ -100,9 +99,9 @@ Full retained outputs live outside the prompt. Use `read_files` with `@artifact/
 | `finish` | The worker's completion claim with a summary. Gated on facts (the diff, the verification after the last edit, the sources) and Jev's reading of them; never on the summary text alone. |
 | `ask_user` | Persists the session and returns the question to the terminal. Resume with `--message`. |
 
-Writes and shell are disabled by default. Filesystem tools reject absolute paths, traversal, and symlink targets outside the repository, along with `.git`, `.leana`, `.env*`, private-key filenames, and dependency folders. These checks are useful boundaries for cooperative local use, **not an OS sandbox or a defense against concurrent hostile filesystem races**.
+Writes and shell are enabled by default; `--no-bash` turns the shell off and `--read-only` turns off both (in the app: `/allow write|bash off`). Filesystem tools reject absolute paths, traversal, and symlink targets outside the repository, along with `.git`, `.leana`, `.env*`, private-key filenames, and dependency folders. These checks are useful boundaries for cooperative local use, **not an OS sandbox or a defense against concurrent hostile filesystem races**.
 
-`--allow-bash` permits arbitrary shell commands with the current user's privileges, including writes outside the repository even without `--allow-write`. Use a container/worktree appropriate to the repository's trust level. The child process receives a small environment allowlist rather than inheriting API keys. If a build requires other environment variables, the current prototype needs explicit adaptation. Permission decisions never come from a Jev probability.
+The shell runs arbitrary commands with the current user's privileges, including writes outside the repository even when writes are off. Use a container/worktree appropriate to the repository's trust level. The child process receives a small environment allowlist rather than inheriting API keys. If a build requires other environment variables, the current prototype needs explicit adaptation. Permission decisions never come from a Jev probability.
 
 Jev is hosted: the objective, task text, and bounded source/output excerpts are sent to TypeSafe. Bonsai inference uses the configured local endpoint. Local session artifacts and action logs can contain source code and command arguments. Secret filename exclusions are a convenience, not general secret detection.
 

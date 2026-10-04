@@ -436,7 +436,7 @@ test('A step and a file generation stream through the real Agent: the thought is
   });
   const root = await mkdtemp(join(tmpdir(), 'leana-stream-')); t.after(() => rm(root, { recursive: true, force: true }));
   const store = new Store(join(root, '.leana', 'runs', 'r')); await store.init();
-  const cfg = { ...defaults, baseUrl: `${url}/v1`, allowWrite: true, maxSteps: 1, contextWindow: 64000, workingTokens: 16000, maxTokens: 4096, createTokens: 4000, codeThinking: false };
+  const cfg = { ...defaults, baseUrl: `${url}/v1`, allowWrite: true, allowBash: false, maxSteps: 1, contextWindow: 64000, workingTokens: 16000, maxTokens: 4096, createTokens: 4000, codeThinking: false };
   const noul = (v: number) => ({ type: 'noul' as const, noul: v });
   const jev = { decide: async (_s: unknown, _q: unknown, ctx?: { phase: string }): Promise<Answers> => { if (ctx?.phase === 'watchdog') return { progress: noul(.8), same_failure: noul(.05), stuck: noul(.05), objective_satisfied: noul(.2), needs_user: noul(.05), in_scope: noul(.9) }; throw new Error(`unexpected ${ctx?.phase}`); } };
   const seen: { at: number; e: ProgressEvent }[] = []; const screen: string[] = [];

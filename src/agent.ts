@@ -130,6 +130,7 @@ export class Agent {
       s.previousCheck = s.lastCheck;
       let output = result.text; try { output = String(JSON.parse(result.text).output ?? result.text); } catch { /* plain text */ }
       s.lastCheck = { step: s.step, ok: result.ok, text: clipEnds(output, 1500), summary: await summarizeCheck(result.text, s.root, [...s.writes, ...s.knownFiles]), fileHashes: await sourceHashes(s.root, s.writes), ...(kind === 'bash' && typeof args?.command === 'string' ? { command: args.command.trim() } : {}) };
+      if (result.ok) s.lastPassedCheck = { step: s.step, ...(s.lastCheck.command ? { command: s.lastCheck.command } : {}) };
       if (!result.ok) {
         // Every line the output names, in every file it names, as the file reads now (read
         // as read_files and the edits read it, so its sha256 is the hash an edit carries):
@@ -329,11 +330,16 @@ export class Agent {
     await this.logPrompt(s, route, prompt, tokens);
     this.observe({ kind: 'generating', step: s.step, route, attempt: 1 });
     // As it streams: how far the prompt has been read, then a step's thought and actions so far; any other reply only its token count.
+    // The step's reply may follow the model's own thinking (stepThinking); no other route thinks.
+    const thinking = route === 'step' && this.config.stepThinking ? this.config.stepThinkingBudget : undefined;
     const args = await this.bonsai.generate(prompt, schema, temperature, { step: s.step, route }, undefined, every(100, (p: StreamProgress) => {
       const reply = route === 'step' && !p.prompt ? partialJson(p.text) : undefined;
-      this.observe(typeof reply?.thought === 'string' ? { kind: 'thinking', step: s.step, text: reply.thought, tokens: p.tokens, ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}) }
+      this.observe(p.reasoning && !p.text ? { kind: 'reasoning', step: s.step, text: p.reasoning, tokens: p.tokens } : typeof reply?.thought === 'string' ? { kind: 'thinking', step: s.step, text: reply.thought, tokens: p.tokens, ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}) }
         : { kind: 'generating', step: s.step, route, attempt: 1, ...(p.prompt ? { prompt: p.prompt } : { tokens: p.tokens }) });
-    }));
+    }), thinking);
+    // The thinking is kept in the log, not in the prompt: the turn holds the reply, whose thought is its summary.
+    const reasoning = this.bonsai.lastMeta?.reasoning;
+    if (reasoning) await this.store.log('reasoning', { step: s.step, chars: reasoning.length, text: clip(reasoning, 16000) });
     this.observe({ kind: 'generated', step: s.step, route, meta: this.bonsai.lastMeta ?? null, args });
     return args;
   }
@@ -350,7 +356,7 @@ export class Agent {
     let prompt = builds[0]!(); let counted = await this.bonsai.count(prompt);
     for (const smaller of builds.slice(1)) { if (counted.tokens <= this.config.workingTokens) break; prompt = smaller(); counted = await this.bonsai.count(prompt); }
     if (counted.tokens > this.config.workingTokens) { const fitted = await this.fit(s, builds.at(-1)!); prompt = fitted.prompt; counted = { tokens: fitted.tokens, mode: 'fit' }; }
-    const request = hash(JSON.stringify({ tail: [...volatile(s, false), prompt.at(-1)], temperature: this.config.codeTemperature, minP: this.config.codeMinP, budget }));
+    const request = hash(JSON.stringify({ tail: [...volatile(s, false), prompt.at(-1)], temperature: this.config.codeTemperature, topP: this.config.codeTopP, topK: this.config.codeTopK, minP: this.config.codeMinP, presence: this.config.codePresencePenalty, budget }));
     chosen?.(request);
     s.lastPromptTokens = counted.tokens;
     this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
@@ -358,9 +364,12 @@ export class Agent {
     this.observe({ kind: 'generating', step: s.step, route, attempt: 1 });
     // As it is written: how far the prompt has been read, then the file's lines so far and the last of them.
     const progress = every(100, (p: StreamProgress) => this.observe(p.prompt ? { kind: 'generating', step: s.step, route, attempt: 1, prompt: p.prompt }
+      : p.reasoning && !p.text ? { kind: 'reasoning', step: s.step, text: p.reasoning, tokens: p.tokens }
       : { kind: 'writing', step: s.step, route, path, from, ...tailLines(p.text, liveHeight), tokens: p.tokens, ...(p.perSecond ? { perSecond: p.perSecond } : {}) }));
     if (this.bonsai.generateText) {
-      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, ...(around ? { around } : {}), progress });
+      // The model thinks before the code (codeThinking); its thought is logged, never put in a prompt.
+      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, ...(around ? { around } : {}), progress, ...(this.config.codeThinking ? { think: this.config.codeThinkingBudget } : {}) });
+      if (g.meta?.reasoning) await this.store.log('reasoning', { step: s.step, route, path, chars: g.meta.reasoning.length, text: clip(g.meta.reasoning, 16000) });
       this.observe({ kind: 'generated', step: s.step, route, meta: g.meta, args: { chars: g.text.length, finish: g.finish }, file: { path, from, lines: tailLines(g.text, 0).lines } });
       const run = fence.match(/^`+/)?.[0].length ?? 3; const opened = g.text.match(/^\s*(`{3,})[^\n]*\n/);
       // A cut keeps whole lines only; the kept text ends at the start of the cut line.
@@ -413,9 +422,12 @@ export class Agent {
     // the same content returned the same text byte for byte (run 71, steps 34, 36 and 37: 1452
     // tokens three times, from prompts of 29k and 15k tokens whose last two messages were
     // identical). A check that ran since, a module or package that changed, other notes: another
-    // request, which is generated.
+    // request, which is generated. That was measured at codeTemperature 0.3; above it a repeat can come
+    // out otherwise (at 0.7, the instruct-mode setting, it is a new sample), and so does one after a thought
+    // sampled at the thinking-mode temperature (codeThinking), so it is generated.
+    const deterministic = this.config.codeTemperature <= .3 && !this.config.codeThinking;
     const sha = current === undefined ? undefined : hash(current);
-    const known = rewrite && exact ? s.reproduced?.[exact] : undefined;
+    const known = rewrite && exact && deterministic ? s.reproduced?.[exact] : undefined;
     // The file around a region's block, all of it: a block may repeat any number of the lines that stay.
     const around = region ? { before: lines.slice(0, region.start - 1).join('\n'), region: lines.slice(region.start - 1, region.end).join('\n'), after: lines.slice(region.end).join('\n') } : undefined;
     const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', path, region?.start ?? 1, builds, this.config.createTokens, fenceFor(path), request => {
@@ -446,7 +458,7 @@ export class Agent {
     const repeat = echo ? `lines ${region!.end + 1}..${region!.end + echo.echoed}, the lines after the region${echo.diverged ? ', then went on with other lines' : ''}` : '';
     const where = echo ? `after the block and a repeat of ${repeat}` : `inside line ${at}`;
     const cutLine = !cut ? '' : cut.kind === 'echo' ? `was stopped once it was repeating ${repeat}` : cut.kind === 'cycle' ? `repeated itself ${where}${echo ? '' : opening}: that line reached ${cut.lineChars} characters without ending${cut.unit ? `, ending in one ${cut.unit}-character unit repeated verbatim` : ''}; it was cut at the start of that line`
-      : cut.kind === 'lines' ? `started repeating a block of lines ${echo ? where : `at line ${at}`}; it was cut there`
+      : cut.kind === 'lines' ? `started repeating ${cut.block && cut.times ? `${cut.block === 1 ? 'one line' : `a block of ${cut.block} lines`} (from \`${cut.opening}${cut.truncated ? '…' : ''}\`), which came ${cut.times} times in a row, ` : 'a block of lines '}${echo ? where : `at line ${at}`}; it was cut there`
       : `reached the ${this.config.createTokens}-token budget ${where}${echo ? '' : opening}, which had reached ${cut.lineChars} characters without ending; that line was cut`;
     const lead = cut ? cutLine : echo ? `${echo.diverged ? 'repeated' : 'ended with a repeat of'} ${repeat}` : '';
     // A cut before any line was generated writes nothing: the file stays as it was. A block that was
@@ -598,15 +610,17 @@ export class Agent {
         // same 196 tokens at steps 54 and 55). Each further step of such a streak is sampled at
         // the next temperature of the escalation; a turn that changes something ends it.
         const streak = s.unchangedTurns ?? 0; const escalation = this.config.stepTemperatureEscalation ?? [];
-        const temperature = streak && escalation.length ? Math.max(this.config.stepTemperature, escalation[Math.min(streak, escalation.length) - 1]!) : this.config.stepTemperature;
-        if (temperature !== this.config.stepTemperature) await this.store.log('sampling', { step: s.step, unchangedTurns: streak, temperature });
+        // A step that thinks samples at the thinking-mode temperature; the escalation never goes below the base.
+        const base = this.config.stepThinking ? this.config.stepThinkingTemperature : this.config.stepTemperature;
+        const temperature = streak && escalation.length ? Math.max(base, escalation[Math.min(streak, escalation.length) - 1]!) : base;
+        if (temperature !== base) await this.store.log('sampling', { step: s.step, unchangedTurns: streak, temperature });
         try {
           const item = { anyOf: stepSchema.anyOf!.filter(alt => allowed.includes(alt.properties!.action!.const as Route)) };
           const gen = await this.generateJson(s, 'step', () => stepMessages(s, allowed, notes.join(' ') || undefined), { type: 'object', properties: { thought: { type: 'string' }, actions: { type: 'array', minItems: 1, maxItems: 8, items: item } }, required: ['thought', 'actions'], additionalProperties: false }, temperature);
           thought = String(gen.thought ?? '').trim(); batch = (gen.actions as any[]).map(a => ({ action: String(a.action) as Route, args: (a.args ?? {}) as Record<string, any> }));
           s.lastThought = thought;
           await this.store.log('thought', { step: s.step, thought: clip(thought, 2000), actions: batch.map(b => b.action), temperature });
-          this.observe({ kind: 'thought', step: s.step, thought, actions: batch });
+          this.observe({ kind: 'thought', step: s.step, thought, actions: batch, ...(this.bonsai.lastMeta?.reasoning ? { reasoning: this.bonsai.lastMeta.reasoning } : {}) });
         } catch (e) {
           if (++generationFailures >= 4) throw e;
           const cut = /\(length\)/.test((e as Error).message);
@@ -827,9 +841,10 @@ export class Agent {
       const kind = String(args.kind ?? ''); const start = String(args.start ?? ''); const target = String(args.target ?? '');
       const artifactPath = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-observe.png`);
       const prefix = await shellPrefixFor(this.tools.root).catch(() => '');
-      const r = await observeResult(kind, start, target, { root: this.tools.root, artifactPath, timeoutMs: this.config.commandTimeoutMs, prefix, files: s.knownFiles });
-      await this.store.log('observe', { step: s.step, kind, start, target, ok: r.ok, text: clip(r.text, 3000) });
-      s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 1800) };
+      const inputs = Array.isArray(args.inputs) ? (args.inputs as any[]).filter(i => i && typeof i === 'object').map(i => ({ do: String(i.do) as any, what: String(i.what ?? ''), ms: Number(i.ms) || 0 })) : [];
+      const r = await observeResult(kind, start, target, { root: this.tools.root, artifactPath, timeoutMs: this.config.commandTimeoutMs, prefix, files: s.knownFiles, inputs });
+      await this.store.log('observe', { step: s.step, kind, start, target, ...(inputs.length ? { inputs } : {}), ok: r.ok, text: clip(r.text, 4000) });
+      s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 2600) };
       await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
       this.observe({ kind: 'result', step: s.step, route, ok: r.ok, ms: 0, chars: r.text.length, text: clip(r.text, 200) });
       return r.ok ? 'ok' : 'failed';
@@ -837,6 +852,18 @@ export class Agent {
     if (route === 'ask_user') { s.status = 'paused'; s.stopReason = String(args.question ?? 'The worker needs a decision from the user.'); await this.store.log('ask', { step: s.step, question: s.stopReason }); return 'stop'; }
     if (route === 'finish') {
       if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1)) return refuse(`${s.lastCheckCommand} has not run since the last edit; run it, then finish.`);
+      // A check of record that failed after the last write, or none at all, is a rejection the gate
+      // makes from code whatever Jev reads, so it is stated before the gate runs, with what decides it:
+      // which command the check of record is and how it is replaced. The same finish on the same state
+      // is a duplicate, so a streak of them raises the sampling temperature and ends at four in a row.
+      // (Run dk-country-3: the check of record was a throwaway Node mock that failed; told only "the
+      // verification did not pass after the last edit", the worker finished the same way 40 times.)
+      if (!s.lastCheck || s.lastCheck.ok === false) {
+        const c = s.lastCheck; const quote = (x?: string) => `\`${clip((x ?? '').replace(/\s+/g, ' '), 120)}\``;
+        const passed = s.lastPassedCheck && s.lastPassedCheck.step > s.lastWriteStep && s.lastPassedCheck.step !== c?.step ? ` The last check that exited 0 was step ${s.lastPassedCheck.step}'s ${quote(s.lastPassedCheck.command)}, after that write; a later check replaced it.` : '';
+        const state = `${c?.step ?? -1}:${s.lastWriteStep}`; const again = s.finishRefused === state; s.finishRefused = state;
+        return refuse(`finish was not judged: the check of record ${c ? `failed (step ${c.step}, ${quote(c.command ?? s.lastCheckCommand ?? '')}, exit ${c.summary.code ?? 'unknown'})` : 'has never run: no bash command has been run with check: true in this session'}. Finish is judged once the check of record exits 0 after the last write${s.lastWriteStep >= 0 ? ` (step ${s.lastWriteStep})` : ''}; the check of record is the last bash command run with check: true, so each one replaces the one before.${passed}${again ? ` This finish was refused at the same state before (nothing has been written or checked since).` : ''}`, again);
+      }
       const facts = await this.completionFacts(s, String(args.summary ?? ''));
       await this.store.log('completion-facts', { step: s.step, facts: { ...facts, sources: Object.keys(facts.sources as object) } });
       const verdict = await evidenceGate(this.jev, s, facts);

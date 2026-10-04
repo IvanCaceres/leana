@@ -11,9 +11,10 @@ export type ProgressEvent =
   | { kind: 'generating'; step: number; route: string; attempt: number; tokens?: number; prompt?: { total: number; cache: number; processed: number } }
   // A step reply as it streams: its thought so far, and once its actions have begun each as far as it has come
   // (its own thought, then its route and arguments), and its tokens.
+  | { kind: 'reasoning'; step: number; text: string; tokens: number }
   | { kind: 'thinking'; step: number; text: string; actions?: unknown[]; tokens: number }
   // A step's reply once it is complete and valid: the whole thought and the actions it chose.
-  | { kind: 'thought'; step: number; thought: string; actions: { action: string; args: Record<string, any> }[] }
+  | { kind: 'thought'; step: number; thought: string; actions: { action: string; args: Record<string, any> }[]; reasoning?: string }
   // A file's content as it is generated: its lines so far and the last of them (open: the last is still being
   // written; from: the file line the block starts at).
   | { kind: 'writing'; step: number; route: string; path: string; from: number; lines: number; tokens: number; perSecond?: number; tail: string[]; open: boolean }
@@ -148,16 +149,19 @@ export function describe(e: ProgressEvent, verbose: boolean): string | null {
     // A code generation is recorded by what it produced, how it ended (a cut is told in the warning after it)
     // and what it cost; a step's arguments are its thought and actions, printed whole after it.
     case 'generated': { const s = generationSpeed(e.meta); const m = e.meta; const f = e.file;
+      // The thought before a file's code (codeThinking), printed whole above what was generated.
+      const thought = f && m?.reasoning ? `[${e.step}] reasoning for ${f.path}: ${plain(m.reasoning)}` : null;
       const file = f ? `[${e.step}] generated ${f.path}${f.from > 1 ? ` from line ${f.from}` : ''} | ${plural(f.lines, 'line')} | ${s.generated == null ? '? tokens' : plural(s.generated, 'token')} | ${m ? secs(m.ms) : '-'}${s.perSecond ? ` | ${s.perSecond.toFixed(1)} tok/s` : ''}${m?.finishReason && m.finishReason !== 'stop' ? ` | ${m.finishReason}` : ''}` : null;
-      if (!verbose) return file;
-      return [file, `${p} bonsai ${m ? secs(m.ms) : '-'} | ${s.generated ?? '?'} generated tokens${s.perSecond ? ` @ ${s.perSecond.toFixed(1)} tok/s` : ''}${s.promptPerSecond ? ` | prompt ${m?.timings?.prompt_n ?? m?.promptTokens} tokens @ ${s.promptPerSecond.toFixed(0)} tok/s` : ''}${s.cached ? ` | ${s.cached} cached` : ''} | finish ${m?.finishReason ?? '?'}`,
+      if (!verbose) return [thought, file].filter(Boolean).join('\n') || null;
+      return [thought, file, `${p} bonsai ${m ? secs(m.ms) : '-'} | ${s.generated ?? '?'} generated tokens${s.perSecond ? ` @ ${s.perSecond.toFixed(1)} tok/s` : ''}${s.promptPerSecond ? ` | prompt ${m?.timings?.prompt_n ?? m?.promptTokens} tokens @ ${s.promptPerSecond.toFixed(0)} tok/s` : ''}${s.cached ? ` | ${s.cached} cached` : ''} | finish ${m?.finishReason ?? '?'}`,
         e.route === 'step' ? null : `${p} args ${short(JSON.stringify(e.args), 300)}`].filter(l => l !== null).join('\n'); }
     // Why nothing ran: a reply that failed or was cut short, a refused action, a lost connection.
     case 'generation_error': return `[${e.step}] no action: ${e.message}`;
     case 'result': return verbose ? `${p} result ${e.ok ? 'ok' : 'FAILED'} | ${e.ms.toFixed(0)}ms | ${e.chars} chars | ${short(e.text.replace(/\s+/g, ' '), 200)}` : null;
     case 'undo': return `[${e.step}] undo | reverting ${e.files.join(', ')}`;
     // The step's thought whole, and what it chose; never a reply still being written.
-    case 'thought': return `[${e.step}] thought: ${plain(e.thought)}\n[${e.step}] actions: ${e.actions.map(a => actionSummary(a.action, a.args)).join(' | ')}`;
+    // The model's own thinking first, when it thought before replying (stepThinking).
+    case 'thought': return `${e.reasoning ? `[${e.step}] reasoning: ${plain(e.reasoning)}\n` : ''}[${e.step}] thought: ${plain(e.thought)}\n[${e.step}] actions: ${e.actions.map(a => actionSummary(a.action, a.args)).join(' | ')}`;
     case 'warning': return `warning | ${e.text}`;
     default: return null;
   }
@@ -179,7 +183,7 @@ export class Display {
   private panelLines = 0; private timer: NodeJS.Timeout | null = null;
   // What is being generated, shown live under the panel: a step's thought, or a file's last lines. Once one
   // has been shown its rows stay (blank between generations), so the panel does not jump as they start and end.
-  private live: Extract<ProgressEvent, { kind: 'thinking' | 'writing' }> | null = null; private liveShown = false;
+  private live: Extract<ProgressEvent, { kind: 'reasoning' | 'thinking' | 'writing' }> | null = null; private liveShown = false;
   constructor(private out: Stream, private opts: { objective: string; session: string; verbose: boolean }) {
     if (out.isTTY) { this.timer = setInterval(() => this.render(), 1000); this.timer.unref?.(); }
   }
@@ -209,6 +213,7 @@ export class Display {
       case 'generating': { const p = e.prompt;
         this.now = p ? `Bonsai reading the ${e.route} prompt | ${k(p.processed - p.cache)} / ${k(p.total - p.cache)} tokens${p.cache ? ` | ${k(p.cache)} cached` : ''}`
           : `${e.route === 'create_file' || e.route === 'rewrite_file' ? 'Bonsai writing the file as code' : `Bonsai generating ${e.route} arguments${e.attempt > 1 ? ' (retry)' : ''}`}${e.tokens ? ` | ${plural(e.tokens, 'token')}` : ''}`; break; }
+      case 'reasoning': this.live = e; this.liveShown = true; this.now = `Bonsai reasoning | ${plural(e.tokens, 'token')}`; break;
       case 'thinking': this.live = e; this.liveShown = true; this.now = `Bonsai ${e.actions ? 'choosing the actions' : 'thinking'} | ${plural(e.tokens, 'token')}`; break;
       case 'writing': this.live = e; this.liveShown = true;
         this.now = `Bonsai writing ${e.path}${e.from > 1 ? ` from line ${e.from}` : ''} | ${plural(e.lines, 'line')} | ${plural(e.tokens, 'token')}${e.perSecond ? ` | ${e.perSecond.toFixed(1)} tok/s` : ''}`; break;
@@ -265,7 +270,9 @@ export class Display {
       const shown = e.tail.slice(-height); const first = e.from + e.lines - shown.length;
       return shown.map((l, i) => `${label(i ? '' : 'Writing')}${String(first + i).padStart(5)} | ${fitTo(row(l.replace(/\t/g, '  ')), w - 8, e.open && i === shown.length - 1)}`);
     }
-    const actions = (e.actions ?? []).map((a: any, i) => `${label(`Action ${i + 1}`)}${fitTo(typeof a?.action === 'string' ? actionSummary(a.action, a.args && typeof a.args === 'object' ? a.args : {}) : plain(typeof a?.thought === 'string' ? a.thought : ''), w)}`).slice(-height);
+    // The model's own thinking, by its last rows: it can run to stepThinkingBudget tokens.
+    if (e.kind === 'reasoning') { const rows = e.text.trim() ? wrap(plain(e.text), w) : []; return rows.slice(-height).map((r, i) => `${label(i ? '' : 'Reasoning')}${r}`); }
+    const actions = (e.actions ?? []).map((a: any, i) => `${label(`Action ${i + 1}`)}${fitTo(typeof a?.action === 'string' ? actionSummary(a.action, a.args && typeof a.args === 'object' ? a.args : {}) : '', w)}`).slice(-height);
     const thought = e.text.trim() ? wrap(plain(e.text), w) : [];
     return thought.slice(thought.length - Math.min(thought.length, height - actions.length)).map((r, i) => `${label(i ? '' : 'Thinking')}${r}`).concat(actions);
   }

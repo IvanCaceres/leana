@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createServer, type ServerResponse } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { defaults } from '../src/config.js';
-import { Bonsai, post, repeatCut, streamEvents, type StreamProgress } from '../src/clients.js';
+import { Bonsai, post, repeatCut, streamEvents, thinkingBudgetMessage, type StreamProgress } from '../src/clients.js';
 import { Display, describe, partialJson, wrap, type ProgressEvent } from '../src/display.js';
 import { Agent, newSession } from '../src/agent.js';
 import { Store } from '../src/store.js';
@@ -119,7 +119,7 @@ test('partialJson reads a step reply from any prefix of its JSON: the thought as
 });
 
 test('A step reply is read as it streams: the thought grows in the progress, and the reply, usage, timings and finish are those of the unstreamed request', async t => {
-  const content = JSON.stringify({ thought: 'The build failed in src/App.tsx \u2014 caf\u00e9 \ud83d\ude80; read it first.', actions: [{ thought: 'look', action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }] });
+  const content = JSON.stringify({ thought: 'The build failed in src/App.tsx \u2014 caf\u00e9 \ud83d\ude80; read it first.', actions: [{ action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }] });
   // Pieces of three characters cut escapes and surrogate pairs anywhere; reads of five bytes cut characters and lines.
   const pieces = content.match(/[\s\S]{1,3}/g)!; let mode = 'ok'; const bodies: any[] = [];
   const url = await listen(t, async (req, res) => {
@@ -150,7 +150,8 @@ test('A step reply is read as it streams: the thought grows in the progress, and
   const done = logged.find(([type]) => type === 'bonsai')![1]; assert.deepEqual([done.usage, done.timings, done.finishReason, done.model], [usage, timings, 'stop', 'bonsai-27b']);
   // Delivery options only: every other field is the unstreamed request's.
   const { stream, stream_options, return_progress, ...rest } = bodies[0]; assert.deepEqual([stream, stream_options, return_progress], [true, { include_usage: true }, true]);
-  assert.deepEqual(Object.keys(rest), ['model', 'messages', 'temperature', 'min_p', 'max_tokens', 'chat_template_kwargs', 'response_format']);
+  assert.deepEqual(Object.keys(rest), ['model', 'messages', 'temperature', 'top_p', 'top_k', 'min_p', 'max_tokens', 'chat_template_kwargs', 'response_format']);
+  assert.deepEqual([rest.top_p, rest.top_k], [.95, 20], 'top_p and top_k are sent, not left to the server flags');
   // A server that sends no usage: made from the timings, as the server builds it.
   mode = 'nousage'; await bonsai.generate([{ role: 'user', content: 'u' }], stepReply);
   assert.deepEqual(bonsai.lastMeta?.usage, { completion_tokens: pieces.length, prompt_tokens: 1000, total_tokens: 1000 + pieces.length, prompt_tokens_details: { cached_tokens: 900 } });
@@ -204,7 +205,7 @@ async function codeServer(t: any) {
   });
   return { url, state };
 }
-const config = (url: string) => ({ ...defaults, baseUrl: `${url}/v1`, maxTokens: 4096, createTokens: 6000, contextWindow: 64000, workingTokens: 16000, safetyTokens: 1024 });
+const config = (url: string) => ({ ...defaults, baseUrl: `${url}/v1`, maxTokens: 4096, createTokens: 6000, contextWindow: 64000, workingTokens: 16000, safetyTokens: 1024, stepThinking: false });
 const fenced = (s: string) => chars(s);
 
 test('A streamed code generation is one request to the budget, and its text, finish, cut and log are those of the unstreamed reply of the same tokens', async t => {
@@ -221,7 +222,7 @@ test('A streamed code generation is one request to the budget, and its text, fin
   const g = await bonsai.generateText(messages, { fence: '```ts', context: { step: 4, route: 'create_file' }, progress: p => seen.push({ ...p }) });
   assert.equal(g.text, 'const a = 1;\nconst s = "café ⚡";\nexport { a };'); assert.equal(g.finish, 'stop'); assert.equal(g.cut, undefined);
   assert.equal(state.requests.length, 1, 'one request'); const r = state.requests[0];
-  assert.deepEqual([r.n_predict, r.stream, r.timings_per_token, r.return_progress, r.cache_prompt, r.return_tokens, r.stop, r.temperature, r.min_p, r.top_k, r.top_p], [6000, true, true, true, true, true, ['\n```'], .3, .05, 20, .9]);
+  assert.deepEqual([r.n_predict, r.stream, r.timings_per_token, r.return_progress, r.cache_prompt, r.return_tokens, r.stop, r.temperature, r.min_p, r.top_k, r.top_p, r.presence_penalty], [6000, true, true, true, true, true, ['\n```'], .3, .05, 20, .9, 0]);
   assert.deepEqual(r.message_delimiters, [{ role: 'user', delimiter: '<|im_start|>user' }]);
   assert.deepEqual(r.prompt, [...`${chatml({ messages })}\`\`\`ts\n`].map(c => c.codePointAt(0)), 'the prompt ids as before');
   assert.equal(g.meta.continuations, 0); assert.equal(g.meta.usage.completion_tokens, tokens.length - 5, 'every token through the fence');
@@ -302,7 +303,7 @@ test('Between chunk ends a stream is judged only for a loop inside the line bein
   // react-demo-40 step 6's shape: eight identical decorative lines in a file that ends before its first chunk end.
   const hero = ['export function Hero() {', '  return (', '    <section className="hero">', '      <h1 className="hero__title">Build faster</h1>', '      <div className="hero__visual">',
     ...Array(8).fill('        <div className="hero__visual__line" />'), '      </div>', '      <p className="hero__text">Ship the landing page today.</p>', '    </section>', '  )', '}', ''].join('\n');
-  assert(repeatCut(hero.slice(0, hero.indexOf('      </div>'))), 'a chunk ending right after the eight lines would cut them');
+  assert.equal(repeatCut(hero.slice(0, hero.indexOf('      </div>'))), null, 'eight identical lines are not a loop at a chunk end either (twelve are)');
   state.script = [chars(`${hero}\`\`\`\n`)]; const s = await streamed.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
   state.script = [chars(`${hero}\`\`\`\n`)]; const u = await plain.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx' });
   assert.deepEqual([s.text, s.finish, s.cut], [hero.replace(/\n$/, ''), 'stop', undefined]); assert.deepEqual([u.text, u.finish, u.cut], [s.text, s.finish, s.cut]);
@@ -361,8 +362,8 @@ test('The display shows a step\'s thought and actions as they are written and pr
   let live = d.panel().slice(11); assert.equal(live.length, 7, 'the live rows take a fixed height');
   const rows = live.filter(Boolean); assert(rows.length >= 2 && rows.length <= 7 && rows[0]!.startsWith('Thinking   '), live.join('\n'));
   assert(thought.slice(0, 200).endsWith(rows.at(-1)!.trim()), 'the newest words show, a dash as a dash'); assert.equal(row('Now').slice(13), 'Bonsai thinking | 1 token');
-  both([{ kind: 'thinking', step: 2, text: thought, tokens: 61, actions: [{ thought: 'look', action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }, { thought: 'then build it ag' }] }]);
-  live = d.panel().slice(11).filter(Boolean); assert.deepEqual(live.slice(-2), ['Action 1   read_files src/App.tsx 1..40', 'Action 2   then build it ag'], 'each action as far as it has come, under the thought');
+  both([{ kind: 'thinking', step: 2, text: thought, tokens: 61, actions: [{ action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }, {}] }]);
+  live = d.panel().slice(11).filter(Boolean); assert.deepEqual(live.slice(-2), ['Action 1   read_files src/App.tsx 1..40', 'Action 2   '], 'each action as far as it has come, under the thought (one whose name has not come yet is an empty row)');
   assert(live[0]!.startsWith('Thinking   ') && live.length === 6 && live.slice(1, -2).every(l => /^ {11}\S/.test(l)), live.join('\n')); assert.equal(row('Now').slice(13), 'Bonsai choosing the actions | 61 tokens');
   both([{ kind: 'generated', step: 2, route: 'step', meta: null, args: {} },
     { kind: 'thought', step: 2, thought, actions: [{ action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }, { action: 'bash', args: { command: 'npm run build', purpose: 'p', check: true } }, { action: 'bash', args: { command: 'printf "\x1b[2J"; npx vitest run --reporter=verbose src/components/Hero.test.tsx', purpose: 'p', check: false } }] }]);
@@ -423,7 +424,7 @@ test('The panel fits the screen: on a short terminal the live rows take only the
 });
 
 test('A step and a file generation stream through the real Agent: the thought is shown as it comes (at most ten updates a second), printed once, and the file\'s lines are shown as they are written', async t => {
-  const reply = JSON.stringify({ thought: 'Create the greeting module: one exported function that formats a name, nothing else is needed yet.', actions: [{ thought: 'write it', action: 'create_file', args: { path: 'src/greet.ts', purpose: 'export greet(name) returning a greeting' } }] });
+  const reply = JSON.stringify({ thought: 'Create the greeting module: one exported function that formats a name, nothing else is needed yet.', actions: [{ action: 'create_file', args: { path: 'src/greet.ts', purpose: 'export greet(name) returning a greeting' } }] });
   const file = 'export function greet(name: string): string {\n  return `Hello, ${name}!`\n}\n';
   const url = await listen(t, async (req, res) => {
     const b = await body(req);
@@ -435,7 +436,7 @@ test('A step and a file generation stream through the real Agent: the thought is
   });
   const root = await mkdtemp(join(tmpdir(), 'leana-stream-')); t.after(() => rm(root, { recursive: true, force: true }));
   const store = new Store(join(root, '.leana', 'runs', 'r')); await store.init();
-  const cfg = { ...defaults, baseUrl: `${url}/v1`, allowWrite: true, maxSteps: 1, contextWindow: 64000, workingTokens: 16000, maxTokens: 4096, createTokens: 4000 };
+  const cfg = { ...defaults, baseUrl: `${url}/v1`, allowWrite: true, maxSteps: 1, contextWindow: 64000, workingTokens: 16000, maxTokens: 4096, createTokens: 4000, codeThinking: false };
   const noul = (v: number) => ({ type: 'noul' as const, noul: v });
   const jev = { decide: async (_s: unknown, _q: unknown, ctx?: { phase: string }): Promise<Answers> => { if (ctx?.phase === 'watchdog') return { progress: noul(.8), same_failure: noul(.05), stuck: noul(.05), objective_satisfied: noul(.2), needs_user: noul(.05), in_scope: noul(.9) }; throw new Error(`unexpected ${ctx?.phase}`); } };
   const seen: { at: number; e: ProgressEvent }[] = []; const screen: string[] = [];
@@ -458,4 +459,87 @@ test('A step and a file generation stream through the real Agent: the thought is
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.every(e => !['thinking', 'writing', 'generating'].includes(e.type)), 'nothing display-only is logged');
   const raw = events.filter(e => e.type === 'bonsai' && e.data.raw).at(-1).data; assert.deepEqual([raw.finishReason, raw.continuations, raw.usage.completion_tokens], ['stop', 0, [...`${file}\`\`\``].length]);
+});
+
+test('With stepThinking the step request asks for the model\'s own thinking at thinkingEffort within its budget; the thinking streams ahead of the reply, is kept in the meta and the log, and never enters the reply', async t => {
+  const reply = JSON.stringify({ thought: 'Read the config first.', actions: [{ action: 'read_files', args: { files: [{ path: 'vite.config.ts', start: 1, end: 40 }] } }] });
+  const reasoning = 'The build says the plugin is missing. Is it in the manifest? The config imports it, so read the config first.';
+  const bodies: any[] = []; const logs: [string, any][] = [];
+  const url = await listen(t, async (req, res) => {
+    const b = await body(req);
+    if (req.url === '/apply-template') return res.end(JSON.stringify({ prompt: chatml(b) }));
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    bodies.push(b);
+    const { events } = chat(reply.match(/[\s\S]{1,4}/g)!);
+    // The server parses the thinking out ahead of the content (reasoning_format deepseek): reasoning_content deltas first.
+    const thinking = reasoning.match(/[\s\S]{1,5}/g)!.map(p => ({ ...events[1], choices: [{ finish_reason: null, index: 0, delta: { reasoning_content: p } }] }));
+    await serve(res, [events[0], ...thinking, ...events.slice(1)], { done: true });
+  });
+  const bonsai = new Bonsai({ ...defaults, baseUrl: `${url}/v1` }, 'local', async (type, data) => { logs.push([type, data]); });
+  const seen: StreamProgress[] = [];
+  const args = await bonsai.generate([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], stepReply, .2, { step: 1, route: 'step' }, undefined, p => seen.push({ ...p }), 1024);
+  assert.deepEqual(args, JSON.parse(reply), 'the reply is the content alone');
+  assert.equal(bonsai.lastMeta?.reasoning, reasoning);
+  const b = bodies.at(-1);
+  assert.deepEqual([b.chat_template_kwargs, b.reasoning_effort, b.reasoning_budget_tokens, typeof b.reasoning_budget_message], [{ enable_thinking: true }, defaults.thinkingEffort, 1024, 'string'], 'the configured effort, the same for every request');
+  assert(seen.some(p => p.reasoning && !p.text) && seen.at(-1)!.reasoning === reasoning, 'the thinking is reported as it streams, before the reply');
+  const logged = logs.find(([type]) => type === 'bonsai')![1]; assert.deepEqual([logged.reasoningChars, logged.reasoningForced], [reasoning.length, false]);
+  // Without a budget the request is today's: the empty think block is pre-filled and no thinking field is sent.
+  await bonsai.generate([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], stepReply, .2, { step: 2, route: 'step' }, undefined, undefined);
+  assert.deepEqual([bodies.at(-1).chat_template_kwargs, 'reasoning_effort' in bodies.at(-1), 'reasoning_budget_tokens' in bodies.at(-1)], [{ enable_thinking: false }, false, false]);
+  assert.equal(bonsai.lastMeta?.reasoning, undefined);
+  // The display shows the thinking live by its last rows, then prints it whole above the thought.
+  assert.equal(describe({ kind: 'thought', step: 3, thought: 'Read the config first.', actions: [{ action: 'plan', args: { notes: 'n' } }], reasoning }, false)!.split('\n')[0], `[3] reasoning: ${reasoning}`);
+  const writes: string[] = []; const d = new Display({ isTTY: true, columns: 100, rows: 40, write: (x: string) => { writes.push(x); return true; } } as any, { objective: 'o', session: 's', verbose: false });
+  d.update({ kind: 'reasoning', step: 3, text: reasoning, tokens: 30 });
+  assert(d.panel().some(l => l.startsWith('Reasoning  ') && l.includes('The build says')), 'live under the panel'); d.close();
+});
+
+test('With codeThinking a file is planned first: a thought at the thinking-mode sampling, stopped at </think> or its budget, then the code at the code sampling after the closed thought, inside the opened fence', async t => {
+  const bodies: any[] = []; const thought = 'The canvas is #gameCanvas; speeds are pixels per second, times dt in seconds.';
+  const url = await listen(t, async (req, res) => {
+    const b = await body(req);
+    if (req.url === '/apply-template') return res.end(JSON.stringify({ prompt: chatml(b).replace(/<think>\n\n<\/think>\n\n$/, b.chat_template_kwargs?.enable_thinking ? '<think>\n' : '<think>\n\n</think>\n\n') }));
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    if (req.url === '/detokenize') return res.end(JSON.stringify({ content: (b.tokens as number[]).map(c => String.fromCodePoint(c)).join('') }));
+    bodies.push({ ...b, text: (b.prompt as number[]).map((c: number) => String.fromCodePoint(c)).join('') });
+    const reply = b.stop?.[0] === '</think>' ? (bodies.length === 1 ? thought : 'x'.repeat(40)) : 'const a = 1;\n';
+    const stopType = b.stop?.[0] === '</think>' ? (bodies.length === 1 ? 'word' : 'limit') : 'word';
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ content: reply, tokens: [...reply].map(c => c.codePointAt(0)), stop_type: stopType, stopping_word: stopType === 'word' ? (b.stop?.[0] ?? '') : '', tokens_predicted: reply.length, timings: { predicted_per_second: 40 } }));
+  });
+  const logs: [string, any][] = [];
+  const bonsai = new Bonsai({ ...defaults, baseUrl: `${url}/v1` }, 'local', async (type, data) => { logs.push([type, data]); });
+  const seen: StreamProgress[] = [];
+  const g = await bonsai.generateText([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], { fence: '```ts', think: 512, progress: p => seen.push(p) });
+  assert.equal(g.text, 'const a = 1;\n'); assert.equal(g.meta.reasoning, thought);
+  const [think, code] = bodies;
+  assert.deepEqual([think.stop, think.n_predict, think.temperature, think.top_p], [['</think>'], 512, defaults.stepThinkingTemperature, defaults.stepTopP], 'the thought: thinking-mode sampling, its own budget, stopped at </think>');
+  assert(think.text.endsWith('<|im_start|>assistant\n<think>\n'), 'the template opened the thought');
+  assert(code.text.endsWith(`<think>\n${thought}\n</think>\n\n\`\`\`ts\n`), 'the code follows the closed thought inside the opened fence');
+  assert.deepEqual([code.temperature, code.top_p, code.min_p], [defaults.codeTemperature, defaults.codeTopP, defaults.codeMinP], 'the code: the code sampling');
+  assert.equal(logs.find(([type]) => type === 'bonsai')![1].reasoningForced, false);
+  // A thought that reaches its budget is closed after the budget message.
+  bodies.length = 1;
+  await bonsai.generateText([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], { fence: '```ts', think: 40 });
+  assert(bodies.at(-1).text.endsWith(`${'x'.repeat(40)}${thinkingBudgetMessage}</think>\n\n\`\`\`ts\n`));
+});
+
+test('Every request renders at the one thinkingEffort: a file written without its own thought while the steps think is rendered as they are, its thought left empty, so the system message (where xhigh puts its sentence) is the steps\' and the cached prefix holds', async t => {
+  const templates: any[] = []; const prompts: string[] = [];
+  const url = await listen(t, async (req, res) => {
+    const b = await body(req);
+    if (req.url === '/apply-template') { templates.push(b.chat_template_kwargs); const think = b.chat_template_kwargs?.enable_thinking; const effort = think ? (b.chat_template_kwargs.reasoning_effort ?? 'xhigh') : null;
+      return res.end(JSON.stringify({ prompt: `<|im_start|>system\n${effort === 'xhigh' ? 'Reasoning effort is set to xhigh.\n\n' : ''}S<|im_end|>\n<|im_start|>assistant\n${think ? '<think>\n' : '<think>\n\n</think>\n\n'}` })); }
+    if (req.url === '/tokenize') return res.end(JSON.stringify({ tokens: [...String(b.content)].map(c => c.codePointAt(0)) }));
+    prompts.push((b.prompt as number[]).map((c: number) => String.fromCodePoint(c)).join(''));
+    res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ content: 'const a = 1;\n', tokens: [], stop_type: 'word', stopping_word: '\n```', tokens_predicted: 5 }));
+  });
+  const bonsai = new Bonsai({ ...defaults, baseUrl: `${url}/v1`, stepThinking: true, thinkingEffort: 'xhigh', codeThinking: false }, 'local', async () => {});
+  await bonsai.generateText([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], { fence: '```ts' });
+  assert.deepEqual(templates.filter(k => k?.enable_thinking), [{ enable_thinking: true, reasoning_effort: 'xhigh' }]);
+  assert.equal(prompts[0], '<|im_start|>system\nReasoning effort is set to xhigh.\n\nS<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n```ts\n', 'the steps\' system message, the template\'s own empty thought');
+  const quiet = new Bonsai({ ...defaults, baseUrl: `${url}/v1`, stepThinking: false, codeThinking: false }, 'local', async () => {});
+  await quiet.generateText([{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }], { fence: '```ts' });
+  assert.equal(prompts[1], '<|im_start|>system\nS<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n```ts\n', 'with no thinking anywhere, the plain prompt');
 });

@@ -54,7 +54,9 @@ async function repo(t: any) {
   return { root, store };
 }
 const events = async (store: Store) => (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
-const config = { ...defaults, allowWrite: true, allowBash: true, maxSteps: 12, workingTokens: 90000, contextWindow: 200000 };
+// Steps without thinking unless a test turns it on: the escalation tests are written against stepTemperature.
+// Code at 0.3, the temperature the reproduced-rewrite tests (run 71) were recorded at; above it the rule stands down.
+const config = { ...defaults, allowWrite: true, allowBash: true, maxSteps: 12, workingTokens: 90000, contextWindow: 200000, stepThinking: false, codeThinking: false, codeTemperature: .3 };
 
 test('Orientation is gathered by code before the first step: the tree, the manifests, the toolchains present, the verification the ecosystem offers', async t => {
   const { root } = await repo(t);
@@ -92,6 +94,47 @@ test('The loop: orient, reason then act, verify what the worker declared as its 
   assert.equal(result.notes!.split('\n').length, 3);
   const gate = jev.calls.find(c => c.phase === 'evidence-gate')!; assert(gate.state.diffStat && gate.state.verification.afterLastWrite === true, 'the gate sees the facts');
   assert.equal(jev.calls.filter(c => c.phase === 'watchdog').length, 6, 'one reading per batch, none after the accepted finish');
+});
+
+test('A finish while the check of record failed is refused before the gate, naming the check and the passing one it replaced; the same finish on the same state is a duplicate that raises the temperature and ends at four (run dk-country-3)', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'ok.mjs'), 'process.exit(0);\n'); await writeFile(join(root, 'mock.mjs'), 'process.exit(1);\n');
+  const finish = { thought: 'The mock is not a real check; the page rendered, so finish.', action: 'finish', args: { summary: 'built the game' } };
+  const bonsai = bonsaiOf({ steps: [
+    { thought: 'write it', action: 'create_file', args: { path: 'index.html', purpose: 'the game' } },
+    { thought: 'syntax', action: 'bash', args: { command: 'node ok.mjs', purpose: 'syntax check', check: true } },
+    { thought: 'mock', action: 'bash', args: { command: 'node mock.mjs', purpose: 'mock run', check: true } },
+    finish, finish, finish, finish, finish,
+  ] });
+  const jev = jevOf({});
+  const result = await new Agent({ ...config, maxSteps: 12 }, store, jev, bonsai, root, () => {}, () => {}).run(await newSession(root, 'Build the game'));
+  assert.equal(result.status, 'paused'); assert.match(result.stopReason, /four (actions|turns) in a row/);
+  assert(!jev.calls.some(c => c.phase === 'evidence-gate'), 'the gate is never asked: the check decides it');
+  const refusals = (await events(store)).filter(e => e.type === 'refused' && e.data.route === 'finish').map(e => e.data.why as string);
+  assert.equal(refusals.length, 4);
+  assert.match(refusals[0]!, /^finish was not judged: the check of record failed \(step 3, `node mock\.mjs`, exit 1\)\. Finish is judged once the check of record exits 0 after the last write \(step 1\); the check of record is the last bash command run with check: true, so each one replaces the one before\. The last check that exited 0 was step 2's `node ok\.mjs`, after that write; a later check replaced it\.$/);
+  assert(refusals.slice(1).every(r => r.endsWith('This finish was refused at the same state before (nothing has been written or checked since).')));
+  assert((await events(store)).some(e => e.type === 'sampling' && e.data.temperature > config.stepTemperature), 'repeated refusals raise the temperature');
+});
+
+test('Only the step route thinks, within stepThinkingBudget, at stepThinkingTemperature, and only when stepThinking is on; the thinking is logged, not added to the prompt', async t => {
+  for (const on of [true, false]) {
+    const { root, store } = await repo(t);
+    const bonsai = bonsaiOf({ steps: [{ thought: 'done', action: 'plan', args: { notes: 'n' } }] });
+    const budgets: unknown[] = []; const temps: unknown[] = []; let meta: any = null; const prompts: Message[][] = [];
+    const spy = { ...bonsai, get lastMeta() { return meta; }, generate: async (m: Message[], schema: any, temperature?: number, context?: any, max?: number, progress?: (p: any) => void, thinking?: number) => {
+      budgets.push(thinking); temps.push(temperature); prompts.push(m); if (thinking) { progress?.({ text: '', tokens: 3, reasoning: 'why' }); meta = { ms: 1, promptTokens: 1, reasoning: 'Because the notes are empty.' }; } else meta = { ms: 1, promptTokens: 1 };
+      return bonsai.generate(m, schema); } };
+    const shown: any[] = [];
+    await new Agent({ ...config, maxSteps: 1, stepThinking: on, stepThinkingBudget: 512 }, store, jevOf({}), spy as any, root, () => {}, e => shown.push(e)).run(await newSession(root, 'x'));
+    assert.deepEqual(budgets, [on ? 512 : undefined]);
+    assert.deepEqual(temps, [on ? defaults.stepThinkingTemperature : config.stepTemperature], 'a thinking step samples at the thinking-mode temperature');
+    const logged = (await events(store)).filter(e => e.type === 'reasoning');
+    assert.deepEqual(logged.map(e => e.data.text), on ? ['Because the notes are empty.'] : []);
+    assert.equal(shown.find(e => e.kind === 'thought')?.reasoning, on ? 'Because the notes are empty.' : undefined);
+    if (on) assert(shown.some(e => e.kind === 'reasoning'), 'shown live');
+    assert(!JSON.stringify(prompts).includes('Because the notes are empty'), 'never in a prompt');
+  }
 });
 
 test('A completion Jev does not accept comes back as feedback; one it routes to the user pauses the session', async t => {
@@ -1190,14 +1233,16 @@ test('A stuck streak sets its reasoning aside and keeps its results: the turns o
 
 test('The render action shows the worker what the user sees: errors, a broken image, overflow, the headings; and the gate is told when a page was never rendered', async t => {
   if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
-  const html = '<!doctype html><html><head><title>Demo</title><style>body{margin:0;font-family:sans-serif}.wide{width:2000px;height:20px;background:red}</style></head><body><header><nav><ul><li><a href="/a">A</a></li><li><a href="/b">B</a></li></ul></nav></header><main><h1>Hello there</h1><img src="/missing.png" alt="Logo"><div class="wide"></div><section id="empty" style="height:40px"></section><script>console.error("boom"); throw new Error("kaput")</script></main></body></html>';
+  const html = '<!doctype html><html><head><title>Demo</title><style>body{margin:0;font-family:sans-serif}.wide{width:2000px;height:20px;background:red}</style></head><body><header><nav><ul><li><a href="/a">A</a></li><li><a href="/b">B</a></li></ul></nav></header><main><h1>Hello there</h1><img src="/missing.png" alt="Logo"><div class="wide"></div><div class="drawer" style="position:fixed;top:0;left:100%;width:300px;height:100px"><p>Cart</p></div><img src="http://127.0.0.1:1/gone.png" alt="Gone"><section id="empty" style="height:40px"></section><script>console.error("boom"); throw new Error("kaput")</script></main></body></html>';
   const server = createServer((req, res) => { if (req.url === '/') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(html); } else { res.writeHead(404); res.end('no'); } });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r())); t.after(() => server.close());
   const port = (server.address() as any).port;
   const { root } = await repo(t);
   const r = await renderFacts(root, `http://127.0.0.1:${port}/`, undefined, join(root, 'shot.png'), 30000);
   assert.equal(r.ok, false);
-  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /overflowing the viewport horizontally: [^|]*div\.wide/); assert.match(r.text, /exceptions thrown in the page: .*kaput/); assert.match(r.text, /Console messages: .*boom/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
+  assert.match(r.text, /^RENDER FAILED/); assert.match(r.text, /title "Demo"/); assert.match(r.text, /h1: Hello there/); assert.match(r.text, /images that did not load: \/missing\.png \(alt "Logo"\)/); assert.match(r.text, /The page scrolls sideways: it is 2000px wide in a \d+px viewport\./); assert.match(r.text, /cut by the viewport's edge \(partly on screen\) in a \d+px viewport: [^|\n]*div\.wide spans 0\.\.2000px/);
+  assert.match(r.text, /Elements wholly outside the viewport \(not on screen where they are\): [^\n]*div\.drawer spans \d+\.\.\d+px/); assert.doesNotMatch(r.text, /> p spans/, 'a listed element\'s descendants are not listed again');
+  assert.match(r.text, /failed: net::ERR_[A-Z_]+ http:\/\/127\.0\.0\.1:1\/gone\.png/, 'a request that never completed is named by its URL'); assert.match(r.text, /exceptions thrown in the page: .*kaput/); assert.match(r.text, /Console messages: .*boom/); assert.match(r.text, /requests that failed: 404 [^ ]*missing\.png/); assert.match(r.text, /Visible regions with no text or media: .*section#empty/);
   assert((await readFile(join(root, 'shot.png'))).length > 1000, 'a screenshot is kept for the report');
 });
 
@@ -1343,7 +1388,7 @@ test('A generation that ends without closing its code block is reported as incom
   const result = await new Agent({ ...config, maxSteps: 2 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
   assert(result.entries.some(e => /generated content of src\/B\.tsx ended before the file was complete/.test(e.text)), 'the truncated creation is named');
   assert(result.entries.some(e => /rewrite of src\/Hero\.tsx reproduced its current content unchanged and ended before the file was complete/.test(e.text)), 'the no-op rewrite is named with its cause');
-  const { codeSampling } = await import('../src/clients.js'); assert.equal((codeSampling as any).dry_multiplier, undefined, 'no repetition penalty on code');
+  assert(!Object.keys(defaults).some(k => /dry/i.test(k)) && defaults.codePresencePenalty === 0, 'no repetition penalty on code by default');
 });
 
 // Every tool description is tested against the harness: a field the prose names
@@ -2230,6 +2275,19 @@ test('PROBE informative: a refusal that states a new fact (the file exists) is f
 // Run 71, steps 31-37: the build failed at step 31; rewrite_file of src/utils/index.ts wrote at
 // steps 32 and 33, then the same request (same path and purpose) generated the current content
 // back three times (1452 tokens each, 64 s), and the model kept citing the step-31 errors.
+test('Above codeTemperature 0.3 a rewrite that reproduced its file is generated again: a repeat is a new sample there, the byte-identical repeats having been measured at 0.3', async t => {
+  const { root, store } = await repo(t);
+  await mkdir(join(root, 'src'), { recursive: true });
+  await writeFile(join(root, 'src', 'utils.ts'), 'export const cx = (...a: string[]) => a.join(" ");\n');
+  const fixed = 'export const cx = (...a: (string | false)[]) => a.filter(Boolean).join(" ");\n';
+  const rewrite = { thought: 'cx must accept booleans.', action: 'rewrite_file', args: { path: 'src/utils.ts', purpose: 'cx that accepts booleans' } };
+  const base = bonsaiOf({ steps: [rewrite, rewrite, rewrite] }); let generated = 0;
+  const bonsai = { ...base, generateText: async () => { generated++; return { text: fixed, finish: 'stop' as const, meta: { ms: 1, promptTokens: 1 } }; } };
+  const result = await new Agent({ ...config, maxSteps: 3, codeTemperature: .7 }, store, jevOf({}), bonsai as any, root, () => {}, () => {}).run(await newSession(root, 'x'));
+  assert.equal(generated, 3, 'steps 2 and 3 are generated again');
+  assert(!result.entries.some(e => /it was not generated again/.test(e.text)));
+});
+
 test('Run 71, steps 31-37: a rewrite that reproduces its file states when and by what the file was last written and that the last check ran before it; the same request on the same content is not generated again', async t => {
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
@@ -2345,4 +2403,57 @@ test('A rewrite of a file that starts with a byte-order mark lands: the file is 
   const bonsai = bonsaiOf({ steps: [{ thought: 'rewrite a', action: 'rewrite_file', args: { path: 'a.ts', purpose: 'a becomes 2' } }], files: { 'a.ts': 'export const a = 2;\n' } });
   const result = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
   assert.equal(await readFile(join(root, 'a.ts'), 'utf8'), 'export const a = 2;\n', result.entries.map(e => e.text).join('\n'));
+});
+
+test('A script is written knowing the element ids the markup defines, and markup knowing the elements the scripts look up (run space-invaders-4)', async t => {
+  const { root } = await repo(t);
+  await writeFile(join(root, 'index.html'), '<canvas id="gameCanvas"></canvas><div id=\'overlay\'><p id="overlay-text"></p></div><span id={"score"}></span>');
+  await writeFile(join(root, 'game.js'), 'const c = document.getElementById("game");\nconst b = document.querySelector(\'#startBtn\');\nconst t = $(`.title`);\n');
+  const { generationFacts } = await import('../src/profiles.js');
+  assert.deepEqual(await generationFacts(root, 'main.js', undefined, ['index.html', 'game.js']), { elementIdsInMarkup: { 'index.html': ['gameCanvas', 'overlay', 'overlay-text', 'score'] } });
+  assert.deepEqual(await generationFacts(root, 'about.html', undefined, ['index.html', 'game.js']), { elementsScriptsLookUp: { 'game.js': ['#game', '#startBtn', '.title'] } });
+  assert.deepEqual(await generationFacts(root, 'notes.md', undefined, ['index.html', 'game.js']), {}, 'other files get neither');
+});
+
+test('observe plays a page as its user would: each input states the exceptions it set off, the frames drawn, how much of the canvas changed and where, and the text that came or went (runs space-invaders-3 and -4)', async t => {
+  if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
+  const { root } = await repo(t);
+  // A square that moves 200 px a second while ArrowLeft is held; Enter starts it and shows "Playing"; Space throws.
+  await writeFile(join(root, 'game.html'), `<!doctype html><body style="margin:0;background:#000;color:#fff"><p id="msg">Press Enter</p><canvas id="game" width="400" height="200"></canvas><script>
+const ctx = document.getElementById('game').getContext('2d'); const keys = {}; let x = 300, last = performance.now(), on = false;
+addEventListener('keydown', e => { keys[e.key] = true; if (e.key === 'Enter') { on = true; document.getElementById('msg').textContent = 'Playing'; } if (e.key === ' ') { const k = 1; k = 2; } });
+addEventListener('keyup', e => { keys[e.key] = false; });
+(function f(t) { const dt = (t - last) / 1000; last = t; if (on && keys.ArrowLeft) x = Math.max(0, x - 200 * dt); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 400, 200); ctx.fillStyle = '#0f0'; ctx.fillRect(x, 150, 30, 30); requestAnimationFrame(f); })(last);
+</script>`);
+  const r = await renderFacts(root, `file://${join(root, 'game.html')}`, undefined, null, 30000, [{ do: 'press', what: 'Enter', ms: 300 }, { do: 'hold', what: 'ArrowLeft', ms: 600 }, { do: 'press', what: 'Space', ms: 200 }, { do: 'click', what: '#missing', ms: 0 }, { do: 'press', what: 'F13', ms: 0 }]);
+  assert.equal(r.ok, false, 'an exception thrown while played fails the observation');
+  assert.match(r.text, /exceptions thrown while it was played: after input 3 \(pressed Space, then 200 ms\): (?:Uncaught )?TypeError: Assignment to constant variable\./);
+  assert.match(r.text, /1\. pressed Enter, then 300 ms: \d+ frames drawn in [\d.]+ s; canvas#game: unchanged; text now shows "Playing"; no longer shows "Press Enter"/);
+  const held = r.text.match(/2\. held ArrowLeft for 600 ms: (\d+) frames drawn in [\d.]+ s; canvas#game \(400x200\): ([\d.]+)% of it changed, within x (\d+)\.\.(\d+), y (\d+)\.\.(\d+); text unchanged/);
+  assert(held, r.text); assert(Number(held[1]) > 10, 'frames are counted'); assert(Number(held[4]) - Number(held[3]) >= 120, 'the change spans where the square went'); assert(Number(held[5]) >= 130, 'low on the canvas, where the square is');
+  assert.match(r.text, /4\. click "#missing": no element matches that selector/); assert.match(r.text, /5\. press "F13": not a key this observer knows/);
+});
+
+test('A page\'s inline scripts are parsed where they stand, so a broken brace in a one-page game is a fact at write time (run pacman-1)', async t => {
+  const { inlineScriptProblems, syntaxCheck } = await import('../src/profiles.js');
+  const page = '<!doctype html>\n<body>\n<script>\nfunction parse(){ for (const r of rows) { grid.push(r); }\nfunction move(){}\n</script>\n</body>';
+  assert.deepEqual(await inlineScriptProblems('index.html', page), ["line 7, column 8 (at the end of the file): '}' expected"]);
+  assert.deepEqual(await syntaxCheck('/tmp', 'index.html', page), await inlineScriptProblems('index.html', page), 'the HTML profile parses through it');
+  assert.deepEqual(await inlineScriptProblems('index.html', '<script>const a = 1;</script><script type="application/json">{not js</script><script src="x.js"></script><script type="module">export const b = 2;</script>'), [], 'data blocks and external scripts are not parsed; module scripts are');
+});
+
+test('observe takes a repository file by its path: index.html, ./index.html and file://index.html load the file; a path that is no file says so', async t => {
+  if (!(await findBrowser())) { t.skip('no browser on this machine'); return; }
+  const { root } = await repo(t); await writeFile(join(root, 'index.html'), '<!doctype html><title>T</title><h1>Hi</h1>');
+  const { observeResult } = await import('../src/observe.js');
+  const ctx = { root, artifactPath: join(root, 'shot.png'), timeoutMs: 20000, prefix: '', files: ['index.html'] };
+  for (const target of ['index.html', './index.html', 'file://index.html', 'file:///index.html']) assert.match((await observeResult('page', '', target, ctx)).text, new RegExp(`^Rendered file://${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/index\\.html: no exception`), target);
+  assert.match((await observeResult('page', '', 'missing.html', ctx)).text, /^missing\.html is not a URL, and no file of the repository has that path/);
+});
+
+test('A cut of whole repeated lines says what repeated and how many times in a row', async () => {
+  const { repeatCut } = await import('../src/clients.js');
+  const text = ['const grid = [', ...Array(13).fill('  "#.#.#.#.#.#.#.#.#.#.#",'), ''].join('\n');
+  const r = repeatCut(text)!;
+  assert.deepEqual([r.cut.kind, r.cut.line, r.cut.block, r.cut.times], ['lines', 3, 1, 13]);
 });

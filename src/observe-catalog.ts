@@ -5,7 +5,7 @@
 export interface ObserverDescription { kind: string; what: string; question: string }
 export const observerCatalog: ObserverDescription[] = [
   { kind: 'page',
-    what: 'a page loaded in a headless browser: exceptions, failed requests and images, console messages, how it is styled, overflow, headings, links and text',
+    what: 'a page loaded in a headless browser: exceptions, failed requests and images, console messages, how it is styled, overflow, headings, links and text; with inputs, played as its user would (keys, clicks, typing), with what each input did',
     question: 'Judged only by this render evidence, does the page look finished to the user the objective describes: styled and laid out as intended, its content present, nothing broken?' },
   { kind: 'http',
     what: 'a running service answering one HTTP GET: the status, content type, size, and the body (with the keys of a JSON body)',

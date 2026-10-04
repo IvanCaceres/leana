@@ -159,7 +159,7 @@ export interface Config {
   // Every sampling value is sent with each request, so the server's own flags never decide it. A step
   // that thinks (stepThinking) samples at stepThinkingTemperature, the model's thinking-mode setting;
   // stepTemperature is for steps that do not think. top_p and top_k apply to both kinds of step.
-  stepThinkingTemperature: number; stepTopP: number; stepTopK: number; codeTopP: number; codeTopK: number;
+  stepThinkingTemperature: number; stepTopP: number; stepTopK: number; codeTopP: number; codeTopK: number; codePresencePenalty: number;
   // The temperatures of the steps that follow turns which changed nothing (every
   // action refused or repeated what the evidence shows, notes as they were): the
   // k-th such turn in a row samples the next step at the k-th value (the last one
@@ -169,6 +169,10 @@ export interface Config {
   // The model's own thinking before each step's reply (its template's <think> block at effort medium),
   // capped at stepThinkingBudget tokens, where the server closes it. false: the empty block is pre-filled.
   stepThinking: boolean; stepThinkingBudget: number;
+  // The model's own thinking before each file's code (create_file, rewrite_file), capped at codeThinkingBudget tokens.
+  codeThinking: boolean; codeThinkingBudget: number;
+  // The template's reasoning effort for every thinking request (one value: its sentence is in the shared system message).
+  thinkingEffort: 'xhigh' | 'medium' | 'low';
   // The verification command. When set, it is run as a baseline before any edit and
   // after every edit; only this command counts as verification.
   checkCommand: string;

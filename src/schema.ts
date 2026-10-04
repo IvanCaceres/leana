@@ -34,8 +34,10 @@ export const schemas: Record<Route, JsonSchema> = {
   // The worker's own notes: its plan and what it has learned, replaced whole.
   plan: obj({ notes: str() }),
   // Observe the result as its user does: kind names the observer, start the command
-  // that starts what is observed (empty when none), target the URL or command.
-  observe: obj({ kind: { type: 'string', enum: observerKinds }, start: str(500), target: str(1000) }),
+  // that starts what is observed (empty when none), target the URL or command; inputs play a page
+  // as its user would (empty for none, and for the other kinds).
+  observe: obj({ kind: { type: 'string', enum: observerKinds }, start: str(500), target: str(1000),
+    inputs: { type: 'array', maxItems: 12, items: obj({ do: { type: 'string', enum: ['press', 'hold', 'type', 'click', 'wait'] }, what: str(200), ms: integer(0, 10000) }) } }),
 };
 // One action of a step: its name, then its arguments under that action's schema. The step's
 // reasoning is its one thought, written before all its actions;

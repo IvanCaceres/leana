@@ -65,10 +65,56 @@ class Cdp {
   }
 }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+// One input of a played page, as observe takes it: press a key (down, then up), hold one for ms, type text
+// into what has focus, click the element a selector names, or wait; each followed by ms of watching.
+export interface PageInput { do: 'press' | 'hold' | 'type' | 'click' | 'wait'; what: string; ms: number }
+// The key a name means, as CDP dispatches it: its key, code and key code, and the text it types.
+function keyOf(name: string): { key: string; code: string; keyCode: number; text?: string } | null {
+  const named: Record<string, [string, string, number]> = { enter: ['Enter', 'Enter', 13], space: [' ', 'Space', 32], ' ': [' ', 'Space', 32], escape: ['Escape', 'Escape', 27], esc: ['Escape', 'Escape', 27], tab: ['Tab', 'Tab', 9], backspace: ['Backspace', 'Backspace', 8],
+    shift: ['Shift', 'ShiftLeft', 16], control: ['Control', 'ControlLeft', 17], alt: ['Alt', 'AltLeft', 18], arrowleft: ['ArrowLeft', 'ArrowLeft', 37], arrowup: ['ArrowUp', 'ArrowUp', 38], arrowright: ['ArrowRight', 'ArrowRight', 39], arrowdown: ['ArrowDown', 'ArrowDown', 40],
+    left: ['ArrowLeft', 'ArrowLeft', 37], up: ['ArrowUp', 'ArrowUp', 38], right: ['ArrowRight', 'ArrowRight', 39], down: ['ArrowDown', 'ArrowDown', 40] };
+  const n = named[name.toLowerCase()] ?? named[name.toLowerCase().replace(/^key/, '')];
+  if (n) return { key: n[0], code: n[1], keyCode: n[2], ...(n[0] === ' ' || n[0] === 'Enter' ? { text: n[0] === ' ' ? ' ' : '\r' } : {}) };
+  if (/^[a-z]$/i.test(name)) return { key: name, code: `Key${name.toUpperCase()}`, keyCode: name.toUpperCase().charCodeAt(0), text: name };
+  if (/^[0-9]$/.test(name)) return { key: name, code: `Digit${name}`, keyCode: name.charCodeAt(0), text: name };
+  return null;
+}
+// What the page shows at a moment, for comparing two moments: its text, and each canvas as a grid of
+// 96x72 cells of 16 grey levels (a canvas drawn from another origin cannot be read and is left out). The
+// frame counter counts animation frames from when play began.
+const snapshot = `(() => {
+  const canvases = [...document.querySelectorAll('canvas')].filter(c => c.width && c.height).slice(0, 4).map((c, i) => {
+    const name = 'canvas' + (c.id ? '#' + c.id : c.classList.length ? '.' + c.classList[0] : i ? ':nth(' + i + ')' : '');
+    try { const g = document.createElement('canvas'); g.width = 96; g.height = 72; const x = g.getContext('2d'); x.drawImage(c, 0, 0, 96, 72); const d = x.getImageData(0, 0, 96, 72).data; let s = '';
+      for (let k = 0; k < d.length; k += 4) s += Math.min(15, Math.round((d[k] * .3 + d[k + 1] * .59 + d[k + 2] * .11) / 17)).toString(16);
+      return { name, w: c.width, h: c.height, cells: s }; } catch { return { name, w: c.width, h: c.height, cells: null }; } });
+  return { text: (document.body.innerText || '').replace(/[ \\t]+/g, ' ').slice(0, 4000), canvases, frames: window.__leanaFrames || 0, t: performance.now() };
+})()`;
+// Starts counting animation frames, so how fast the page draws while it is played is a fact.
+const countFrames = `(() => { if (!window.__leanaFrames) { window.__leanaFrames = 0; const f = () => { window.__leanaFrames++; requestAnimationFrame(f); }; requestAnimationFrame(f); } return true; })()`;
+interface Snap { text: string; canvases: { name: string; w: number; h: number; cells: string | null }[]; frames: number; t: number }
+// How two moments differ: per canvas, the share of its cells whose grey level changed and the box they
+// span in canvas pixels; the lines of text that came and went.
+function changes(a: Snap, b: Snap): string[] {
+  const out: string[] = [];
+  for (const cb of b.canvases) {
+    const ca = a.canvases.find(c => c.name === cb.name);
+    if (!ca || !ca.cells || !cb.cells) { out.push(`${cb.name}: ${cb.cells ? 'appeared' : 'not readable (drawn from another origin)'}`); continue; }
+    let n = 0; let x0 = 96, y0 = 72, x1 = -1, y1 = -1;
+    for (let k = 0; k < cb.cells.length; k++) if (cb.cells[k] !== ca.cells[k]) { n++; const x = k % 96, y = Math.floor(k / 96); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+    const sx = cb.w / 96, sy = cb.h / 72;
+    out.push(n ? `${cb.name} (${cb.w}x${cb.h}): ${(100 * n / cb.cells.length).toFixed(1)}% of it changed, within x ${Math.round(x0 * sx)}..${Math.round((x1 + 1) * sx)}, y ${Math.round(y0 * sy)}..${Math.round((y1 + 1) * sy)}` : `${cb.name}: unchanged`);
+  }
+  const la = new Set(a.text.split('\n').map(l => l.trim()).filter(Boolean)); const lb = new Set(b.text.split('\n').map(l => l.trim()).filter(Boolean));
+  const came = [...lb].filter(l => !la.has(l)); const went = [...la].filter(l => !lb.has(l));
+  out.push(came.length || went.length ? `text${came.length ? ` now shows ${came.slice(0, 4).map(l => JSON.stringify(l.slice(0, 60))).join(', ')}` : ''}${went.length ? `${came.length ? ';' : ''} no longer shows ${went.slice(0, 4).map(l => JSON.stringify(l.slice(0, 60))).join(', ')}` : ''}` : 'text unchanged');
+  return out;
+}
 // Render a URL, optionally after starting a server with `serve` in `root`
 // (stopped afterwards, whatever happens). Returns facts as text and, when a
 // path is given, a PNG screenshot for the session's report.
-export async function renderFacts(root: string, url: string, serve: string | undefined, screenshotPath: string | null, timeoutMs = 60000): Promise<{ ok: boolean; text: string; unmatched?: string[] }> {
+// inputs: the page is then played as its user would, input by input, and what each did is stated.
+export async function renderFacts(root: string, url: string, serve: string | undefined, screenshotPath: string | null, timeoutMs = 60000, inputs: PageInput[] = []): Promise<{ ok: boolean; text: string; unmatched?: string[] }> {
   const browser = await findBrowser(); if (!browser) return { ok: false, text: 'No browser is installed on this machine (chromium or google-chrome); the page cannot be rendered.' };
   let server: Started | null = null;
   try {
@@ -89,10 +135,43 @@ export async function renderFacts(root: string, url: string, serve: string | und
       await sleep(1500);
       const evaluated = await cdp.send('Runtime.evaluate', { expression: probe, returnByValue: true }, sessionId);
       const facts = evaluated?.result?.value as Facts | undefined;
+      // Played: each input, then what the page did in the time after it. Exceptions are told by the input
+      // after which they were thrown; one thrown while playing fails the observation, as one at load does.
+      const played: string[] = []; const playErrors: string[] = []; const loadThrown = cdp.events.filter(e => e.method === 'Runtime.exceptionThrown').length;
+      if (facts && inputs.length) {
+        const look = async (): Promise<Snap> => (await cdp.send('Runtime.evaluate', { expression: snapshot, returnByValue: true }, sessionId))?.result?.value as Snap;
+        const thrown = () => cdp.events.filter(e => e.method === 'Runtime.exceptionThrown').length;
+        await cdp.send('Runtime.evaluate', { expression: countFrames }, sessionId); await sleep(300);
+        let before = await look();
+        for (const [i, input] of inputs.slice(0, 12).entries()) {
+          const ms = Math.max(0, Math.min(10000, Math.round(input.ms))); const errorsBefore = thrown(); let did = '';
+          if (input.do === 'press' || input.do === 'hold') {
+            const k = keyOf(input.what.trim());
+            if (!k) did = `${input.do} ${JSON.stringify(input.what)}: not a key this observer knows (Enter, Space, Escape, Tab, Backspace, Shift, arrows, a letter or a digit)`;
+            else {
+              await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: k.key, code: k.code, windowsVirtualKeyCode: k.keyCode, ...(k.text ? { text: k.text } : {}) }, sessionId);
+              await sleep(input.do === 'hold' ? ms : 60);
+              await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: k.key, code: k.code, windowsVirtualKeyCode: k.keyCode }, sessionId);
+              if (input.do === 'press') await sleep(ms);
+              did = input.do === 'hold' ? `held ${k.key === ' ' ? 'Space' : k.key} for ${ms} ms` : `pressed ${k.key === ' ' ? 'Space' : k.key}, then ${ms} ms`;
+            }
+          } else if (input.do === 'type') { await cdp.send('Input.insertText', { text: input.what }, sessionId); await sleep(ms); did = `typed ${JSON.stringify(input.what.slice(0, 60))}, then ${ms} ms`; }
+          else if (input.do === 'click') {
+            const at = (await cdp.send('Runtime.evaluate', { expression: `(() => { const e = document.querySelector(${JSON.stringify(input.what)}); if (!e) return null; e.scrollIntoView({ block: 'center' }); const r = e.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`, returnByValue: true }, sessionId).catch(() => null))?.result?.value;
+            if (!at) did = `click ${JSON.stringify(input.what)}: no element matches that selector`;
+            else { for (const type of ['mousePressed', 'mouseReleased']) await cdp.send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: 'left', clickCount: 1 }, sessionId); await sleep(ms); did = `clicked ${input.what}, then ${ms} ms`; }
+          } else { await sleep(ms); did = `waited ${ms} ms`; }
+          const after = await look(); const seconds = (after.t - before.t) / 1000;
+          const errs = cdp.events.filter(e => e.method === 'Runtime.exceptionThrown').slice(errorsBefore).map(e => String(e.params?.exceptionDetails?.exception?.description ?? e.params?.exceptionDetails?.text ?? '').split('\n')[0]!.slice(0, 200));
+          if (errs.length) playErrors.push(`after input ${i + 1} (${did}): ${errs.join(' | ')}`);
+          played.push(`${i + 1}. ${did}: ${errs.length ? `exception: ${errs.join(' | ')}; ` : ''}${after.frames - before.frames} frames drawn in ${seconds.toFixed(1)} s; ${changes(before, after).join('; ')}`);
+          before = after;
+        }
+      }
       if (screenshotPath) { try { const shot = await cdp.send('Page.captureScreenshot', { format: 'png' }, sessionId); await writeFile(screenshotPath, Buffer.from(shot.data, 'base64')); } catch { /* the facts matter more */ } }
       // The browser requests /favicon.ico by itself when a page declares no icon: that request is the browser's, not the page's.
       const own = (u: string) => !/\/favicon\.ico(?:$|\?)/.test(u);
-      const errors = cdp.events.filter(e => e.method === 'Runtime.exceptionThrown').map(e => String(e.params?.exceptionDetails?.exception?.description ?? e.params?.exceptionDetails?.text ?? '').split('\n')[0]!.slice(0, 200));
+      const errors = cdp.events.filter(e => e.method === 'Runtime.exceptionThrown').slice(0, loadThrown).map(e => String(e.params?.exceptionDetails?.exception?.description ?? e.params?.exceptionDetails?.text ?? '').split('\n')[0]!.slice(0, 200));
       const consoleErrors = cdp.events.filter(e => e.method === 'Runtime.consoleAPICalled' && (e.params?.type === 'error' || e.params?.type === 'warning')).map(e => `${e.params.type}: ${(e.params.args ?? []).map((a: any) => a.value ?? a.description ?? '').join(' ').slice(0, 200)}`);
       const logErrors = cdp.events.filter(e => e.method === 'Log.entryAdded' && e.params?.entry?.level === 'error' && own(String(e.params.entry.url ?? ''))).map(e => String(e.params.entry.text ?? '').slice(0, 200));
       const failed = cdp.events.filter(e => e.method === 'Network.responseReceived' && (e.params?.response?.status ?? 0) >= 400 && own(String(e.params.response.url))).map(e => `${e.params.response.status} ${String(e.params.response.url).slice(0, 120)}`);
@@ -108,6 +187,7 @@ export async function renderFacts(root: string, url: string, serve: string | und
       const c = facts.classes;
       const verdict = [
         errors.length ? `exceptions thrown in the page: ${errors.slice(0, 12).join(' | ')}` : '',
+        playErrors.length ? `exceptions thrown while it was played: ${playErrors.join(' | ')}` : '',
         requests.length ? `requests that failed: ${requests.join(' | ')}` : '',
         facts.images.length ? `images that did not load: ${facts.images.join(' | ')}` : '',
       ].filter(Boolean);
@@ -124,6 +204,7 @@ export async function renderFacts(root: string, url: string, serve: string | und
         facts.empty.length ? `Visible regions with no text or media: ${facts.empty.join(' | ')}` : '',
         `Links: ${facts.links.length ? facts.links.slice(0, 12).join(' | ') : 'none'}`,
         `Text begins: ${facts.textHead}`,
+        played.length ? `Played as its user would (each input, then what the page did until the next):\n${played.join('\n')}` : '',
       ].filter(Boolean);
       return { ok, text: lines.join('\n'), ...(c.unmatched ? { unmatched: c.all } : {}) };
     } finally { try { child.kill('SIGKILL'); } catch { /* gone */ } }

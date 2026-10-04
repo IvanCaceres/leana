@@ -256,7 +256,7 @@ export const languages: LanguageProfile[] = [
   { id: 'jvm', extensions: /\.(?:java|kt|kts|scala)$/, kind: 'source', callSite: segment => segment.match(/^([A-Za-z_][\w.]*)\s*\(/)?.[1] ?? identifier(segment) },
   { id: 'other-source', extensions: /\.(?:rb|php|swift|cs|c|cc|cpp|h|hpp|ex|exs|zig|lua|sh)$/, kind: 'source', callSite: segment => identifier(segment) },
   { id: 'vue-svelte', extensions: /\.(?:vue|svelte|astro)$/, kind: 'markup', callSite: segment => segment.match(/^<\s*([A-Za-z_][\w.-]*)/)?.[1] ?? identifier(segment), parse: (root, path, text) => componentProblems(root, path, text) },
-  { id: 'html', extensions: /\.html?$/, kind: 'markup', callSite: segment => segment.match(/^<\s*([A-Za-z][\w-]*)/)?.[1] ?? null },
+  { id: 'html', extensions: /\.html?$/, kind: 'markup', callSite: segment => segment.match(/^<\s*([A-Za-z][\w-]*)/)?.[1] ?? null, parse: (_root, path, text) => inlineScriptProblems(path, text) },
   { id: 'style', extensions: /\.(?:css|scss|sass|less)$/, kind: 'style' },
 ];
 export const languageFor = (path: string): LanguageProfile | null => languages.find(l => l.extensions.test(path)) ?? null;
@@ -560,6 +560,17 @@ export function importSpelling(from: string, to: string): string {
 // The parsers that run in process, cheap enough to judge an edit before it
 // lands: TypeScript's for JS, TS and JSON, and a language profile's own parse.
 // null: the language has none here.
+// The scripts written inside an HTML page (no src; no type, or a JavaScript or module type), parsed as JavaScript
+// where they stand: the rest of the page is blanked to spaces with its line breaks kept, so a problem's line and
+// column are the page's own. A page's script was checked by nothing (run pacman-1: an unbalanced brace in a
+// one-page game took 12 steps of the worker extracting the script with node -e to find it).
+export async function inlineScriptProblems(path: string, text: string): Promise<string[]> {
+  const scripts = [...text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(m => !/\bsrc\s*=/i.test(m[1]!) && (!/\btype\s*=/i.test(m[1]!) || /\btype\s*=\s*["']?(?:text\/javascript|application\/javascript|module)["']?(?:\s|$)/i.test(m[1]!)));
+  if (!scripts.length) return [];
+  const page = text.replace(/[^\n]/g, ' ').split('');
+  for (const m of scripts) { const at = m.index! + m[0].indexOf('>') + 1; for (let k = 0; k < m[2]!.length; k++) page[at + k] = m[2]![k]!; }
+  return syntaxErrors(`${path}.js`, page.join(''));
+}
 export async function parseInProcess(root: string, path: string, text: string): Promise<string[] | null> {
   const lang = languageFor(path);
   if (!lang || lang.id === 'typescript' || /\.json$/i.test(path)) return syntaxErrors(path, text);
@@ -645,11 +656,42 @@ export async function markupClassNames(root: string, files: string[], limit = 40
 // Class names a stylesheet has a selector for (any rule that mentions .name).
 export const stylesheetClasses = (css: string): Set<string> => new Set([...css.matchAll(/\.(-?[_A-Za-z][\w-]*)/g)].map(m => m[1]!));
 
+// The element ids a markup file defines (id="x", id='x', id={"x"}), literal ones only.
+export function markupIds(text: string): string[] {
+  return [...new Set([...text.matchAll(/\bid\s*=\s*(?:"([^"{}$]+)"|'([^'{}$]+)'|\{\s*["'`]([^"'`$]+)["'`]\s*\})/g)].map(m => (m[1] ?? m[2] ?? m[3]!).trim()).filter(n => /^[\w:.-]+$/.test(n)))];
+}
+// What a script looks the page's elements up by: getElementById's ids, and the selectors passed to
+// querySelector(All), closest, matches and $/jQuery, as written (literal strings only).
+export function scriptLookups(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/\bgetElementById\s*\(\s*(["'`])([^"'`$]+)\1\s*\)/g)) out.add(`#${m[2]!.trim()}`);
+  for (const m of text.matchAll(/(?:\bquerySelector(?:All)?|\bclosest|\bmatches|(?:^|[^\w$.])\$|\bjQuery)\s*\(\s*(["'`])([^"'`$]+)\1\s*[,)]/g)) out.add(m[2]!.trim());
+  return [...out].filter(sel => sel.length <= 120);
+}
+const scriptFile = /\.[cm]?[jt]sx?$/;
+const shipped = (f: string) => !/(^|\/)(?:node_modules|dist|build|\.venv|vendor|coverage)\//.test(f);
 // Facts for a file about to be generated, from what the repository holds, by
 // the kind of file: a stylesheet is written against the class names the markup
-// uses (and, when it exists, told which of them it has no rule for yet).
+// uses (and, when it exists, told which of them it has no rule for yet). A script
+// and the markup it drives are written against each other: a script is told the
+// element ids the markup files define, and markup the elements the scripts look up
+// (run space-invaders-4: game.js, written after index.html in the same batch without
+// seeing it, looked up #game, #startBtn and #overlayTitle, which the page named
+// gameCanvas, overlay-text and none; 9 of 23 steps went to finding them).
 export async function generationFacts(root: string, path: string, current: string | undefined, files: string[]): Promise<Record<string, unknown>> {
   const out: Record<string, unknown> = {};
+  const others = files.filter(f => f !== path && shipped(f)).slice(0, 400);
+  const read = async (f: string) => { try { return await boundedRead(join(root, f)); } catch { return null; } };
+  if (scriptFile.test(path)) {
+    const ids: Record<string, string[]> = {};
+    for (const f of others.filter(f => languageFor(f)?.kind === 'markup').slice(0, 20)) { const t = await read(f); const found = t === null ? [] : markupIds(t); if (found.length) ids[f] = found.slice(0, 120); }
+    if (Object.keys(ids).length) out.elementIdsInMarkup = ids;
+  }
+  if (languageFor(path)?.kind === 'markup') {
+    const looked: Record<string, string[]> = {};
+    for (const f of others.filter(f => scriptFile.test(f)).slice(0, 60)) { const t = await read(f); const found = t === null ? [] : scriptLookups(t); if (found.length) looked[f] = found.slice(0, 80); }
+    if (Object.keys(looked).length) out.elementsScriptsLookUp = looked;
+  }
   if (languageFor(path)?.kind === 'style') {
     const used = await markupClassNames(root, files).catch(() => ({} as Record<string, string[]>));
     if (Object.keys(used).length) {

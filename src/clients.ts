@@ -151,33 +151,52 @@ export interface TextGeneration { text: string; finish: 'stop' | 'length' | 'rep
 // in it and after it; a block that starts reproducing the lines after it is stopped (echoOf).
 export interface Around { before: string; region: string; after: string }
 // progress: called as the text arrives (each token of a stream, each chunk otherwise); kept out of context, which is logged.
-export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number; around?: Around; progress?: (p: StreamProgress) => void }
+// think: the model reasons first, up to that many tokens, in its own <think> block, then writes the code (planFirst).
+export interface TextOptions { budgetTokens?: number; temperature?: number; context?: { step: number; route: string }; fence?: string | null; thinking?: boolean; thinkingBudget?: number; around?: Around; progress?: (p: StreamProgress) => void; think?: number }
 // Sampling for code: codeTemperature, codeTopP, codeTopK, codeMinP, sent with each request.
 // No repetition penalty: code repeats itself legitimately (similar blocks, a
 // rewrite that keeps most of a file), and a penalty on repeating pushes the model
 // to end the generation mid-line. A loop is caught by repetitionStart instead.
-// A generation that has started repeating itself: the same block of three or
-// more lines three times in a row in the recent tail, or one line six times in
-// a row. Only back-to-back repetition counts: a line that recurs across a file
-// (a closing tag, a brace, a return) is how code is made. Returns the line
+// A generation that has started repeating itself: the same block of three to
+// eight lines three times back to back in the recent tail, or one line twelve
+// times in a row. Only back-to-back repetition counts: a line that recurs across
+// a file (a closing tag, a brace, a return) is how code is made, and so is data
+// whose rows repeat a few times (run pacman-1: a maze with ten identical rows, and
+// one whose three-row pattern came twice after an earlier occurrence, were cut as
+// loops four times, and the worker spent 50 steps writing around "the harness's
+// truncation"). The block once counted a match anywhere earlier as one of the
+// three; the one recorded block loop (react-demo-82) repeated 18 times in a row.
+// A loop never ends, so a higher count costs a few lines of it. Returns the line
 // index at which the first repeat begins, or -1.
 export function repetitionStart(text: string, tail = 80): number {
   const lines = text.split('\n'); const from = Math.max(0, lines.length - tail);
   for (let i = from, run = 1; i < lines.length; i++) {
     const l = lines[i]!.trim(); run = i > from && l.length >= 3 && l === lines[i - 1]!.trim() ? run + 1 : 1;
-    if (run >= 6) return i - run + 2;
+    if (run >= 12) return i - run + 2;
   }
   for (let size = 3; size <= 8; size++) {
-    const seen = new Map<string, number>();
-    for (let i = from; i + size <= lines.length; i++) {
-      const w = lines.slice(i, i + size).map(l => l.trim()).join('\n');
+    for (let i = from; i + 3 * size <= lines.length; i++) {
+      const ws = lines.slice(i, i + size).map(l => l.trim()); const w = ws.join('\n');
       if (w.replace(/[\s{}()[\];,]/g, '').length < 24) continue;
-      const first = seen.get(w);
-      if (first !== undefined) { let n = 2; for (let j = i + size; j + size <= lines.length; j += size) { if (lines.slice(j, j + size).map(l => l.trim()).join('\n') === w) n++; else break; } if (n >= 3) return i; }
-      else seen.set(w, i);
+      // A block that is itself a shorter block repeated (identical rows) is the shorter block's run: judged by its own count.
+      if ([1, 2, 3, 4].some(d => d < size && size % d === 0 && ws.every((l, k) => l === ws[k % d]))) continue;
+      let n = 1; for (let j = i + size; j + size <= lines.length && lines.slice(j, j + size).map(l => l.trim()).join('\n') === w; j += size) n++;
+      if (n >= 3) return i + size;
     }
   }
   return -1;
+}
+// How a run of whole lines repeats from line index at: the smallest block (1..8 lines) that recurs back to
+// back there, and how many times in a row it came (counting the occurrence just before at, the first).
+export function repeatRun(lines: string[], at: number): { size: number; times: number } | null {
+  const t = lines.map(l => l.trim());
+  for (let size = 1; size <= 8; size++) {
+    const first = at - size; if (first < 0) continue;
+    const w = t.slice(first, at).join('\n'); if (t.slice(at, at + size).join('\n') !== w) continue;
+    let times = 1; for (let j = first + size; j + size <= t.length && t.slice(j, j + size).join('\n') === w; j += size) times++;
+    if (times >= 2) return { size, times };
+  }
+  return null;
 }
 // A generation caught in a loop inside one line (a path, a data array, a
 // string that never closes): the tail is one short unit over and over. Real
@@ -266,7 +285,7 @@ export function cyclingLine(text: string, maxPeriod = 2000, span = 3000): { star
 // when there is more); kind 'lines' is a repeat of whole lines, 'cycle' one inside
 // a single line, 'budget' an unfinished line at the token budget, 'echo' a region's
 // block reproducing the lines after the region (echoed and diverged as echoOf says).
-export interface GenerationCut { kind: 'cycle' | 'lines' | 'budget' | 'echo'; line: number; opening: string; truncated?: true; lineChars: number; unit?: number; echoed?: number; diverged?: true }
+export interface GenerationCut { kind: 'cycle' | 'lines' | 'budget' | 'echo'; line: number; opening: string; truncated?: true; lineChars: number; unit?: number; echoed?: number; diverged?: true; block?: number; times?: number }
 export function lineCut(body: string, at: number, kind: GenerationCut['kind'], unit?: number): { kept: string; cut: GenerationCut } {
   // At 0 the cut line is the first (lastIndexOf from -1 would find a line break at 0 and keep it).
   const ls = at ? body.lastIndexOf('\n', at - 1) + 1 : 0; const le = body.indexOf('\n', ls);
@@ -289,7 +308,11 @@ export function repeatCut(body: string, around?: Around, lines = true): { kept: 
   // A block that has started reproducing the lines after its region, judged on its whole lines, is cut where the repeat starts.
   const echo = around ? echoOf(judged.slice(0, judged.lastIndexOf('\n') + 1), around, false) : null;
   if (echo && (!hit || lineStart(echo.line - 1) <= hit.start)) { const c = lineCut(body, lineStart(echo.line - 1), 'echo'); return { kept: c.kept, cut: { ...c.cut, echoed: echo.echoed, ...(echo.diverged ? { diverged: true as const } : {}) } }; }
-  return hit ? lineCut(body, hit.start, hit.kind, hit.unit) : null;
+  if (!hit) return null;
+  const c = lineCut(body, hit.start, hit.kind, hit.unit);
+  // A run of whole lines is stated by what repeated: its block and how many times in a row (whole lines only, the last may be unfinished).
+  const run = hit.kind === 'lines' ? repeatRun(judged.slice(0, judged.lastIndexOf('\n') + 1).split('\n').slice(0, -1), c.cut.line - 1) : null;
+  return run ? { kept: c.kept, cut: { ...c.cut, block: run.size, times: run.times } } : c;
 }
 // One /completion reply, streamed or not: the text, the token ids, and the stop fields. exact is false when
 // the ids are not all there (a stream drops the id of a token that ends inside a character); aborted when the
@@ -342,7 +365,8 @@ export class Bonsai {
   private async render(messages: Message[], thinking = false): Promise<{ key: string; prompt: string; tokens?: number }> {
     const key = JSON.stringify([thinking, messages]); if (this.rendered?.key === key) return this.rendered;
     const applied = await postJson(`${this.root}/apply-template`, {
-      messages, add_generation_prompt: true, chat_template_kwargs: { enable_thinking: thinking },
+      // Effort medium with thinking: xhigh, the template's default, would prepend a sentence to the system message.
+      messages, add_generation_prompt: true, chat_template_kwargs: { enable_thinking: thinking, ...(thinking ? { reasoning_effort: this.config.thinkingEffort } : {}) },
     }, this.key, 10000, 0);
     if (typeof applied.prompt !== 'string') throw new Error('Missing rendered prompt');
     return this.rendered = { key, prompt: applied.prompt };
@@ -415,6 +439,21 @@ export class Bonsai {
     if (lost > 0) { exact = false; tail += '\uFFFD'; }
     return { content: content + tail, tokens, tokens_predicted: final.tokens_predicted, stop_type: final.stop_type, stopping_word: final.stopping_word, truncated: final.truncated, timings: final.timings ?? timings, exact };
   }
+  // The thought before a file's code: a raw completion of the prompt rendered with thinking at effort medium
+  // (its template opens <think>), stopped at </think> or at budget tokens, at the thinking-mode sampling the
+  // steps use (stepThinkingTemperature, stepTopP, stepTopK, stepMinP). Streamed when the server streams, so
+  // the reasoning shows as it is written. The code that follows is a request of its own at the code sampling.
+  private async planFirst(messages: Message[], budget: number, context: { step: number; route: string } | undefined, progress: (p: StreamProgress) => void): Promise<{ text: string; forced: boolean; tokens: number; ms: number }> {
+    const start = performance.now(); const ids = await this.tokenize((await this.render(messages, true)).prompt); const userStart = await this.userDelimiter();
+    const url = `${this.root}/completion`; const abort = new AbortController(); const live = this.streams === true;
+    const response = await post(url, { prompt: ids, n_predict: budget, temperature: this.config.stepThinkingTemperature, top_p: this.config.stepTopP, top_k: this.config.stepTopK, min_p: this.config.stepMinP, cache_prompt: true, return_tokens: true, stop: ['</think>'], ...(live ? { stream: true, return_progress: true } : { stream: false }), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, requestTimeoutMs(ids.length, budget, this.tokensPerSecond), 0, abort.signal);
+    const r: Completion = isEventStream(response) ? await this.completionStream(response, url, abort, requestTimeoutMs(ids.length, 0, this.tokensPerSecond), Infinity, p => progress({ text: '', tokens: p.tokens, ...(p.prompt ? { prompt: p.prompt } : { reasoning: p.text }) }), () => false) : await response.json();
+    if (typeof r.content !== 'string') throw new Error('Bonsai returned no thought');
+    const stop: string = r.stop_type ?? (r.stopped_limit ? 'limit' : r.stopped_word ? 'word' : r.stopped_eos ? 'eos' : 'none');
+    const tokens = typeof r.tokens_predicted === 'number' ? r.tokens_predicted : (r.tokens ?? []).length;
+    await this.log('bonsai-think', { ...context, ms: performance.now() - start, tokens, stop, timings: r.timings });
+    return { text: r.content.replace(/<\/think>\s*$/, ''), forced: stop === 'limit', tokens, ms: performance.now() - start };
+  }
   async count(messages: Message[]): Promise<{ tokens: number; mode: string }> {
     try {
       const r = await this.render(messages); r.tokens ??= (await this.tokenize(r.prompt)).length;
@@ -433,9 +472,8 @@ export class Bonsai {
   // Agent.generateJson). The template opens <think> instead of pre-filling an empty block; the JSON grammar
   // holds only after </think>, which the server forces at the budget (reasoning_budget_tokens, with
   // reasoning_budget_message written before it); reasoning_format's default splits the thinking into
-  // reasoning_content. Effort medium: the template's default, xhigh, prepends a sentence to the system
-  // message, which would break the prefix cached for every other request; medium adds no text, and past
-  // turns render alike either way, so only the generation prompt differs.
+  // reasoning_content. Effort is thinkingEffort, the same for every request: xhigh and low put a sentence
+  // in the system message, so requests of two efforts would share no cached prefix.
   async generate(messages: Message[], schema: JsonSchema, temperature = this.config.stepTemperature, context?: { step: number; route: string }, maxTokens = this.config.maxTokens, progress?: (p: StreamProgress) => void, thinking?: number): Promise<Record<string, any>> {
     const count = await this.count(messages);
     if (count.tokens > this.config.workingTokens || count.tokens + maxTokens + this.config.safetyTokens > this.config.contextWindow)
@@ -448,7 +486,7 @@ export class Bonsai {
     const response = await post(url, {
       model: this.config.model, messages, temperature, top_p: this.config.stepTopP, top_k: this.config.stepTopK, min_p: this.config.stepMinP, max_tokens: maxTokens,
       stream: true, stream_options: { include_usage: true }, return_progress: true, chat_template_kwargs: { enable_thinking: Boolean(thinking) },
-      ...(thinking ? { reasoning_effort: 'medium', reasoning_budget_tokens: thinking, reasoning_budget_message: thinkingBudgetMessage } : {}),
+      ...(thinking ? { reasoning_effort: this.config.thinkingEffort, reasoning_budget_tokens: thinking, reasoning_budget_message: thinkingBudgetMessage } : {}),
       response_format: { type: 'json_schema', json_schema: { name: 'arguments', strict: true, schema: samplingSchema(schema) } },
     }, this.key, 60000 + maxTokens * 60, 0, abort.signal);
     this.streams = isEventStream(response);
@@ -484,9 +522,22 @@ export class Bonsai {
     const fence = options.fence === undefined ? '```' : options.fence;
     const requestId = randomUUID();
     const start = performance.now();
-    let prompt: number[]; let promptTokens: number;
-    try { prompt = await this.tokenize((await this.render(messages, thinking)).prompt + (fence && !thinking ? `${fence}\n` : '')); promptTokens = prompt.length; }
+    let prompt: number[]; let promptTokens: number; let plan: { text: string; forced: boolean; tokens: number; ms: number } | undefined;
+    // While the steps think, a file is rendered as they are and its thought left empty (the template's own
+    // non-thinking prefill): the effort's sentence is in the system message every request shares, so a file
+    // rendered without it would have the server process the whole prompt again.
+    const shared = this.config.stepThinking && !thinking && Boolean(fence);
+    try { prompt = await this.tokenize((await this.render(messages, thinking || shared)).prompt + (shared ? '\n</think>\n\n' : '') + (fence && !thinking ? `${fence}\n` : '')); promptTokens = prompt.length; }
     catch (e) { await this.log('bonsai-error', { requestId, ...context, ms: 0, error: `render: ${(e as Error).message}` }); throw new Error(`The server could not render the prompt: ${(e as Error).message}`); }
+    // The model's own reasoning before the code (options.think tokens at most), the way its coding scores
+    // were measured: then the code is generated after the closed thought, inside the opened fence, as
+    // before. A thought that reaches its budget is closed after the budget message.
+    if (options.think && fence && !thinking) {
+      try {
+        plan = await this.planFirst(messages, options.think, context, quietly(options.progress));
+        prompt = await this.tokenize(`${(await this.render(messages, true)).prompt}${plan.text}${plan.forced ? thinkingBudgetMessage : '\n'}</think>\n\n${fence}\n`); promptTokens = prompt.length;
+      } catch (e) { await this.log('bonsai-error', { requestId, ...context, ms: 0, error: `think: ${(e as Error).message}` }); throw e; }
+    }
     if (promptTokens > this.config.workingTokens || promptTokens + Math.min(budget, this.config.maxTokens) + this.config.safetyTokens > this.config.contextWindow)
       throw new Error('Prompt exceeds budget; generation refused');
     // The server checkpoints this hybrid model's recurrent state, the only points a later request can
@@ -505,7 +556,7 @@ export class Bonsai {
     // are alive at once (88 without), under the cap of 128, so the cap still never drops the low restore
     // points an eviction falls back to.
     const userStart = await this.userDelimiter();
-    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, topP: this.config.codeTopP, topK: this.config.codeTopK, minP: this.config.codeMinP, budgetTokens: budget, raw: true, thinking, userStart });
+    await this.log('bonsai-request', { requestId, ...context, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, temperature, topP: this.config.codeTopP, topK: this.config.codeTopK, minP: this.config.codeMinP, presencePenalty: this.config.codePresencePenalty, budgetTokens: budget, raw: true, thinking, userStart });
     // Chunks are where a loop is checked for; a continuation reuses the cached ids, so a small one costs little
     // (one token to process: 124 ms, the median of 263 recorded continuations). A region's block is checked
     // every 128 tokens (about 2.7 s of generation, so about 5% more time) for a repeat of the lines after it,
@@ -536,7 +587,7 @@ export class Bonsai {
         // generation slower than the last one is not lost to its deadline; a hang is caught by streamEvents.
         const timeout = requestTimeoutMs(continuations === 0 ? promptTokens : 0, n, this.tokensPerSecond) + (live ? 60000 * (Math.ceil(n / step) - 1) : 0);
         const prior = text.length; const url = `${this.root}/completion`; const abort = new AbortController();
-        const response = await post(url, { prompt, n_predict: n, temperature, top_p: this.config.codeTopP, top_k: this.config.codeTopK, min_p: this.config.codeMinP, cache_prompt: true, return_tokens: true, ...(live ? { stream: true, timings_per_token: true, return_progress: true } : { stream: false }), ...(thoughtClosed ? { stop: stopWords } : {}), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, timeout, 0, abort.signal);
+        const response = await post(url, { prompt, n_predict: n, temperature, top_p: this.config.codeTopP, top_k: this.config.codeTopK, min_p: this.config.codeMinP, presence_penalty: this.config.codePresencePenalty, cache_prompt: true, return_tokens: true, ...(live ? { stream: true, timings_per_token: true, return_progress: true } : { stream: false }), ...(thoughtClosed ? { stop: stopWords } : {}), ...(userStart ? { message_delimiters: [{ role: 'user', delimiter: userStart }] } : {}) }, this.key, timeout, 0, abort.signal);
         const streamed = isEventStream(response);
         // A server that streams chat but answers this as JSON is not judged until the reply ends: later generations go back to chunks.
         if (live && !streamed) this.streams = false;
@@ -591,10 +642,10 @@ export class Bonsai {
       // A file that reached the budget inside a line: that line is unfinished,
       // so it is left out like a cut one.
       if (finish === 'length' && fence && thoughtClosed && !cut && text !== '' && !text.endsWith('\n')) { const c = lineCut(text, text.length, 'budget'); cutFrom = text; text = c.kept; cut = c.cut; }
-      this.lastMeta = { ms: performance.now() - start, usage: { prompt_tokens: promptTokens, completion_tokens: generated }, timings, finishReason: finish, promptTokens, continuations };
+      this.lastMeta = { ms: performance.now() - start, usage: { prompt_tokens: promptTokens, completion_tokens: generated + (plan?.tokens ?? 0) }, timings, finishReason: finish, promptTokens, continuations, ...(plan ? { reasoning: plan.text.trim() } : {}) };
       // What a loop cut discarded, so the next detector can be measured on real loops.
       if (cut) await this.log(finish === 'repetition' ? 'repetition-cut' : 'budget-cut', { requestId, ...context, kept: text.length, generated: cutFrom.length, cut, discardedTail: cutFrom.slice(-4000) });
-      await this.log('bonsai', { requestId, ...context, model: this.config.model, ms: this.lastMeta.ms, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, usage: this.lastMeta.usage, timings, finishReason: finish, continuations, raw: true });
+      await this.log('bonsai', { requestId, ...context, model: this.config.model, ms: this.lastMeta.ms, prompt: { tokens: promptTokens, mode: 'llama-tokenizer' }, usage: this.lastMeta.usage, timings, finishReason: finish, continuations, raw: true, ...(plan ? { reasoningChars: plan.text.trim().length, reasoningForced: plan.forced, reasoningTokens: plan.tokens, reasoningMs: Math.round(plan.ms) } : {}) });
       return { text, finish, meta: this.lastMeta, ...(cut ? { cut } : {}) };
     } catch (e) {
       await this.log('bonsai-error', { requestId, ...context, ms: performance.now() - start, error: (e as Error).message });

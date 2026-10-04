@@ -2,25 +2,35 @@ import { readFile } from 'node:fs/promises';
 import type { Config } from './types.js';
 export const defaults: Config = {
   baseUrl: 'http://127.0.0.1:8080/v1', model: 'bonsai-27b', contextWindow: 48000,
-  maxTokens: 4096, workingTokens: 12000, safetyTokens: 1024,
+  maxTokens: 8192, workingTokens: 12000, safetyTokens: 1024,
   jevUrl: 'https://api.typesafe.ai/v1/systemone', jevModel: 'jev-latest',
   routeProbability: .55, routeMargin: .12, compactProbability: .75, completeProbability: .9,
   compactCooldown: 4, maxSteps: 80, toolChars: 6000, commandTimeoutMs: 60000,
   allowWrite: false, allowBash: false, verbose: false, checkCommand: '',
   createTokens: 12000,
   // The server's own min_p is 0.05, so these defaults change nothing it did before.
-  stepTemperature: .2, stepMinP: .05, codeTemperature: .3, codeMinP: .05,
-  // PrismML's thinking-mode sampling for Bonsai 2 (the GGUF's general.sampling, its docs and demo scripts):
-  // temperature 1.0, top_p 0.95, top_k 20, min_p 0.05; every published Bonsai score was measured with it, and
-  // PrismML warns that mixing thinking and instruct settings degrades output. Code keeps its own (top_p 0.9).
+  stepTemperature: .2, stepMinP: .05,
+  // Code at temperature 0.3, top_p 0.9, min_p 0.05: the settings of the runs that worked. PrismML's instruct-mode
+  // sampling (0.7, top_p 0.8, min_p 0, presence_penalty 1.5) and its thinking mode were tried on 2026-10-03 and
+  // made the same objective slower and worse (below); codePresencePenalty stays for an experiment.
+  codeTemperature: .3, codeMinP: .05, codePresencePenalty: 0,
+  // Thinking-mode sampling, used only when a step thinks (stepThinking): PrismML's temperature 1.0, top_p 0.95,
+  // top_k 20, min_p 0.05. top_p and top_k apply to every step.
   stepThinkingTemperature: 1, stepTopP: .95, stepTopK: 20, codeTopP: .9, codeTopK: 20,
   // Only after turns that changed nothing. The server applies temperature after top_k,
   // top_p and min_p, so a higher value reweights the same candidate tokens, never adds one.
   stepTemperatureEscalation: [.5, .8, 1],
-  // Thinking costs generation time only (about 27 ms a token; it is never reused from the cache, the next
-  // prompt holding the turn without it): 1024 tokens is at most about 28 s a step.
-  stepThinking: true, stepThinkingBudget: 1024,
+  // The model's own thinking is off: measured on one objective ("a supermarket groceries react app"), runs
+  // without it took 13 and 20.5 min and completed (react-demo-82, -84); step thinking at 1024 tokens 20.3 and
+  // 23.5 min (-85, -86, the second at temperature 1.0); thinking at effort xhigh with 4096 tokens for steps and
+  // files, code at 0.7, 78 min, the 120-step limit and an unusable app (-87: a step's reply went from 174 to
+  // 2955 tokens at the median, and the work spread into 26 files it could not reconcile). PrismML's scores
+  // were measured with thinking; on this harness and these tasks it cost time and bought no quality.
+  // Each thinking token costs about 27 ms and is never reused from the cache.
+  stepThinking: false, stepThinkingBudget: 1024, thinkingEffort: 'medium',
+  codeThinking: false, codeThinkingBudget: 1024,
 };
+const zeroable = new Set(['stepMinP', 'codeMinP', 'codePresencePenalty']);
 export async function loadConfig(path?: string, overrides: Partial<Config> = {}): Promise<Config> {
   const input = path ? JSON.parse(await readFile(path, 'utf8')) : {};
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Config must be an object');
@@ -28,7 +38,8 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   for (const [key, value] of Object.entries(c)) {
     const expected = defaults[key as keyof Config];
     if (expected === undefined || typeof value !== typeof expected) throw new Error(`Invalid config: ${key}`);
-    if (typeof value === 'number' && (!Number.isFinite(value) || value <= 0)) throw new Error(`Invalid number: ${key}`);
+    // min_p and the presence penalty may be 0 (off); every other number is positive.
+    if (typeof value === 'number' && (!Number.isFinite(value) || value < 0 || (value === 0 && !zeroable.has(key)))) throw new Error(`Invalid number: ${key}`);
   }
   for (const k of ['routeProbability', 'routeMargin', 'compactProbability', 'completeProbability'] as const)
     if (c[k] >= 1) throw new Error(`${k} must be between 0 and 1`);
@@ -43,9 +54,12 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   for (const k of ['stepTopP', 'codeTopP'] as const) if (c[k] > 1) throw new Error(`${k} must be above 0 and at most 1`);
   for (const k of ['stepTopK', 'codeTopK'] as const) if (!Number.isSafeInteger(c[k])) throw new Error(`${k} must be an integer`);
   for (const k of ['stepTemperature', 'stepThinkingTemperature', 'codeTemperature'] as const) if (c[k] > 2) throw new Error(`${k} must be above 0 and at most 2`);
+  if (c.codePresencePenalty > 2) throw new Error('codePresencePenalty must be between 0 and 2');
   for (const k of ['stepMinP', 'codeMinP'] as const) if (c[k] >= 1) throw new Error(`${k} must be between 0 and 1`);
   if (!Array.isArray(c.stepTemperatureEscalation) || c.stepTemperatureEscalation.length > 8 || c.stepTemperatureEscalation.some(t => typeof t !== 'number' || !Number.isFinite(t) || t <= 0 || t > 2))
     throw new Error('stepTemperatureEscalation must be a list of at most 8 temperatures, each above 0 and at most 2');
+  if (!['xhigh', 'medium', 'low'].includes(c.thinkingEffort)) throw new Error('thinkingEffort must be xhigh, medium or low');
+  if (!Number.isSafeInteger(c.codeThinkingBudget) || c.codeThinkingBudget > 8192) throw new Error('codeThinkingBudget must be an integer of at most 8192');
   if (!Number.isSafeInteger(c.stepThinkingBudget) || c.stepThinkingBudget >= c.maxTokens - 256) throw new Error('stepThinkingBudget must be an integer below maxTokens - 256 (the reply follows the thinking in the same output budget)');
   if (c.toolChars < 500 || c.toolChars > 20000) throw new Error('toolChars must be 500..20000');
   for (const key of ['baseUrl', 'jevUrl'] as const) {

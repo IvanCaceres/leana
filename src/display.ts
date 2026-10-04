@@ -149,9 +149,11 @@ export function describe(e: ProgressEvent, verbose: boolean): string | null {
     // A code generation is recorded by what it produced, how it ended (a cut is told in the warning after it)
     // and what it cost; a step's arguments are its thought and actions, printed whole after it.
     case 'generated': { const s = generationSpeed(e.meta); const m = e.meta; const f = e.file;
+      // The thought before a file's code (codeThinking), printed whole above what was generated.
+      const thought = f && m?.reasoning ? `[${e.step}] reasoning for ${f.path}: ${plain(m.reasoning)}` : null;
       const file = f ? `[${e.step}] generated ${f.path}${f.from > 1 ? ` from line ${f.from}` : ''} | ${plural(f.lines, 'line')} | ${s.generated == null ? '? tokens' : plural(s.generated, 'token')} | ${m ? secs(m.ms) : '-'}${s.perSecond ? ` | ${s.perSecond.toFixed(1)} tok/s` : ''}${m?.finishReason && m.finishReason !== 'stop' ? ` | ${m.finishReason}` : ''}` : null;
-      if (!verbose) return file;
-      return [file, `${p} bonsai ${m ? secs(m.ms) : '-'} | ${s.generated ?? '?'} generated tokens${s.perSecond ? ` @ ${s.perSecond.toFixed(1)} tok/s` : ''}${s.promptPerSecond ? ` | prompt ${m?.timings?.prompt_n ?? m?.promptTokens} tokens @ ${s.promptPerSecond.toFixed(0)} tok/s` : ''}${s.cached ? ` | ${s.cached} cached` : ''} | finish ${m?.finishReason ?? '?'}`,
+      if (!verbose) return [thought, file].filter(Boolean).join('\n') || null;
+      return [thought, file, `${p} bonsai ${m ? secs(m.ms) : '-'} | ${s.generated ?? '?'} generated tokens${s.perSecond ? ` @ ${s.perSecond.toFixed(1)} tok/s` : ''}${s.promptPerSecond ? ` | prompt ${m?.timings?.prompt_n ?? m?.promptTokens} tokens @ ${s.promptPerSecond.toFixed(0)} tok/s` : ''}${s.cached ? ` | ${s.cached} cached` : ''} | finish ${m?.finishReason ?? '?'}`,
         e.route === 'step' ? null : `${p} args ${short(JSON.stringify(e.args), 300)}`].filter(l => l !== null).join('\n'); }
     // Why nothing ran: a reply that failed or was cut short, a refused action, a lost connection.
     case 'generation_error': return `[${e.step}] no action: ${e.message}`;

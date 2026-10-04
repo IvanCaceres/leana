@@ -119,7 +119,7 @@ test('Sampling comes from the config: reasoning turns and file content each send
   const baseUrl = `http://127.0.0.1:${(server.address() as any).port}/v1`;
   const plain = new Bonsai({ ...defaults, baseUrl }, 'local', noop);
   await plain.generate([{ role: 'user', content: 'u' }], schemas.bash); await plain.generateText([{ role: 'user', content: 'u' }], { fence: null });
-  assert.deepEqual([bodies.chat![0].temperature, bodies.chat![0].min_p], [.2, .05]); assert.deepEqual([bodies.completion![0].temperature, bodies.completion![0].min_p], [.3, .05]);
+  assert.deepEqual([bodies.chat![0].temperature, bodies.chat![0].min_p], [.2, .05]); assert.deepEqual([bodies.completion![0].temperature, bodies.completion![0].min_p, bodies.completion![0].top_p, bodies.completion![0].top_k, bodies.completion![0].presence_penalty], [.3, .05, .9, 20, 0], 'code: the sampling of the runs that worked, the presence penalty off');
   const varied = new Bonsai({ ...defaults, baseUrl, stepTemperature: .7, stepMinP: .1, codeTemperature: .6, codeMinP: .08 }, 'local', noop);
   await varied.generate([{ role: 'user', content: 'u' }], schemas.bash); await varied.generateText([{ role: 'user', content: 'u' }], { fence: null });
   assert.deepEqual([bodies.chat![1].temperature, bodies.chat![1].min_p], [.7, .1]); assert.deepEqual([bodies.completion![1].temperature, bodies.completion![1].min_p], [.6, .08]);
@@ -193,7 +193,9 @@ test('repetitionStart finds a looping tail and leaves honest repetition alone', 
   const block = ['  <li>Item</li>', '  <li>Item</li>', '  <li>Item</li>'];
   const looping = ['const a = 1;', ...Array.from({ length: 5 }, () => ['<div className="feature">', '  <h3>Fast</h3>', '  <p>Really fast builds.</p>', '</div>']).flat()].join('\n');
   const at = repetitionStart(looping); assert(at >= 1 && at <= 5, `first repeat at ${at}`);
-  assert.equal(repetitionStart(['const a = 1;', ...block, 'const b = 2;'].join('\n')), -1, 'three identical lines are not a loop'); assert.equal(repetitionStart(['const a = 1;', ...Array.from({ length: 6 }, () => '  <li>Item</li>')].join('\n')), 2, 'six identical substantive lines are, from the second');
+  assert.equal(repetitionStart(['const a = 1;', ...block, 'const b = 2;'].join('\n')), -1, 'three identical lines are not a loop'); assert.equal(repetitionStart(['const a = 1;', ...Array.from({ length: 10 }, () => '  <li>Item</li>')].join('\n')), -1, 'ten identical rows are data (run pacman-1: maze rows)'); assert.equal(repetitionStart(['const a = 1;', ...Array.from({ length: 12 }, () => '  <li>Item</li>')].join('\n')), 2, 'twelve identical substantive lines are a loop, from the second');
+  // A three-row pattern twice in a row after an earlier occurrence is data, not a block repeated three times back to back (run pacman-1 steps 2 and 6).
+  const rows = ['##.#.##.##.##.##.##.##.##.#', '##.#.##.##.##.##.##.##.##.#', '##.#...##.##.##.##...##.##.#']; assert.equal(repetitionStart(['const m = [', ...rows, '##.##.##.##.##.##.##.##.##.#', ...rows, ...rows, '];'].join('\n')), -1);
   const honest = Array.from({ length: 30 }, (_, i) => `export const v${i} = ${i};`).join('\n');
   assert.equal(repetitionStart(honest), -1);
   assert.equal(repetitionStart(Array.from({ length: 12 }, () => '}').join('\n')), -1, 'closing braces are not content');
@@ -287,7 +289,7 @@ test('generateText continues by token ids with the fence prefilled, stops on the
     res.statusCode = 404; res.end('{}');
   }).listen(0, '127.0.0.1');
   await new Promise<void>(resolve => server.once('listening', resolve)); t.after(() => server.close());
-  const bonsai = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 }, 'local', noop);
+  const bonsai = new Bonsai({ ...defaults, stepThinking: false, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 }, 'local', noop);
   // Two chunks: the first stops at the chunk size, the second at the closing fence.
   script = [{ content: 'const a = 1;\n', stop_type: 'limit' }, { content: 'export { a };', stop_type: 'word' }];
   const g = await bonsai.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', context: { step: 1, route: 'create_file' } });
@@ -321,7 +323,7 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   assert.equal(dl.cut?.line, 2); assert.equal(dl.cut?.unit, unit.length); assert(dl.cut!.opening.startsWith('<path d="M0 0'));
   // What a cut discards is logged, so the next loop can be measured rather than guessed at.
   const logged: [string, any][] = [];
-  const logging = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 }, 'local', async (type, data) => { logged.push([type, data]); });
+  const logging = new Bonsai({ ...defaults, stepThinking: false, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 64, createTokens: 200, contextWindow: 4000, workingTokens: 2000, safetyTokens: 100 }, 'local', async (type, data) => { logged.push([type, data]); });
   script = [{ content: `const d = 1;\n<path d="M0 0${drift}`, stop_type: 'limit' }];
   await logging.generateText([{ role: 'system', content: 'S' }], { fence: '```tsx', context: { step: 7, route: 'create_file' } });
   const cut = logged.find(([type]) => type === 'repetition-cut')![1];
@@ -356,7 +358,7 @@ test('generateText continues by token ids with the fence prefilled, stops on the
   assert.equal(l.finish, 'length'); assert(l.text.length >= 200 && l.text.length <= 256, `generated ${l.text.length} characters`);
   // A region's block is checked every 128 tokens for a repeat of the lines after the region, and stopped at it:
   // the kept text ends where the repeat starts, and nothing more is asked for.
-  const wide = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 8192, createTokens: 12000, contextWindow: 64000, workingTokens: 32000, safetyTokens: 100 }, 'local', noop);
+  const wide = new Bonsai({ ...defaults, stepThinking: false, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxTokens: 8192, createTokens: 12000, contextWindow: 64000, workingTokens: 32000, safetyTokens: 100 }, 'local', noop);
   const around = { before: 'import { x } from "./x"\n\nexport function a() {', region: '  return x(0)', after: '}\n\nexport function b(n: number) {\n  return x(n) * 2\n}\n\nexport const c = b(3)\nexport const d = 4\nexport const e = 5\nexport const f = 6\nexport const g = 7\nexport const h = 8\nexport const i = 9' };
   script = [{ content: '  return x(1)\n}\n\nexport function b(n: number) {\n', stop_type: 'limit' }, { content: '  return x(n) * 2\n}\n\nexport const c = b(3)\nexport const d = 4\nexport const e = 5\nexport const f = 6\nexport const g = 7\nexport const h = 8\nexport const i = 90\nexport', stop_type: 'limit' }];
   const ec = await wide.generateText([{ role: 'system', content: 'S' }], { fence: '```ts', around });
@@ -425,7 +427,7 @@ test('A prompt counted to fit it is not rendered and tokenized again when it is 
   }).listen(0, '127.0.0.1');
   await new Promise<void>(resolve => server.once('listening', resolve)); t.after(() => server.close());
   const logged: [string, any][] = [];
-  const bonsai = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1` }, 'local', async (type, data) => { logged.push([type, data]); });
+  const bonsai = new Bonsai({ ...defaults, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, stepThinking: false }, 'local', async (type, data) => { logged.push([type, data]); });
   const a = [{ role: 'system' as const, content: 'S' }, { role: 'user' as const, content: 'step a' }]; const b = [{ role: 'system' as const, content: 'S' }, { role: 'user' as const, content: 'step b' }];
   const counted = await bonsai.count(a); await bonsai.generate(a, schemas.bash);
   assert.deepEqual([calls['/apply-template'], calls['/tokenize']], [1, 1], 'counted once for the fit and the request');
@@ -816,7 +818,7 @@ test('A component file is judged by the compiler its project installed, resolved
   const odd = join(root, 'odd', 'node_modules', '@vue', 'compiler-sfc'); await mkdir(odd, { recursive: true });
   await writeFile(join(odd, 'package.json'), JSON.stringify({ name: '@vue/compiler-sfc', main: 'index.cjs' })); await writeFile(join(odd, 'index.cjs'), 'exports.parse = o => { if (typeof o !== "object") throw new TypeError("options"); return {}; };\n');
   assert.deepEqual(await componentProblems(root, 'odd/A.vue', '<script>\nexport default {}\n'), ['line 1: "<script>" opens a <script> block that no </script> closes before the file ends']);
-  assert.equal(await parseInProcess(root, 'index.html', '<html><body></div>'), null, 'HTML has no parser here: the browser recovers, the page observation is its check');
+  assert.deepEqual(await parseInProcess(root, 'index.html', '<html><body></div>'), [], 'HTML markup is not judged (the browser recovers, the page observation is its check); only its inline scripts are parsed');
   assert.deepEqual(await syntaxCheck(root, 'src/B.vue', '<template>\n<p>x</p>\n'), ['line 1: "<template>" opens a <template> block that no </template> closes before the file ends'], 'the fact after a write comes from the same parser');
 });
 

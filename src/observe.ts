@@ -5,14 +5,16 @@
 // gate only know "an observation"; everything particular to a kind of result
 // lives in its observer, as ecosystem knowledge lives in the profiles.
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { findBrowser, renderFacts } from './render.js';
+import { isAbsolute, join, resolve, sep } from 'node:path';
+import { existsSync, statSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { findBrowser, renderFacts, type PageInput } from './render.js';
 import { connectionRefused, listeningAt, localAddresses, notAnswering, startServer } from './serve.js';
 import { commandShell, describeProcesses, runCommand } from './tools.js';
 import { describeObserver, observerKinds } from './observe-catalog.js';
 const described = (kind: string) => describeObserver(kind)!;
 
-export interface ObserveContext { root: string; artifactPath: string; timeoutMs: number; prefix: string; files: string[] }
+export interface ObserveContext { root: string; artifactPath: string; timeoutMs: number; prefix: string; files: string[]; inputs?: PageInput[] }
 export interface Observation { ok: boolean; text: string }
 export interface Observer {
   // kind, what it shows (for the action catalogue), and the gate's focused question about it: see observe-catalog.ts.
@@ -22,12 +24,25 @@ export interface Observer {
 }
 const clipEnds = (text: string, limit: number) => text.length <= limit ? text : `${text.slice(0, Math.floor(limit * .55))}\n…\n${text.slice(text.length - Math.floor(limit * .45))}`;
 
+// The file:// URL of a repository file a target names by its path, or null (a URL, or no such file).
+function fileTarget(root: string, target: string): string | null {
+  const t = target.trim(); if (/^(?!file:)[a-z][\w+.-]*:\/\//i.test(t)) return null;
+  const rel = t.replace(/^file:\/\/(?:localhost)?/i, '').replace(/[?#].*$/, ''); const suffix = t.slice(t.search(/[?#]|$/));
+  for (const p of [resolve(root, rel.replace(/^\/+/, '')), ...(isAbsolute(rel) ? [rel] : [])]) {
+    if ((p === root || p.startsWith(root + sep)) && existsSync(p) && statSync(p).isFile()) return pathToFileURL(p).href + suffix;
+  }
+  return null;
+}
 // A page loaded in a headless browser.
 const page: Observer = {
   ...described('page'),
   available: async () => Boolean(await findBrowser().catch(() => null)),
   async observe(start, target, ctx) {
-    const r = await renderFacts(ctx.root, target, start || undefined, ctx.artifactPath, ctx.timeoutMs);
+    // A file of the repository named by its path (index.html, file://index.html, file:///index.html) is loaded from
+    // where it is: every game run of 2026-10-03 spent two or three steps finding the absolute file:// URL.
+    const local = fileTarget(ctx.root, target); if (local) target = local;
+    else if (!/^[a-z][\w+.-]*:/i.test(target.trim())) return { ok: false, text: `${target} is not a URL, and no file of the repository has that path (paths are taken from the repository root, ${ctx.root}).` };
+    const r = await renderFacts(ctx.root, target, start || undefined, ctx.artifactPath, ctx.timeoutMs, ctx.inputs ?? []);
     if (!r.unmatched?.length) return r;
     // Where each class name without a CSS rule is used, so the stylesheet can be completed without re-reading every component.
     const styles = /\.(?:css|scss|sass|less|styl)$/;

@@ -356,7 +356,7 @@ export class Agent {
     let prompt = builds[0]!(); let counted = await this.bonsai.count(prompt);
     for (const smaller of builds.slice(1)) { if (counted.tokens <= this.config.workingTokens) break; prompt = smaller(); counted = await this.bonsai.count(prompt); }
     if (counted.tokens > this.config.workingTokens) { const fitted = await this.fit(s, builds.at(-1)!); prompt = fitted.prompt; counted = { tokens: fitted.tokens, mode: 'fit' }; }
-    const request = hash(JSON.stringify({ tail: [...volatile(s, false), prompt.at(-1)], temperature: this.config.codeTemperature, minP: this.config.codeMinP, budget }));
+    const request = hash(JSON.stringify({ tail: [...volatile(s, false), prompt.at(-1)], temperature: this.config.codeTemperature, topP: this.config.codeTopP, topK: this.config.codeTopK, minP: this.config.codeMinP, presence: this.config.codePresencePenalty, budget }));
     chosen?.(request);
     s.lastPromptTokens = counted.tokens;
     this.observe({ kind: 'route', step: s.step, route, tokens: counted.tokens, entries: s.entries.length });
@@ -364,9 +364,12 @@ export class Agent {
     this.observe({ kind: 'generating', step: s.step, route, attempt: 1 });
     // As it is written: how far the prompt has been read, then the file's lines so far and the last of them.
     const progress = every(100, (p: StreamProgress) => this.observe(p.prompt ? { kind: 'generating', step: s.step, route, attempt: 1, prompt: p.prompt }
+      : p.reasoning && !p.text ? { kind: 'reasoning', step: s.step, text: p.reasoning, tokens: p.tokens }
       : { kind: 'writing', step: s.step, route, path, from, ...tailLines(p.text, liveHeight), tokens: p.tokens, ...(p.perSecond ? { perSecond: p.perSecond } : {}) }));
     if (this.bonsai.generateText) {
-      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, ...(around ? { around } : {}), progress });
+      // The model thinks before the code (codeThinking); its thought is logged, never put in a prompt.
+      const g = await this.bonsai.generateText(prompt, { budgetTokens: budget, context: { step: s.step, route }, fence, ...(around ? { around } : {}), progress, ...(this.config.codeThinking ? { think: this.config.codeThinkingBudget } : {}) });
+      if (g.meta?.reasoning) await this.store.log('reasoning', { step: s.step, route, path, chars: g.meta.reasoning.length, text: clip(g.meta.reasoning, 16000) });
       this.observe({ kind: 'generated', step: s.step, route, meta: g.meta, args: { chars: g.text.length, finish: g.finish }, file: { path, from, lines: tailLines(g.text, 0).lines } });
       const run = fence.match(/^`+/)?.[0].length ?? 3; const opened = g.text.match(/^\s*(`{3,})[^\n]*\n/);
       // A cut keeps whole lines only; the kept text ends at the start of the cut line.
@@ -419,9 +422,12 @@ export class Agent {
     // the same content returned the same text byte for byte (run 71, steps 34, 36 and 37: 1452
     // tokens three times, from prompts of 29k and 15k tokens whose last two messages were
     // identical). A check that ran since, a module or package that changed, other notes: another
-    // request, which is generated.
+    // request, which is generated. That was measured at codeTemperature 0.3; above it a repeat can come
+    // out otherwise (at 0.7, the instruct-mode setting, it is a new sample), and so does one after a thought
+    // sampled at the thinking-mode temperature (codeThinking), so it is generated.
+    const deterministic = this.config.codeTemperature <= .3 && !this.config.codeThinking;
     const sha = current === undefined ? undefined : hash(current);
-    const known = rewrite && exact ? s.reproduced?.[exact] : undefined;
+    const known = rewrite && exact && deterministic ? s.reproduced?.[exact] : undefined;
     // The file around a region's block, all of it: a block may repeat any number of the lines that stay.
     const around = region ? { before: lines.slice(0, region.start - 1).join('\n'), region: lines.slice(region.start - 1, region.end).join('\n'), after: lines.slice(region.end).join('\n') } : undefined;
     const generated = await this.generateCode(s, rewrite ? 'rewrite_file' : 'create_file', path, region?.start ?? 1, builds, this.config.createTokens, fenceFor(path), request => {
@@ -452,7 +458,7 @@ export class Agent {
     const repeat = echo ? `lines ${region!.end + 1}..${region!.end + echo.echoed}, the lines after the region${echo.diverged ? ', then went on with other lines' : ''}` : '';
     const where = echo ? `after the block and a repeat of ${repeat}` : `inside line ${at}`;
     const cutLine = !cut ? '' : cut.kind === 'echo' ? `was stopped once it was repeating ${repeat}` : cut.kind === 'cycle' ? `repeated itself ${where}${echo ? '' : opening}: that line reached ${cut.lineChars} characters without ending${cut.unit ? `, ending in one ${cut.unit}-character unit repeated verbatim` : ''}; it was cut at the start of that line`
-      : cut.kind === 'lines' ? `started repeating a block of lines ${echo ? where : `at line ${at}`}; it was cut there`
+      : cut.kind === 'lines' ? `started repeating ${cut.block && cut.times ? `${cut.block === 1 ? 'one line' : `a block of ${cut.block} lines`} (from \`${cut.opening}${cut.truncated ? '…' : ''}\`), which came ${cut.times} times in a row, ` : 'a block of lines '}${echo ? where : `at line ${at}`}; it was cut there`
       : `reached the ${this.config.createTokens}-token budget ${where}${echo ? '' : opening}, which had reached ${cut.lineChars} characters without ending; that line was cut`;
     const lead = cut ? cutLine : echo ? `${echo.diverged ? 'repeated' : 'ended with a repeat of'} ${repeat}` : '';
     // A cut before any line was generated writes nothing: the file stays as it was. A block that was
@@ -835,9 +841,10 @@ export class Agent {
       const kind = String(args.kind ?? ''); const start = String(args.start ?? ''); const target = String(args.target ?? '');
       const artifactPath = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-observe.png`);
       const prefix = await shellPrefixFor(this.tools.root).catch(() => '');
-      const r = await observeResult(kind, start, target, { root: this.tools.root, artifactPath, timeoutMs: this.config.commandTimeoutMs, prefix, files: s.knownFiles });
-      await this.store.log('observe', { step: s.step, kind, start, target, ok: r.ok, text: clip(r.text, 3000) });
-      s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 1800) };
+      const inputs = Array.isArray(args.inputs) ? (args.inputs as any[]).filter(i => i && typeof i === 'object').map(i => ({ do: String(i.do) as any, what: String(i.what ?? ''), ms: Number(i.ms) || 0 })) : [];
+      const r = await observeResult(kind, start, target, { root: this.tools.root, artifactPath, timeoutMs: this.config.commandTimeoutMs, prefix, files: s.knownFiles, inputs });
+      await this.store.log('observe', { step: s.step, kind, start, target, ...(inputs.length ? { inputs } : {}), ok: r.ok, text: clip(r.text, 4000) });
+      s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 2600) };
       await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
       this.observe({ kind: 'result', step: s.step, route, ok: r.ok, ms: 0, chars: r.text.length, text: clip(r.text, 200) });
       return r.ok ? 'ok' : 'failed';

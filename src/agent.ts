@@ -1061,9 +1061,93 @@ export class Agent {
     exact?: string,
     given?: string,
   ): Promise<void> {
+    const current = await this.currentContent(path, rewrite);
+    // A block of the file: lines start..end regenerated and spliced in, the rest untouched.
+    const lines =
+      current === undefined || current === ''
+        ? []
+        : (current.endsWith('\n') ? current.slice(0, -1) : current).split('\n');
+    const region: Region | null =
+      rewrite && (typeof range?.start === 'number' || typeof range?.end === 'number')
+        ? regionOf(s, path, current!, lines, range!)
+        : null;
+    const project = await projectFor(this.tools.root, path);
+    const sha = current === undefined ? undefined : hash(current);
+    // The file around a region's block, all of it: a block may repeat any number of the lines that stay.
+    const around = region
+      ? {
+          before: lines.slice(0, region.start - 1).join('\n'),
+          region: lines.slice(region.start - 1, region.end).join('\n'),
+          after: lines.slice(region.end).join('\n'),
+        }
+      : undefined;
+    const echoesAfter = around && /\S/.test(around.after) ? around : undefined;
+    const generated =
+      given !== undefined
+        ? fromCall(given, echoesAfter)
+        : await this.generateCode(
+            s,
+            rewrite ? 'rewrite_file' : 'create_file',
+            path,
+            region?.start ?? 1,
+            await this.generationRequest(s, path, purpose, thought, current, region, project),
+            this.config.createTokens,
+            fenceFor(path),
+            this.reproductionGuard(s, path, sha, region, range, rewrite ? exact : undefined),
+            echoesAfter,
+          );
+    const finish = generated.finish;
+    const cut = generated.cut;
+    const { code, echo, blockCount } = region
+      ? spliceRegion(generated.code, region, lines, current!, around!, cut)
+      : { code: generated.code, echo: null, blockCount: 0 };
+    // A cut is stated as facts about lines: which line, how it opens, how long it
+    // grew, and which lines were written; the cut line itself never is.
+    const written = region ? blockCount : code === '' ? 0 : code.replace(/\n$/, '').split('\n').length;
+    const { lead, ended } = this.generationOutcome(path, region, lines, written, finish, cut, echo);
+    // A cut before any line was generated writes nothing: the file stays as it was. A block that was
+    // nothing but a repeat of the lines after the region empties it, which removes its lines; an
+    // insertion has none, so nothing changes.
+    if (written === 0 && (echo ? region!.end < region!.start : cut))
+      throw new Error(
+        `the generation of ${path} ${lead}; no line was generated before it, so nothing was written${current !== undefined ? ` and ${path} is unchanged` : ''}`,
+      );
+    if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
+    // What the generation cost, as the client measured it.
+    const spent =
+      generated.ms === undefined
+        ? ''
+        : ` (${generated.tokens !== undefined ? `${generated.tokens} tokens, ` : ''}${(generated.ms / 1000).toFixed(1)} s)`;
+    // A rewrite that reproduced the file is stated with where the file's content came from
+    // and whether the last check has seen it: the facts a request to change it was made on.
+    if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, ''))
+      this.refuseReproduction(s, path, code, current!, sha!, region, generated, spent, ended, exact, given);
+    const result = rewrite
+      ? await this.execute(
+          s,
+          'write',
+          {
+            path,
+            expectedHash: hash(current!),
+            oldText: current!,
+            newText: code,
+            wholeFile: true,
+            ...(region ? { region } : {}),
+          },
+          'rewrite',
+        )
+      : await this.execute(s, 'create_file', { path, content: code }, 'create');
+    if (!result.ok) throw new Error(result.text);
+    await this.stateContractFacts(s, path, code, project, result, { cut, echo, ended, finish });
+    // A whole-file rewrite generates every line: how many of them differ from the content it
+    // replaced, and what generating them cost, is a fact about the write (region rewrites and
+    // creations generate only what is new).
+    if (rewrite && !region) noteRewriteDiff(s, path, current!, code, spent);
+  }
+  // Read as the edit tools read it (a byte-order mark is not part of the text), so the hash a
+  // rewrite carries is the one the write checks; a missing file is one to create.
+  private async currentContent(path: string, rewrite: boolean): Promise<string | undefined> {
     let current: string | undefined;
-    // Read as the edit tools read it (a byte-order mark is not part of the text), so the hash a
-    // rewrite carries is the one the write checks; a missing file is one to create.
     try {
       current = await boundedRead(await safePath(this.tools.root, path, true));
     } catch (e: any) {
@@ -1075,135 +1159,80 @@ export class Agent {
         `${path} already exists; use rewrite_file to replace its whole content, or replace_lines for a small edit`,
       );
     if (current === undefined && rewrite) throw new Error(`${path} does not exist; use create_file`);
-    // A block of the file: lines start..end regenerated and spliced in, the rest untouched.
-    const lines =
-      current === undefined || current === ''
-        ? []
-        : (current.endsWith('\n') ? current.slice(0, -1) : current).split('\n');
-    const region =
-      rewrite && (typeof range?.start === 'number' || typeof range?.end === 'number')
-        ? (() => {
-            const start = Math.min(
-              Math.max(1, typeof range!.start === 'number' ? range!.start : lines.length + 1),
-              lines.length + 1,
-            );
-            const end = Math.min(typeof range!.end === 'number' ? range!.end : start - 1, lines.length);
-            if (end < start - 1)
-              throw new Error(
-                `lines ${start}..${end} of ${path} is not a range: end must be at least start - 1 (start - 1 inserts before line start)`,
-              );
-            // Line numbers name a version of the file: one the worker has not seen may have moved them. Appending needs no numbers.
-            const seen = s.hashes[path];
-            if (start <= lines.length && seen && seen !== hash(current!))
-              throw new Error(
-                `${path} changed since the version you last saw, so lines ${start}..${end} may no longer be the lines you mean; read it again (or append with start = totalLines + 1)`,
-              );
-            return { start, end };
-          })()
-        : null;
-    const project = await projectFor(this.tools.root, path);
-    // The facts a generation is written against: the modules it names, the declared packages, what the repository says this kind of file is written against.
-    const request = async (): Promise<(() => Message[])[]> => {
-      const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
-      const declared = project
-        ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[])
-        : [];
-      const markup = await generationFacts(this.tools.root, path, current, s.knownFiles).catch(
-        () => ({}) as Record<string, unknown>,
-      );
-      return region
-        ? [0, 1].map(
-            k => () =>
-              regionMessages(s, path, purpose, current!, region.start, region.end, contracts, declared, k, markup),
-          )
-        : [0, 1].map(k => () => newFileMessages(s, path, purpose, contracts, declared, k, current, markup));
-    };
-    // A rewrite whose exact arguments already reproduced this very content, from the same request
-    // in front of the generation (only the earlier steps differ), is not generated again: code is
-    // sampled at a low temperature, and across 73 recorded runs every repeat of the same request on
-    // the same content returned the same text byte for byte (run 71, steps 34, 36 and 37: 1452
-    // tokens three times, from prompts of 29k and 15k tokens whose last two messages were
-    // identical). A check that ran since, a module or package that changed, other notes: another
-    // request, which is generated. That was measured at codeTemperature 0.3; above it a repeat can come
-    // out otherwise (at 0.7, the instruct-mode setting, it is a new sample), and so does one after a thought
-    // sampled at the thinking-mode temperature (codeThinking), so it is generated.
+    return current;
+  }
+  // The facts a generation is written against: the modules it names, the declared packages, what the repository says this kind of file is written against.
+  private async generationRequest(
+    s: Session,
+    path: string,
+    purpose: string,
+    thought: string,
+    current: string | undefined,
+    region: Region | null,
+    project: Awaited<ReturnType<typeof projectFor>>,
+  ): Promise<(() => Message[])[]> {
+    const contracts = await this.contractsFor(s, path, `${purpose}\n${thought}\n${s.notes ?? ''}`);
+    const declared = project
+      ? await project.eco.declared(join(this.tools.root, project.dir)).catch(() => [] as string[])
+      : [];
+    const markup = await generationFacts(this.tools.root, path, current, s.knownFiles).catch(
+      () => ({}) as Record<string, unknown>,
+    );
+    return region
+      ? [0, 1].map(
+          k => () =>
+            regionMessages(s, path, purpose, current!, region.start, region.end, contracts, declared, k, markup),
+        )
+      : [0, 1].map(k => () => newFileMessages(s, path, purpose, contracts, declared, k, current, markup));
+  }
+  // A rewrite whose exact arguments already reproduced this very content, from the same request
+  // in front of the generation (only the earlier steps differ), is not generated again: code is
+  // sampled at a low temperature, and across 73 recorded runs every repeat of the same request on
+  // the same content returned the same text byte for byte (run 71, steps 34, 36 and 37: 1452
+  // tokens three times, from prompts of 29k and 15k tokens whose last two messages were
+  // identical). A check that ran since, a module or package that changed, other notes: another
+  // request, which is generated. That was measured at codeTemperature 0.3; above it a repeat can come
+  // out otherwise (at 0.7, the instruct-mode setting, it is a new sample), and so does one after a thought
+  // sampled at the thinking-mode temperature (codeThinking), so it is generated.
+  // The guard sees each request before it is sent and refuses the one that reproduced the file.
+  private reproductionGuard(
+    s: Session,
+    path: string,
+    sha: string | undefined,
+    region: Region | null,
+    range: { start?: unknown; end?: unknown } | undefined,
+    exact: string | undefined,
+  ): (request: string) => void {
     const deterministic = this.config.codeTemperature <= 0.3 && !this.config.codeThinking;
-    const sha = current === undefined ? undefined : hash(current);
-    const known = rewrite && exact && deterministic ? s.reproduced?.[exact] : undefined;
-    // The file around a region's block, all of it: a block may repeat any number of the lines that stay.
-    const around = region
-      ? {
-          before: lines.slice(0, region.start - 1).join('\n'),
-          region: lines.slice(region.start - 1, region.end).join('\n'),
-          after: lines.slice(region.end).join('\n'),
-        }
-      : undefined;
-    const looped =
-      given === undefined ? null : repeatCut(given, around && /\S/.test(around.after) ? around : undefined);
-    const generated: {
-      code: string;
-      finish: string;
-      cut?: GenerationCut;
-      ms?: number;
-      tokens?: number;
-      request: string;
-    } =
-      given !== undefined
-        ? {
-            code: looped ? looped.kept : given,
-            finish: looped ? 'repetition' : 'stop',
-            ...(looped ? { cut: looped.cut } : {}),
-            request: '',
-          }
-        : await this.generateCode(
-            s,
-            rewrite ? 'rewrite_file' : 'create_file',
-            path,
-            region?.start ?? 1,
-            await request(),
-            this.config.createTokens,
-            fenceFor(path),
-            request => {
-              if (!known || known.sha !== sha || known.request !== request) return;
-              const was =
-                known.ms === undefined
-                  ? ''
-                  : ` (${known.tokens !== undefined ? `${known.tokens} tokens, ` : ''}${(known.ms / 1000).toFixed(1)} s)`;
-              const shown = s.entries.some(e => e.step === known.step && e.kind !== 'turn')
-                ? `e${known.step}`
-                : 'its result has left the evidence';
-              throw Object.assign(
-                new Error(
-                  `this exact ${Agent.describe('rewrite_file', { path, ...(region ? { start: range!.start, end: range!.end } : {}) })} reproduced the file unchanged at step ${known.step}${was} from the same request as now (sha256=${sha}, and the same purpose, lines, notes, check state, modules and packages; only earlier steps differ); it was not generated again (${shown}). ${Agent.provenance(s, path, sha!, exact)}`,
-                ),
-                { duplicate: true },
-              );
-            },
-            around && /\S/.test(around.after) ? around : undefined,
-          );
-    const finish = generated.finish;
-    let code = generated.code;
-    const cut = generated.cut;
-    let blockCount = 0;
-    let echo: Echo | null = null;
-    if (region) {
-      // The block alone, without lines around the region the model repeated, spliced between the untouched lines.
-      const trimmed = trimContext(code, around!, Boolean(cut));
-      // What the block repeated of the lines after the region: stopped there while it was generated, or trimmed once it ended.
-      // Either way the block before the repeat is whole: the model had moved on to the lines that follow it.
-      echo =
-        cut?.kind === 'echo' ? { line: cut.line, echoed: cut.echoed!, diverged: Boolean(cut.diverged) } : trimmed.echo;
-      const block = trimmed.text.replace(/\n$/, '');
-      const blockLines = block === '' ? [] : block.split('\n');
-      code =
-        [...lines.slice(0, region.start - 1), ...blockLines, ...lines.slice(region.end)].join('\n') +
-        (current!.endsWith('\n') || !current ? '\n' : '');
-      (region as any).lines = blockLines.length;
-      blockCount = blockLines.length;
-    }
-    // A cut is stated as facts about lines: which line, how it opens, how long it
-    // grew, and which lines were written; the cut line itself never is.
-    const written = region ? blockCount : code === '' ? 0 : code.replace(/\n$/, '').split('\n').length;
+    const known = exact && deterministic ? s.reproduced?.[exact] : undefined;
+    return request => {
+      if (!known || known.sha !== sha || known.request !== request) return;
+      const was =
+        known.ms === undefined
+          ? ''
+          : ` (${known.tokens !== undefined ? `${known.tokens} tokens, ` : ''}${(known.ms / 1000).toFixed(1)} s)`;
+      const shown = s.entries.some(e => e.step === known.step && e.kind !== 'turn')
+        ? `e${known.step}`
+        : 'its result has left the evidence';
+      throw Object.assign(
+        new Error(
+          `this exact ${Agent.describe('rewrite_file', { path, ...(region ? { start: range!.start, end: range!.end } : {}) })} reproduced the file unchanged at step ${known.step}${was} from the same request as now (sha256=${sha}, and the same purpose, lines, notes, check state, modules and packages; only earlier steps differ); it was not generated again (${shown}). ${Agent.provenance(s, path, sha!, exact)}`,
+        ),
+        { duplicate: true },
+      );
+    };
+  }
+  // How a generation ended, as facts about lines: lead names the cut or the repeat of the lines after the
+  // region, ended adds what was and was not written ('' for a generation that closed its block).
+  private generationOutcome(
+    path: string,
+    region: Region | null,
+    lines: string[],
+    written: number,
+    finish: string,
+    cut: GenerationCut | undefined,
+    echo: Echo | null,
+  ): { lead: string; ended: string } {
     const at = region ? region.start + written : written + 1;
     const opening = cut ? ` (\`${cut.opening}${cut.truncated ? '…' : ''}\`)` : '';
     // A repeat of the lines after the region is stated as the lines it repeated, which stay as they were.
@@ -1221,13 +1250,6 @@ export class Agent {
             ? `started repeating ${cut.block && cut.times ? `${cut.block === 1 ? 'one line' : `a block of ${cut.block} lines`} (from \`${cut.opening}${cut.truncated ? '…' : ''}\`), which came ${cut.times} times in a row, ` : 'a block of lines '}${echo ? where : `at line ${at}`}; it was cut there`
             : `reached the ${this.config.createTokens}-token budget ${where}${echo ? '' : opening}, which had reached ${cut.lineChars} characters without ending; that line was cut`;
     const lead = cut ? cutLine : echo ? `${echo.diverged ? 'repeated' : 'ended with a repeat of'} ${repeat}` : '';
-    // A cut before any line was generated writes nothing: the file stays as it was. A block that was
-    // nothing but a repeat of the lines after the region empties it, which removes its lines; an
-    // insertion has none, so nothing changes.
-    if (written === 0 && (echo ? region!.end < region!.start : cut))
-      throw new Error(
-        `the generation of ${path} ${lead}; no line was generated before it, so nothing was written${current !== undefined ? ` and ${path} is unchanged` : ''}`,
-      );
     const followed =
       !region || region.end >= lines.length
         ? ''
@@ -1252,56 +1274,57 @@ export class Agent {
             : finish === 'eos'
               ? 'ended before the file was complete (the model stopped without closing the code block)'
               : '';
-    if (ended) this.observe({ kind: 'warning', step: s.step, text: `${path}: the generated content ${ended}` });
-    // What the generation cost, as the client measured it.
-    const spent =
-      generated.ms === undefined
-        ? ''
-        : ` (${generated.tokens !== undefined ? `${generated.tokens} tokens, ` : ''}${(generated.ms / 1000).toFixed(1)} s)`;
-    // A rewrite that reproduced the file is stated with where the file's content came from
-    // and whether the last check has seen it: the facts a request to change it was made on.
-    if (rewrite && code.replace(/\s+$/, '') === current!.replace(/\s+$/, '')) {
-      if (exact && given === undefined) {
-        (s.reproduced ??= {})[exact] = {
-          step: s.step,
-          sha: sha!,
-          request: generated.request,
-          ...(generated.ms !== undefined ? { ms: generated.ms } : {}),
-          ...(generated.tokens !== undefined ? { tokens: generated.tokens } : {}),
-        };
-        for (const old of Object.keys(s.reproduced).slice(0, -20)) delete s.reproduced[old];
-      }
-      // Equal once trailing whitespace is set aside: said as equal only when it is byte for byte.
-      const equal =
-        code === current
-          ? region
-            ? 'equal them'
-            : 'equals'
-          : region
-            ? 'differ from them only in trailing whitespace'
-            : 'differs only in trailing whitespace from';
-      const made = given === undefined ? 'generated' : 'written';
-      throw new Error(
-        `the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}: ${region ? `the ${made} lines ${region.start}..${region.end}${spent} ${equal}` : `the ${made} file${spent} ${equal} ${path}`} as it is (sha256=${sha}); nothing was written. ${Agent.provenance(s, path, sha!, exact)}`,
-      );
+    return { lead, ended };
+  }
+  // A rewrite that reproduced the file is refused with where the file's content came from; a generated one is
+  // remembered by its exact arguments, so the same request on the same content is not generated again.
+  private refuseReproduction(
+    s: Session,
+    path: string,
+    code: string,
+    current: string,
+    sha: string,
+    region: Region | null,
+    generated: Generated,
+    spent: string,
+    ended: string,
+    exact: string | undefined,
+    given: string | undefined,
+  ): never {
+    if (exact && given === undefined) {
+      (s.reproduced ??= {})[exact] = {
+        step: s.step,
+        sha,
+        request: generated.request,
+        ...(generated.ms !== undefined ? { ms: generated.ms } : {}),
+        ...(generated.tokens !== undefined ? { tokens: generated.tokens } : {}),
+      };
+      for (const old of Object.keys(s.reproduced).slice(0, -20)) delete s.reproduced[old];
     }
-    const result = rewrite
-      ? await this.execute(
-          s,
-          'write',
-          {
-            path,
-            expectedHash: hash(current!),
-            oldText: current!,
-            newText: code,
-            wholeFile: true,
-            ...(region ? { region } : {}),
-          },
-          'rewrite',
-        )
-      : await this.execute(s, 'create_file', { path, content: code }, 'create');
-    if (!result.ok) throw new Error(result.text);
-    // Contracts the file breaks are facts for the worker: names a repository module does not declare, packages the manifest does not declare.
+    // Equal once trailing whitespace is set aside: said as equal only when it is byte for byte.
+    const equal =
+      code === current
+        ? region
+          ? 'equal them'
+          : 'equals'
+        : region
+          ? 'differ from them only in trailing whitespace'
+          : 'differs only in trailing whitespace from';
+    const made = given === undefined ? 'generated' : 'written';
+    throw new Error(
+      `the rewrite of ${path} reproduced its current content unchanged${ended ? ` and ${ended}` : ''}: ${region ? `the ${made} lines ${region.start}..${region.end}${spent} ${equal}` : `the ${made} file${spent} ${equal} ${path}`} as it is (sha256=${sha}); nothing was written. ${Agent.provenance(s, path, sha, exact)}`,
+    );
+  }
+  // Contracts the file breaks are facts for the worker: names a repository module does not declare, packages
+  // the manifest does not declare; and how the generation ended, when it did not close its block.
+  private async stateContractFacts(
+    s: Session,
+    path: string,
+    code: string,
+    project: Awaited<ReturnType<typeof projectFor>>,
+    result: ToolResult,
+    how: { cut: GenerationCut | undefined; echo: Echo | null; ended: string; finish: string },
+  ): Promise<void> {
     const readRepo = async (p: string) => {
       try {
         return await readFile(await safePath(this.tools.root, p), 'utf8');
@@ -1323,6 +1346,7 @@ export class Agent {
           `${path} imports ${missing.join(', ')}, which ${present.join(' or ')} does not declare: declare them (the package manager chooses the version) so they can be installed`,
         );
     }
+    const { cut, echo, ended, finish } = how;
     if (ended)
       facts.unshift(
         cut || echo
@@ -1341,23 +1365,6 @@ export class Agent {
       const e = s.entries.at(-1);
       if (e) e.text += `\nHarness: ${facts.join(' | ')}`;
       s.lastError = facts.join(' | ');
-    }
-    // A whole-file rewrite generates every line: how many of them differ from the content it
-    // replaced, and what generating them cost, is a fact about the write (region rewrites and
-    // creations generate only what is new).
-    if (rewrite && !region) {
-      const { removed, added, exact: counted } = lineDiff(current!, code);
-      const total = code === '' ? 0 : code.replace(/\n$/, '').split('\n').length;
-      // Lines are compared without their endings: a CRLF file rewritten with LF endings is said so once.
-      const endings =
-        /\r\n/.test(current!) && !/\r\n/.test(code)
-          ? ` (compared without line endings: its CRLF line endings were written as LF)`
-          : '';
-      const most = counted ? '' : 'at most ';
-      const least = counted ? '' : 'at least ';
-      const e = s.entries.at(-1);
-      if (e?.kind === 'write')
-        e.text += `\nHarness: the rewrite generated every line of ${path}${spent}; compared with the content it replaced${endings}, ${most}${nLines(removed)} went, ${most}${nLines(added)} came and ${least}${nLines(total - added)} stayed as ${total - added === 1 ? 'it was' : 'they were'}.`;
     }
   }
   // Where a file's current content came from, and whether the last check has run on it:
@@ -2523,6 +2530,97 @@ export class Agent {
     });
   }
 }
+// The block of a file a rewrite regenerates: lines start..end (end = start - 1 inserts before start); lines is
+// set to the number of lines the generated block holds once it is spliced in.
+interface Region {
+  start: number;
+  end: number;
+  lines?: number;
+}
+// A file's content as generated (or as the model wrote it in its call), how the generation ended, and the request
+// it answered (empty for content the model wrote).
+interface Generated {
+  code: string;
+  finish: string;
+  cut?: GenerationCut;
+  ms?: number;
+  tokens?: number;
+  request: string;
+}
+// The lines of an existing file a rewrite's range names, checked against the file and against the version the
+// worker last saw.
+function regionOf(
+  s: Session,
+  path: string,
+  current: string,
+  lines: string[],
+  range: { start?: unknown; end?: unknown },
+): Region {
+  const start = Math.min(
+    Math.max(1, typeof range.start === 'number' ? range.start : lines.length + 1),
+    lines.length + 1,
+  );
+  const end = Math.min(typeof range.end === 'number' ? range.end : start - 1, lines.length);
+  if (end < start - 1)
+    throw new Error(
+      `lines ${start}..${end} of ${path} is not a range: end must be at least start - 1 (start - 1 inserts before line start)`,
+    );
+  // Line numbers name a version of the file: one the worker has not seen may have moved them. Appending needs no numbers.
+  const seen = s.hashes[path];
+  if (start <= lines.length && seen && seen !== hash(current))
+    throw new Error(
+      `${path} changed since the version you last saw, so lines ${start}..${end} may no longer be the lines you mean; read it again (or append with start = totalLines + 1)`,
+    );
+  return { start, end };
+}
+// The content the model wrote in its call (the tools form), with a repeat cut as a generation's is.
+function fromCall(given: string, around: Around | undefined): Generated {
+  const looped = repeatCut(given, around);
+  return {
+    code: looped ? looped.kept : given,
+    finish: looped ? 'repetition' : 'stop',
+    ...(looped ? { cut: looped.cut } : {}),
+    request: '',
+  };
+}
+// The block alone, without lines around the region the model repeated, spliced between the untouched lines.
+function spliceRegion(
+  generated: string,
+  region: Region,
+  lines: string[],
+  current: string,
+  around: Around,
+  cut: GenerationCut | undefined,
+): { code: string; echo: Echo | null; blockCount: number } {
+  const trimmed = trimContext(generated, around, Boolean(cut));
+  // What the block repeated of the lines after the region: stopped there while it was generated, or trimmed once it ended.
+  // Either way the block before the repeat is whole: the model had moved on to the lines that follow it.
+  const echo =
+    cut?.kind === 'echo' ? { line: cut.line, echoed: cut.echoed!, diverged: Boolean(cut.diverged) } : trimmed.echo;
+  const block = trimmed.text.replace(/\n$/, '');
+  const blockLines = block === '' ? [] : block.split('\n');
+  const code =
+    [...lines.slice(0, region.start - 1), ...blockLines, ...lines.slice(region.end)].join('\n') +
+    (current.endsWith('\n') || !current ? '\n' : '');
+  region.lines = blockLines.length;
+  return { code, echo, blockCount: blockLines.length };
+}
+// A whole-file rewrite's line diff against the content it replaced, added to its result.
+function noteRewriteDiff(s: Session, path: string, current: string, code: string, spent: string): void {
+  const { removed, added, exact: counted } = lineDiff(current, code);
+  const total = code === '' ? 0 : code.replace(/\n$/, '').split('\n').length;
+  // Lines are compared without their endings: a CRLF file rewritten with LF endings is said so once.
+  const endings =
+    /\r\n/.test(current) && !/\r\n/.test(code)
+      ? ` (compared without line endings: its CRLF line endings were written as LF)`
+      : '';
+  const most = counted ? '' : 'at most ';
+  const least = counted ? '' : 'at least ';
+  const e = s.entries.at(-1);
+  if (e?.kind === 'write')
+    e.text += `\nHarness: the rewrite generated every line of ${path}${spent}; compared with the content it replaced${endings}, ${most}${nLines(removed)} went, ${most}${nLines(added)} came and ${least}${nLines(total - added)} stayed as ${total - added === 1 ? 'it was' : 'they were'}.`;
+}
+
 const nLines = (n: number) => `${n} line${n === 1 ? '' : 's'}`;
 // At most one call per ms milliseconds: a stream delivers 40 to 290 tokens a second, and each live event redraws the panel.
 const every = <T>(ms: number, f: (x: T) => void) => {

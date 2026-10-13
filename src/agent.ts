@@ -6,7 +6,7 @@
 // implement anything.
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Answers, Config, EditAttempt, Message, Questions, Route, Session, ToolResult } from './types.js';
+import type { Answers, Config, EditAttempt, Entry, Message, Questions, Route, Session, ToolResult } from './types.js';
 import { editRoutes } from './types.js';
 import { liveHeight, partialJson, tailLines, type ProgressEvent } from './display.js';
 import { Store } from './store.js';
@@ -71,6 +71,26 @@ import {
 } from './control.js';
 import type { Around, Bonsai, Echo, GenerationCut, StreamProgress } from './clients.js';
 import { repeatCut } from './clients.js';
+// A worker's turn: its reasoning and the ordered actions it named (problem: what is wrong with the call itself).
+type Batch = { action: Route; args: Record<string, any>; problem?: string }[];
+interface Turn {
+  thought: string;
+  batch: Batch;
+}
+// An invocation's budget: turns under the tools form (maxTurns), else steps (endStep); failures counts the
+// generations and actions in a row that could not run.
+interface RunBudget {
+  maxTurns: number;
+  endStep: number;
+  turns: number;
+  failures: number;
+}
+type WatchReading = NonNullable<Session['watch']>['readings'][number];
+// A turn's thought as it is compared for repeats: its whitespace collapsed.
+const saidIn = (e: { text: string }) =>
+  String(JSON.parse(e.text).thought ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 // A repository file's text, or null when it cannot be read: missing (the worker
 // may delete any file it wrote), outside the root, or not text. Never throws.
@@ -1436,6 +1456,60 @@ export class Agent {
 
   // ---- the loop ----------------------------------------------------------------
   async run(s: Session): Promise<Session> {
+    const run = await this.begin(s);
+    try {
+      while (run.maxTurns ? run.turns < run.maxTurns : s.step < run.endStep) {
+        if (this.stopRequested) {
+          s.status = 'paused';
+          s.stopReason = 'Stopped by the user; resume to continue.';
+          break;
+        }
+        s.step++;
+        this.current = s.step;
+        s.currentTurn = null;
+        run.turns++;
+        this.observe({ kind: 'step', step: s.step, phase: s.phase, ...this.counted(run) });
+        if (this.config.allowBash && (await this.retrySetup(s))) {
+          s.unchangedTurns = 0;
+          await this.store.save(s);
+          continue;
+        }
+        await this.pinObjectiveFiles(s);
+        const notes = await this.standingNotes(s);
+        if (notes === 'stop') break;
+        const allowed: Route[] = [...actions].filter(
+          a =>
+            (this.config.allowWrite || !editRoutes.includes(a as Route)) &&
+            (this.config.allowBash || (a !== 'bash' && a !== 'observe')),
+        ) as Route[];
+        s.allowedActions = allowed;
+        const next = await this.nextTurn(s, allowed, notes, run);
+        if (!next) {
+          await this.store.save(s);
+          continue;
+        }
+        if ((await this.runTurn(s, next, allowed, run)) === 'stop') break;
+        await this.watch(s);
+        await this.store.save(s);
+      }
+      if (s.status === 'running') {
+        s.status = 'paused';
+        s.stopReason = run.maxTurns
+          ? `Reached the ${run.maxTurns}-turn limit for this invocation`
+          : `Reached the ${this.config.maxSteps}-step limit for this invocation`;
+      }
+    } catch (e) {
+      s.status = 'paused';
+      s.stopReason = `Stopped: ${(e as Error).message}`;
+    }
+    await this.store.log('stop', { step: s.step, status: s.status, reason: s.stopReason });
+    this.observe({ kind: 'stop', step: s.step, status: s.status, reason: s.stopReason });
+    await this.store.save(s);
+    return s;
+  }
+
+  // The session made ready for an invocation, and the invocation's budget.
+  private async begin(s: Session): Promise<RunBudget> {
     s.status = 'running';
     s.stopReason = '';
     delete s.outcome;
@@ -1456,366 +1530,378 @@ export class Agent {
     }
     if (this.config.checkCommand && !s.lastCheckCommand) s.lastCheckCommand = this.config.checkCommand;
     this.tools.config.checkCommand = s.lastCheckCommand ?? '';
+    // A new invocation starts from the base temperature, as the four in a row starts from zero.
+    s.unchangedTurns = 0;
     // The limit of an invocation: Bonsai's counts actions (maxSteps); under the tools form it counts turns
     // (openrouterMaxTurns), since a model that batches its calls runs several actions a turn.
     const maxTurns = s.form === 'tools' ? this.config.openrouterMaxTurns : 0;
-    let turns = 0;
-    const endStep = maxTurns ? Number.MAX_SAFE_INTEGER : s.step + this.config.maxSteps;
-    const counted = (): { maxStep: number; turn?: number; maxTurn?: number } =>
-      maxTurns ? { maxStep: 0, turn: turns, maxTurn: maxTurns } : { maxStep: endStep };
-    let generationFailures = 0;
-    // A new invocation starts from the base temperature, as the four in a row starts from zero.
-    s.unchangedTurns = 0;
+    return {
+      maxTurns,
+      endStep: maxTurns ? Number.MAX_SAFE_INTEGER : s.step + this.config.maxSteps,
+      turns: 0,
+      failures: 0,
+    };
+  }
+  private counted(run: RunBudget): { maxStep: number; turn?: number; maxTurn?: number } {
+    return run.maxTurns ? { maxStep: 0, turn: run.turns, maxTurn: run.maxTurns } : { maxStep: run.endStep };
+  }
+  // The files the objective names, pinned as read by the harness; a changed one is read and ranked again.
+  private async pinObjectiveFiles(s: Session): Promise<void> {
+    const pinned = await pinReferences(s, this.tools.root, (query, chunks) =>
+      relevance(this.jev, s, query, chunks, 1200),
+    ).catch(() => [] as string[]);
+    if (pinned.length)
+      await this.store.log('references', {
+        step: s.step,
+        files: pinned,
+        chunks: s.referenceEvidence.filter(e => pinned.includes(e.path)).length,
+      });
+  }
+
+  // What the harness states to the worker this step, from the watchdog's standing readings and the session's
+  // state; 'stop' when a reading ends the session instead.
+  private async standingNotes(s: Session): Promise<string[] | 'stop'> {
+    // The watchdog's standing verdicts shape the step: a repeated failure blocks its identical retry; no progress for a run of steps ends the attempt or asks the user.
+    const last = s.watch!.readings.at(-1);
+    const notes: string[] = [];
+    if (last && last.stuck >= 0.9 && s.watch!.noProgress >= 2 && (await this.escalate(s, last, notes)) === 'stop')
+      return 'stop';
+    // Scope and completion, read by Jev, stated to the worker: work beyond the objective for a run of steps, or an objective that reads as satisfied.
+    const recent = s.watch!.readings.slice(-3);
+    if (recent.length === 3 && recent.every(r => (r.inScope ?? 1) < 0.3))
+      notes.push(
+        'Jev reads the last three steps as work the objective did not ask for. Finish what the objective asks, run your check, and finish; or ask the user whether the extra work is wanted.',
+      );
+    if ((await this.proposeCompletion(s, last, notes)) === 'stop') return 'stop';
+    if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1) && s.editsSinceCheck >= 3)
+      notes.push(`${s.editsSinceCheck} edits have landed since your check last ran; run it when you want them judged.`);
+    const readOnly = s.readOnlyTurns ?? 0;
+    if (readOnly >= 3)
+      notes.push(
+        `Your last ${readOnly} turns only read or searched; nothing changed. The evidence already holds what they returned. Act on it now, or say in your thought exactly which fact is still missing.`,
+      );
+    if (s.setupError)
+      notes.push(
+        `The dependency install failed for the current manifest: ${s.setupError}. The manifest is yours to change; the install runs again by itself after the change.`,
+      );
+    if (s.completionFeedback && !s.completionFeedback.addressed) notes.push(s.completionFeedback.text);
+    return notes;
+  }
+  // No progress for a run of steps with a high stuck reading: the second time, or when the user is needed, the
+  // session pauses; the first time the worker's reasoning from the streak is set aside and it is told.
+  private async escalate(s: Session, last: WatchReading, notes: string[]): Promise<'stop' | undefined> {
+    s.watch!.escalations++;
+    if (last.needsUser >= 0.5 || s.watch!.escalations >= 2) {
+      s.status = 'paused';
+      ending(
+        s,
+        `Jev reads the session as stuck (stuck ${last.stuck.toFixed(2)}, no progress for ${s.watch!.noProgress} steps)${last.needsUser >= 0.5 ? ' and in need of the user' : ''}. Last error: `,
+        s.lastError ?? 'none',
+        300,
+      );
+      return 'stop';
+    }
+    // Every earlier turn is dropped, the results kept: the facts stay, the
+    // line of thought the worker would copy and anchor on goes (a turn
+    // before the streak often holds the same reasoning).
+    // The results the compaction riding on it takes are said, so the note stays a fact.
+    const dropped = s.entries.filter(e => e.kind === 'turn');
+    const before = Agent.shape(s);
+    let removed = 0;
+    if (dropped.length) {
+      s.entries = s.entries.filter(e => !dropped.includes(e));
+      await this.store.log('reasoning-reset', { step: s.step, turns: dropped.map(e => e.id) });
+      removed = await this.compactBehind(s, before, 'reasoning-reset');
+    }
+    notes.push(
+      `Jev reads no progress for ${s.watch!.noProgress} steps (stuck ${last.stuck.toFixed(2)}).${dropped.length ? ` Your reasoning from those steps was set aside; their results are still shown${removed ? `, except ${removed} that left the prompt at the same time` : ''}.` : ''} Do not repeat what was tried; change the approach, or ask the user if only they can decide.`,
+    );
+    s.watch!.noProgress = 0;
+    return undefined;
+  }
+  // The harness proposes completion itself when Jev reads the objective as
+  // satisfied and the check passed after the last edit: once per check,
+  // judged by the evidence gate like a worker's claim; a rejection says why.
+  // Never while the last observation of the result failed or predates the last edit.
+  private async proposeCompletion(
+    s: Session,
+    last: WatchReading | undefined,
+    notes: string[],
+  ): Promise<'stop' | undefined> {
+    const observationStands = !s.lastObservation || (s.lastObservation.ok && s.lastObservation.step > s.lastWriteStep);
+    const proposeFinish = Boolean(
+      last &&
+      last.objective >= 0.7 &&
+      s.lastCheck?.ok &&
+      s.lastCheck.step > s.lastWriteStep &&
+      observationStands &&
+      s.finishTriedAtCheck !== s.lastCheck.step,
+    );
+    if (!proposeFinish) return undefined;
+    s.finishTriedAtCheck = s.lastCheck!.step;
+    await this.store.log('auto-finish', { step: s.step, objective: last!.objective, check: s.lastCheck!.step });
+    const facts = await this.completionFacts(
+      s,
+      `Proposed by the harness: Jev reads the objective as satisfied (${last!.objective.toFixed(2)}) and ${s.lastCheck!.command ?? s.lastCheckCommand} passed after the last edit. Notes: ${clip(s.notes ?? '', 600)}`,
+    );
+    const verdict = await evidenceGate(this.jev, s, facts);
+    await this.store.log('completion', { step: s.step, proposedBy: 'harness', ...verdict });
+    this.observe({
+      kind: 'jev',
+      step: s.step,
+      ms: 0,
+      questions: 4,
+      stateBytes: 0,
+      route: [[verdict.route, 1]],
+      nouls: { matches: verdict.matches, unaddressed: verdict.unaddressed, supported: verdict.supported },
+    });
+    if (verdict.accepted) {
+      s.status = 'complete';
+      ending(s, "Complete: the objective is met by the facts and Jev's reading; ", s.notes ?? '', 300);
+      return 'stop';
+    }
+    if (verdict.route === 'human') {
+      s.status = 'paused';
+      ending(s, 'Completion proposed by the harness; Jev routes it to the user for review. ', s.notes ?? '', 300);
+      return 'stop';
+    }
+    notes.push(
+      `The harness proposed completion because Jev reads the objective as likely satisfied and your check passes; the evidence gate did not accept it: ${verdict.reason}. Address that, then finish.`,
+    );
+    return undefined;
+  }
+
+  // The worker's next turn: one reasoning and an ordered batch of actions, sampled at the temperature of the
+  // streak of turns that changed nothing. A generation that fails is recorded as evidence (null); the fourth
+  // failure in a row ends the invocation.
+  private async nextTurn(s: Session, allowed: Route[], notes: string[], run: RunBudget): Promise<Turn | null> {
+    // A turn that changed nothing leaves the state as it was: it leaves the prompt, and
+    // only the harness's statements about it are added, so the prompt is (nearly) the one
+    // that produced it, and near-greedy sampling of it returns that turn again (run 58: the
+    // same 196 tokens at steps 54 and 55). Each further step of such a streak is sampled at
+    // the next temperature of the escalation; a turn that changes something ends it.
+    const streak = s.unchangedTurns ?? 0;
+    const escalation = this.config.stepTemperatureEscalation ?? [];
+    // A step that thinks samples at the thinking-mode temperature; the escalation never goes below the base.
+    const base = this.config.stepThinking ? this.config.stepThinkingTemperature : this.config.stepTemperature;
+    const temperature =
+      streak && escalation.length ? Math.max(base, escalation[Math.min(streak, escalation.length) - 1]!) : base;
+    if (temperature !== base) await this.store.log('sampling', { step: s.step, unchangedTurns: streak, temperature });
     try {
-      for (; maxTurns ? turns < maxTurns : s.step < endStep;) {
-        if (this.stopRequested) {
-          s.status = 'paused';
-          s.stopReason = 'Stopped by the user; resume to continue.';
-          break;
-        }
+      const item = {
+        anyOf: stepSchema.anyOf!.filter(alt => allowed.includes(alt.properties!.action!.const as Route)),
+      };
+      const gen = await this.generateJson(
+        s,
+        'step',
+        () => stepMessages(s, allowed, notes.join(' ') || undefined),
+        {
+          type: 'object',
+          properties: {
+            thought: { type: 'string' },
+            actions: { type: 'array', minItems: 1, maxItems: 8, items: item },
+          },
+          required: ['thought', 'actions'],
+          additionalProperties: false,
+        },
+        temperature,
+      );
+      const thought = String(gen.thought ?? '').trim();
+      const batch: Batch = (gen.actions as any[]).map(a => ({
+        action: String(a.action) as Route,
+        args: (a.args ?? {}) as Record<string, any>,
+        ...(typeof a.problem === 'string' ? { problem: a.problem } : {}),
+      }));
+      s.lastThought = thought;
+      await this.store.log('thought', {
+        step: s.step,
+        thought: clip(thought, 2000),
+        actions: batch.map(b => b.action),
+        temperature,
+      });
+      this.observe({
+        kind: 'thought',
+        step: s.step,
+        thought,
+        actions: batch,
+        ...(this.bonsai.lastMeta?.reasoning ? { reasoning: this.bonsai.lastMeta.reasoning } : {}),
+      });
+      return { thought, batch };
+    } catch (e) {
+      if (++run.failures >= 4) throw e;
+      const cut = /\(length\)/.test((e as Error).message);
+      const why =
+        cut && s.form === 'tools'
+          ? 'your reply reached its output limit before its first call was complete, so nothing ran: a large file goes in a call of its own, or in blocks (rewrite_file with start and end); keep the text before the calls short.'
+          : cut
+            ? `your reply reached the ${this.config.maxTokens}-token limit before it closed, so nothing ran: file content inside the arguments (replace_lines or write with a large newText) does not fit. Use rewrite_file or create_file for large content, which generate it as code without that limit; keep the thought short.`
+            : (e as Error).message;
+      this.observe({ kind: 'generation_error', step: s.step, message: why });
+      await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` });
+      return null;
+    }
+  }
+
+  // A turn: recorded in the evidence, its batch run back to back until the first failure, then judged as a
+  // whole. 'stop' when an action ended the session.
+  private async runTurn(s: Session, next: Turn, allowed: Route[], run: RunBudget): Promise<'stop' | undefined> {
+    const { thought, batch } = next;
+    const { turn, repeated } = await this.recordTurn(s, thought, batch);
+    // The batch's edits are recorded from its first action on: a later action of
+    // the batch that carries a hash from before one of them is mapped through them.
+    this.tools.journal = [];
+    let halted = false;
+    const outcomes: string[] = [];
+    const duplicates: boolean[] = [];
+    const startFailures = run.failures;
+    const notesBefore: string | undefined = s.notes;
+    for (let i = 0; i < batch.length; i++) {
+      if (i > 0) {
+        if (s.step >= run.endStep) break;
         s.step++;
         this.current = s.step;
-        s.currentTurn = null;
-        turns++;
-        this.observe({ kind: 'step', step: s.step, phase: s.phase, ...counted() });
-        if (this.config.allowBash && (await this.retrySetup(s))) {
-          s.unchangedTurns = 0;
-          await this.store.save(s);
-          continue;
-        }
-        // The files the objective names, pinned as read by the harness; a changed one is read and ranked again.
-        const pinned = await pinReferences(s, this.tools.root, (query, chunks) =>
-          relevance(this.jev, s, query, chunks, 1200),
-        ).catch(() => [] as string[]);
-        if (pinned.length)
-          await this.store.log('references', {
-            step: s.step,
-            files: pinned,
-            chunks: s.referenceEvidence.filter(e => pinned.includes(e.path)).length,
-          });
-        // The watchdog's standing verdicts shape the step: a repeated failure blocks its identical retry; no progress for a run of steps ends the attempt or asks the user.
-        const last = s.watch.readings.at(-1);
-        const notes: string[] = [];
-        if (last && last.stuck >= 0.9 && s.watch.noProgress >= 2) {
-          s.watch.escalations++;
-          if (last.needsUser >= 0.5 || s.watch.escalations >= 2) {
-            s.status = 'paused';
-            ending(
-              s,
-              `Jev reads the session as stuck (stuck ${last.stuck.toFixed(2)}, no progress for ${s.watch.noProgress} steps)${last.needsUser >= 0.5 ? ' and in need of the user' : ''}. Last error: `,
-              s.lastError ?? 'none',
-              300,
-            );
-            break;
-          }
-          // Every earlier turn is dropped, the results kept: the facts stay, the
-          // line of thought the worker would copy and anchor on goes (a turn
-          // before the streak often holds the same reasoning).
-          // The results the compaction riding on it takes are said, so the note stays a fact.
-          const dropped = s.entries.filter(e => e.kind === 'turn');
-          const before = Agent.shape(s);
-          let removed = 0;
-          if (dropped.length) {
-            s.entries = s.entries.filter(e => !dropped.includes(e));
-            await this.store.log('reasoning-reset', { step: s.step, turns: dropped.map(e => e.id) });
-            removed = await this.compactBehind(s, before, 'reasoning-reset');
-          }
-          notes.push(
-            `Jev reads no progress for ${s.watch.noProgress} steps (stuck ${last.stuck.toFixed(2)}).${dropped.length ? ` Your reasoning from those steps was set aside; their results are still shown${removed ? `, except ${removed} that left the prompt at the same time` : ''}.` : ''} Do not repeat what was tried; change the approach, or ask the user if only they can decide.`,
-          );
-          s.watch.noProgress = 0;
-        }
-        // Scope and completion, read by Jev, stated to the worker: work beyond the objective for a run of steps, or an objective that reads as satisfied.
-        const recent = s.watch.readings.slice(-3);
-        if (recent.length === 3 && recent.every(r => (r.inScope ?? 1) < 0.3))
-          notes.push(
-            'Jev reads the last three steps as work the objective did not ask for. Finish what the objective asks, run your check, and finish; or ask the user whether the extra work is wanted.',
-          );
-        // The harness proposes completion itself when Jev reads the objective as
-        // satisfied and the check passed after the last edit: once per check,
-        // judged by the evidence gate like a worker's claim; a rejection says why.
-        // Never while the last observation of the result failed or predates the last edit.
-        const observationStands =
-          !s.lastObservation || (s.lastObservation.ok && s.lastObservation.step > s.lastWriteStep);
-        const proposeFinish = Boolean(
-          last &&
-          last.objective >= 0.7 &&
-          s.lastCheck?.ok &&
-          s.lastCheck.step > s.lastWriteStep &&
-          observationStands &&
-          s.finishTriedAtCheck !== s.lastCheck.step,
-        );
-        if (proposeFinish) {
-          s.finishTriedAtCheck = s.lastCheck!.step;
-          await this.store.log('auto-finish', { step: s.step, objective: last!.objective, check: s.lastCheck!.step });
-          const facts = await this.completionFacts(
-            s,
-            `Proposed by the harness: Jev reads the objective as satisfied (${last!.objective.toFixed(2)}) and ${s.lastCheck!.command ?? s.lastCheckCommand} passed after the last edit. Notes: ${clip(s.notes ?? '', 600)}`,
-          );
-          const verdict = await evidenceGate(this.jev, s, facts);
-          await this.store.log('completion', { step: s.step, proposedBy: 'harness', ...verdict });
-          this.observe({
-            kind: 'jev',
-            step: s.step,
-            ms: 0,
-            questions: 4,
-            stateBytes: 0,
-            route: [[verdict.route, 1]],
-            nouls: { matches: verdict.matches, unaddressed: verdict.unaddressed, supported: verdict.supported },
-          });
-          if (verdict.accepted) {
-            s.status = 'complete';
-            ending(s, "Complete: the objective is met by the facts and Jev's reading; ", s.notes ?? '', 300);
-            break;
-          }
-          if (verdict.route === 'human') {
-            s.status = 'paused';
-            ending(s, 'Completion proposed by the harness; Jev routes it to the user for review. ', s.notes ?? '', 300);
-            break;
-          }
-          notes.push(
-            `The harness proposed completion because Jev reads the objective as likely satisfied and your check passes; the evidence gate did not accept it: ${verdict.reason}. Address that, then finish.`,
-          );
-        }
-        if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1) && s.editsSinceCheck >= 3)
-          notes.push(
-            `${s.editsSinceCheck} edits have landed since your check last ran; run it when you want them judged.`,
-          );
-        const readOnly = s.readOnlyTurns ?? 0;
-        if (readOnly >= 3)
-          notes.push(
-            `Your last ${readOnly} turns only read or searched; nothing changed. The evidence already holds what they returned. Act on it now, or say in your thought exactly which fact is still missing.`,
-          );
-        if (s.setupError)
-          notes.push(
-            `The dependency install failed for the current manifest: ${s.setupError}. The manifest is yours to change; the install runs again by itself after the change.`,
-          );
-        if (s.completionFeedback && !s.completionFeedback.addressed) notes.push(s.completionFeedback.text);
-        const allowed: Route[] = [...actions].filter(
-          a =>
-            (this.config.allowWrite || !editRoutes.includes(a as Route)) &&
-            (this.config.allowBash || (a !== 'bash' && a !== 'observe')),
-        ) as Route[];
-        s.allowedActions = allowed;
-        // One reasoning per batch of actions, not per action: the worker names an
-        // ordered list, the harness runs it back to back and stops at the first
-        // failure, which is when reasoning is worth paying for again.
-        let thought = '';
-        let batch: { action: Route; args: Record<string, any>; problem?: string }[] = [];
-        // A turn that changed nothing leaves the state as it was: it leaves the prompt, and
-        // only the harness's statements about it are added, so the prompt is (nearly) the one
-        // that produced it, and near-greedy sampling of it returns that turn again (run 58: the
-        // same 196 tokens at steps 54 and 55). Each further step of such a streak is sampled at
-        // the next temperature of the escalation; a turn that changes something ends it.
-        const streak = s.unchangedTurns ?? 0;
-        const escalation = this.config.stepTemperatureEscalation ?? [];
-        // A step that thinks samples at the thinking-mode temperature; the escalation never goes below the base.
-        const base = this.config.stepThinking ? this.config.stepThinkingTemperature : this.config.stepTemperature;
-        const temperature =
-          streak && escalation.length ? Math.max(base, escalation[Math.min(streak, escalation.length) - 1]!) : base;
-        if (temperature !== base)
-          await this.store.log('sampling', { step: s.step, unchangedTurns: streak, temperature });
-        try {
-          const item = {
-            anyOf: stepSchema.anyOf!.filter(alt => allowed.includes(alt.properties!.action!.const as Route)),
-          };
-          const gen = await this.generateJson(
-            s,
-            'step',
-            () => stepMessages(s, allowed, notes.join(' ') || undefined),
-            {
-              type: 'object',
-              properties: {
-                thought: { type: 'string' },
-                actions: { type: 'array', minItems: 1, maxItems: 8, items: item },
-              },
-              required: ['thought', 'actions'],
-              additionalProperties: false,
-            },
-            temperature,
-          );
-          thought = String(gen.thought ?? '').trim();
-          batch = (gen.actions as any[]).map(a => ({
-            action: String(a.action) as Route,
-            args: (a.args ?? {}) as Record<string, any>,
-            ...(typeof a.problem === 'string' ? { problem: a.problem } : {}),
-          }));
-          s.lastThought = thought;
-          await this.store.log('thought', {
-            step: s.step,
-            thought: clip(thought, 2000),
-            actions: batch.map(b => b.action),
-            temperature,
-          });
-          this.observe({
-            kind: 'thought',
-            step: s.step,
-            thought,
-            actions: batch,
-            ...(this.bonsai.lastMeta?.reasoning ? { reasoning: this.bonsai.lastMeta.reasoning } : {}),
-          });
-        } catch (e) {
-          if (++generationFailures >= 4) throw e;
-          const cut = /\(length\)/.test((e as Error).message);
-          const why =
-            cut && s.form === 'tools'
-              ? 'your reply reached its output limit before its first call was complete, so nothing ran: a large file goes in a call of its own, or in blocks (rewrite_file with start and end); keep the text before the calls short.'
-              : cut
-                ? `your reply reached the ${this.config.maxTokens}-token limit before it closed, so nothing ran: file content inside the arguments (replace_lines or write with a large newText) does not fit. Use rewrite_file or create_file for large content, which generate it as code without that limit; keep the thought short.`
-                : (e as Error).message;
-          this.observe({ kind: 'generation_error', step: s.step, message: why });
-          await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` });
-          await this.store.save(s);
-          continue;
-        }
-        // The turn enters the evidence before its actions run: the prefix only grows,
-        // and a file generated inside the batch already sees the reasoning behind it.
-        // Reasoning copied word for word from the previous turn is the worker anchoring on its
-        // own text, without waiting for the watchdog to read the session as stuck. Whole-thought
-        // equality, as stored: turns that only open alike (a status sentence) are ordinary progress.
-        // Whether the next thought repeats follows the copies the next prompt holds (runs to 76:
-        // none 1/51, one 20/42, two or more 11/12), so a repeat is not added: the previous turn stays
-        // and the prompt only grows. Removing the earlier copy left the same one copy and
-        // re-processed everything after it (runs 49-76: 26 resets of turns that ran an action,
-        // 44.6 s; run 73 step 30, 5,638 tokens). Its results follow as those of a turn that left.
-        const turn = turnEntry(s.step, thought, batch, s.form === 'tools');
-        const said = (e: { text: string }) =>
-          String(JSON.parse(e.text).thought ?? '')
-            .replace(/\s+/g, ' ')
-            .trim();
-        const previous = s.entries.filter(e => e.kind === 'turn').at(-1);
-        const repeated = Boolean(previous && said(turn).length >= 40 && said(previous) === said(turn));
-        // The copies of the thought but kept leave the prompt (results stay). The copy kept is the previous
-        // turn, the last one in the prompt: it is the one the next thought is compared with, so a further
-        // repeat is caught. An earlier copy (the thought came back after another) goes.
-        const dropCopies = async (kept?: typeof turn) => {
-          const dropped = s.entries.filter(e => e.kind === 'turn' && e !== kept && said(e) === said(turn));
-          if (!dropped.length) return;
-          const before = Agent.shape(s);
-          s.entries = s.entries.filter(e => !dropped.includes(e));
-          await this.store.log('reasoning-reset', { step: s.step, reason: 'repeated', turns: dropped.map(e => e.id) });
-          await this.compactBehind(s, before, 'reasoning-reset');
-        };
-        if (repeated) {
-          await this.store.log('repeated-thought', { step: s.step, kept: previous!.id });
-          await dropCopies(previous);
-        } else s.entries.push(turn);
-        s.currentTurn = turn.id;
-        // The batch's edits are recorded from its first action on: a later action of
-        // the batch that carries a hash from before one of them is mapped through them.
-        this.tools.journal = [];
-        let halted = false;
-        const outcomes: string[] = [];
-        const duplicates: boolean[] = [];
-        const startFailures = generationFailures;
-        const notesBefore: string | undefined = s.notes;
-        for (let i = 0; i < batch.length; i++) {
-          if (i > 0) {
-            if (s.step >= endStep) break;
-            s.step++;
-            this.current = s.step;
-            this.observe({ kind: 'step', step: s.step, phase: s.phase, ...counted() });
-          }
-          // Under the tools form a call may leave out the fields that have a default; they are filled in, then the call is checked alone.
-          const args = s.form === 'tools' ? withDefaults(batch[i]!.action, batch[i]!.args) : batch[i]!.args;
-          // A write without a hash edits the file as it is now (its exact anchor is the guard), or creates it when there is none.
-          if (
-            s.form === 'tools' &&
-            batch[i]!.action === 'write' &&
-            args.expectedHash === undefined &&
-            typeof args.path === 'string'
-          )
-            args.expectedHash =
-              (await this.diskHashes([args.path]).catch(() => ({}) as Record<string, string | null>))[args.path] ??
-              'new';
-          this.duplicate = false;
-          const outcome = await this.perform(
-            s,
-            batch[i]!.action,
-            args,
-            thought,
-            batch[i]!.problem ??
-              (s.form === 'tools' ? argsProblem(batch[i]!.action, args, allowed, s.hashes) : undefined),
-          );
-          outcomes.push(outcome);
-          duplicates.push(outcome === 'repeated' || (outcome === 'refused' && this.duplicate));
-          turn.outcomes!.push(
-            `${batch[i]!.action} ${outcome}${outcome === 'failed' || outcome === 'refused' ? `: ${(s.lastError ?? '').split('\n')[0]!.slice(0, 90)}` : outcome === 'repeated' ? `: shown in ${s.entries.at(-1)?.cites?.join(', ') || 'no entry'}` : ''}`,
-          );
-          // A refused action (blocked, malformed) counts toward the four in a row that
-          // end the attempt; a command that ran and failed is a result, except after a
-          // repeat in the same turn. A repeated read stops nothing: the batch goes on,
-          // and the turn is judged as a whole below.
-          if ((outcome === 'ok' && !(batch[i]!.action === 'plan' && s.notes === notesBefore)) || outcome === 'failed')
-            generationFailures = 0;
-          if (outcome === 'refused' && ++generationFailures >= 4)
-            throw new Error('four actions in a row could not be executed; the session needs a different approach');
-          if (outcome === 'stop') {
-            halted = true;
-            break;
-          }
-          if ((outcome === 'failed' || outcome === 'refused') && i < batch.length - 1) {
-            const e = s.entries.at(-1);
-            if (e)
-              e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch
-                .slice(i + 1)
-                .map(b => b.action)
-                .join(', ')}); reason about the result first.`;
-            break;
-          }
-        }
-        s.currentTurn = null;
-        // A turn whose every action was refused or repeated what the evidence shows changed
-        // nothing and is a template the worker copies word for word: it leaves the prompt, the
-        // refusals and the repeats' facts stay. A turn of repeats, and of a failure after them,
-        // counts once toward the four in a row (a refusal among them has counted already).
-        // A repeat that changed nothing takes the earlier copies with it after its batch, so none is
-        // left (then the next thought differed 50 times in 51): the re-processing the reset still pays.
-        if (outcomes.length && outcomes.every(o => o === 'refused' || o === 'repeated')) {
-          s.entries = s.entries.filter(e => e !== turn);
-          for (const e of s.entries) if (e.turn === turn.id) delete e.turn;
-          if (repeated) await dropCopies();
-        }
-        // Judged as a whole, whatever the order: a turn whose repeats came with nothing but
-        // failures and notes counts once from where the turn began (a plan or a failure inside
-        // it does not reset the count).
-        if (
-          outcomes.includes('repeated') &&
-          outcomes.every((o, k) => o === 'repeated' || o === 'failed' || (o === 'ok' && batch[k]!.action === 'plan')) &&
-          (generationFailures = startFailures + 1) >= 4
-        )
-          throw new Error(
-            'four turns in a row could not be executed or only repeated earlier requests; the session needs a different approach',
-          );
-        if (halted) break;
-        // Changed nothing: no action ran (each was refused or repeated what the evidence shows)
-        // but a plan that left the notes as they were.
-        s.unchangedTurns =
-          outcomes.length &&
-          s.notes === notesBefore &&
-          outcomes.every((o, k) => duplicates[k] || (o === 'ok' && batch[k]!.action === 'plan'))
-            ? (s.unchangedTurns ?? 0) + 1
-            : 0;
-        s.readOnlyTurns = batch.every(b => b.action === 'read_files' || b.action === 'search_codebase')
-          ? (s.readOnlyTurns ?? 0) + 1
-          : 0;
-        await this.watch(s);
-        await this.store.save(s);
+        this.observe({ kind: 'step', step: s.step, phase: s.phase, ...this.counted(run) });
       }
-      if (s.status === 'running') {
-        s.status = 'paused';
-        s.stopReason = maxTurns
-          ? `Reached the ${maxTurns}-turn limit for this invocation`
-          : `Reached the ${this.config.maxSteps}-step limit for this invocation`;
+      const { action, problem } = batch[i]!;
+      const args = await this.callArguments(s, batch[i]!);
+      this.duplicate = false;
+      const outcome = await this.perform(
+        s,
+        action,
+        args,
+        thought,
+        problem ?? (s.form === 'tools' ? argsProblem(action, args, allowed, s.hashes) : undefined),
+      );
+      outcomes.push(outcome);
+      duplicates.push(outcome === 'repeated' || (outcome === 'refused' && this.duplicate));
+      turn.outcomes!.push(
+        `${action} ${outcome}${outcome === 'failed' || outcome === 'refused' ? `: ${(s.lastError ?? '').split('\n')[0]!.slice(0, 90)}` : outcome === 'repeated' ? `: shown in ${s.entries.at(-1)?.cites?.join(', ') || 'no entry'}` : ''}`,
+      );
+      // A refused action (blocked, malformed) counts toward the four in a row that
+      // end the attempt; a command that ran and failed is a result, except after a
+      // repeat in the same turn. A repeated read stops nothing: the batch goes on,
+      // and the turn is judged as a whole below.
+      if ((outcome === 'ok' && !(action === 'plan' && s.notes === notesBefore)) || outcome === 'failed')
+        run.failures = 0;
+      if (outcome === 'refused' && ++run.failures >= 4)
+        throw new Error('four actions in a row could not be executed; the session needs a different approach');
+      if (outcome === 'stop') {
+        halted = true;
+        break;
       }
-    } catch (e) {
-      s.status = 'paused';
-      s.stopReason = `Stopped: ${(e as Error).message}`;
+      if ((outcome === 'failed' || outcome === 'refused') && i < batch.length - 1) {
+        const e = s.entries.at(-1);
+        if (e)
+          e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch
+            .slice(i + 1)
+            .map(b => b.action)
+            .join(', ')}); reason about the result first.`;
+        break;
+      }
     }
-    await this.store.log('stop', { step: s.step, status: s.status, reason: s.stopReason });
-    this.observe({ kind: 'stop', step: s.step, status: s.status, reason: s.stopReason });
-    await this.store.save(s);
-    return s;
+    s.currentTurn = null;
+    await this.judgeTurn(s, { turn, repeated, batch, outcomes, duplicates, startFailures, notesBefore, halted }, run);
+    return halted ? 'stop' : undefined;
+  }
+  // Under the tools form a call may leave out the fields that have a default; they are filled in, then the
+  // call is checked alone. A write without a hash edits the file as it is now (its exact anchor is the guard),
+  // or creates it when there is none.
+  private async callArguments(s: Session, call: Batch[number]): Promise<Record<string, any>> {
+    const args = s.form === 'tools' ? withDefaults(call.action, call.args) : call.args;
+    if (
+      s.form === 'tools' &&
+      call.action === 'write' &&
+      args.expectedHash === undefined &&
+      typeof args.path === 'string'
+    )
+      args.expectedHash =
+        (await this.diskHashes([args.path]).catch(() => ({}) as Record<string, string | null>))[args.path] ?? 'new';
+    return args;
+  }
+  // The turn enters the evidence before its actions run: the prefix only grows,
+  // and a file generated inside the batch already sees the reasoning behind it.
+  // Reasoning copied word for word from the previous turn is the worker anchoring on its
+  // own text, without waiting for the watchdog to read the session as stuck. Whole-thought
+  // equality, as stored: turns that only open alike (a status sentence) are ordinary progress.
+  // Whether the next thought repeats follows the copies the next prompt holds (runs to 76:
+  // none 1/51, one 20/42, two or more 11/12), so a repeat is not added: the previous turn stays
+  // and the prompt only grows. Removing the earlier copy left the same one copy and
+  // re-processed everything after it (runs 49-76: 26 resets of turns that ran an action,
+  // 44.6 s; run 73 step 30, 5,638 tokens). Its results follow as those of a turn that left.
+  private async recordTurn(s: Session, thought: string, batch: Batch): Promise<{ turn: Entry; repeated: boolean }> {
+    const turn = turnEntry(s.step, thought, batch, s.form === 'tools');
+    const previous = s.entries.filter(e => e.kind === 'turn').at(-1);
+    const repeated = Boolean(previous && saidIn(turn).length >= 40 && saidIn(previous) === saidIn(turn));
+    if (repeated) {
+      await this.store.log('repeated-thought', { step: s.step, kept: previous!.id });
+      await this.dropCopies(s, turn, previous);
+    } else s.entries.push(turn);
+    s.currentTurn = turn.id;
+    return { turn, repeated };
+  }
+  // The copies of the thought but kept leave the prompt (results stay). The copy kept is the previous
+  // turn, the last one in the prompt: it is the one the next thought is compared with, so a further
+  // repeat is caught. An earlier copy (the thought came back after another) goes.
+  private async dropCopies(s: Session, turn: Entry, kept?: Entry): Promise<void> {
+    const dropped = s.entries.filter(e => e.kind === 'turn' && e !== kept && saidIn(e) === saidIn(turn));
+    if (!dropped.length) return;
+    const before = Agent.shape(s);
+    s.entries = s.entries.filter(e => !dropped.includes(e));
+    await this.store.log('reasoning-reset', { step: s.step, reason: 'repeated', turns: dropped.map(e => e.id) });
+    await this.compactBehind(s, before, 'reasoning-reset');
+  }
+  // A turn judged as a whole once its batch has run: whether it leaves the prompt, whether it counts toward the
+  // four in a row that end the attempt, and whether it changed nothing or only read.
+  private async judgeTurn(
+    s: Session,
+    t: {
+      turn: Entry;
+      repeated: boolean;
+      batch: Batch;
+      outcomes: string[];
+      duplicates: boolean[];
+      startFailures: number;
+      notesBefore: string | undefined;
+      halted: boolean;
+    },
+    run: RunBudget,
+  ): Promise<void> {
+    const { turn, batch, outcomes, duplicates, notesBefore } = t;
+    // A turn whose every action was refused or repeated what the evidence shows changed
+    // nothing and is a template the worker copies word for word: it leaves the prompt, the
+    // refusals and the repeats' facts stay. A turn of repeats, and of a failure after them,
+    // counts once toward the four in a row (a refusal among them has counted already).
+    // A repeat that changed nothing takes the earlier copies with it after its batch, so none is
+    // left (then the next thought differed 50 times in 51): the re-processing the reset still pays.
+    if (outcomes.length && outcomes.every(o => o === 'refused' || o === 'repeated')) {
+      s.entries = s.entries.filter(e => e !== turn);
+      for (const e of s.entries) if (e.turn === turn.id) delete e.turn;
+      if (t.repeated) await this.dropCopies(s, turn);
+    }
+    // Judged as a whole, whatever the order: a turn whose repeats came with nothing but
+    // failures and notes counts once from where the turn began (a plan or a failure inside
+    // it does not reset the count).
+    if (
+      outcomes.includes('repeated') &&
+      outcomes.every((o, k) => o === 'repeated' || o === 'failed' || (o === 'ok' && batch[k]!.action === 'plan')) &&
+      (run.failures = t.startFailures + 1) >= 4
+    )
+      throw new Error(
+        'four turns in a row could not be executed or only repeated earlier requests; the session needs a different approach',
+      );
+    // An action that ended the session leaves the streaks as they were.
+    if (t.halted) return;
+    // Changed nothing: no action ran (each was refused or repeated what the evidence shows)
+    // but a plan that left the notes as they were.
+    s.unchangedTurns =
+      outcomes.length &&
+      s.notes === notesBefore &&
+      outcomes.every((o, k) => duplicates[k] || (o === 'ok' && batch[k]!.action === 'plan'))
+        ? (s.unchangedTurns ?? 0) + 1
+        : 0;
+    s.readOnlyTurns = batch.every(b => b.action === 'read_files' || b.action === 'search_codebase')
+      ? (s.readOnlyTurns ?? 0) + 1
+      : 0;
   }
 
   // Run one action with every check the harness can make around it. Returns

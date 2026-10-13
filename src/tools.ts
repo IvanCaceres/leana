@@ -536,6 +536,17 @@ export async function listRepoFiles(root: string): Promise<string[]> {
   await visit(root);
   return files.sort();
 }
+// The files a developer sees as the project: in a git repository, what git tracks and what it would track, on
+// disk now, not what it ignores (build output, caches, other worktrees checked out inside it); elsewhere the
+// whole tree. The same exclusions as listRepoFiles (dependency folders, .env files, keys).
+export async function visibleRepoFiles(root: string): Promise<string[]> {
+  const r = await runCommand('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], root, 10000).catch(() => null);
+  if (!r || r.code !== 0 || r.truncated) return listRepoFiles(root);
+  const excluded = /(^|\/)(\.git|\.leana|node_modules)\/|(^|\/)\.env(\.[^/]*)?$|\.(pem|key)$/i;
+  const listed = [...new Set(r.output.split('\0').filter(Boolean))].filter(f => !excluded.test(f));
+  const present = await Promise.all(listed.map(f => stat(resolve(root, f)).then(s => s.isFile(), () => false)));
+  return listed.filter((_, i) => present[i]).sort();
+}
 // What a shell command did to the tree, whatever the command was: every file's
 // size and modification time before and after it. Installed environments
 // (node_modules, a Python virtual environment, marked by its pyvenv.cfg) are the
@@ -688,7 +699,8 @@ export async function runCommand(command: string, args: string[], cwd: string, t
     // takes precedence in them.
     Object.assign(env, { CI: '1', FORCE_COLOR: '0', NO_COLOR: '1', npm_config_yes: 'true', DEBIAN_FRONTEND: 'noninteractive' });
     // On Windows the shell carries a mark everything it starts inherits: what is left is found by it (see windowsLeft).
-    const started = Date.now(); const mark = runMark(); if (mark) env.LEANA_RUN = mark;
+    // Only a shell can leave something running; the harness's own git and rg calls are not searched after.
+    const started = Date.now(); const mark = command === 'bash' ? runMark() : undefined; if (mark) env.LEANA_RUN = mark;
     const child = spawn(command === 'bash' ? bashPath() : command, args, { cwd, env, detached: process.platform !== 'win32', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = []; let size = 0; let truncated = false; let timedOut = false; let lastOutput = Date.now(); let stoppedEarly: string | undefined;
     let exitCode: number | null = null; let finished = false; let drain: NodeJS.Timeout | null = null;

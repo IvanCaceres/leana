@@ -11,6 +11,8 @@ export const defaults: Config = {
   openrouterWorkingTokens: 0,
   // The turns an invocation through OpenRouter may take (a turn runs one to eight actions); maxSteps is Bonsai's, in actions.
   openrouterMaxTurns: 120,
+  // Prompt caching through OpenRouter: auto for a model whose catalogue lists a cache-read price, or off.
+  promptCache: 'auto',
   // How the prompt is written (Session.form): json for Bonsai; fitted to an OpenRouter model, tools when it takes them, else text.
   promptForm: 'json',
   jevUrl: 'https://api.typesafe.ai/v1/systemone', jevModel: 'jev-latest',
@@ -72,6 +74,7 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   // Which efforts a model takes is the model's (models.ts); here only the shape.
   if (!/^[a-z]+$/.test(c.thinkingEffort)) throw new Error('thinkingEffort must be one word, such as medium');
   if (!['json', 'text', 'tools'].includes(c.promptForm)) throw new Error('promptForm must be json, text or tools');
+  if (!['auto', 'off'].includes(c.promptCache)) throw new Error('promptCache must be auto or off');
   if (!Number.isSafeInteger(c.openrouterWorkingTokens) || (c.openrouterWorkingTokens && c.openrouterWorkingTokens < 2000)) throw new Error('openrouterWorkingTokens must be 0 (fitted to the model) or an integer of at least 2000');
   if (!Number.isSafeInteger(c.codeThinkingBudget) || c.codeThinkingBudget > 8192) throw new Error('codeThinkingBudget must be an integer of at most 8192');
   if (!Number.isSafeInteger(c.stepThinkingBudget) || c.stepThinkingBudget >= c.maxTokens - 256) throw new Error('stepThinkingBudget must be an integer below maxTokens - 256 (the reply follows the thinking in the same output budget)');
@@ -87,7 +90,7 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
 // config directory. Permissions are not kept: write and shell are on unless turned off for a run.
 export const settingsPath = (): string => join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'leana', 'settings.json');
 const kept = new Set(['provider', 'model', 'openrouterUrl', 'providerKeyFile', 'baseUrl', 'stepThinking', 'codeThinking', 'thinkingEffort', 'stepThinkingBudget', 'codeThinkingBudget',
-  'stepTemperature', 'stepThinkingTemperature', 'codeTemperature', 'stepTopP', 'codeTopP', 'stepTopK', 'codeTopK', 'stepMinP', 'codeMinP', 'codePresencePenalty', 'maxTokens', 'workingTokens', 'openrouterWorkingTokens', 'maxSteps', 'openrouterMaxTurns']);
+  'stepTemperature', 'stepThinkingTemperature', 'codeTemperature', 'stepTopP', 'codeTopP', 'stepTopK', 'codeTopK', 'stepMinP', 'codeMinP', 'codePresencePenalty', 'maxTokens', 'workingTokens', 'openrouterWorkingTokens', 'maxSteps', 'openrouterMaxTurns', 'promptCache']);
 export interface Settings { config: Partial<Config>; repo?: string }
 export async function loadSettings(path = settingsPath()): Promise<Settings> {
   let raw: any; try { raw = JSON.parse(await readFile(path, 'utf8')); } catch { return { config: {} }; }

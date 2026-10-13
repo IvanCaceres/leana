@@ -39,6 +39,7 @@ function jevOf(j: JevScript) {
   return { calls, decide: async (state: unknown, q: Questions, ctx?: { step: number; phase: string }): Promise<Answers> => {
     const phase = ctx?.phase ?? ''; calls.push({ phase, state });
     if (phase === 'watchdog') { const w = j.watch?.(++watches) ?? {}; return { progress: noul(w.progress ?? .8), same_failure: noul(w.same_failure ?? .05), stuck: noul(w.stuck ?? .05), objective_satisfied: noul(w.objective_satisfied ?? .2), needs_user: noul(w.needs_user ?? .05), in_scope: noul(w.in_scope ?? .9) }; }
+    if (phase === 'answer-gate') { const g = j.gate ?? {}; return { implementation_matches_request: noul(g.implementation_matches_request ?? .9), requirement_unaddressed: noul(g.requirement_unaddressed ?? .1), claim_supported: noul(g.claim_supported ?? .9), ...Object.fromEntries(Object.keys(q).filter(k => k.startsWith('clause_')).map(k => [k, noul(j.clauses?.((state as any).clauses[k]) ?? .9)])) }; }
     if (phase === 'evidence-gate') { const g = j.gate ?? {}; const route = g.verification_needed ?? 'deterministic_only'; const clauses = Object.fromEntries(Object.keys(q).filter(k => k.startsWith('clause_')).map(k => [k, noul(j.clauses?.((state as any).clauses[k]) ?? .9)])); const weakest = (g as any).weakest_evidence ?? 'sources'; const weakestAnswer: Answers = q.weakest_evidence ? { weakest_evidence: { type: 'choice' as const, choice: weakest, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.weakest_evidence as any).criteria).map(k => [k, k === weakest ? .9 : .02])) } } : {}; return { ...clauses, ...weakestAnswer, implementation_matches_request: noul(g.implementation_matches_request ?? .9), requirement_unaddressed: noul(g.requirement_unaddressed ?? .1), claim_supported: noul(g.claim_supported ?? .9), verification_needed: { type: 'choice', choice: route, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.verification_needed as any).criteria).map(k => [k, k === route ? .9 : .05])) } }; }
     if (phase === 'evidence-focus') return { evidence_shows_done: noul((j.gate as any)?.focus ?? .8) };
     if (phase === 'failure-triage') { const kind = j.triage ?? 'code_bug'; return { failure: { type: 'choice', choice: kind, confidence: .9, probabilities: Object.fromEntries(Object.keys((q.failure as any).criteria).map(k => [k, k === kind ? .9 : .01])) } }; }
@@ -117,6 +118,56 @@ test('A finish while the check of record failed is refused before the gate, nami
   assert.match(refusals[0]!, /^finish was not judged: the check of record failed \(step 3, `node mock\.mjs`, exit 1\)\. Finish is judged once the check of record exits 0 after the last write \(step 1\); the check of record is the last bash command run with check: true, so each one replaces the one before\. The last check that exited 0 was step 2's `node ok\.mjs`, after that write; a later check replaced it\.$/);
   assert(refusals.slice(1).every(r => r.endsWith('This finish was refused at the same state before (nothing has been written or checked since).')));
   assert((await events(store)).some(e => e.type === 'sampling' && e.data.temperature > config.stepTemperature), 'repeated refusals raise the temperature');
+});
+
+test('A finish with nothing written is an answer: no check is asked for, and Jev judges it against what the worker read; once a file is written, a finish without a check is refused', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'a.ts'), 'export const a = 1;\n');
+  const steps = [
+    { thought: 'read it', action: 'read_files', args: { files: [{ path: 'a.ts', start: 1, end: 1 }] } },
+    { thought: 'that answers it', action: 'finish', args: { summary: 'a.ts exports a = 1' } },
+  ];
+  const jev = jevOf({});
+  const read = await new Agent({ ...config, maxSteps: 3 }, store, jev, bonsaiOf({ steps }), root, () => {}, () => {}).run(await newSession(root, 'What does a.ts export?'));
+  assert.equal(read.status, 'complete', read.stopReason);
+  const gate = jev.calls.find(c => c.phase === 'answer-gate');
+  assert(gate, 'the answer gate judged it'); assert(!jev.calls.some(c => c.phase === 'evidence-gate'), 'not the gate of a change: no verification or observation to ask for');
+  assert(Object.values(gate.state.evidence as Record<string, string>).some(t => t.includes('export const a = 1;')), 'Jev sees what was read');
+  assert.match(gate.state.read['a.ts'], /^lines 1-1 of \d+$|^whole/, 'and how much of each file'); assert(Array.isArray(gate.state.unread));
+  // Evidence heavy with escapes is held under Jev's byte cap as JSON, the newest kept.
+  const { answerGate } = await import('../src/control.js');
+  const heavy = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`e${i} read_files (step ${i})`, '"\\'.repeat(700)]));
+  const capped = jevOf({}); await answerGate(capped as any, { ...read, notes: 'n'.repeat(1500) }, 's'.repeat(1500), heavy, { read: {}, unread: [], files: 0 });
+  const sent = capped.calls[0]!.state; assert(Buffer.byteLength(JSON.stringify(sent)) <= 22000); assert('e11 read_files (step 11)' in sent.evidence && !('e0 read_files (step 0)' in sent.evidence));
+  // A long summary is clipped where the model reads it back (the stop reason, the recovery note on resume) and whole where the user reads it.
+  const long = await repo(t); const summary = `Findings:\n${'- a finding about the harness\n'.repeat(40)}The end.`;
+  await writeFile(join(long.root, 'a.ts'), 'export const a = 1;\n');
+  const ended = await new Agent({ ...config, maxSteps: 3 }, long.store, jevOf({}), bonsaiOf({ steps: [steps[0]!, { ...steps[1]!, args: { summary } }] }), long.root, () => {}, () => {}).run(await newSession(long.root, 'What does a.ts export?'));
+  assert.equal(ended.status, 'complete', ended.stopReason); assert(ended.stopReason.length < 500); assert.equal(ended.outcome, `Complete: ${summary}`);
+  // Part of the objective read as unanswered: the rejection names what was never read, the fact the worker can act on.
+  const partial = await repo(t);
+  await writeFile(join(partial.root, 'a.ts'), 'export const a = 1;\n'); await writeFile(join(partial.root, 'b.ts'), 'export const b = 2;\n');
+  const gaps = await new Agent({ ...config, maxSteps: 2 }, partial.store, jevOf({ gate: { implementation_matches_request: .3, requirement_unaddressed: .9 } }), bonsaiOf({ steps }), partial.root, () => {}, () => {}).run(await newSession(partial.root, 'Examine every file'));
+  assert.match(gaps.completionFeedback?.text ?? '', /Jev reads part of the objective as unanswered \(0\.90\); of the repository's 2 files, 1 were read, these in part: a\.ts \(lines 1-1 of 2\); never read: b\.ts\. Address it/);
+  // Three answers Jev does not accept: the last goes to the user, whole, with Jev's readings, instead of round again.
+  const thrice = await repo(t); await writeFile(join(thrice.root, 'a.ts'), 'export const a = 1;\n');
+  const answers = [1, 2, 3].map(i => ({ thought: `answer ${i}`, action: 'finish', args: { summary: `a.ts exports a (${i})` } }));
+  const reviewed = await new Agent({ ...config, maxSteps: 8 }, thrice.store, jevOf({ gate: { implementation_matches_request: .5 } }), bonsaiOf({ steps: [steps[0]!, ...answers, steps[0]!] }), thrice.root, () => {}, () => {}).run(await newSession(thrice.root, 'What does a.ts export?'));
+  assert.equal(reviewed.status, 'paused', reviewed.stopReason);
+  assert.match(reviewed.stopReason, /^Answer proposed; Jev did not accept it in 3 readings \(last: matches 0\.50, unanswered 0\.10, supported 0\.90\), so it goes to you for review/);
+  assert.equal(reviewed.outcome?.endsWith('a.ts exports a (3)'), true);
+  // An answer Jev reads as unsupported goes back to the worker with the reason, not through as done.
+  const unsupported = await repo(t);
+  const rejected = await new Agent({ ...config, maxSteps: 2 }, unsupported.store, jevOf({ gate: { claim_supported: .2 } }), bonsaiOf({ steps }), unsupported.root, () => {}, () => {}).run(await newSession(unsupported.root, 'What does a.ts export?'));
+  assert.notEqual(rejected.status, 'complete');
+  assert.match(rejected.completionFeedback?.text ?? '', /not supported by the evidence read \(0\.20\).* Address it and finish again\.$/);
+  const written = await repo(t);
+  const edit = await new Agent({ ...config, maxSteps: 3 }, written.store, jevOf({}), bonsaiOf({ steps: [
+    { thought: 'write', action: 'create_file', args: { path: 'b.ts', purpose: 'b' } },
+    { thought: 'done', action: 'finish', args: { summary: 'wrote b.ts' } },
+  ], files: { 'b.ts': 'export const b = 2;\n' } }), written.root, () => {}, () => {}).run(await newSession(written.root, 'Add b.ts'));
+  assert.notEqual(edit.status, 'complete');
+  assert((await events(written.store)).some(e => e.type === 'refused' && e.data.route === 'finish' && /has never run/.test(e.data.why)), 'a write without a check is refused');
 });
 
 test('Only the step route thinks, within stepThinkingBudget, at stepThinkingTemperature, and only when stepThinking is on; the thinking is logged, not added to the prompt', async t => {

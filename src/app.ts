@@ -171,7 +171,7 @@ export class App {
     try {
       const outcome = await runSession({ config: await this.config(), jevKey: this.opts.jevKey, ...what, started: a => { this.agent = a; }, out: l => this.write(l) });
       const s = outcome.session;
-      this.write(`\n${s.status.toUpperCase()}: ${s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps\nSession: ${outcome.store.path}`);
+      this.write(`\n${s.status.toUpperCase()}: ${s.outcome ?? s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps\nSession: ${outcome.store.path}`);
     } finally { this.agent = null; this.running = false; }
   }
 }

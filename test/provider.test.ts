@@ -173,6 +173,9 @@ test('Under the tools form a step is the model\'s own tool calling: each action 
   assert(shown.some(e => e.kind === 'thought' && e.thought === 'Write the module.' && e.actions.map((a: any) => a.action).join() === 'create_file,plan' && e.reasoning === 'Step 1 reasoning.'), 'the turn reaches the display with its reasoning');
   assert.match(events.find(e => e.type === 'refused')!.data.why, /^read_files arguments\.files: /, 'the bad call alone is refused, by what is wrong with it');
   assert.equal(bodies.length, 4, 'one request a turn: no file is generated in a request of its own');
+  // The model caches, so its cache points arrive as text parts: read as the text they carry (caching has a test of its own).
+  assert(bodies.every(b => b.messages.some((m: any) => Array.isArray(m.content))));
+  for (const b of bodies) for (const m of b.messages) if (Array.isArray(m.content)) m.content = m.content.map((p: any) => p.text).join('');
   assert(bodies.every(b => b.tool_choice === 'auto' && b.reasoning?.effort === 'medium' && !b.response_format && b.max_tokens >= fitted.maxTokens + fitted.createTokens), 'a model that reasons chooses its calls; a step has room for a file');
   assert.deepEqual(bodies[0].tools.map((x: any) => x.function.name).sort(), [...gptActions].sort());
   const tool = (name: string) => bodies[0].tools.find((x: any) => x.function.name === name).function;
@@ -306,4 +309,46 @@ test('Under the tools form a call may leave out what has a default: the tool sch
     'replace_lines arguments: missing expectedHash (expectedHash is the sha256 of src/a.ts as last read or edited: fileHashes has src/a.ts sha256=0123456789abcdef)');
   assert.equal(argsProblem('write', { path: 'b.ts', oldText: 'a', newText: 'b' }, all), undefined, 'an exact replacement needs no hash: its anchor is the guard');
   assert.match(argsProblem('move_lines', { source: 'b.ts', start: 1, end: 2, destination: 'c.ts', destinationHash: 'new' }, all)!, /missing expectedHash \(expectedHash is the sha256 of b\.ts as last read or edited; read it first\)$/);
+});
+
+test('Prompt caching through OpenRouter: the cache points are marked where the model caches, a run keeps one session for provider routing, a model without a cache price is not marked, off sends neither, and a provider that refuses the markers is asked again without them', async t => {
+  const { cachePoints } = await import('../src/context.js');
+  const msg = (role: any, content: string) => ({ role, content });
+  // The prompt: system, orientation, evidence and turns, then the volatile block and the request.
+  const prompt = [msg('system', 'You are the worker.'), msg('user', '{"objective":"x"}'), msg('user', '{"evidence":1}'), msg('assistant', 'read a.ts'), msg('user', '{"notes":""}'), msg('user', '{"role":"act"}')];
+  assert.deepEqual(cachePoints(prompt), [1, 3], 'after the orientation and after the evidence');
+  assert.deepEqual(cachePoints([...prompt.slice(0, 3), { role: 'assistant', content: '', tool_calls: [] } as any, ...prompt.slice(4)]), [1, 2], 'a turn that only calls tools has no text: the point moves to the message before it');
+  assert.deepEqual(cachePoints([msg('user', 'x'), msg('user', 'y')]), [], 'not a prompt of the agent: nothing marked');
+  const schema = { type: 'object' as const, properties: { content: { type: 'string' as const } }, required: ['content'], additionalProperties: false as const };
+  const reply = (refuseMarked: boolean) => async (b: any, _n: number, res: ServerResponse) => {
+    if (refuseMarked && b.messages.some((m: any) => Array.isArray(m.content))) { res.statusCode = 400; res.end('{"error":{"message":"unknown field"}}'); return; }
+    if (/code/.test(JSON.stringify(b.messages.at(-1)))) { await sse(res, [{ content: '```\nconst a = 1;\n```' }]); return; }
+    await sse(res, [{ content: '{"content":"ok"}' }], 'stop', { prompt_tokens: 1000, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 800, cache_write_tokens: 0 } } as any);
+  };
+  const marked = (b: any) => b.messages.map((m: any, i: number) => Array.isArray(m.content) ? i : -1).filter((i: number) => i >= 0);
+  // A model whose catalogue lists a cache-read price: both points marked, as text parts with cache_control; one session_id for the run.
+  const caching = await mock(t, reply(false)); const events: any[] = [];
+  const claude = new OpenRouter(cfg(caching.url, 'anthropic/claude-sonnet-5.5'), 'k', async (type, data) => { events.push({ type, data }); });
+  await claude.generate(prompt, schema); await claude.generate(prompt, schema);
+  await claude.generateText([...prompt.slice(0, 5), msg('user', '{"role":"write the code"}')], { budgetTokens: 200 });
+  for (const b of caching.bodies) assert.deepEqual(marked(b), [1, 3], 'the points, and nothing else');
+  assert.deepEqual(caching.bodies[0].messages[1].content, [{ type: 'text', text: '{"objective":"x"}', cache_control: { type: 'ephemeral' } }]);
+  assert.equal(caching.bodies[0].messages[0].content, 'You are the worker.', 'the rest as it was');
+  assert(caching.bodies[0].session_id && caching.bodies.every(b => b.session_id === caching.bodies[0].session_id), 'one session for the run');
+  assert.equal(claude.lastMeta?.usage?.prompt_tokens_details?.cached_tokens, 0, 'a file generation keeps the cached tokens its replies report');
+  assert(events.some(e => e.type === 'bonsai' && e.data.usage?.prompt_tokens_details?.cached_tokens === 800), 'cached tokens are logged as the provider reports them');
+  // A model with no cache price: nothing marked, still one provider for the run.
+  const plain = await mock(t, reply(false));
+  await new OpenRouter(cfg(plain.url, 'inclusionai/ling-3.1-flash'), 'k', async () => {}).generate(prompt, schema);
+  assert.deepEqual(marked(plain.bodies[0]), []); assert(plain.bodies[0].session_id);
+  // Off: neither.
+  const off = await mock(t, reply(false));
+  await new OpenRouter(cfg(off.url, 'anthropic/claude-sonnet-5.5', { promptCache: 'off' }), 'k', async () => {}).generate(prompt, schema);
+  assert.deepEqual(marked(off.bodies[0]), []); assert.equal(off.bodies[0].session_id, undefined);
+  // A provider that refuses the markers: the request is sent again without them, and the run goes on unmarked.
+  const refusing = await mock(t, reply(true)); const logged: string[] = [];
+  const client = new OpenRouter(cfg(refusing.url, 'anthropic/claude-sonnet-5.5'), 'k', async type => { logged.push(type); });
+  assert.deepEqual(await client.generate(prompt, schema), { content: 'ok' }); assert.deepEqual(await client.generate(prompt, schema), { content: 'ok' });
+  assert.deepEqual(refusing.bodies.map(marked), [[1, 3], [], []], 'refused once, then sent unmarked');
+  assert.equal(logged.filter(x => x === 'cache-markers-off').length, 1);
 });

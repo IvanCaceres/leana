@@ -4,7 +4,7 @@
 // present, what each detected ecosystem offers as verification, what is
 // declared. Nothing here decides anything.
 import { join } from 'node:path';
-import { boundedRead, listRepoFiles, repositoryStatus, runCommand } from './tools.js';
+import { boundedRead, repositoryStatus, runCommand, visibleRepoFiles } from './tools.js';
 import { detectProjects, inProject, shellPrefixFor } from './profiles.js';
 import { clip } from './context.js';
 import { findBrowser } from './render.js';
@@ -27,7 +27,7 @@ const tools = ['git', 'node', 'npm', 'pnpm', 'yarn', 'bun', 'python3', ...(proce
 const windowsShell = ' The machine is Windows; bash is Git Bash: ls, cat, grep, sed, find and the toolchain above work, paths take forward slashes (C:/... or /c/...), and there is no apt, sudo or /usr/bin of a Linux system.';
 export async function orient(root: string): Promise<Orientation> {
   const status = await repositoryStatus(root).catch(() => ({ git: false, changed: [] as string[], changedCount: 0, scripts: {} as Record<string, string>, topLevel: [] as string[], packages: [] }));
-  const files = await listRepoFiles(root).catch(() => [] as string[]);
+  const files = await visibleRepoFiles(root).catch(() => [] as string[]);
   const directories: Record<string, number> = {};
   for (const f of files) { const d = f.includes('/') ? f.slice(0, f.lastIndexOf('/')).split('/').slice(0, 2).join('/') : '.'; directories[d] = (directories[d] ?? 0) + 1; }
   const present: string[] = []; const projects: Record<string, string[]> = {}; const manifests: Record<string, string> = {}; const candidates: string[] = []; const declared: string[] = [];

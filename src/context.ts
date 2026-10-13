@@ -312,7 +312,7 @@ const details: Record<Route, string> = {
   create_file: 'path is the repository-relative path of a file that does not exist yet (never an existing file: those are edited with write or replace_lines); purpose says in one sentence what the file must contain. The content itself is not written here: the harness asks for it as code in the next generation.',
   write: 'For a short anchor only (a few lines) in a file that exists: for a region of many lines use replace_lines, and to relocate a block use move_lines. expectedHash must be the current sha256 of the path from fileHashes (the same value the latest read_files or edit result reported). oldText is a small unique anchor (a few consecutive lines) copied exactly from that read; never paste a truncated excerpt or an entire file. newText replaces the anchor and must differ from it. Never overwrite an unread file; a new file is made with create_file.',
   bash: 'check is true only when this command is the verification of the work (a build, a type check, a test run): from then on it is the check of record, and running that same command again is a check too; false for installs, scaffolds, inspections and everything else. The harness never runs the check by itself: run it after edits when you want them judged, and before finish, which is refused while an edit is newer than the last check. command runs with bash in the repository root (the harness already sets cwd; use repository-relative paths and do not cd into a subdirectory or to /workspace). Explain its purpose. Use it for diagnostics too. A command that succeeded is not run again until something is written or installed, because its output is already in the evidence. Do not start background processes or servers.',
-  finish: 'summary reports the final code structure, the verification from verification, and limitations concisely. While a check command exists and verificationAfterLastWrite is false, finish is refused: run the check first. The evidence gate reads the changed files as they are now, the diff and the last observation; your earlier turns show what was done. Missing history proves neither that a requested procedure was followed nor that it was skipped. Do not infer a procedural violation from absent records. Report only what the evidence establishes.',
+  finish: 'summary reports the final code structure, the verification from verification, and limitations concisely. Once anything has been written, finish is refused while verificationAfterLastWrite is false: run the check first. With nothing written there is nothing to verify: the summary is your answer, judged against what you read, so state what the evidence you gathered shows. The evidence gate reads the changed files as they are now, the diff and the last observation; your earlier turns show what was done. Missing history proves neither that a requested procedure was followed nor that it was skipped. Do not infer a procedural violation from absent records. Report only what the evidence establishes.',
   ask_user: 'Ask one concise question that explains the missing information.',
 };
 export const language = (path: string): string => ({ ts: 'ts', tsx: 'tsx', js: 'js', jsx: 'jsx', mjs: 'js', cjs: 'js', json: 'json', css: 'css', scss: 'scss', html: 'html', md: 'md', yml: 'yaml', yaml: 'yaml', toml: 'toml', py: 'python', rs: 'rust', go: 'go', sh: 'bash' } as Record<string, string>)[path.split('.').pop() ?? ''] ?? '';
@@ -416,6 +416,16 @@ function agentPrefix(s: Session): Message[] {
     ...(s.trail?.length ? [{ role: 'user' as const, content: JSON.stringify({ earlierSteps: s.trail }) }] : []),
     ...(s.form === 'tools' ? toolTranscript(s) : s.entries.map(e => e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : evidenceMessage(e))),
   ];
+}
+// Where a prompt stops changing, for a provider that caches a prefix where the request marks it: after the
+// orientation (the same for the whole session, whatever is evicted) and after the evidence (append-only between
+// evictions, so the next turn's prompt extends it). Every prompt here is agentPrefix, then the volatile block and
+// the request; a continuation appends after those and is not marked.
+export function cachePoints(messages: Message[]): number[] {
+  if (messages[0]?.role !== 'system' || messages.length < 4) return [];
+  // A marker goes on text: an assistant turn that only calls tools has none, so its point is the message before it.
+  let end = messages.length - 3; while (end > 1 && !messages[end]!.content) end--;
+  return [...new Set([1, end])];
 }
 const evidenceContent = (e: Entry): string => JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } });
 const evidenceMessage = (e: Entry): Message => ({ role: 'user', content: evidenceContent(e) });

@@ -5,12 +5,18 @@
 // (its text the thought, each call an action; the prompt is in the tools form, Session.form), else one
 // JSON reply. A file is the reply's fenced code block. Both stream, so the reasoning and the reply show
 // as they are written and a file is judged for loops as it arrives.
+// Prompt caching is OpenRouter's, across providers: the prompt's cache points (context.ts) are marked with
+// cache_control on their text, the form OpenRouter takes for every provider (Anthropic, Gemini and Qwen read it,
+// OpenAI's explicit mode gets it translated; providers that cache on their own cache whatever is marked), and a
+// run's requests carry one session_id, so they stay on the provider whose cache holds the prefix. A model is marked
+// only when it caches (models.ts, cachesPrompts); a provider that refuses the markers is asked again without them,
+// and the run goes on unmarked.
 import { randomUUID } from 'node:crypto';
 import type { Config, GenerationMeta, JsonSchema, Log, Message } from './types.js';
 import { isEventStream, lineCut, post, quietly, repeatCut, streamEvents, type StreamProgress, type TextGeneration, type TextOptions, type GenerationCut } from './clients.js';
 import { actions, samplingSchema, validate } from './schema.js';
-import { describeModel, effortsOf, gatewayEfforts, type ModelInfo } from './models.js';
-import { AGENT_SYSTEM, actionTool, agentSystem } from './context.js';
+import { cachesPrompts, describeModel, effortsOf, gatewayEfforts, type ModelInfo } from './models.js';
+import { AGENT_SYSTEM, actionTool, agentSystem, cachePoints } from './context.js';
 
 // One tool call of a reply, its arguments as the text the model wrote.
 interface Call { id: string; name: string; args: string }
@@ -33,6 +39,8 @@ export class OpenRouter {
   // Tokens per character of a rendered prompt, from the last reply's usage (OpenRouter has no tokenizer
   // endpoint; the model's own count comes back with each reply).
   private ratio = 1 / 3.5;
+  // The run's requests as one session for OpenRouter's provider routing; whether its markers are still sent.
+  private readonly session = randomUUID(); private marking = true;
   constructor(readonly config: Config, private key: string, private log: Log) {
     if (!key) throw new Error('OpenRouter needs an API key: set OPENROUTER_API_KEY, or providerKeyFile to a file that holds it.');
   }
@@ -112,6 +120,22 @@ export class OpenRouter {
     }
     return { content, calls: calls.filter(Boolean), reasoning, finish, usage, model };
   }
+  // The messages with their cache points marked, when the model caches and marking is on: the point's text as one
+  // content part carrying cache_control. extra is appended after them, unmarked (a continuation).
+  private cacheable(m: ModelInfo, original: Message[], messages: Message[], extra: Message[] = []): { messages: unknown[]; marked: boolean } {
+    const points = this.config.promptCache === 'auto' && this.marking && cachesPrompts(m) ? new Set(cachePoints(original)) : new Set<number>();
+    const out = messages.map((x, i) => points.has(i) && x.content ? { ...x, content: [{ type: 'text', text: x.content, cache_control: { type: 'ephemeral' } }] } : x);
+    return { messages: [...out, ...extra], marked: points.size > 0 };
+  }
+  private routing(): Record<string, unknown> { return this.config.promptCache === 'auto' ? { session_id: this.session } : {}; }
+  // A request whose markers a provider refused (HTTP 400) is sent again without them, and marking stops for the run.
+  private async unmarkedOnRefusal<T>(marked: boolean, send: (unmarked: boolean) => Promise<T>, context?: { step: number; route: string }): Promise<T> {
+    try { return await send(false); } catch (e) {
+      if (!marked || !/^HTTP 400\b/.test((e as Error).message)) throw e;
+      this.marking = false; await this.log('cache-markers-off', { ...context, model: this.config.model, error: (e as Error).message });
+      return send(true);
+    }
+  }
   private budgetCheck(count: { tokens: number }, maxTokens: number, m: ModelInfo): void {
     if (count.tokens > this.config.workingTokens || count.tokens + maxTokens + this.config.safetyTokens > (m.contextLength || this.config.contextWindow))
       throw new Error('Prompt exceeds budget; generation refused');
@@ -135,7 +159,8 @@ export class OpenRouter {
     const step = stepActions(schema);
     const via = step && this.config.promptForm === 'tools' && m.params.includes('tools') ? 'native' : m.structured ? 'schema' : m.params.includes('tools') ? 'tool' : 'prompt';
     const choose = (forced: unknown) => m.params.includes('tool_choice') ? { tool_choice: reasons ? 'auto' : forced } : {};
-    const body: Record<string, any> = { model: this.config.model, messages: this.messages(messages, via === 'prompt' ? schema : undefined),
+    const prepared = this.messages(messages, via === 'prompt' ? schema : undefined); const cached = this.cacheable(m, messages, prepared);
+    const body: Record<string, any> = { model: this.config.model, messages: cached.messages, ...this.routing(),
       // Reasoning counts against max_tokens: a model that reasons gets its budget on top of the reply's. A native step
       // writes files in its calls, so it has a file's budget (createTokens) on top as well.
       max_tokens: Math.min(maxTokens + (via === 'native' ? this.config.createTokens : 0) + (reasons ? thinking ?? this.config.stepThinkingBudget : 0), m.maxOutput || Infinity), ...this.sampling(m, 'step', temperature), ...this.reasoning(m, thinking),
@@ -143,12 +168,12 @@ export class OpenRouter {
         : via === 'schema' ? { response_format: { type: 'json_schema', json_schema: { name: 'arguments', strict: true, schema: samplingSchema(schema) } }, provider: { require_parameters: true } }
         : via === 'tool' ? { tools: [{ type: 'function', function: { name: replyTool, description: 'Your reply: every reply is this one call, its arguments the whole reply.', parameters: schema } }], ...choose({ type: 'function', function: { name: replyTool } }) }
         : m.params.includes('response_format') ? { response_format: { type: 'json_object' } } : {}) };
-    await this.log('bonsai-request', { requestId, ...context, provider: 'openrouter', model: this.config.model, prompt: count, temperature, maxTokens: body.max_tokens, ...(body.reasoning ? { reasoning: body.reasoning } : {}), structured: m.structured, via });
+    await this.log('bonsai-request', { requestId, ...context, provider: 'openrouter', model: this.config.model, prompt: count, temperature, maxTokens: body.max_tokens, ...(body.reasoning ? { reasoning: body.reasoning } : {}), structured: m.structured, via, cacheMarked: cached.marked });
     let reply = '';
     // As it streams, a native step is shown as the step reply it becomes, so its thought and actions show as they are written.
     const asStep = (content: string, calls: Call[]) => !content.trim() && !calls.length ? '' : `{"thought":${JSON.stringify(content.trim())},"actions":[${calls.map(c => `{"action":${JSON.stringify(c.name)},"args":${c.args || '{'}`).join('},')}`;
     try {
-      const r = await this.chat(body, 60000 + Number(body.max_tokens) * 120, quietly(progress), undefined, via === 'native' ? asStep : undefined);
+      const r = await this.unmarkedOnRefusal(cached.marked, unmarked => this.chat(unmarked ? { ...body, messages: prepared } : body, 60000 + Number(body.max_tokens) * 120, quietly(progress), undefined, via === 'native' ? asStep : undefined), context);
       reply = via === 'native' ? [r.content, ...r.calls.map(c => `${c.name}(${c.args})`)].filter(Boolean).join('\n') : r.calls[0]?.args || r.content;
       this.learn(messages, r.usage);
       const ms = performance.now() - start;
@@ -196,16 +221,18 @@ export class OpenRouter {
         const n = Math.min(budget - generated, m.maxOutput || budget); if (n <= 0) { finish = 'length'; break; }
         // A continuation goes on after the last whole line written.
         const lastLine = text.replace(/\n$/, '').split('\n').at(-1) ?? '';
-        const sent = continuations === 0 ? this.messages(messages) : [...this.messages(messages), { role: 'assistant' as const, content: `${opening}\n${text}` },
+        const extra: Message[] = continuations === 0 ? [] : [{ role: 'assistant' as const, content: `${opening}\n${text}` },
           { role: 'user' as const, content: `Your reply stopped at the output limit. Reply with the rest of the code as one fenced code block: it goes on right after the line ${JSON.stringify(lastLine)}, without repeating anything written so far.` }];
+        const prepared = this.messages(messages); const cached = this.cacheable(m, messages, prepared, extra);
         const think = continuations === 0 ? options.think : undefined;
-        const body: Record<string, any> = { model: this.config.model, messages: sent, max_tokens: Math.min(n + (think ?? 0), m.maxOutput || Infinity), ...this.sampling(m, 'code', temperature), ...this.reasoning(m, think), ...tools };
+        const body: Record<string, any> = { model: this.config.model, messages: cached.messages, ...this.routing(), max_tokens: Math.min(n + (think ?? 0), m.maxOutput || Infinity), ...this.sampling(m, 'code', temperature), ...this.reasoning(m, think), ...tools };
         let judgedAt = 0; const prior = text;
-        const r = await this.chat(body, 60000 + Number(body.max_tokens) * 120, p => progress({ ...p, text: prior + codeOf(p.text).code, tokens: generated + p.tokens }),
-          (content, tokens) => { if (tokens - judgedAt < 8 || !content.endsWith('\n')) return false; judgedAt = tokens; return repeatCut(prior + codeOf(content).code, options.around, false) !== null; }, c => c);
+        const r = await this.unmarkedOnRefusal(cached.marked, unmarked => this.chat(unmarked ? { ...body, messages: [...prepared, ...extra] } : body, 60000 + Number(body.max_tokens) * 120, p => progress({ ...p, text: prior + codeOf(p.text).code, tokens: generated + p.tokens }),
+          (content, tokens) => { if (tokens - judgedAt < 8 || !content.endsWith('\n')) return false; judgedAt = tokens; return repeatCut(prior + codeOf(content).code, options.around, false) !== null; }, c => c), context);
         last = r.content;
         if (r.reasoning) reasoning += r.reasoning;
-        usage = { prompt_tokens: (usage.prompt_tokens ?? 0) + (r.usage?.prompt_tokens ?? 0), completion_tokens: (usage.completion_tokens ?? 0) + (r.usage?.completion_tokens ?? 0), ...(r.usage?.cost !== undefined ? { cost: (usage.cost ?? 0) + r.usage.cost } : {}) };
+        usage = { prompt_tokens: (usage.prompt_tokens ?? 0) + (r.usage?.prompt_tokens ?? 0), completion_tokens: (usage.completion_tokens ?? 0) + (r.usage?.completion_tokens ?? 0), ...(r.usage?.cost !== undefined ? { cost: (usage.cost ?? 0) + r.usage.cost } : {}),
+          prompt_tokens_details: { cached_tokens: (usage.prompt_tokens_details?.cached_tokens ?? 0) + (r.usage?.prompt_tokens_details?.cached_tokens ?? 0), cache_write_tokens: (usage.prompt_tokens_details?.cache_write_tokens ?? 0) + (r.usage?.prompt_tokens_details?.cache_write_tokens ?? 0) } };
         if (continuations === 0) this.learn(messages, r.usage);
         generated += Number(r.usage?.completion_tokens ?? 0) || Math.ceil(r.content.length / 3.5);
         const block = codeOf(r.content);
@@ -233,7 +260,7 @@ export class OpenRouter {
       }
       if (finish === 'length' && !cut && text !== '' && !text.endsWith('\n')) { const c = lineCut(text, text.length, 'budget'); cutFrom = text; text = c.kept; cut = c.cut; }
       const ms = performance.now() - start;
-      this.lastMeta = { ms, usage: { prompt_tokens: usage.prompt_tokens ?? count.tokens, completion_tokens: generated }, timings: generated ? { predicted_per_second: generated / (ms / 1000) } : undefined, finishReason: finish, promptTokens: count.tokens, continuations, ...(reasoning ? { reasoning: reasoning.trim() } : {}) };
+      this.lastMeta = { ms, usage: { prompt_tokens: usage.prompt_tokens ?? count.tokens, completion_tokens: generated, prompt_tokens_details: usage.prompt_tokens_details }, timings: generated ? { predicted_per_second: generated / (ms / 1000) } : undefined, finishReason: finish, promptTokens: count.tokens, continuations, ...(reasoning ? { reasoning: reasoning.trim() } : {}) };
       if (cut) await this.log(finish === 'repetition' ? 'repetition-cut' : 'budget-cut', { requestId, ...context, kept: text.length, generated: cutFrom.length, cut, discardedTail: cutFrom.slice(-4000) });
       await this.log('bonsai', { requestId, ...context, provider: 'openrouter', model: this.config.model, ms, prompt: count, usage: this.lastMeta.usage, finishReason: finish, continuations, ...(reasoning ? { reasoningChars: reasoning.trim().length } : {}), ...(usage.cost !== undefined ? { cost: usage.cost } : {}) });
       return { text, finish, meta: this.lastMeta, ...(cut ? { cut } : {}) };

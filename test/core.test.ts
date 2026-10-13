@@ -983,3 +983,15 @@ test('On Windows what a command left running is found by the mark its shell pass
   } finally { stopMarked(a.mark); stopMarked(b.mark); }
   assert.deepEqual(await windowsLeft(b.mark, Date.now()), [], 'stopped: nothing carries the mark');
 });
+
+test('The project the worker is shown is the one git sees: ignored build output and worktrees checked out inside it are not listed; untracked new files are; outside git, the whole tree', async t => {
+  const { visibleRepoFiles, listRepoFiles, runCommand } = await import('../src/tools.js');
+  const root = await mkdtemp(join(tmpdir(), 'leana-visible-')); t.after(() => rm(root, { recursive: true, force: true }));
+  for (const f of ['src/a.ts', 'dist/a.js', '.claude/worktrees/w/src/a.ts', 'notes.md', '.env', 'id.key']) { await mkdir(join(root, f, '..'), { recursive: true }); await writeFile(join(root, f), 'x\n'); }
+  assert.deepEqual(await visibleRepoFiles(root), await listRepoFiles(root), 'not a repository: the tree as it is');
+  await writeFile(join(root, '.gitignore'), 'dist/\n');
+  const git = (...a: string[]) => runCommand('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], root, 20000);
+  await git('init', '-q'); await writeFile(join(root, '.git', 'info', 'exclude'), '.claude/worktrees/\n');
+  await git('add', 'src/a.ts', '.gitignore'); await git('commit', '-qm', 'x');
+  assert.deepEqual(await visibleRepoFiles(root), ['.gitignore', 'notes.md', 'src/a.ts'], 'tracked and untracked, without what git ignores, .env files or keys');
+});

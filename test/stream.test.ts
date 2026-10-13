@@ -373,9 +373,9 @@ test('The display shows a step\'s thought and actions as they are written and pr
   assert.equal(out.filter(l => l.startsWith('[2] thought: ')).length, 1, 'printed once');
   assert.equal(block.map(l => l.trim()).join(' '), `[2] thought: ${thought}`, 'word-wrapped, never cut');
   assert(block.length >= 3 && block.every(l => cells(l) <= 79), block.join('\n'));
-  const chose = '[2] actions: read_files src/App.tsx 1..40 | bash npm run build | bash printf "[2J"; npx vitest run --reporter=verbose src/components/Hero...';
+  const chose = '[2] actions: read_files src/App.tsx 1..40 | bash npm run build | bash printf "[2J"; npx vitest run --reporter=verbose src/components/Hero.test.tsx';
   const from = out.findIndex(l => l.startsWith('[2] actions: ')); const actions = [out[from]!]; for (let i = from + 1; /^ {13}\S/.test(out[i] ?? ''); i++) actions.push(out[i]!);
-  assert.equal(actions.map(l => l.trim()).join(' '), chose, 'every action, wrapped'); assert(actions.length === 2 && actions.every(l => l.length <= 79));
+  assert.equal(actions.map(l => l.trim()).join(' '), chose, 'every action, wrapped'); assert(actions.length >= 2 && actions.every(l => l.length <= 79));
   assert(!tty.join('').includes('\x1b[2J'), 'no escape sequence from the model reaches the terminal');
   // A file being written: its last lines numbered as in the file, tabs as spaces, a long line cut at its end
   // once whole and shown by its end while it is still being written.

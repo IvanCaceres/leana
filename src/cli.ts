@@ -137,7 +137,7 @@ async function main(): Promise<void> {
     if (Number.isFinite(at) && at < Date.now() - outcome.elapsedMs - 5000) since = `; ${elapsed(Date.now() - at)} since the session began`;
   } catch { /* no event log */ }
   const r = outcome.session;
-  console.log(`\n${r.status.toUpperCase()}: ${r.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps (${r.step} in total)${since}\nSession: ${outcome.store.path}`);
+  console.log(`\n${r.status.toUpperCase()}: ${r.outcome ?? r.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps (${r.step} in total)${since}\nSession: ${outcome.store.path}`);
   if (r.status !== 'complete') process.exitCode = 2;
 }
 if (process.argv[1] && import.meta.url === new URL(`file://${resolve(process.argv[1])}`).href)

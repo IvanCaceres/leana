@@ -1,5 +1,5 @@
 import type { Session } from './types.js';
-import { boundedRead, hash, safePath } from './tools.js';
+import { boundedRead, hash, safePath } from './files.js';
 
 // The files the objective names are pinned for the worker as source excerpts,
 // never as model-written interpretations of the task. The harness reads each

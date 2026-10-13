@@ -4,7 +4,9 @@
 // present, what each detected ecosystem offers as verification, what is
 // declared. Nothing here decides anything.
 import { join } from 'node:path';
-import { boundedRead, repositoryStatus, runCommand, visibleRepoFiles } from './tools.js';
+import { boundedRead, visibleRepoFiles } from './files.js';
+import { repositoryStatus } from './repository.js';
+import { runCommand } from './commands.js';
 import { detectProjects, inProject, shellPrefixFor } from './profiles.js';
 import { clip } from './context.js';
 import { findBrowser } from './render.js';

@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createFixture, verifyFixture } from '../src/live-test.js';
-import { runCommand } from '../src/tools.js';
+import { runCommand } from '../src/commands.js';
 
 async function fixture(t: any) {
   const parent = await mkdtemp(join(tmpdir(), 'leana-live-fixture-'));

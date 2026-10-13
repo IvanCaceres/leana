@@ -12,7 +12,8 @@ import { loadConfig } from './config.js';
 import { benchmarkPrompt, benchmarkVersion, fixtureFiles, fixtureHash, prepareBenchmark } from './benchmark-fixture.js';
 import { verifyBenchmark } from './benchmark-verify.js';
 import { comparisonMarkdown, summarizeEvents, type Event } from './benchmark-metrics.js';
-import { hash, runCommand } from './tools.js';
+import { hash } from './files.js';
+import { runCommand } from './commands.js';
 import { snapshotFiles } from './live-test.js';
 import { killTree } from './shell.js';
 

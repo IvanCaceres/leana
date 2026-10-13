@@ -11,7 +11,7 @@ import { OpenRouter } from './openrouter.js';
 import { describeModel, effortsOf, fitToModel, unsupportedSettings, type ModelInfo } from './models.js';
 import { Agent, newSession } from './agent.js';
 import { Store, runsDir, stateDir } from './store.js';
-import { runCommand } from './tools.js';
+import { runCommand } from './commands.js';
 import { Display } from './display.js';
 
 // A key file holds one key, or NAME=key (TYPESAFE_API_KEY, OPENROUTER_API_KEY, any NAME).

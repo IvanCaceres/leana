@@ -10,21 +10,11 @@ import type { Answers, Config, EditAttempt, Message, Questions, Route, Session, 
 import { editRoutes } from './types.js';
 import { liveHeight, partialJson, tailLines, type ProgressEvent } from './display.js';
 import { Store } from './store.js';
-import {
-  ToolBox,
-  boundedRead,
-  droppedLines,
-  hash,
-  listRepoFiles,
-  repositoryStatus,
-  runCommand,
-  safePath,
-  sourceHashes,
-  summarizeCheck,
-  treeChanges,
-  treeSnapshot,
-  TreeHashes,
-} from './tools.js';
+import { ToolBox } from './tools.js';
+import { boundedRead, hash, listRepoFiles, safePath, treeChanges, treeSnapshot, TreeHashes } from './files.js';
+import { droppedLines } from './edit-checks.js';
+import { repositoryStatus, sourceHashes, summarizeCheck } from './repository.js';
+import { runCommand } from './commands.js';
 import {
   breakIndex,
   clip,

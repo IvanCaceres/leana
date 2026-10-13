@@ -5,24 +5,24 @@ import { pathToFileURL } from 'node:url';
 import { builtinModules, createRequire } from 'node:module';
 import type { CheckSummary } from './types.js';
 import { bashPathOf, venvBin, windowsExe } from './shell.js';
+import { boundedRead, hash, safePath } from './files.js';
 import {
-  boundedRead,
   exportedSignatures,
-  hash,
   importCandidates,
-  installCommand,
   problemAt,
   problemKey,
-  installedPackages,
-  manifestFailures,
   relativeImports,
-  repositoryStatus,
-  runCommand,
-  safePath,
-  solutionTsconfigReferences,
   syntaxErrors,
   topLevelDeclarations,
-} from './tools.js';
+} from './code.js';
+import {
+  installCommand,
+  installedPackages,
+  manifestFailures,
+  repositoryStatus,
+  solutionTsconfigReferences,
+} from './repository.js';
+import { runCommand } from './commands.js';
 type RepositoryStatus = Awaited<ReturnType<typeof repositoryStatus>>;
 const nested = (repository: RepositoryStatus | undefined, ...manifests: string[]) =>
   (repository?.packages ?? []).some(p => p.tools.some(f => manifests.includes(f)));

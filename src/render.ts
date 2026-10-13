@@ -11,7 +11,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { runCommand } from './tools.js';
+import { runCommand } from './commands.js';
 import { announcedElsewhere, notAnswering, startServer, type Started } from './serve.js';
 export { announcedElsewhere };
 

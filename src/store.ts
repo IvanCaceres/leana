@@ -8,7 +8,7 @@ import type { Session } from './types.js';
 import { decisionLog } from './decision-log.js';
 import { clip, rememberEdit, retireEvidence } from './context.js';
 import { editRoutes } from './types.js';
-import { summarizeCheck } from './tools.js';
+import { summarizeCheck } from './repository.js';
 // Sessions live outside the repository, in the user's state directory, so the
 // project directory holds only the project: a scaffolder or a clean-tree check
 // sees exactly what the user sees.

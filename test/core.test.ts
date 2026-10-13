@@ -88,32 +88,30 @@ import {
   solutionTsconfigReferences,
   checkUnusable,
   checkAdvice,
-  assertBalancePreserved,
   completionSource,
-  hash,
-  runCommand,
-  safePath,
   sourceHashes,
+  summarizeCheck,
+} from '../src/repository.js';
+import {
+  assertBalancePreserved,
   StaleWriteError,
   stripLiterals,
-  ToolBox,
-  summarizeCheck,
-  syntaxErrors,
-  describeProcesses,
-  groupProcesses,
   assertNoBulkDuplication,
-  treeChanges,
-  treeSnapshot,
-  TreeHashes,
   dropDuplicateImports,
+  rangeEchoes,
+} from '../src/edit-checks.js';
+import { hash, safePath, treeChanges, treeSnapshot, TreeHashes } from '../src/files.js';
+import { runCommand, describeProcesses, groupProcesses } from '../src/commands.js';
+import { ToolBox } from '../src/tools.js';
+import {
+  syntaxErrors,
   exportedSignatures,
   importCandidates,
   problemAt,
   problemKey,
-  rangeEchoes,
   relativeImports,
   statementBounds,
-} from '../src/tools.js';
+} from '../src/code.js';
 import type { Answers, Questions } from '../src/types.js';
 
 const noop = async () => {};
@@ -2391,7 +2389,7 @@ test('Shell command output reaches the harness without colour or hyperlink seque
     'RESET = "\u001bc"\n',
     'a command run for its content (a search, a program) keeps its bytes',
   );
-  const { plainText } = await import('../src/tools.js');
+  const { plainText } = await import('../src/commands.js');
   assert.equal(
     plainText('SAVE = "\u001b7"; RED = "\u001b[31m"'),
     'SAVE = "\u001b7"; RED = ""',
@@ -2549,7 +2547,8 @@ test(
 );
 
 test('The project the worker is shown is the one git sees: ignored build output and worktrees checked out inside it are not listed; untracked new files are; outside git, the whole tree', async t => {
-  const { visibleRepoFiles, listRepoFiles, runCommand } = await import('../src/tools.js');
+  const { visibleRepoFiles, listRepoFiles } = await import('../src/files.js');
+  const { runCommand } = await import('../src/commands.js');
   const root = await mkdtemp(join(tmpdir(), 'leana-visible-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   for (const f of ['src/a.ts', 'dist/a.js', '.claude/worktrees/w/src/a.ts', 'notes.md', '.env', 'id.key']) {

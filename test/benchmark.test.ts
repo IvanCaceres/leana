@@ -7,7 +7,7 @@ import { createServer } from 'node:http';
 import { prepareBenchmark, referenceRefactor, fixtureHash, fixtureFiles } from '../src/benchmark-fixture.js';
 import { verifyBenchmark } from '../src/benchmark-verify.js';
 import { comparisonMarkdown, summarizeEvents } from '../src/benchmark-metrics.js';
-import { runCommand } from '../src/tools.js';
+import { runCommand } from '../src/commands.js';
 import { Jev } from '../src/clients.js';
 import { Store } from '../src/store.js';
 import { defaults } from '../src/config.js';

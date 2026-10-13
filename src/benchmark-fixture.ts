@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { hash } from './tools.js';
+import { hash } from './files.js';
 
 export const benchmarkVersion = 'order-refactor-v1';
 export const benchmarkPrompt = `Refactor this order-processing project to remove duplicated business logic across checkout, subscription renewal, and quotation. Preserve all existing public APIs, returned fields, error messages, rounding rules, input immutability, and injected-clock behavior.

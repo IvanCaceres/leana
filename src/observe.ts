@@ -10,7 +10,7 @@ import { existsSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { findBrowser, renderFacts, type PageInput } from './render.js';
 import { connectionRefused, listeningAt, localAddresses, notAnswering, startServer } from './serve.js';
-import { commandShell, describeProcesses, runCommand } from './tools.js';
+import { commandShell, describeProcesses, runCommand } from './commands.js';
 import { describeObserver, observerKinds } from './observe-catalog.js';
 const described = (kind: string) => describeObserver(kind)!;
 

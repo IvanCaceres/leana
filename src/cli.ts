@@ -5,7 +5,7 @@ import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { loadConfig, loadSettings } from './config.js';
 import { Jev, postJson } from './clients.js';
-import { runCommand } from './tools.js';
+import { runCommand } from './commands.js';
 import { renderReport } from './report.js';
 import { describeModel, effortsOf, listModels, modelOptions } from './models.js';
 import { elapsed, forModel, modelClient, providerKey, readKey, runSession } from './session.js';

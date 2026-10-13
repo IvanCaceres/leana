@@ -1,1444 +1,28 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { open, readFile, realpath, rename, stat, unlink, mkdir, readdir } from 'node:fs/promises';
-import { dirname, isAbsolute, posix, relative, resolve, sep } from 'node:path';
-import { spawn } from 'node:child_process';
-import { bashPath, bashPathOf, commandEnv, killTree, missingBash, runMark, windowsLeft } from './shell.js';
-import { builtinModules } from 'node:module';
-import type { CheckSummary, Config, Route, SourceEvidence, ToolResult } from './types.js';
+import { randomUUID } from 'node:crypto';
+import { open, rename, stat, unlink } from 'node:fs/promises';
+import { relative } from 'node:path';
+import type { Config, Route, ToolResult } from './types.js';
 import { clip } from './context.js';
 import { localAddresses } from './serve.js';
-// The first 16 hex digits (64 bits) of SHA-256: enough to tell one version of a
-// file from another in a session, and a quarter of the tokens every prompt pays for.
-export const hash = (text: string | Buffer): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
-// A write whose target was never read, or was read before it changed. Only this
-// failure class requires a fresh read; other edit failures are argument mistakes.
-export class StaleWriteError extends Error {}
-// One edit that landed, in the numbering of the text it was applied to: lines
-// start..end (end = start - 1: none, an insertion before start) were replaced by
-// count lines; every other line is unchanged and moves by the difference.
-// changes null: the whole text was replaced, so no line of it maps forward.
-export type LineChange = { start: number; end: number; count: number };
-export type EditRecord = {
-  path: string;
-  step: number;
-  route: string;
-  before: string;
-  after: string;
-  changes: LineChange[] | null;
-};
-const describeChange = (c: LineChange) =>
-  c.end < c.start ? `inserted ${c.count} line(s) before ${c.start}` : `${c.start}..${c.end} -> ${c.count} line(s)`;
-// Where lines start..end (end = start - 1: the position before start) of a text
-// are after changes numbered in that same text landed; null when a change
-// replaced any of those lines or put lines between them. The arithmetic is the
-// bottom-up application replace_lines does within one call.
-export function mapRange(start: number, end: number, changes: LineChange[]): { start: number; end: number } | null {
-  const insert = end === start - 1;
-  let shift = 0;
-  for (const c of changes) {
-    const cInsert = c.end === c.start - 1;
-    const delta = c.count - (c.end - c.start + 1);
-    if (cInsert ? c.start <= start : c.end < start) shift += delta;
-    else if (insert ? !cInsert && c.start < start : c.start <= end) return null;
-  }
-  return { start: start + shift, end: end + shift };
-}
-// An import or export line the file already has is dropped from an insertion:
-// the intent (have that import) is already met, so the edit is repaired, not
-// refused. Returns the lines to insert and the ones dropped.
-export function dropDuplicateImports(before: string, inserted: string[]): { kept: string[]; dropped: string[] } {
-  const norm = (l: string) => l.trim().replace(/'/g, '"').replace(/;$/, '').replace(/\s+/g, ' ');
-  const present = new Set(before.split('\n').map(norm));
-  const kept: string[] = [];
-  const dropped: string[] = [];
-  for (const line of inserted) {
-    if (/^\s*(import|export)\b.*\bfrom\b/.test(line) && present.has(norm(line))) dropped.push(line);
-    else kept.push(line);
-  }
-  return { kept, dropped };
-}
-// An edit that pastes a block the file already contains (a header copied
-// again, a function duplicated) is wrong content, the recurring way a small
-// model breaks a file: refused, so the worker generates something else.
-export function assertNoBulkDuplication(before: string, inserted: string[], label: string, countRule = true): void {
-  const trimmed = (xs: string[]) => xs.map(l => l.trim());
-  const beforeLines = trimmed(before.split('\n'));
-  if (!countRule) return;
-  // A run of five consecutive substantive inserted lines that already appears
-  // consecutively in the file is a pasted block, not a shared idiom.
-  // (five closing braces are not a paste: every line must carry some text and the run some substance)
-  const substantive = (w: string[]) => w.every(l => l.length >= 4) && w.join('').length >= 60;
-  const windows = new Set<string>();
-  for (let i = 0; i + 5 <= beforeLines.length; i++) {
-    const w = beforeLines.slice(i, i + 5);
-    if (substantive(w)) windows.add(w.join('\n'));
-  }
-  const ins = trimmed(inserted);
-  for (let i = 0; i + 5 <= ins.length; i++) {
-    const w = ins.slice(i, i + 5);
-    if (substantive(w) && windows.has(w.join('\n')))
-      throw new Error(
-        `Edit refused: it would insert a block that ${label} already contains (starting ${JSON.stringify(w[0]!.slice(0, 60))}). The file already has these lines; add only what is missing.`,
-      );
-  }
-}
-// The lines the replaced ranges held that their new text does not contain
-// (compared trimmed, each new line matching one old line), as "n: text".
-export function droppedLines(
-  lines: string[],
-  edits: { start: number; end: number }[],
-  rendered: (e: any) => string[],
-  limit = 6,
-): string[] {
-  const out: string[] = [];
-  for (const e of [...edits].sort((x, y) => x.start - y.start)) {
-    if (e.end < e.start) continue;
-    const left = new Map<string, number>();
-    for (const l of rendered(e)) {
-      const t = l.trim();
-      left.set(t, (left.get(t) ?? 0) + 1);
-    }
-    for (let n = e.start; n <= e.end; n++) {
-      const t = (lines[n - 1] ?? '').trim();
-      if (!t) continue;
-      const k = left.get(t) ?? 0;
-      if (k > 0) left.set(t, k - 1);
-      else out.push(`${n}: ${t.slice(0, 80)}`);
-    }
-  }
-  return out.length > limit ? [...out.slice(0, limit), `${out.length - limit} more`] : out;
-}
-// The lines at the start of a range's new text that are the lines just before the range as they
-// are, and those at its end that are the lines just after it: exact, with some text among them,
-// and never lines another range of the call replaces. In runs 49-76, 18 edits repeated a
-// neighbouring line and in none did the worker's thought ask for a second copy: 7 of the 8 that
-// landed left a duplicate (a CSS property, a wrapper div, 8 CSS rules, an object key, a
-// destructured name, a call), and 7 calls were refused.
-export function rangeEchoes(
-  lines: string[],
-  e: { start: number; end: number },
-  fresh: string[],
-  taken: (n: number) => boolean = () => false,
-): { head: number; tail: number } {
-  const last = Math.max(e.end, e.start - 1); // an insertion before line s sits between s - 1 and s
-  const repeats = (from: number, xs: string[]) =>
-    xs.some(l => l.trim()) && xs.every((l, i) => l === lines[from - 1 + i] && !taken(from + i));
-  let head = 0;
-  for (let k = Math.min(fresh.length, e.start - 1); k > 0 && !head; k--)
-    if (repeats(e.start - k, fresh.slice(0, k))) head = k;
-  let tail = 0;
-  for (let k = Math.min(fresh.length - head, lines.length - last); k > 0 && !tail; k--)
-    if (repeats(last + 1, fresh.slice(fresh.length - k))) tail = k;
-  return { head, tail };
-}
-const bracketPairs = [
-  ['{', '}'],
-  ['(', ')'],
-  ['[', ']'],
-] as const;
-type Pair = readonly [string, string];
-// The brackets of one kind that code (literals and comments stripped) leaves unmatched: how many
-// opens it does not close and how many closes it does not open.
-function unmatched(code: string, [open, close]: Pair): { opens: number; closes: number } {
-  let opens = 0;
-  let closes = 0;
-  for (const ch of code)
-    if (ch === open) opens++;
-    else if (ch === close) {
-      if (opens) opens--;
-      else closes++;
-    }
-  return { opens, closes };
-}
-// The lines outside a range holding the brackets that match the ones it leaves unmatched: the
-// first ones of the other side not matched on the way, scanning away from the range.
-function matchingLines(
-  stripped: string[],
-  from: number,
-  forward: boolean,
-  [open, close]: Pair,
-  count: number,
-): number[] {
-  const out: number[] = [];
-  let depth = 0;
-  const [away, back] = forward ? [open, close] : [close, open];
-  for (let i = from; out.length < count && i >= 0 && i < stripped.length; i += forward ? 1 : -1)
-    for (const ch of forward ? stripped[i]! : [...stripped[i]!].reverse())
-      if (ch === away) depth++;
-      else if (ch === back) {
-        if (depth) depth--;
-        else if (out.push(i + 1) === count) break;
-      }
-  return out;
-}
-// A refused edit stated range by range: for the bracket kinds the refusal names, what the replaced
-// lines leave unmatched (with the line outside the range that matches it) against what the new
-// text does, and new text that repeats the lines around its range. Only ranges that change that
-// balance or repeat a neighbour are stated. Run 73 step 50's new text ended with line 38, the line
-// after its range; step 58's opened a '{' it never closed; both were told only that "the range cuts
-// through a declaration", and were redone by a whole-file rewrite (10.6 s) and a read and a region
-// rewrite (25.5 s).
-export function editFacts(
-  lines: string[],
-  edits: { label: string; start: number; end: number; fresh: string[] }[],
-  kinds: readonly Pair[],
-): string[] {
-  const stripped = stripLiterals(lines.join('\n')).split('\n');
-  const out: string[] = [];
-  const count = (n: number, ch: string) => `${n} '${ch}'`;
-  const by = (xs: number[], verb: string) => {
-    const u = [...new Set(xs)];
-    return u.length > 1 ? `lines ${u.join(', ')} ${verb}` : `line ${u[0]} ${verb}s`;
-  };
-  const quote = (l: string) => JSON.stringify(l.length > 80 ? `${l.slice(0, 80)}…` : l);
-  for (const e of edits) {
-    const taken = (n: number) => edits.some(x => x !== e && n >= x.start && n <= x.end);
-    const { head, tail } = rangeEchoes(lines, e, e.fresh, taken);
-    const last = Math.max(e.end, e.start - 1);
-    const was = kinds.map(k => unmatched(e.end >= e.start ? stripped.slice(e.start - 1, e.end).join('\n') : '', k));
-    const now = kinds.map(k => unmatched(stripLiterals(e.fresh.join('\n')), k));
-    const changed = kinds.filter((_, i) => was[i]!.opens - was[i]!.closes !== now[i]!.opens - now[i]!.closes);
-    if (!changed.length && !head && !tail) continue;
-    const old = changed.flatMap(k => {
-      const w = was[kinds.indexOf(k)]!;
-      const after = matchingLines(stripped, e.end, true, k, w.opens);
-      const before = matchingLines(stripped, e.start - 2, false, k, w.closes);
-      return [
-        ...(w.opens ? [`open ${count(w.opens, k[0])}${after.length ? ` that ${by(after, 'close')}` : ''}`] : []),
-        ...(w.closes ? [`close ${count(w.closes, k[1])}${before.length ? ` that ${by(before, 'open')}` : ''}`] : []),
-      ];
-    });
-    const fresh = changed.flatMap(k => {
-      const w = now[kinds.indexOf(k)]!;
-      return [
-        ...(w.opens ? [`opens ${count(w.opens, k[0])} it does not close`] : []),
-        ...(w.closes ? [`closes ${count(w.closes, k[1])} it does not open`] : []),
-      ];
-    });
-    const none = `no unmatched ${changed
-      .flatMap(k => [`'${k[0]}'`, `'${k[1]}'`])
-      .join(', ')
-      .replace(/, ([^,]+)$/, ' or $1')}`;
-    const echo = [
-      ...(head
-        ? [
-            `${head === e.fresh.length ? 'is' : 'starts with'} ${head === 1 ? `${quote(e.fresh[0]!)}, which is line ${e.start - 1} as it is, the line before the range` : `lines ${e.start - head}..${e.start - 1} as they are, the lines before the range`}`,
-          ]
-        : []),
-      ...(tail
-        ? [
-            `${tail === e.fresh.length ? 'is' : 'ends with'} ${tail === 1 ? `${quote(e.fresh.at(-1)!)}, which is line ${last + 1} as it is, the line after the range` : `lines ${last + 1}..${last + tail} as they are, the lines after the range`}`,
-          ]
-        : []),
-    ];
-    const replaced =
-      !changed.length || e.end < e.start
-        ? ''
-        : `the replaced lines ${old.length ? old.join(' and ') : `have ${none}`}; `;
-    const text = [...(changed.length ? [fresh.length ? fresh.join(' and ') : `has ${none}`] : []), ...echo].join(
-      ', and ',
-    );
-    out.push(`${e.label[0]!.toUpperCase()}${e.label.slice(1)}: ${replaced}its new text ${text}.`);
-  }
-  return out;
-}
-// Facts in the room a refusal has: the evidence entry of a failed edit keeps 600 characters
-// (agent.ts), so whole facts are kept while they fit, the first always, and the rest are counted.
-export function factsInRoom(facts: string[], room: number): string {
-  const kept: string[] = [];
-  let used = 0;
-  for (const [i, f] of facts.entries()) {
-    if (kept.length && used + f.length + 1 + (i < facts.length - 1 ? 40 : 0) > room) break;
-    kept.push(f);
-    used += f.length + 1;
-  }
-  return `${kept.join(' ')}${kept.length < facts.length ? ` (${facts.length - kept.length} more range(s) left out for room.)` : ''}`;
-}
-// A large range whose new text mostly equals the old is a retype. The lines
-// that differ are the change the worker meant, so the edit is applied and the
-// note names them; refusing it would only discard the generation.
-export function nearRetype(oldLines: string[], newLines: string[], start: number): string | null {
-  if (oldLines.length < 12 || newLines.length !== oldLines.length) return null;
-  const differing = oldLines.map((l, i) => (l.trim() === newLines[i]!.trim() ? -1 : start + i)).filter(n => n >= 0);
-  if (differing.length === 0 || differing.length > Math.max(2, Math.floor(oldLines.length * 0.2))) return null;
-  return `this rewrote ${oldLines.length} lines of which only ${differing.length} changed (line${differing.length > 1 ? 's' : ''} ${differing.join(', ')}); next time edit only those lines, in ranges of their own`;
-}
-// The exported surface of a file as short signatures: what another file may
-// import from it. Interfaces and type aliases are shown whole when short; a
-// function, class or const shows its first line up to the body.
-export async function exportedSignatures(path: string, text: string, limit = 14): Promise<string[]> {
-  if (tsModule === undefined) {
-    try {
-      const m: any = await import('typescript');
-      tsModule = m.default ?? m;
-    } catch {
-      tsModule = null;
-    }
-  }
-  if (!tsModule || !parseable.test(path)) return [];
-  const ts = tsModule;
-  const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-  const out: string[] = [];
-  const hasExport = (st: any) =>
-    (ts.canHaveModifiers(st) ? (ts.getModifiers(st) ?? []) : []).some(
-      (m: any) => m.kind === ts.SyntaxKind.ExportKeyword,
-    );
-  const isDefault = (st: any) =>
-    (ts.canHaveModifiers(st) ? (ts.getModifiers(st) ?? []) : []).some(
-      (m: any) => m.kind === ts.SyntaxKind.DefaultKeyword,
-    );
-  const upTo = (st: any, pos: number) => text.slice(st.getStart(sf), pos).replace(/\s+$/, '').replace(/\s+/g, ' ');
-  for (const st of sf.statements) {
-    if (out.length >= limit) break;
-    if (ts.isExportAssignment(st)) {
-      out.push(`export default ${clip(st.expression.getText(sf).split('\n')[0]!, 120)}`);
-      continue;
-    }
-    if (ts.isExportDeclaration(st)) {
-      out.push(clip(st.getText(sf).replace(/\s+/g, ' '), 160));
-      continue;
-    }
-    if (!hasExport(st)) continue;
-    const full = st.getText(sf);
-    if (
-      (ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st) || ts.isEnumDeclaration(st)) &&
-      full.split('\n').length <= 24
-    ) {
-      out.push(full);
-      continue;
-    }
-    // A function or class shows its head up to the body; an arrow function up to its arrow.
-    if (ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st)) {
-      const body = ts.isFunctionDeclaration(st) ? st.body : null;
-      const at = body
-        ? body.getStart(sf)
-        : ts.isClassDeclaration(st)
-          ? full.indexOf('{') + st.getStart(sf)
-          : st.getEnd();
-      out.push(clip(upTo(st, at), 200));
-      continue;
-    }
-    if (ts.isVariableStatement(st)) {
-      const init = st.declarationList.declarations[0]?.initializer;
-      if (init && ts.isArrowFunction(init)) {
-        out.push(clip(upTo(st, init.equalsGreaterThanToken.getEnd()), 200));
-        continue;
-      }
-      if (init && ts.isFunctionExpression(init)) {
-        out.push(clip(upTo(st, init.body.getStart(sf)), 200));
-        continue;
-      }
-    }
-    out.push(clip(full.split('\n')[0]!.replace(/\s*\{\s*$/, ''), 160) + (isDefault(st) ? '' : ''));
-  }
-  return out;
-}
-// The relative imports of a file (a spec starting with . or /), with the local
-// names each binds: 'default', '*', the named bindings, or none for a
-// side-effect import such as a stylesheet.
-export async function relativeImports(
-  path: string,
-  text: string,
-  all = false,
-): Promise<{ spec: string; names: string[]; typeOnly?: boolean }[]> {
-  if (tsModule === undefined) {
-    try {
-      const m: any = await import('typescript');
-      tsModule = m.default ?? m;
-    } catch {
-      tsModule = null;
-    }
-  }
-  if (!tsModule || !parseable.test(path)) return [];
-  const ts = tsModule;
-  const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-  const out: { spec: string; names: string[]; typeOnly?: boolean }[] = [];
-  for (const st of sf.statements) {
-    let spec: string | null = null;
-    const names: string[] = [];
-    let typeOnly = false;
-    if (ts.isImportDeclaration(st)) {
-      spec = st.moduleSpecifier.text;
-      const c = st.importClause;
-      typeOnly = Boolean(c?.isTypeOnly);
-      if (c?.name) names.push('default');
-      if (c?.namedBindings && ts.isNamespaceImport(c.namedBindings)) names.push('*');
-      if (c?.namedBindings && ts.isNamedImports(c.namedBindings)) {
-        const els = c.namedBindings.elements;
-        for (const b of els) names.push(b.propertyName?.text ?? b.name.text);
-        if (els.length && els.every((b: any) => b.isTypeOnly)) typeOnly = true;
-      }
-    } else if (ts.isExportDeclaration(st) && st.moduleSpecifier) {
-      spec = st.moduleSpecifier.text;
-      typeOnly = Boolean(st.isTypeOnly);
-      for (const b of st.exportClause && ts.isNamedExports(st.exportClause) ? st.exportClause.elements : [])
-        names.push(b.propertyName?.text ?? b.name.text);
-    }
-    if (spec && (all || /^\.\.?\//.test(spec))) out.push({ spec, names, ...(typeOnly ? { typeOnly: true } : {}) });
-  }
-  return out;
-}
-// The repository paths an import specifier can denote, in resolution order:
-// the exact path, then the source extensions, then an index file.
-export function importCandidates(importer: string, spec: string): string[] {
-  const cleaned = posix.normalize(posix.join(posix.dirname(importer.replace(/\\/g, '/')), spec)).replace(/^\.\//, '');
-  if (/\.(?:[cm]?[jt]sx?|json|css|scss|svg|png|jpe?g|webp|gif|md)$/i.test(cleaned)) {
-    // TypeScript convention: an import of ./x.js may denote ./x.ts.
-    const swapped = cleaned
-      .replace(/\.js$/, '.ts')
-      .replace(/\.jsx$/, '.tsx')
-      .replace(/\.mjs$/, '.mts');
-    return [...new Set([cleaned, swapped])];
-  }
-  return [
-    cleaned,
-    ...['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'json'].map(e => `${cleaned}.${e}`),
-    ...['ts', 'tsx', 'js', 'jsx'].map(e => `${cleaned}/index.${e}`),
-  ];
-}
-// The smallest line range containing from..to that starts and ends at
-// top-level statement boundaries, so a region rewrite never cuts a declaration.
-export async function statementBounds(
-  path: string,
-  text: string,
-  from: number,
-  to: number,
-): Promise<{ start: number; end: number }> {
-  const total = text.split('\n').length;
-  let start = Math.max(1, Math.min(from, total));
-  let end = Math.max(start, Math.min(to, total));
-  if (tsModule === undefined) {
-    try {
-      const m: any = await import('typescript');
-      tsModule = m.default ?? m;
-    } catch {
-      tsModule = null;
-    }
-  }
-  if (!tsModule || !parseable.test(path)) return { start, end };
-  const ts = tsModule;
-  const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-  const spans: { a: number; b: number }[] = sf.statements.map((st: any) => ({
-    a: sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1,
-    b: sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1,
-  }));
-  let startFound = false;
-  let endFound = false;
-  for (const { a, b } of spans) {
-    if (a <= start && b >= start) {
-      start = a;
-      startFound = true;
-    }
-    if (a <= end && b >= end) {
-      end = b;
-      endFound = true;
-    }
-  }
-  // A bound that fell between statements moves to the nearest statement edge
-  // inside the range, so the region never begins or ends on blank lines.
-  if (!startFound) {
-    const next = spans.filter(x => x.a > start && x.a <= end).map(x => x.a);
-    if (next.length) start = Math.min(...next);
-  }
-  if (!endFound) {
-    const prev = spans.filter(x => x.b < end && x.b >= start).map(x => x.b);
-    if (prev.length) end = Math.max(...prev);
-  }
-  return { start, end };
-}
-// Top-level declarations of a file by name, with their line ranges.
-export async function topLevelDeclarations(
-  path: string,
-  text: string,
-): Promise<Map<string, { start: number; end: number; kind: string; exported: boolean }>> {
-  const out = new Map<string, { start: number; end: number; kind: string; exported: boolean }>();
-  if (tsModule === undefined) {
-    try {
-      const m: any = await import('typescript');
-      tsModule = m.default ?? m;
-    } catch {
-      tsModule = null;
-    }
-  }
-  if (!tsModule || !parseable.test(path)) return out;
-  const ts = tsModule;
-  const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-  for (const st of sf.statements) {
-    const names: string[] = [];
-    if (
-      (ts.isFunctionDeclaration(st) ||
-        ts.isClassDeclaration(st) ||
-        ts.isInterfaceDeclaration(st) ||
-        ts.isTypeAliasDeclaration(st) ||
-        ts.isEnumDeclaration(st)) &&
-      st.name
-    )
-      names.push(st.name.text);
-    if (ts.isVariableStatement(st))
-      for (const d of st.declarationList.declarations) if (ts.isIdentifier(d.name)) names.push(d.name.text);
-    if (!names.length) continue;
-    const start = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1;
-    const end = sf.getLineAndCharacterOfPosition(st.getEnd()).line + 1;
-    const exported = (ts.canHaveModifiers(st) ? (ts.getModifiers(st) ?? []) : []).some(
-      (m: any) => m.kind === ts.SyntaxKind.ExportKeyword,
-    );
-    const kind = ts.isVariableStatement(st) ? 'VariableStatement' : ts.SyntaxKind[st.kind]; // SyntaxKind[] yields the enum alias FirstStatement
-    for (const n of names) out.set(n, { start, end, kind, exported });
-  }
-  return out;
-}
-// A configured check that cannot run here: its directory is missing or its
-// executable is not installed. Such a command is dropped, not retried forever.
-export async function checkUnusable(root: string, command: string, prefix = ''): Promise<string | null> {
-  const dir = command.match(/(?:--dir|-C|--prefix)\s+(\S+)/)?.[1] ?? command.match(/^\s*cd\s+(\S+)/)?.[1];
-  if (dir) {
-    try {
-      await stat(resolve(root, dir));
-    } catch {
-      return `its directory ${dir} does not exist in this repository`;
-    }
-  }
-  const exe =
-    command
-      .replace(/^\s*cd\s+\S+\s*(?:&&|;)\s*/, '')
-      .trim()
-      .split(/\s+/)[0] ?? '';
-  if (exe && !exe.includes('/')) {
-    const r = await runCommand(
-      'bash',
-      ['--noprofile', '--norc', '-c', `${prefix}command -v -- ${JSON.stringify(exe)}`],
-      root,
-      5000,
-    ).catch(() => null);
-    if (!r || r.code !== 0) return `${exe} is not installed on this machine`;
-  }
-  return null;
-}
-// What the repository looks like right now, for inference: git status, the
-// package scripts, and the top-level entries. Works without git.
-export async function repositoryStatus(
-  root: string,
-): Promise<{
-  git: boolean;
-  changed: string[];
-  changedCount: number;
-  scripts: Record<string, string>;
-  topLevel: string[];
-  packages: { dir: string; scripts: Record<string, string>; tools: string[] }[];
-}> {
-  const ignore = /(^|\/)(node_modules|dist|build|\.leana|\.git|coverage|target|__pycache__)(\/|$)/;
-  const r = await runCommand('git', ['status', '--porcelain=v1', '--untracked-files=all'], root, 10000).catch(
-    () => null,
-  );
-  const git = Boolean(r && r.code === 0);
-  const all = git
-    ? r!.output
-        .split('\n')
-        .filter(Boolean)
-        .map(l => l.slice(3).trim().replace(/^"|"$/g, ''))
-        .filter(p => !ignore.test(p))
-    : [];
-  let scripts: Record<string, string> = {};
-  try {
-    const pkg = JSON.parse(await boundedRead(await safePath(root, 'package.json')));
-    if (pkg && typeof pkg.scripts === 'object')
-      scripts = Object.fromEntries(
-        Object.entries(pkg.scripts)
-          .slice(0, 20)
-          .map(([k, v]) => [k, String(v).slice(0, 120)]),
-      );
-  } catch {
-    /* none */
-  }
-  let topLevel: string[] = [];
-  try {
-    topLevel = (await readdir(root))
-      .filter(n => !/^(node_modules|\.git|\.leana)$/.test(n))
-      .sort()
-      .slice(0, 40);
-  } catch {
-    /* none */
-  }
-  // Packages below the root, to depth 3: a monorepo's checks live with the package.
-  const packages: { dir: string; scripts: Record<string, string>; tools: string[] }[] = [];
-  const manifests = [
-    'package.json',
-    'tsconfig.json',
-    'pyproject.toml',
-    'setup.py',
-    'Cargo.toml',
-    'go.mod',
-    'Makefile',
-    'pom.xml',
-    'build.gradle',
-  ];
-  const walk = async (dir: string, depth: number) => {
-    if (depth > 3 || packages.length >= 12) return;
-    let entries: string[];
-    try {
-      entries = await readdir(resolve(root, dir));
-    } catch {
-      return;
-    }
-    const found = entries.filter(n => manifests.includes(n));
-    if (found.length && dir !== '.') {
-      let pkgScripts: Record<string, string> = {};
-      if (found.includes('package.json')) {
-        try {
-          const pkg = JSON.parse(await boundedRead(resolve(root, dir, 'package.json')));
-          if (pkg && typeof pkg.scripts === 'object')
-            pkgScripts = Object.fromEntries(
-              Object.entries(pkg.scripts)
-                .slice(0, 12)
-                .map(([k, v]) => [k, String(v).slice(0, 100)]),
-            );
-        } catch {
-          /* none */
-        }
-      }
-      packages.push({ dir, scripts: pkgScripts, tools: found });
-    }
-    for (const n of entries)
-      if (!/^(node_modules|\.git|\.leana|dist|build|coverage|target|vendor|\.[^/]*)$/.test(n)) {
-        try {
-          if ((await stat(resolve(root, dir, n))).isDirectory()) await walk(dir === '.' ? n : `${dir}/${n}`, depth + 1);
-        } catch {
-          /* skip */
-        }
-      }
-  };
-  await walk('.', 0);
-  return { git, changed: all.slice(0, 40), changedCount: all.length, scripts, topLevel, packages };
-}
-// The packages a generated file may import: the manifest's dependencies, so
-// the worker never invents one.
-export async function installedPackages(root: string): Promise<string[]> {
-  let pkg: any;
-  try {
-    pkg = JSON.parse(await boundedRead(await safePath(root, 'package.json')));
-  } catch {
-    return [];
-  }
-  const names = (o: unknown) =>
-    o && typeof o === 'object'
-      ? Object.entries(o as Record<string, string>).map(([k, v]) => `${k}@${String(v).replace(/^[\^~]/, '')}`)
-      : [];
-  return [...new Set([...names(pkg?.dependencies), ...names(pkg?.devDependencies), ...names(pkg?.peerDependencies)])];
-}
-// A trial that failed for want of dependencies, and the install the manifest implies.
-export async function installCommand(root: string, dir = '.', force = false): Promise<string | null> {
-  const has = async (p: string) => {
-    try {
-      await stat(resolve(root, dir, p));
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  if (await has('package.json')) {
-    if (!force && (await has('node_modules'))) return null;
-    // A forced install follows a manifest change: the lockfile no longer
-    // matches it, so the frozen forms (npm ci, --frozen-lockfile) would refuse.
-    const cmd = (await has('pnpm-lock.yaml'))
-      ? force
-        ? 'pnpm install --no-frozen-lockfile'
-        : 'pnpm install --frozen-lockfile'
-      : (await has('yarn.lock'))
-        ? force
-          ? 'yarn install'
-          : 'yarn install --frozen-lockfile'
-        : (await has('bun.lockb')) || (await has('bun.lock'))
-          ? 'bun install'
-          : !force && (await has('package-lock.json'))
-            ? 'npm ci --no-audit --no-fund'
-            : 'npm install --no-audit --no-fund';
-    return dir === '.' ? cmd : `cd ${dir} && ${cmd}`;
-  }
-  if (await has('requirements.txt'))
-    return `${dir === '.' ? '' : `cd ${dir} && `}python3 -m pip install -r requirements.txt`;
-  if (await has('pyproject.toml')) return `${dir === '.' ? '' : `cd ${dir} && `}python3 -m pip install -e .`;
-  return null;
-}
-// A check whose output depends on a cache is not a verification: incremental
-// tsc reuses a file's cached diagnostics until that file itself changes, so a
-// new module that stops declaring globals leaves stale results elsewhere.
-export async function checkAdvice(root: string, command: string): Promise<string | null> {
-  if (!command || /--incremental\s+false|--force\b/.test(command)) return null;
-  const dir = command.match(/(?:--dir|-C|--prefix|cd)\s+(\S+)/)?.[1] ?? '.';
-  const tsc = /\btsc\b/.test(command) || /\b(lint|typecheck|check|build)\b/.test(command);
-  if (!tsc) return null;
-  for (const name of ['tsconfig.json', 'tsconfig.build.json']) {
-    try {
-      const text = await readFile(resolve(root, dir, name), 'utf8');
-      if (/"incremental"\s*:\s*true/.test(text) || /"composite"\s*:\s*true/.test(text))
-        return `${command} runs tsc with incremental mode (${dir}/${name}); its error list depends on the previous run's cache, so rollbacks would be judged on stale results. Use a non-incremental check, for example: pnpm --dir ${dir === '.' ? '.' : dir} exec tsc --noEmit --incremental false`;
-    } catch {
-      /* absent */
-    }
-  }
-  return null;
-}
-// Fresh, parser-backed facts for completion. Historical edits can be evicted or
-// conservatively rejected by an old rollback; current imports and declarations
-// still establish the final structure. Names are selected from the objective,
-// never inferred from a worker's claim. Comments and strings are not declarations.
-export async function completionSource(root: string, paths: string[], objective: string): Promise<SourceEvidence[]> {
-  if (tsModule === undefined) {
-    try {
-      const m: any = await import('typescript');
-      tsModule = m.default ?? m;
-    } catch {
-      tsModule = null;
-    }
-  }
-  const wanted = new Set(objective.match(/[A-Za-z_$][\w$]*/g) ?? []);
-  const out: SourceEvidence[] = [];
-  let remaining = 6500;
-  for (const path of [...new Set(paths)].slice(0, 12)) {
-    const evidence: SourceEvidence = { path, facts: [] };
-    try {
-      const text = await boundedRead(await safePath(root, path));
-      evidence.hash = hash(text);
-      if (tsModule && parseable.test(path)) {
-        const ts = tsModule;
-        const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
-        for (const st of sf.statements) {
-          const line = sf.getLineAndCharacterOfPosition(st.getStart(sf)).line + 1;
-          const endLine = sf.getLineAndCharacterOfPosition(st.getEnd() - 1).line + 1;
-          const exported = Boolean(st.modifiers?.some((m: any) => m.kind === ts.SyntaxKind.ExportKeyword));
-          if (ts.isImportDeclaration(st)) {
-            const c = st.importClause;
-            const bindings = [
-              ...(c?.name ? [{ name: c.name, propertyName: { text: 'default' } }] : []),
-              ...(c?.namedBindings?.elements ?? []),
-              ...(c?.namedBindings?.name ? [{ name: c.namedBindings.name, propertyName: { text: '*' } }] : []),
-            ];
-            for (const b of bindings)
-              if (wanted.has(b.name.text) || wanted.has(b.propertyName?.text))
-                evidence.facts.push({
-                  line,
-                  endLine,
-                  kind: 'import',
-                  name: b.name.text,
-                  imported: b.propertyName?.text ?? b.name.text,
-                  from: st.moduleSpecifier.text,
-                  typeOnly: Boolean(c.isTypeOnly || b.isTypeOnly),
-                });
-          } else if (ts.isExportDeclaration(st)) {
-            for (const b of st.exportClause?.elements ?? [])
-              if (wanted.has(b.name.text) || wanted.has(b.propertyName?.text))
-                evidence.facts.push({
-                  line,
-                  endLine,
-                  kind: 'export',
-                  name: b.name.text,
-                  local: b.propertyName?.text ?? b.name.text,
-                  from: st.moduleSpecifier?.text,
-                });
-          } else if (ts.isVariableStatement(st)) {
-            for (const d of st.declarationList.declarations)
-              if (ts.isIdentifier(d.name) && wanted.has(d.name.text))
-                evidence.facts.push({ line, endLine, kind: 'variable', name: d.name.text, exported });
-          } else if (st.name && ts.isIdentifier(st.name) && wanted.has(st.name.text)) {
-            evidence.facts.push({ line, endLine, kind: ts.SyntaxKind[st.kind], name: st.name.text, exported });
-          }
-        }
-      }
-      const all = evidence.facts.length;
-      evidence.facts = evidence.facts.slice(0, 16);
-      if (!all) evidence.excerpt = clip(text.split('\n').slice(0, 20).join('\n'), 600);
-      while (Buffer.byteLength(JSON.stringify(evidence)) > remaining && evidence.facts.length) evidence.facts.pop();
-      if (evidence.facts.length < all) evidence.omitted = all - evidence.facts.length;
-      if (Buffer.byteLength(JSON.stringify(evidence)) > remaining) evidence.excerpt = undefined;
-    } catch (e) {
-      evidence.error = clip((e as Error).message, 160);
-    }
-    remaining -= Buffer.byteLength(JSON.stringify(evidence));
-    out.push(evidence);
-    if (remaining < 500) break;
-  }
-  return out;
-}
-export async function sourceHashes(root: string, paths: string[]): Promise<Record<string, string>> {
-  const out: Record<string, string> = {};
-  for (const path of new Set(paths)) {
-    try {
-      out[path] = hash(await boundedRead(await safePath(root, path)));
-    } catch {
-      out[path] = 'unavailable';
-    }
-  }
-  return out;
-}
-// A check's result as facts: its exit code, and the repository files its
-// output names. No tool's format is parsed: a path token counts only when it
-// resolves to a file of the repository (not of an installed dependency), and
-// a line number is kept when one follows it (path:12, path(12,5), path", line 12).
-// A path printed relative to a subdirectory the check ran in resolves through
-// the known files that end with it, when exactly one does.
-const dependencyTree = /(^|\/)(?:node_modules|\.git|\.leana|\.venv|venv|site-packages)\//;
-export async function summarizeCheck(text: string, root: string, known: string[] = []): Promise<CheckSummary> {
-  let output = text;
-  let code: number | null = null;
-  try {
-    const parsed = JSON.parse(text);
-    if (typeof parsed?.output === 'string') output = parsed.output;
-    if (typeof parsed?.code === 'number') code = parsed.code;
-  } catch {
-    /* plain text */
-  }
-  const prefix = `${root.replace(/\/$/, '')}/`;
-  // On Windows a tool names a file of the repository by its Windows path (C:\repo\src\a.py, C:/repo/...,
-  // or /c/repo/... from bash): it is read with forward slashes, relative to the root.
-  if (process.platform === 'win32') {
-    const forward = (s: string) => s.replace(/\\/g, '/');
-    output = forward(output);
-    for (const r of new Set([forward(root), bashPathOf(root)]))
-      output = output.replace(new RegExp(`${r.replace(/\/$/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`, 'gi'), '');
-  }
-  const files: Record<string, number[]> = {};
-  const resolved = new Map<string, string | null>();
-  const resolvePath = async (token: string): Promise<string | null> => {
-    if (resolved.has(token)) return resolved.get(token)!;
-    let p: string | null = token.replace(/^file:\/\//, '');
-    if (p.startsWith('/')) p = p.startsWith(prefix) ? p.slice(prefix.length) : null;
-    if (p !== null) p = posix.normalize(p).replace(/^\.\//, '');
-    if (p !== null && (p.startsWith('../') || dependencyTree.test(p))) p = null;
-    if (p !== null) {
-      const isFile = await stat(resolve(root, p)).then(
-        s => s.isFile(),
-        () => false,
-      );
-      if (!isFile) {
-        const ends = known.filter(f => f.endsWith(`/${p}`));
-        p = ends.length === 1 ? ends[0]! : null;
-      }
-    }
-    resolved.set(token, p);
-    return p;
-  };
-  for (const m of output.matchAll(
-    /(?:^|[\s"'`(\[<=,:])((?:file:\/\/)?(?:\/|\.{1,2}\/)?(?:[\w@+.-]+\/)*[\w@+-][\w@+.-]*\.[A-Za-z]\w{0,7})(?:(?::|\(|", line )(\d+))?/g,
-  )) {
-    if (resolved.size >= 300) break;
-    const p = await resolvePath(m[1]!);
-    if (!p) continue;
-    const lines = (files[p] ??= []);
-    const n = Number(m[2] ?? 0);
-    if (n && lines.length < 12 && !lines.includes(n)) lines.push(n);
-  }
-  return { code, files: Object.fromEntries(Object.entries(files).slice(0, 20)) };
-}
-// What a failed install says the manifest got wrong: a version that does not
-// exist (ETARGET) or a package that does not (E404). Repairing either is code's
-// work: look the real version up, or drop the dependency.
-export function manifestFailures(output: string): { name: string; kind: 'notarget' | 'notfound' }[] {
-  const out = new Map<string, 'notarget' | 'notfound'>();
-  for (const m of output.matchAll(/No matching version found for ((?:@[\w.-]+\/)?[\w.-]+)@/g))
-    out.set(m[1]!, 'notarget');
-  for (const m of output.matchAll(
-    /404\s+(?:Not Found\s+-\s+GET\s+\S+\/((?:@[\w.-]+(?:%2f|\/))?[\w.-]+)(?:\s|$)|'((?:@[\w.-]+\/)?[\w.-]+)@[^']*' is not in this registry)/g,
-  )) {
-    const n = (m[1] ?? m[2] ?? '').replace('%2f', '/');
-    if (n && !out.has(n)) out.set(n, 'notfound');
-  }
-  return [...out.entries()].map(([name, kind]) => ({ name, kind }));
-}
-// Bracket balance of code, ignoring string literals and comments so an ANSI
-// escape such as "\u001B[?25l" or a "{" in a comment does not skew the count.
-// An edit that leaves a file with more unmatched brackets than before is refused
-// before it lands on disk; its caller states what each range does to them (editFacts).
-// An edit that leaves a TypeScript or JavaScript file unparseable is refused
-// with the parser's own message: cheaper than a lint, a rollback and a rejected
-// edit, and it names the exact line. Uses the harness's TypeScript when present.
-// A parse problem as the harness states it: the line the parser names, and the
-// column with the text that starts there within its whitespace-delimited run
-// when the parser gives a position; the parser's own message (its first line);
-// and the text of that line when it has any. The position is an offset into the text or a line
-// and 1-based column; an offset that does not fall on the line given is not used.
-export function problemAt(
-  text: string,
-  message: string,
-  at: { offset?: number; line?: number; column?: number },
-): string {
-  const said = (message.split('\n')[0] ?? '').trim().replace(/\.$/, '');
-  let line = at.line;
-  let column = at.column;
-  if (!(line && column) && typeof at.offset === 'number' && at.offset >= 0 && at.offset <= text.length) {
-    const before = text.slice(0, at.offset);
-    const n = before.split('\n').length;
-    if (!line || line === n) {
-      line = n;
-      column = at.offset - before.lastIndexOf('\n');
-    }
-  }
-  const lines = line ? text.split('\n') : [];
-  const src = lines[line ? line - 1 : -1];
-  if (!line || src === undefined) return line ? `line ${line}: ${said}` : said;
-  const line80 = src.trim();
-  const cut = line80.length > 80 && /[\ud800-\udbff]/.test(line80[79]!) ? 79 : 80;
-  const quoted = line80 ? `: ${JSON.stringify(line80.slice(0, cut))}` : '';
-  if (!column) return `line ${line}: ${said}${quoted}`;
-  const i = column - 1;
-  const content = src.replace(/\s+$/, '');
-  let where: string;
-  if (i >= content.length)
-    where = lines.slice(line).some(l => l.trim()) ? 'at the end of the line' : 'at the end of the file';
-  else if (/\s/.test(src[i]!)) where = 'at whitespace';
-  else {
-    let s = i;
-    while (s > 0 && !/\s/.test(src[s - 1]!)) s--;
-    let e = i;
-    while (e < src.length && !/\s/.test(src[e]!)) e++;
-    // Bounds that never split a surrogate pair (a character outside the basic plane is two UTF-16 units).
-    const low = (k: number) => /[\udc00-\udfff]/.test(src[k] ?? '');
-    let from = Math.max(s, i - 24);
-    if (from > s && low(from)) from--;
-    let to = Math.min(e, i + 24);
-    if (to < e && low(to)) to++;
-    const at = i > s && low(i) ? i - 1 : i;
-    const rest = src.slice(at, to);
-    const run = src.slice(from, to);
-    where = `at ${JSON.stringify(rest)}${run === rest ? '' : ` of ${JSON.stringify(run)}`}`;
-  }
-  return `line ${line}, column ${column} (${where}): ${said}${quoted}`;
-}
-// What names a problem across versions of a file: all of it but its line and
-// column numbers (the message, the text at the column and the line's text), so a
-// problem an edit moved without changing is the same problem.
-export const problemKey = (problem: string): string => problem.replace(/^line \d+(?:, column \d+)?/, '');
-const parseable = /\.(?:[cm]?[jt]sx?)$/i;
-let tsModule: any | null | undefined;
-export async function syntaxErrors(path: string, text: string): Promise<string[]> {
-  const json = /\.json$/i.test(path);
-  if (!parseable.test(path) && !json) return [];
-  if (tsModule === undefined) {
-    try {
-      const m: any = await import('typescript');
-      tsModule = m.default ?? m;
-    } catch {
-      tsModule = null;
-    }
-  }
-  if (!tsModule) {
-    if (json) {
-      try {
-        JSON.parse(text);
-        return [];
-      } catch (e) {
-        return [`invalid JSON: ${(e as Error).message}`];
-      }
-    }
-    return [];
-  }
-  const ts = tsModule;
-  const message = (d: any) =>
-    problemAt(
-      text,
-      ts.flattenDiagnosticMessageText(d.messageText, ' '),
-      d.file && typeof d.start === 'number' ? { offset: d.start } : {},
-    );
-  // JSON with the parser tsconfig uses: comments and trailing commas allowed.
-  if (json) return (ts.parseJsonText(path, text).parseDiagnostics ?? []).slice(0, 5).map(message);
-  // A declaration file has no output to transpile (transpileModule throws "Debug Failure. Output generation failed"): its parse is judged.
-  if (/\.d\.[cm]?ts$/i.test(path))
-    return (ts.createSourceFile(path, text, ts.ScriptTarget.ESNext, true).parseDiagnostics ?? [])
-      .slice(0, 5)
-      .map(message);
-  const out = ts.transpileModule(text, {
-    reportDiagnostics: true,
-    fileName: path,
-    compilerOptions: {
-      target: ts.ScriptTarget.ESNext,
-      module: ts.ModuleKind.ESNext,
-      jsx: ts.JsxEmit.Preserve,
-      allowJs: true,
-    },
-  });
-  return (out.diagnostics ?? []).slice(0, 5).map(message);
-}
-export async function assertParses(
-  path: string,
-  before: string,
-  after: string,
-  parse: (path: string, text: string) => Promise<string[]> = syntaxErrors,
-): Promise<void> {
-  const problems = await parse(path, after);
-  if (!problems.length) return;
-  const had = await parse(path, before);
-  if (had.length && had.length >= problems.length) return; // already broken; do not block repairs
-  throw new Error(
-    `Edit refused: ${path} would no longer parse (${problems.join('; ')}). Re-read the lines around the error and cover whole statements; a missing import is added at the top of the file, never by overwriting the line that uses the name.`,
-  );
-}
-// The bracket kinds an edit leaves with more unmatched brackets than before, as a refusal names them.
-export function worseBrackets(before: string, after: string): { pair: Pair; said: string }[] {
-  const count = (text: string, ch: string): number => text.split(ch).length - 1;
-  const b = stripLiterals(before);
-  const a = stripLiterals(after);
-  return bracketPairs.flatMap(pair => {
-    const [open, close] = pair;
-    const was = count(b, open) - count(b, close);
-    const now = count(a, open) - count(a, close);
-    return Math.abs(now) > Math.abs(was)
-      ? [{ pair, said: `${Math.abs(now)} unmatched '${now > 0 ? open : close}' (was ${Math.abs(was)})` }]
-      : [];
-  });
-}
-// With the ranges of the edit, the refusal states their facts (editFacts) in the room the error
-// entry leaves after the reserved characters.
-export function assertBalancePreserved(
-  before: string,
-  after: string,
-  label: string,
-  edits: { label: string; start: number; end: number; fresh: string[] }[] = [],
-  reserved = 0,
-): void {
-  const worse = worseBrackets(before, after);
-  if (!worse.length) return;
-  const head = `Edit refused: it would leave ${label} with ${worse.map(w => w.said).join(', ')}.`;
-  const facts = edits.length
-    ? factsInRoom(
-        editFacts(
-          before.split('\n'),
-          edits,
-          worse.map(w => w.pair),
-        ),
-        600 - 'Tool error: '.length - head.length - 1 - reserved,
-      )
-    : '';
-  throw new Error(facts ? `${head} ${facts}` : head);
-}
-export function stripLiterals(code: string): string {
-  return code.replace(
-    /\/\*[\s\S]*?\*\/|\/\/[^\n]*|`(?:\\[\s\S]|[^`\\])*`|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/g,
-    m => m.replace(/[^\n]/g, ' '),
-  );
-}
-export async function listRepoFiles(root: string): Promise<string[]> {
-  const files: string[] = [];
-  async function visit(dir: string, prefix = ''): Promise<void> {
-    for (const entry of await readdir(dir, { withFileTypes: true })) {
-      if (['.git', '.leana', 'node_modules'].includes(entry.name) || /^\.env(?:\.|$)/.test(entry.name)) continue;
-      const rel = prefix + entry.name;
-      const path = resolve(dir, entry.name);
-      if (entry.isDirectory()) await visit(path, `${rel}/`);
-      else if (entry.isFile() && !/\.(?:pem|key)$/i.test(entry.name)) files.push(rel);
-    }
-  }
-  await visit(root);
-  return files.sort();
-}
-// The files a developer sees as the project: in a git repository, what git tracks and what it would track, on
-// disk now, not what it ignores (build output, caches, other worktrees checked out inside it); elsewhere the
-// whole tree. The same exclusions as listRepoFiles (dependency folders, .env files, keys).
-export async function visibleRepoFiles(root: string): Promise<string[]> {
-  const r = await runCommand(
-    'git',
-    ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-    root,
-    10000,
-  ).catch(() => null);
-  if (!r || r.code !== 0 || r.truncated) return listRepoFiles(root);
-  const excluded = /(^|\/)(\.git|\.leana|node_modules)\/|(^|\/)\.env(\.[^/]*)?$|\.(pem|key)$/i;
-  const listed = [...new Set(r.output.split('\0').filter(Boolean))].filter(f => !excluded.test(f));
-  const present = await Promise.all(
-    listed.map(f =>
-      stat(resolve(root, f)).then(
-        s => s.isFile(),
-        () => false,
-      ),
-    ),
-  );
-  return listed.filter((_, i) => present[i]).sort();
-}
-// What a shell command did to the tree, whatever the command was: every file's
-// size and modification time before and after it. Installed environments
-// (node_modules, a Python virtual environment, marked by its pyvenv.cfg) are the
-// package manager's, not edits; in a git repository so is everything git ignores
-// (build output, caches). Null when the tree is too large to walk each command.
-export type TreeSnapshot = Map<string, string>;
-export async function treeSnapshot(root: string, limit = 20000): Promise<TreeSnapshot | null> {
-  const out: TreeSnapshot = new Map();
-  async function visit(dir: string, prefix: string): Promise<boolean> {
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return true;
-    }
-    if (prefix && entries.some(e => e.name === 'pyvenv.cfg')) return true;
-    for (const entry of entries) {
-      if (['.git', '.leana', 'node_modules'].includes(entry.name)) continue;
-      const path = resolve(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (!(await visit(path, `${prefix}${entry.name}/`))) return false;
-      } else if (entry.isFile()) {
-        try {
-          const s = await stat(path);
-          out.set(`${prefix}${entry.name}`, `${s.size}:${s.mtimeMs}`);
-        } catch {
-          /* gone */
-        }
-        if (out.size > limit) return false;
-      }
-    }
-    return true;
-  }
-  return (await visit(root, '')) ? out : null;
-}
-export async function treeChanges(
-  root: string,
-  before: TreeSnapshot,
-  after: TreeSnapshot,
-): Promise<{ changed: string[]; created: string[]; deleted: string[] }> {
-  const created = [...after.keys()].filter(p => !before.has(p));
-  const deleted = [...before.keys()].filter(p => !after.has(p));
-  const modified = [...after.keys()].filter(p => before.has(p) && before.get(p) !== after.get(p));
-  let all = [...modified, ...created, ...deleted];
-  if (all.length) {
-    const r = await new Promise<string | null>(done => {
-      const child = spawn('git', ['check-ignore', '--no-index', '--stdin'], {
-        cwd: root,
-        stdio: ['pipe', 'pipe', 'ignore'],
-      });
-      let text = '';
-      child.stdout.on('data', d => {
-        text += String(d);
-      });
-      child.on('error', () => done(null));
-      child.on('close', code => done(code === 0 || code === 1 ? text : null));
-      child.stdin.end(all.join('\n') + '\n');
-    });
-    const ignored = new Set((r ?? '').split('\n').filter(Boolean));
-    all = all.filter(p => !ignored.has(p));
-  }
-  const keep = new Set(all);
-  return { changed: all, created: created.filter(p => keep.has(p)), deleted: deleted.filter(p => keep.has(p)) };
-}
-// Files' content hashes (as read_files shows them) by the signature a tree snapshot
-// records (size and modification time): a file is read only when its signature has
-// not been hashed yet, so what a command did to content costs the files it touched.
-// A file whose signature moved while it was read is not recorded, nor one past the
-// read limit or the budget: for those the content before or after is not known.
-export class TreeHashes {
-  private known = new Map<string, { sig: string; hash: string }>();
-  at(path: string, sig: string | undefined): string | null {
-    const k = this.known.get(path);
-    return k && sig !== undefined && k.sig === sig ? k.hash : null;
-  }
-  async fill(root: string, files: TreeSnapshot, budget = 32 * 1024 * 1024): Promise<void> {
-    let spent = 0;
-    for (const [p, sig] of files) {
-      if (this.known.get(p)?.sig === sig) continue;
-      this.known.delete(p);
-      const size = Number(sig.slice(0, sig.indexOf(':')));
-      if (!(size <= 1024 * 1024) || spent + size > budget) continue;
-      spent += size;
-      const path = resolve(root, p);
-      try {
-        const text = await boundedRead(path);
-        const s = await stat(path);
-        if (`${s.size}:${s.mtimeMs}` === sig) this.known.set(p, { sig, hash: hash(text) });
-      } catch {
-        /* gone, or not readable */
-      }
-    }
-  }
-}
-export const within = (root: string, path: string): boolean => {
-  const rel = relative(root, path);
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-};
-function blocked(path: string): boolean {
-  return path
-    .split(/[\\/]/)
-    .some(
-      part =>
-        ['.git', '.leana', 'node_modules'].includes(part) ||
-        /^\.env(?:\.|$)/.test(part) ||
-        /^(?:id_rsa|id_ed25519)$/.test(part) ||
-        /\.(?:pem|key)$/i.test(part),
-    );
-}
-export async function safePath(root: string, name: string, create = false): Promise<string> {
-  if (!name || name.includes('\0') || isAbsolute(name) || blocked(name))
-    throw new Error('Path is excluded or must be repository-relative');
-  const target = resolve(root, name);
-  if (!within(root, target)) throw new Error('Path escapes repository');
-  let current = target;
-  while (true) {
-    try {
-      const canonical = await realpath(current);
-      if (!within(root, canonical) || blocked(relative(root, canonical)))
-        throw new Error('Symlink escapes repository or targets excluded path');
-      if (current === target) return canonical;
-      return target;
-    } catch (e: any) {
-      if (e.code !== 'ENOENT' || !create || current === root) throw e;
-      current = dirname(current);
-    }
-  }
-}
-// Colour and hyperlink sequences (CSI, 7- and 8-bit; OSC ended by BEL or ST) a tool
-// printed although no terminal is attached: they carry no fact, and they split a path
-// from its line number. Only these: an ESC that is content (a file shown by cat, a
-// search hit) is left alone.
-export const plainText = (text: string): string =>
-  text.replace(/\u001b\[[0-?]*[ -\/]*[@-~]|\u009b[0-?]*[ -\/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '');
-// A process still alive in a command's process group: its id, its parent's, and its command line.
-export interface GroupProcess {
-  pid: number;
-  ppid: number;
-  args: string;
-}
-// The live processes of a process group (zombies left out), read from the process
-// table: Linux's /proc, ps elsewhere (macOS, the BSDs, whose /proc differs or is absent)
-// and wherever /proc cannot be read. An empty group is known without reading the
-// table: signal 0 to it fails. Windows has no groups (runCommand finds what a command left there by its mark).
-export async function groupProcesses(
-  pgid: number,
-  via: 'proc' | 'ps' = process.platform === 'linux' ? 'proc' : 'ps',
-): Promise<GroupProcess[]> {
-  if (process.platform === 'win32' || !(pgid > 0)) return [];
-  try {
-    process.kill(-pgid, 0);
-  } catch {
-    return [];
-  }
-  const found: GroupProcess[] = [];
-  const pids =
-    via === 'proc'
-      ? await readdir('/proc').then(
-          names => names.filter(n => /^\d+$/.test(n)),
-          () => null,
-        )
-      : null;
-  if (pids) {
-    await Promise.all(
-      pids.map(async pid => {
-        const stat = await readFile(`/proc/${pid}/stat`, 'utf8').catch(() => '');
-        const close = stat.lastIndexOf(')');
-        if (close < 0) return;
-        // After the command name: state, ppid, pgrp.
-        const [state, ppid, pgrp] = stat.slice(close + 2).split(' ');
-        if (Number(pgrp) !== pgid || state === 'Z' || state === 'X') return;
-        const cmdline = (await readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => ''))
-          .split('\0')
-          .filter(Boolean)
-          .join(' ');
-        found.push({ pid: Number(pid), ppid: Number(ppid), args: cmdline || stat.slice(stat.indexOf('(') + 1, close) });
-      }),
-    );
-  } else {
-    const table = await new Promise<string>(done => {
-      const ps = spawn('ps', ['-A', '-o', 'pid=,ppid=,pgid=,stat=,args='], { stdio: ['ignore', 'pipe', 'ignore'] });
-      const out: Buffer[] = [];
-      ps.stdout.on('data', d => out.push(d));
-      ps.on('error', () => done(''));
-      ps.on('close', () => done(Buffer.concat(out).toString('utf8')));
-    });
-    for (const line of table.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
-      if (m && Number(m[3]) === pgid && !m[4]!.startsWith('Z'))
-        found.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[5]!.trim() });
-    }
-  }
-  return found.sort((a, b) => a.pid - b.pid);
-}
-// The shell a command runs in, as the process table shows it: a subshell the
-// command forked keeps this command line, which is the harness's, not the worker's.
-export const commandShell = ['bash', '--noprofile', '--norc', '-o', 'pipefail', '-c'];
-// What a command left running, in words: the processes whose parent is not among
-// them (what the command itself started), and how many those started in turn.
-export function describeProcesses(procs: GroupProcess[]): string {
-  const pids = new Set(procs.map(p => p.pid));
-  const roots = procs.filter(p => !pids.has(p.ppid));
-  const shell = commandShell.join(' ') + ' ';
-  const named = roots
-    .slice(0, 4)
-    .map(p =>
-      p.args.replace(/^\S*\/(?=bash )/, '').startsWith(shell)
-        ? `a subshell of this command (pid ${p.pid})`
-        : `"${clip(p.args, 160)}" (pid ${p.pid})`,
-    )
-    .join(', ');
-  const rest = procs.length - Math.min(roots.length, 4);
-  return `${named}${rest ? ` and ${rest} process${rest === 1 ? '' : 'es'} ${roots.length > 4 ? 'more' : `started by ${roots.length === 1 ? 'it' : 'them'}`}` : ''}`;
-}
-const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-// A command has ended when the process it ran exits. Its output is read until
-// its streams close, or for a short drain when something it started in the
-// background still holds them (a server would otherwise hold the command to its
-// timeout; output a background job writes after the drain is lost, and the job
-// is named as stopped). Whatever of its process group is still alive then (after
-// a moment for processes already on their way out) is stopped with it, and
-// returned as leftRunning, so the caller can say what was stopped.
-export async function runCommand(
-  command: string,
-  args: string[],
-  cwd: string,
-  timeout: number,
-  limit = 1024 * 1024,
-  settle?: (output: string, quietMs: number) => string | null,
-): Promise<{
-  stoppedEarly?: string;
-  leftRunning?: GroupProcess[];
-  output: string;
-  code: number | null;
-  truncated: boolean;
-  timedOut: boolean;
-}> {
-  return new Promise((resolveResult, reject) => {
-    const env = commandEnv();
-    // No terminal is attached: tools that would prompt are told so, the way
-    // continuous integration tells them, and npm's own prompts are pre-answered.
-    // NO_COLOR as well as FORCE_COLOR=0: some tools read FORCE_COLOR's presence,
-    // whatever its value, as "force" (TypeScript 6's tsc, picocolors), and NO_COLOR
-    // takes precedence in them.
-    Object.assign(env, {
-      CI: '1',
-      FORCE_COLOR: '0',
-      NO_COLOR: '1',
-      npm_config_yes: 'true',
-      DEBIAN_FRONTEND: 'noninteractive',
-    });
-    // On Windows the shell carries a mark everything it starts inherits: what is left is found by it (see windowsLeft).
-    // Only a shell can leave something running; the harness's own git and rg calls are not searched after.
-    const started = Date.now();
-    const mark = command === 'bash' ? runMark() : undefined;
-    if (mark) env.LEANA_RUN = mark;
-    const child = spawn(command === 'bash' ? bashPath() : command, args, {
-      cwd,
-      env,
-      detached: process.platform !== 'win32',
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let truncated = false;
-    let timedOut = false;
-    let lastOutput = Date.now();
-    let stoppedEarly: string | undefined;
-    let exitCode: number | null = null;
-    let finished = false;
-    let drain: NodeJS.Timeout | null = null;
-    const kill = () => killTree(child.pid, 'SIGKILL', mark);
-    const left = () =>
-      (mark ? windowsLeft(mark, started) : groupProcesses(child.pid!)).catch(() => [] as GroupProcess[]);
-    const timer = setTimeout(() => {
-      timedOut = true;
-      kill();
-    }, timeout);
-    // A command can say it has become something that will not exit (a server): settle decides from its output and how long it has been quiet.
-    const watch = settle
-      ? setInterval(() => {
-          const why = settle(Buffer.concat(chunks).toString('utf8'), Date.now() - lastOutput);
-          if (why) {
-            stoppedEarly = why;
-            kill();
-          }
-        }, 1000)
-      : null;
-    const collect = (data: Buffer) => {
-      const room = Math.max(0, limit - size);
-      if (room) {
-        const part = data.subarray(0, room);
-        chunks.push(part);
-        size += part.length;
-      }
-      if (data.length > room) {
-        truncated = true;
-        kill();
-      }
-      lastOutput = Date.now();
-    };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
-    child.on('error', (e: NodeJS.ErrnoException) => {
-      clearTimeout(timer);
-      if (watch) clearInterval(watch);
-      if (drain) clearTimeout(drain);
-      reject(
-        e.code === 'ENOENT' && command === 'rg'
-          ? new Error(
-              'ripgrep (rg) was not found in PATH. Install ripgrep, confirm rg --version works in this terminal, then retry.',
-            )
-          : e.code === 'ENOENT' && command === 'bash'
-            ? new Error(missingBash())
-            : e,
-      );
-    });
-    const finish = async () => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      if (watch) clearInterval(watch);
-      if (drain) clearTimeout(drain);
-      // Stopped by the harness (timeout, a server, too much output): the group was killed on purpose, and that is the fact already.
-      let leftRunning: GroupProcess[] = [];
-      if (child.pid && !timedOut && !stoppedEarly && !truncated) {
-        const first = await left();
-        if (first.length) {
-          await pause(250);
-          leftRunning = await left();
-        }
-      }
-      // On Windows stopping is a search for the mark: made when the command was stopped or left something.
-      if (!mark || timedOut || stoppedEarly || truncated || leftRunning.length) kill();
-      // Stopped means gone: a killed process holds its ports until it has exited, so what was named is waited for (briefly).
-      for (let i = 0; leftRunning.length && i < 40 && (await left()).length; i++) await pause(50);
-      // Windows programs end lines with CRLF; the output is read as lines, the same as elsewhere.
-      const text = Buffer.concat(chunks).toString('utf8');
-      resolveResult({
-        output: process.platform === 'win32' ? text.replace(/\r\n/g, '\n') : text,
-        code: exitCode,
-        truncated,
-        timedOut,
-        ...(stoppedEarly ? { stoppedEarly } : {}),
-        ...(leftRunning.length ? { leftRunning } : {}),
-      });
-    };
-    child.on('exit', code => {
-      exitCode = code;
-      drain = setTimeout(() => {
-        void finish();
-      }, 1500);
-    });
-    child.on('close', code => {
-      exitCode = code;
-      void finish();
-    });
-  });
-}
-// Makes the directories a file is written into. Where one of them is a file, Linux
-// says ENOTDIR and Windows EEXIST ("file already exists"), which reads as if the file
-// being written existed; Windows' is said as Linux says it.
-export async function parentDirectory(path: string): Promise<void> {
-  try {
-    await mkdir(dirname(path), { recursive: true });
-  } catch (e: any) {
-    if (process.platform === 'win32' && e?.code === 'EEXIST')
-      throw Object.assign(new Error(`ENOTDIR: not a directory, mkdir '${e.path ?? dirname(path)}'`), {
-        code: 'ENOTDIR',
-      });
-    throw e;
-  }
-}
-export async function boundedRead(path: string, limit = 1024 * 1024): Promise<string> {
-  const handle = await open(path, 'r');
-  try {
-    if (!(await handle.stat()).isFile()) throw new Error('Only regular files may be read');
-    const buffer = Buffer.alloc(limit + 1);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (bytesRead > limit) throw new Error('File exceeds read byte limit; narrow with search or split it externally');
-    if (buffer.subarray(0, bytesRead).includes(0)) throw new Error('Binary file excluded');
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
-  } finally {
-    await handle.close();
-  }
-}
+import { relativeImports, syntaxErrors } from './code.js';
+import {
+  type EditRecord,
+  type LineChange,
+  StaleWriteError,
+  assertBalancePreserved,
+  assertNoBulkDuplication,
+  assertParses,
+  describeChange,
+  dropDuplicateImports,
+  droppedLines,
+  editFacts,
+  mapRange,
+  nearRetype,
+  rangeEchoes,
+  worseBrackets,
+} from './edit-checks.js';
+import { boundedRead, hash, parentDirectory, safePath } from './files.js';
+import { commandShell, describeProcesses, plainText, runCommand } from './commands.js';
 export class ToolBox {
   // What the repository's ecosystem prefixes every command with (its
   // environment's tools on the path), set by the loop from the profiles.
@@ -1492,186 +76,562 @@ export class ToolBox {
     return `Stale file hash for ${path}: ${expected} is the text before an earlier edit of this batch: ${done}. ${why ?? ''}${why ? ' ' : ''}${path} is now sha256=${current} totalLines=${lineCount}. One replace_lines call carries several ranges of one file, all numbered as in one read.`;
   }
   async execute(route: Route, a: Record<string, any>): Promise<ToolResult> {
-    if (route === 'read_files') {
-      const results: string[] = [];
-      const hashes: Record<string, string> = {};
-      // Cut at line boundaries inside the evidence budget. A mid-text clip would
-      // hand Bonsai a truncated excerpt that it then pastes back as oldText.
-      const share = Math.floor(this.config.toolChars / a.files.length);
-      for (const f of a.files) {
-        if (/[?*\[\]]/.test(f.path))
-          throw new Error(`read_files requires exact regular file paths; glob rejected: ${f.path}`);
-        if (f.end < f.start) throw new Error(`A read range needs end >= start (got ${f.start}..${f.end})`);
-        // No line cap of its own: the character budget below decides how much of the range is shown.
-        const artifact = f.path.startsWith('@artifact/');
-        const path = artifact ? await safePath(this.artifacts, f.path.slice(10)) : await safePath(this.root, f.path);
-        const text = await boundedRead(path, artifact ? 8 * 1024 * 1024 : 1024 * 1024);
-        const lines = text.split('\n');
-        if (!artifact) hashes[f.path] = hash(text);
-        const end = Math.min(f.end, lines.length);
-        // Reserve room for the header line and the continuation marker.
-        const budget = Math.max(400, share - f.path.length - 240);
-        const body: string[] = [];
-        let size = 0;
-        let shown = f.start - 1;
-        for (let n = f.start; n <= end; n++) {
-          const line = `${n}: ${lines[n - 1]}`;
-          if (body.length && size + line.length + 1 > budget) break;
-          body.push(clip(line, budget));
-          size += line.length + 1;
-          shown = n;
-          if (line.length > budget) break;
-        }
-        const cut =
-          shown < end
-            ? `\n[…truncated at the read budget after line ${shown}; request lines ${shown + 1}..${end} in a later read_files call or narrow the range…]`
-            : '';
-        results.push(
-          `${f.path} sha256=${hash(text)} totalLines=${lines.length} shown=${f.start}..${shown}\n${body.join('\n') || '(no lines in range)'}${cut}`,
-        );
+    const run = this.routes[route as keyof ToolBox['routes']];
+    if (!run) throw new Error(`Not an executable filesystem tool: ${route}`);
+    return run.call(this, a);
+  }
+  // The executable tools, by route: each takes the action's arguments.
+  private readonly routes = {
+    read_files: this.readFiles,
+    search_codebase: this.searchCodebase,
+    create_file: this.createFile,
+    write: this.write,
+    replace_lines: this.replaceLines,
+    move_lines: this.moveLines,
+    bash: this.bash,
+  };
+  private async readFiles(a: Record<string, any>): Promise<ToolResult> {
+    const results: string[] = [];
+    const hashes: Record<string, string> = {};
+    // Cut at line boundaries inside the evidence budget. A mid-text clip would
+    // hand Bonsai a truncated excerpt that it then pastes back as oldText.
+    const share = Math.floor(this.config.toolChars / a.files.length);
+    for (const f of a.files) {
+      if (/[?*\[\]]/.test(f.path))
+        throw new Error(`read_files requires exact regular file paths; glob rejected: ${f.path}`);
+      if (f.end < f.start) throw new Error(`A read range needs end >= start (got ${f.start}..${f.end})`);
+      // No line cap of its own: the character budget below decides how much of the range is shown.
+      const artifact = f.path.startsWith('@artifact/');
+      const path = artifact ? await safePath(this.artifacts, f.path.slice(10)) : await safePath(this.root, f.path);
+      const text = await boundedRead(path, artifact ? 8 * 1024 * 1024 : 1024 * 1024);
+      const lines = text.split('\n');
+      if (!artifact) hashes[f.path] = hash(text);
+      const end = Math.min(f.end, lines.length);
+      // Reserve room for the header line and the continuation marker.
+      const budget = Math.max(400, share - f.path.length - 240);
+      const body: string[] = [];
+      let size = 0;
+      let shown = f.start - 1;
+      for (let n = f.start; n <= end; n++) {
+        const line = `${n}: ${lines[n - 1]}`;
+        if (body.length && size + line.length + 1 > budget) break;
+        body.push(clip(line, budget));
+        size += line.length + 1;
+        shown = n;
+        if (line.length > budget) break;
       }
-      return { ok: true, text: results.join('\n\n'), hashes };
+      const cut =
+        shown < end
+          ? `\n[…truncated at the read budget after line ${shown}; request lines ${shown + 1}..${end} in a later read_files call or narrow the range…]`
+          : '';
+      results.push(
+        `${f.path} sha256=${hash(text)} totalLines=${lines.length} shown=${f.start}..${shown}\n${body.join('\n') || '(no lines in range)'}${cut}`,
+      );
     }
-    if (route === 'search_codebase') {
-      const searchRoot = a.path === '@artifacts' ? this.artifacts : this.root;
-      const path = await safePath(searchRoot, a.path === '@artifacts' ? '.' : a.path);
-      const exclusions = [
-        '!.git/**',
-        '!.leana/**',
-        '!node_modules/**',
-        '!.env',
-        '!.env.*',
-        '!*.pem',
-        '!*.key',
-        '!id_rsa',
-        '!id_ed25519',
-      ];
-      const args =
-        a.mode === 'files' ? ['--files'] : ['-n', '--no-heading', '--color', 'never', '-F', '--max-count', '50'];
-      args.push('--max-filesize', '1M', ...exclusions.flatMap(g => ['--glob', g]));
-      // Paths as the rest of the harness names them, with forward slashes, on Windows too.
-      if (process.platform === 'win32') args.push('--path-separator', '/');
-      if (a.mode === 'text') args.push('-e', a.query);
-      args.push('--', relative(searchRoot, path) || '.');
-      const r = await runCommand('rg', args, searchRoot, 10000);
-      const output =
-        a.mode === 'files'
-          ? r.output
-              .split('\n')
-              .filter(p => p.includes(a.query))
-              .slice(0, 200)
-              .join('\n')
-          : r.output;
-      const none =
-        a.path === '.' || a.path === '@artifacts'
-          ? '(no matches in the repository)'
-          : `(no matches under ${a.path}; the text may live in another file, search path "." to check the whole repository)`;
-      return {
-        ok: !r.timedOut && !r.truncated && (r.code === 0 || r.code === 1),
-        text: JSON.stringify({ ...r, output: output || none }),
-      };
+    return { ok: true, text: results.join('\n\n'), hashes };
+  }
+  private async searchCodebase(a: Record<string, any>): Promise<ToolResult> {
+    const searchRoot = a.path === '@artifacts' ? this.artifacts : this.root;
+    const path = await safePath(searchRoot, a.path === '@artifacts' ? '.' : a.path);
+    const exclusions = [
+      '!.git/**',
+      '!.leana/**',
+      '!node_modules/**',
+      '!.env',
+      '!.env.*',
+      '!*.pem',
+      '!*.key',
+      '!id_rsa',
+      '!id_ed25519',
+    ];
+    const args =
+      a.mode === 'files' ? ['--files'] : ['-n', '--no-heading', '--color', 'never', '-F', '--max-count', '50'];
+    args.push('--max-filesize', '1M', ...exclusions.flatMap(g => ['--glob', g]));
+    // Paths as the rest of the harness names them, with forward slashes, on Windows too.
+    if (process.platform === 'win32') args.push('--path-separator', '/');
+    if (a.mode === 'text') args.push('-e', a.query);
+    args.push('--', relative(searchRoot, path) || '.');
+    const r = await runCommand('rg', args, searchRoot, 10000);
+    const output =
+      a.mode === 'files'
+        ? r.output
+            .split('\n')
+            .filter(p => p.includes(a.query))
+            .slice(0, 200)
+            .join('\n')
+        : r.output;
+    const none =
+      a.path === '.' || a.path === '@artifacts'
+        ? '(no matches in the repository)'
+        : `(no matches under ${a.path}; the text may live in another file, search path "." to check the whole repository)`;
+    return {
+      ok: !r.timedOut && !r.truncated && (r.code === 0 || r.code === 1),
+      text: JSON.stringify({ ...r, output: output || none }),
+    };
+  }
+  private async createFile(a: Record<string, any>): Promise<ToolResult> {
+    // Creation has one meaning: a file that does not exist gets this content.
+    // The content is validated after it lands, never refused for its shape:
+    // a parse problem is reported to the worker as a fact, and the
+    // relative imports are reported.
+    if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
+    if (typeof a.path !== 'string' || /[\\/]$/.test(a.path) || a.path === '.' || a.path === '..')
+      throw new Error('create_file requires a regular file path; directory path rejected');
+    const content = typeof a.content === 'string' ? a.content : '';
+    if (!content.trim()) throw new Error(`create_file for ${a.path} produced no content`);
+    const path = await safePath(this.root, a.path, true);
+    let exists = true;
+    try {
+      await stat(path);
+    } catch (e: any) {
+      if (e.code !== 'ENOENT') throw e;
+      exists = false;
     }
-    if (route === 'create_file') {
-      // Creation has one meaning: a file that does not exist gets this content.
-      // The content is validated after it lands, never refused for its shape:
-      // a parse problem is reported to the worker as a fact, and the
-      // relative imports are reported.
-      if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
-      if (typeof a.path !== 'string' || /[\\/]$/.test(a.path) || a.path === '.' || a.path === '..')
-        throw new Error('create_file requires a regular file path; directory path rejected');
-      const content = typeof a.content === 'string' ? a.content : '';
-      if (!content.trim()) throw new Error(`create_file for ${a.path} produced no content`);
-      const path = await safePath(this.root, a.path, true);
-      let exists = true;
+    if (exists) throw new Error(`${a.path} already exists; edit it with replace_lines or write instead of creating it`);
+    await parentDirectory(path);
+    await safePath(this.root, a.path, true);
+    const handle = await open(path, 'wx', 0o644);
+    try {
+      await handle.writeFile(content);
+    } finally {
+      await handle.close();
+    }
+    const parseErrors = await syntaxErrors(a.path, content);
+    const imports = await relativeImports(a.path, content);
+    const h = hash(content);
+    return {
+      ok: true,
+      changed: [a.path],
+      hashes: { [a.path]: h },
+      snapshots: { [a.path]: '@new' },
+      parseErrors,
+      imports,
+      text: `Created ${a.path} (${content.split('\n').length} lines); sha256=${h}.${parseErrors.length ? ` It does not parse yet (${parseErrors.join('; ')}); it stays as written until an edit fixes it.` : ''}${imports.length ? ` Imports ${imports.map(i => i.spec).join(', ')}.` : ''}`,
+    };
+  }
+  private async write(a: Record<string, any>): Promise<ToolResult> {
+    // An anchor replacement in a file that exists; nothing else.
+    if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
+    if (/[\\/]$/.test(a.path) || a.path === '.' || a.path === '..')
+      throw new Error('write requires a regular file path; directory path rejected');
+    const path = await safePath(this.root, a.path, true);
+    let original: string | null = null;
+    try {
+      original = await boundedRead(path);
+    } catch (e: any) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+    if (original === null)
+      throw new StaleWriteError(
+        `${a.path} does not exist: write replaces an anchor in an existing file; a new file is made with create_file`,
+      );
+    if (a.expectedHash === 'new')
+      throw new StaleWriteError(
+        `expectedHash=new is not a hash; ${a.path} exists: read it with read_files and use the returned sha256`,
+      );
+    if (hash(original) !== a.expectedHash)
+      throw new StaleWriteError(this.staleFacts(a.path, a.expectedHash, hash(original), original.split('\n').length));
+    const snapshots = { [a.path]: await this.snapshot(a.path, original) };
+    const matches = a.oldText ? original.split(a.oldText).length - 1 : 0;
+    if (matches === 0)
+      throw new Error(
+        'oldText must match exactly once: it was not found in the current file. Copy a small anchor exactly from the latest read_files result of this path; never paste a truncated excerpt',
+      );
+    if (matches > 1)
+      throw new Error(
+        `oldText must match exactly once: it matches ${matches} times. Include more surrounding lines so the anchor is unique`,
+      );
+    // An import the file already has is dropped from the replacement, not refused.
+    const { kept, dropped } = dropDuplicateImports(original.replace(a.oldText, ''), String(a.newText).split('\n'));
+    const newText = kept.join('\n');
+    const updated = original.replace(a.oldText, () => newText);
+    if (updated === original)
+      throw new Error(
+        dropped.length
+          ? `Write produced no change: the only new lines were imports ${a.path} already has (${dropped.map(l => l.trim()).join('; ')})`
+          : 'Write produced no change: newText equals oldText. oldText is the exact existing anchor; newText must be the modified text that replaces it',
+      );
+    // A whole-file rewrite is a finished generation of the complete file: like a
+    // created file it lands as written and its parse state is reported, never
+    // refused. The shape guards are for anchor edits, which splice into a file.
+    if (!a.wholeFile) {
+      // A refused anchor is stated as the lines it spans, as replace_lines states its ranges.
+      const at = original.split(a.oldText)[0]!.split('\n').length;
+      const end = at + String(a.oldText).split('\n').length - 1;
+      assertBalancePreserved(original, updated, a.path, [
+        {
+          label: `the anchor (lines ${at}..${end})`,
+          start: at,
+          end,
+          fresh: updated.split('\n').slice(at - 1, end + updated.split('\n').length - original.split('\n').length),
+        },
+      ]);
+      await assertParses(a.path, original, updated, this.parse);
+      assertNoBulkDuplication(original.replace(a.oldText, ''), kept, a.path);
+    }
+    const temp = `${path}.leana-${randomUUID()}.tmp`;
+    try {
+      const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
       try {
-        await stat(path);
-      } catch (e: any) {
-        if (e.code !== 'ENOENT') throw e;
-        exists = false;
-      }
-      if (exists)
-        throw new Error(`${a.path} already exists; edit it with replace_lines or write instead of creating it`);
-      await parentDirectory(path);
-      await safePath(this.root, a.path, true);
-      const handle = await open(path, 'wx', 0o644);
-      try {
-        await handle.writeFile(content);
+        await h.writeFile(updated);
       } finally {
-        await handle.close();
+        await h.close();
       }
-      const parseErrors = await syntaxErrors(a.path, content);
-      const imports = await relativeImports(a.path, content);
-      const h = hash(content);
-      return {
-        ok: true,
-        changed: [a.path],
-        hashes: { [a.path]: h },
-        snapshots: { [a.path]: '@new' },
-        parseErrors,
-        imports,
-        text: `Created ${a.path} (${content.split('\n').length} lines); sha256=${h}.${parseErrors.length ? ` It does not parse yet (${parseErrors.join('; ')}); it stays as written until an edit fixes it.` : ''}${imports.length ? ` Imports ${imports.map(i => i.spec).join(', ')}.` : ''}`,
-      };
+      if (hash(await boundedRead(path)) !== a.expectedHash)
+        throw new StaleWriteError('File changed while preparing edit; read it again');
+      await rename(temp, path);
+    } finally {
+      await unlink(temp).catch(() => {});
     }
-    if (route === 'write') {
-      // An anchor replacement in a file that exists; nothing else.
-      if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
-      if (/[\\/]$/.test(a.path) || a.path === '.' || a.path === '..')
-        throw new Error('write requires a regular file path; directory path rejected');
-      const path = await safePath(this.root, a.path, true);
-      let original: string | null = null;
-      try {
-        original = await boundedRead(path);
-      } catch (e: any) {
-        if (e.code !== 'ENOENT') throw e;
-      }
-      if (original === null)
+    const updatedHash = hash(updated);
+    // The lines that differ between the text before and after (an anchor that starts or ends
+    // with a line break leaves its neighbouring lines as they were); a whole-file write maps nothing forward.
+    const ol = original.split('\n');
+    const ul = updated.split('\n');
+    let pre = 0;
+    while (pre < ol.length && pre < ul.length && ol[pre] === ul[pre]) pre++;
+    let suf = 0;
+    while (suf < ol.length - pre && suf < ul.length - pre && ol[ol.length - 1 - suf] === ul[ul.length - 1 - suf]) suf++;
+    // A region rewrite replaced exactly lines region.start..region.end (end = start - 1: an insertion) with region.lines lines.
+    this.record(
+      a.path,
+      a.region ? 'rewrite_file' : a.wholeFile ? 'rewrite' : 'write',
+      a.expectedHash,
+      updatedHash,
+      a.region
+        ? [{ start: a.region.start, end: Math.max(a.region.end, a.region.start - 1), count: a.region.lines }]
+        : a.wholeFile
+          ? null
+          : [{ start: pre + 1, end: ol.length - suf, count: ul.length - pre - suf }],
+    );
+    const anchorLines = String(a.oldText).split('\n').length;
+    const notes = [
+      dropped.length ? `Dropped ${dropped.length} import line(s) the file already had.` : '',
+      anchorLines > 6 && !a.wholeFile
+        ? `The anchor was ${anchorLines} lines; replace_lines addresses a block by line number without retyping it.`
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+    return {
+      ok: true,
+      changed: [a.path],
+      hashes: { [a.path]: updatedHash },
+      snapshots,
+      text: a.region
+        ? `Replaced lines ${a.region.start}..${a.region.end} of ${a.path} with ${a.region.lines} generated line(s); the file now has ${updated.replace(/\n$/, '').split('\n').length} lines; sha256=${updatedHash}.`
+        : a.wholeFile
+          ? `Rewrote ${a.path} (${updated.split('\n').length} lines); sha256=${updatedHash}.`
+          : `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.`,
+    };
+  }
+  private async replaceLines(a: Record<string, any>): Promise<ToolResult> {
+    if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
+    const path = await safePath(this.root, a.path);
+    const original = await boundedRead(path);
+    const base = hash(original);
+    const lines = original.split('\n');
+    // A hash from before an earlier edit of this batch: the ranges are numbered
+    // as in that text, and the batch's edits say exactly where its lines are now.
+    // Ranges no earlier edit touched are mapped; any other is refused with the facts.
+    let requested = a.edits as { start: number; end: number; newText: string; prepend?: string }[];
+    let mapped = '';
+    if (base !== a.expectedHash) {
+      const links = this.chain(a.path, a.expectedHash, base);
+      if (!links?.length || links.some(r => !r.changes))
         throw new StaleWriteError(
-          `${a.path} does not exist: write replaces an anchor in an existing file; a new file is made with create_file`,
+          this.staleFacts(
+            a.path,
+            a.expectedHash,
+            base,
+            lines.length,
+            links?.length ? 'No range of the earlier text maps into a whole-file replacement.' : undefined,
+          ),
         );
-      if (a.expectedHash === 'new')
+      const moved = requested.map(e => {
+        let r: { start: number; end: number } | null = { start: e.start, end: e.end };
+        for (const l of links) r = r && mapRange(r.start, r.end, l.changes!);
+        return { e, r };
+      });
+      const hit = moved.filter(m => !m.r);
+      if (hit.length)
         throw new StaleWriteError(
-          `expectedHash=new is not a hash; ${a.path} exists: read it with read_files and use the returned sha256`,
+          this.staleFacts(
+            a.path,
+            a.expectedHash,
+            base,
+            lines.length,
+            `Range(s) ${hit.map(m => `${m.e.start}..${m.e.end}`).join(', ')} of this edit cover lines that edit changed, so they have no place in the current text.`,
+          ),
         );
-      if (hash(original) !== a.expectedHash)
-        throw new StaleWriteError(this.staleFacts(a.path, a.expectedHash, hash(original), original.split('\n').length));
+      requested = moved.map(m => ({ ...m.e, ...m.r! }));
+      mapped = ` The ranges were numbered as in sha256=${a.expectedHash}, the text before step ${links.map(l => l.step).join(', ')} of this batch, and were mapped to the current text: ${moved.map(m => `${m.e.start}..${m.e.end} -> ${m.r!.start}..${m.r!.end}`).join(', ')}.`;
+    }
+    // A refusal after the ranges were mapped states the mapping: its line numbers are the current text's.
+    try {
       const snapshots = { [a.path]: await this.snapshot(a.path, original) };
-      const matches = a.oldText ? original.split(a.oldText).length - 1 : 0;
-      if (matches === 0)
-        throw new Error(
-          'oldText must match exactly once: it was not found in the current file. Copy a small anchor exactly from the latest read_files result of this path; never paste a truncated excerpt',
-        );
-      if (matches > 1)
-        throw new Error(
-          `oldText must match exactly once: it matches ${matches} times. Include more surrounding lines so the anchor is unique`,
-        );
-      // An import the file already has is dropped from the replacement, not refused.
-      const { kept, dropped } = dropDuplicateImports(original.replace(a.oldText, ''), String(a.newText).split('\n'));
-      const newText = kept.join('\n');
-      const updated = original.replace(a.oldText, () => newText);
-      if (updated === original)
-        throw new Error(
-          dropped.length
-            ? `Write produced no change: the only new lines were imports ${a.path} already has (${dropped.map(l => l.trim()).join('; ')})`
-            : 'Write produced no change: newText equals oldText. oldText is the exact existing anchor; newText must be the modified text that replaces it',
-        );
-      // A whole-file rewrite is a finished generation of the complete file: like a
-      // created file it lands as written and its parse state is reported, never
-      // refused. The shape guards are for anchor edits, which splice into a file.
-      if (!a.wholeFile) {
-        // A refused anchor is stated as the lines it spans, as replace_lines states its ranges.
-        const at = original.split(a.oldText)[0]!.split('\n').length;
-        const end = at + String(a.oldText).split('\n').length - 1;
-        assertBalancePreserved(original, updated, a.path, [
-          {
-            label: `the anchor (lines ${at}..${end})`,
-            start: at,
-            end,
-            fresh: updated.split('\n').slice(at - 1, end + updated.split('\n').length - original.split('\n').length),
-          },
-        ]);
-        await assertParses(a.path, original, updated, this.parse);
-        assertNoBulkDuplication(original.replace(a.oldText, ''), kept, a.path);
+      // All ranges refer to the file as read; apply from the bottom up so no
+      // edit shifts the line numbers of another. Overlaps are rejected.
+      // prepend: prefix every line in the range with the text, keeping the lines
+      // themselves; the model supplies numbers and a prefix, never retyped code.
+      // A file ending in a newline splits into a trailing empty element; appending
+      // at totalLines + 1 must land before it so the file keeps its final newline.
+      const trailing = lines.length > 1 && lines.at(-1) === '';
+      // At an equal start a replacement is taken before an insertion: inserting before line k
+      // and replacing k..m do not overlap, whatever order they were sent in.
+      // n: the edit's place in the call, as the worker numbered it.
+      const bottomUp = (x: { start: number; end: number }, y: { start: number; end: number }) =>
+        y.start - x.start || Number(x.end === x.start - 1) - Number(y.end === y.start - 1);
+      const all = requested
+        .map((e, i) => ({
+          ...e,
+          n: i + 1,
+          ...(trailing && e.end === e.start - 1 && e.start === lines.length + 1
+            ? { start: lines.length, end: lines.length - 1 }
+            : {}),
+        }))
+        .sort(bottomUp);
+      for (const [i, e] of all.entries()) {
+        // end = start - 1 is an insertion before start (start = totalLines + 1 appends).
+        const insert = e.end === e.start - 1;
+        if (!insert && (e.end < e.start || e.end - e.start >= 2000))
+          throw new Error(
+            `Range ${e.start}..${e.end} must contain 1..2000 lines, or end = start - 1 to insert before start`,
+          );
+        if (insert && e.prepend)
+          throw new Error(`Range ${e.start}..${e.end} is an insertion; prepend applies to existing lines only`);
+        if (insert && !e.newText) throw new Error(`Range ${e.start}..${e.end} is an insertion and needs newText`);
+        if ((insert ? e.start - 1 : e.end) > lines.length)
+          throw new Error(`Range ${e.start}..${e.end} exceeds ${a.path} (${lines.length} lines)`);
+        const next = all[i + 1];
+        if (next && Math.max(next.end, next.start - 1) >= e.start && !(insert && next.end < e.start))
+          throw new Error(
+            `Ranges ${next.start}..${next.end} and ${e.start}..${e.end} overlap; merge them into one edit`,
+          );
+        if (e.prepend)
+          for (let n = e.start; n <= e.end; n++) {
+            const line = lines[n - 1] ?? '';
+            if (/^\s*$/.test(line))
+              throw new Error(`Line ${n} is blank; prepend "${e.prepend}" belongs on the declaration line`);
+            if (/^\s*(import|export)\b/.test(line) && /^\s*export\s*$/.test(e.prepend))
+              throw new Error(
+                `Line ${n} already starts with ${line.trim().split(/\s+/)[0]} (${JSON.stringify(line.trim().slice(0, 60))}); export is prepended only to a declaration line`,
+              );
+            const lastWord = e.prepend.trim().split(/\s+/).pop() ?? '';
+            if (lastWord && line.trimStart().startsWith(`${lastWord} `))
+              throw new Error(
+                `Line ${n} already starts with ${JSON.stringify(lastWord)} (${JSON.stringify(line.trim().slice(0, 60))}); prepend adds only what is missing, so use prepend ${JSON.stringify(e.prepend.trim().split(/\s+/).slice(0, -1).join(' ') + ' ')}`,
+              );
+          }
       }
+      // An edit that leaves its lines as they are is skipped, not fatal: in a
+      // batch of forty deletions one redundant rewrite must not void the rest.
+      // Import lines the file already has (outside the replaced ranges) are
+      // dropped from the inserted text: the intent is met, so the edit is repaired.
+      const outsideText = lines
+        .filter((_, i) => !all.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end))
+        .join('\n');
+      const droppedImports: string[] = [];
+      const rendered = (e: { start: number; end: number; newText: string; prepend?: string }): string[] => {
+        if (e.prepend) return lines.slice(e.start - 1, e.end).map(l => `${e.prepend}${l}`);
+        if (e.newText === '') return [];
+        const { kept, dropped } = dropDuplicateImports(outsideText, e.newText.replace(/\n$/, '').split('\n'));
+        for (const d of dropped) if (!droppedImports.includes(d)) droppedImports.push(d);
+        return kept;
+      };
+      const same = (x: string[], y: string[]) => x.length === y.length && x.every((l, i) => l === y[i]);
+      // A deletion is never a no-op; a rewrite is one only when every line is unchanged.
+      const skipped = all.filter(
+        e =>
+          e.end >= e.start && !(e.newText === '' && !e.prepend) && same(lines.slice(e.start - 1, e.end), rendered(e)),
+      );
+      let edits = all.filter(e => !skipped.includes(e) && !(e.end < e.start && rendered(e).length === 0));
+      if (!edits.length)
+        throw new Error(
+          droppedImports.length
+            ? `replace_lines produced no change: the only new lines were imports ${a.path} already has (${droppedImports.map(l => l.trim()).join('; ')})`
+            : `replace_lines produced no change: every newText equals the current lines (${all.map(e => `${e.start}..${e.end}`).join(', ')})`,
+        );
+      // A harness-chosen rewrite (a region the code picked, validated before
+      // it got here) is applied as it is: the paste and retype rules are for
+      // the worker's own line edits.
+      const harness = a.harness === true;
+      const splice = (xs: typeof edits) => {
+        let out = lines;
+        let shift = 0;
+        for (const e of xs) {
+          const fresh = rendered(e);
+          const removed = Math.max(0, e.end - e.start + 1);
+          out = [...out.slice(0, e.start - 1), ...fresh, ...out.slice(e.start - 1 + removed)];
+          shift += fresh.length - removed;
+        }
+        return { text: out.join('\n'), delta: shift };
+      };
+      let { text: updated, delta } = splice(edits);
+      const passes = async (text: string) => {
+        try {
+          assertBalancePreserved(original, text, a.path);
+          await assertParses(a.path, original, text, this.parse);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const described = (xs: typeof edits) =>
+        xs
+          .filter(e => !e.prepend)
+          .map(e => ({
+            label: `edit ${e.n} (${e.end < e.start ? `insert before line ${e.start}` : `lines ${e.start}..${e.end}`})`,
+            start: e.start,
+            end: e.end,
+            fresh: rendered(e),
+          }));
+      let repaired = '';
+      let applied: typeof requested | null = null;
+      if (!(await passes(updated))) {
+        // New text that repeats the lines just outside its range is the range drawn too
+        // small, or the text drawn too large: the file is the same either way, so when
+        // the repeat alone breaks it (without it the brackets match and the file parses)
+        // and no range moved by the repeat fits (below), it is not written, as a region
+        // rewrite's repeat is not. Of the 7 refusals in runs 49-76 with such a repeat, this
+        // writes 3: run 73 step 50 (its new text ended with line 38, the line after its
+        // range; redone by a 10.6 s whole-file rewrite),
+        // run 62 step 35 (redone by a rewrite to the same code) and run 49 step 34. The
+        // other 4 break the file without the repeat too and are refused with the facts.
+        // A trailing blank line is kept as one (newText drops a final line break).
+        const cut = new Map<number, { head: number; tail: number }>();
+        const trimmed = harness
+          ? edits
+          : edits
+              .map(e => {
+                if (e.prepend || e.newText === '') return e;
+                const fresh = rendered(e);
+                const echo = rangeEchoes(lines, e, fresh, n => edits.some(x => x !== e && n >= x.start && n <= x.end));
+                if (!echo.head && !echo.tail) return e;
+                const kept = fresh.slice(echo.head, fresh.length - echo.tail);
+                cut.set(e.n, echo);
+                return { ...e, newText: `${kept.join('\n')}${kept.at(-1) === '' ? '\n' : ''}` };
+              })
+              .filter(e => !(e.end < e.start && rendered(e).length === 0));
+        const again = cut.size ? splice(trimmed) : null;
+        // The same repeat is what a range drawn k lines off shows (line numbers from an older
+        // read: run 76 step 10 sent line 6 for line 7): the text is then meant for the range
+        // moved k lines, which keeps the line the sent range loses at its other end. When that
+        // edit changes lines and passes the checks too, the two readings are two files, and the
+        // edit is refused with its facts. Moved one line down, run 73 step 50's text would follow
+        // the setValue line it rewrites, and 1 '{' would be unmatched: one reading.
+        const moved = async (xs: typeof edits, text: string) => {
+          for (const [n, c] of cut)
+            for (const k of [-c.head, c.tail].filter(Boolean)) {
+              const e = edits.find(x => x.n === n)!;
+              const m = { ...e, start: e.start + k, end: e.end + k };
+              const end = Math.max(m.end, m.start - 1);
+              const others = xs.filter(x => x.n !== n);
+              if (
+                m.start < 1 ||
+                end > lines.length ||
+                (m.end >= m.start && same(lines.slice(m.start - 1, m.end), rendered(m))) ||
+                others.some(x => x.start <= end && m.start <= Math.max(x.end, x.start - 1))
+              )
+                continue;
+              const alt = splice([...others, m].sort(bottomUp)).text;
+              if (alt !== text && alt !== original && (await passes(alt))) return true;
+            }
+          return false;
+        };
+        if (again && again.text !== original && (await passes(again.text)) && !(await moved(trimmed, again.text))) {
+          const worse = worseBrackets(original, updated).map(w => w.said);
+          repaired = ` ${editFacts(lines, described([...edits].sort((x, y) => x.n - y.n)), [])
+            .map((f, i) => `${i ? f[0]!.toLowerCase() : f[0]}${f.slice(1, -1)}`)
+            .join(
+              '; ',
+            )}; ${[...cut.values()].reduce((k, c) => k + c.head + c.tail, 0) > 1 ? 'those lines were not written, since with them' : 'that line was not written, since with it'} ${a.path} would ${worse.length ? `have ${worse.join(', ')}` : 'no longer parse'}.`;
+          applied = requested.map((r, i) => {
+            const t = trimmed.find(e => e.n === i + 1);
+            return cut.has(i + 1) ? { ...r, newText: t ? t.newText : '' } : r;
+          });
+          edits = trimmed;
+          ({ text: updated, delta } = again);
+        } else {
+          // A refusal states each range's facts. For the brackets: what the replaced lines leave
+          // unmatched against what the new text does, and new text repeating the lines around its
+          // range, fitted to the error entry with the mapping this message may end with. For the
+          // parser: the lines the ranges held that the new text drops, the cause of an unclosed
+          // tag, not only where the parser noticed it; then new text repeating the lines around its
+          // range (run 72 step 20's edit 3 ended with line 33), last, where an entry already over its
+          // 600 characters keeps it; one that fits is not pushed over (run 57 step 52's, 562, whose
+          // dropped "5: <Layout>" is the opener of the "</Layout>" the parser names).
+          const told = described([...edits].sort((x, y) => x.n - y.n));
+          const reserved = mapped ? mapped.length + 90 : 0;
+          const room = 600 - 'Tool error: '.length - reserved;
+          const gone = droppedLines(
+            lines,
+            edits.filter(x => !x.prepend),
+            rendered,
+          );
+          // The lines dropped follow the bracket facts while they fit: run 76 step 10's cause was the
+          // dropped "6: export default defineConfig({", which the balance alone does not quote.
+          try {
+            assertBalancePreserved(original, updated, a.path, told, reserved);
+          } catch (e) {
+            const more = gone.length
+              ? ` The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.`
+              : '';
+            throw new Error(
+              (e as Error).message.length + more.length <= room
+                ? `${(e as Error).message}${more}`
+                : (e as Error).message,
+            );
+          }
+          try {
+            await assertParses(a.path, original, updated, this.parse);
+          } catch (e) {
+            const echoes = editFacts(lines, told, [])
+              .map(f => ` ${f}`)
+              .join('');
+            const said = gone.length
+              ? `${(e as Error).message} The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.`
+              : (e as Error).message;
+            throw new Error(said.length + echoes.length <= room || said.length > room ? `${said}${echoes}` : said);
+          }
+        }
+      }
+      const retypes: string[] = [];
+      if (!harness)
+        for (const e of edits)
+          if (!e.prepend && e.end >= e.start) {
+            const why = nearRetype(lines.slice(e.start - 1, e.end), rendered(e), e.start);
+            if (why) retypes.push(why);
+          }
+      // Retyping a range in place is a rewrite, not a paste: judge the inserted
+      // lines against the file without the ranges they replace.
+      const outside = lines
+        .filter((_, i) => !edits.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end))
+        .join('\n');
+      // The refusal states what the edit replaces and what stays, so a whole new
+      // file sent as a small range shows itself as that.
+      if (!harness)
+        try {
+          assertNoBulkDuplication(
+            outside,
+            edits.filter(e => !e.prepend).flatMap(e => rendered(e)),
+            a.path,
+          );
+        } catch (e) {
+          const removed = edits.reduce((n, x) => n + Math.max(0, x.end - x.start + 1), 0);
+          const added = edits
+            .filter(x => !x.prepend && x.newText)
+            .reduce((n, x) => n + x.newText.replace(/\n$/, '').split('\n').length, 0);
+          const total = lines.length - (trailing ? 1 : 0);
+          throw new Error(
+            `${(e as Error).message} This edit replaces ${removed} line(s) (${edits
+              .map(x => `${x.start}..${x.end}`)
+              .reverse()
+              .join(
+                ', ',
+              )}) with ${added}; the other ${total - removed} line(s) of ${a.path} stay as they are. rewrite_file replaces a whole file.`,
+          );
+        }
       const temp = `${path}.leana-${randomUUID()}.tmp`;
       try {
         const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
@@ -1680,584 +640,192 @@ export class ToolBox {
         } finally {
           await h.close();
         }
-        if (hash(await boundedRead(path)) !== a.expectedHash)
+        if (hash(await boundedRead(path)) !== base)
           throw new StaleWriteError('File changed while preparing edit; read it again');
         await rename(temp, path);
       } finally {
         await unlink(temp).catch(() => {});
       }
-      const updatedHash = hash(updated);
-      // The lines that differ between the text before and after (an anchor that starts or ends
-      // with a line break leaves its neighbouring lines as they were); a whole-file write maps nothing forward.
-      const ol = original.split('\n');
-      const ul = updated.split('\n');
-      let pre = 0;
-      while (pre < ol.length && pre < ul.length && ol[pre] === ul[pre]) pre++;
-      let suf = 0;
-      while (suf < ol.length - pre && suf < ul.length - pre && ol[ol.length - 1 - suf] === ul[ul.length - 1 - suf])
-        suf++;
-      // A region rewrite replaced exactly lines region.start..region.end (end = start - 1: an insertion) with region.lines lines.
+      const summary = edits
+        .map(e => `${e.start}..${e.end}`)
+        .reverse()
+        .join(', ');
+      const newLines = updated.split('\n');
+      const lo = Math.max(1, Math.min(...edits.map(e => e.start)) - 3);
+      const hi = Math.min(newLines.length, Math.max(...edits.map(e => e.end)) + delta + 3);
+      const region =
+        hi >= lo && hi - lo < 120
+          ? `\nThe file now reads, lines ${lo}..${hi}:\n${newLines
+              .slice(lo - 1, hi)
+              .map((l, i) => `${lo + i}: ${l}`)
+              .join('\n')}`
+          : '';
+      // Lines not written come first: the entry keeps this result's first 389 characters (run 49 step 34's
+      // note, after the skipped and dropped ones, was cut at "since wi").
+      const note = [
+        repaired,
+        skipped.length
+          ? ` Skipped ${skipped.length} unchanged range(s): ${skipped
+              .map(e => `${e.start}..${e.end}`)
+              .reverse()
+              .join(', ')}.`
+          : '',
+        droppedImports.length ? ` Dropped ${droppedImports.length} import line(s) the file already had.` : '',
+        retypes.length ? ` Note: ${retypes.join('; ')}.` : '',
+      ].join('');
       this.record(
         a.path,
-        a.region ? 'rewrite_file' : a.wholeFile ? 'rewrite' : 'write',
-        a.expectedHash,
-        updatedHash,
-        a.region
-          ? [{ start: a.region.start, end: Math.max(a.region.end, a.region.start - 1), count: a.region.lines }]
-          : a.wholeFile
-            ? null
-            : [{ start: pre + 1, end: ol.length - suf, count: ul.length - pre - suf }],
+        'replace_lines',
+        base,
+        hash(updated),
+        edits.map(e => ({ start: e.start, end: Math.max(e.end, e.start - 1), count: rendered(e).length })),
       );
-      const anchorLines = String(a.oldText).split('\n').length;
-      const notes = [
-        dropped.length ? `Dropped ${dropped.length} import line(s) the file already had.` : '',
-        anchorLines > 6 && !a.wholeFile
-          ? `The anchor was ${anchorLines} lines; replace_lines addresses a block by line number without retyping it.`
-          : '',
-      ]
-        .filter(Boolean)
-        .join(' ');
       return {
         ok: true,
         changed: [a.path],
-        hashes: { [a.path]: updatedHash },
+        hashes: { [a.path]: hash(updated) },
         snapshots,
-        text: a.region
-          ? `Replaced lines ${a.region.start}..${a.region.end} of ${a.path} with ${a.region.lines} generated line(s); the file now has ${updated.replace(/\n$/, '').split('\n').length} lines; sha256=${updatedHash}.`
-          : a.wholeFile
-            ? `Rewrote ${a.path} (${updated.split('\n').length} lines); sha256=${updatedHash}.`
-            : `Updated ${a.path}; sha256=${updatedHash}.${notes ? ` ${notes}` : ''} Run focused validation.`,
+        ...(mapped || applied ? { applied: { ...a, edits: applied ?? requested } } : {}),
+        text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${mapped}${note} Line numbers below the first edit shifted by ${delta} in total.${region} Run focused validation.`,
       };
+    } catch (e) {
+      if (mapped && e instanceof Error && !(e instanceof StaleWriteError))
+        e.message = `${e.message}${mapped} Line numbers in this message are those of the current text, sha256=${base}.`;
+      throw e;
     }
-    if (route === 'replace_lines') {
-      if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
-      const path = await safePath(this.root, a.path);
-      const original = await boundedRead(path);
-      const base = hash(original);
-      const lines = original.split('\n');
-      // A hash from before an earlier edit of this batch: the ranges are numbered
-      // as in that text, and the batch's edits say exactly where its lines are now.
-      // Ranges no earlier edit touched are mapped; any other is refused with the facts.
-      let requested = a.edits as { start: number; end: number; newText: string; prepend?: string }[];
-      let mapped = '';
-      if (base !== a.expectedHash) {
-        const links = this.chain(a.path, a.expectedHash, base);
-        if (!links?.length || links.some(r => !r.changes))
-          throw new StaleWriteError(
-            this.staleFacts(
-              a.path,
-              a.expectedHash,
-              base,
-              lines.length,
-              links?.length ? 'No range of the earlier text maps into a whole-file replacement.' : undefined,
-            ),
-          );
-        const moved = requested.map(e => {
-          let r: { start: number; end: number } | null = { start: e.start, end: e.end };
-          for (const l of links) r = r && mapRange(r.start, r.end, l.changes!);
-          return { e, r };
-        });
-        const hit = moved.filter(m => !m.r);
-        if (hit.length)
-          throw new StaleWriteError(
-            this.staleFacts(
-              a.path,
-              a.expectedHash,
-              base,
-              lines.length,
-              `Range(s) ${hit.map(m => `${m.e.start}..${m.e.end}`).join(', ')} of this edit cover lines that edit changed, so they have no place in the current text.`,
-            ),
-          );
-        requested = moved.map(m => ({ ...m.e, ...m.r! }));
-        mapped = ` The ranges were numbered as in sha256=${a.expectedHash}, the text before step ${links.map(l => l.step).join(', ')} of this batch, and were mapped to the current text: ${moved.map(m => `${m.e.start}..${m.e.end} -> ${m.r!.start}..${m.r!.end}`).join(', ')}.`;
-      }
-      // A refusal after the ranges were mapped states the mapping: its line numbers are the current text's.
-      try {
-        const snapshots = { [a.path]: await this.snapshot(a.path, original) };
-        // All ranges refer to the file as read; apply from the bottom up so no
-        // edit shifts the line numbers of another. Overlaps are rejected.
-        // prepend: prefix every line in the range with the text, keeping the lines
-        // themselves; the model supplies numbers and a prefix, never retyped code.
-        // A file ending in a newline splits into a trailing empty element; appending
-        // at totalLines + 1 must land before it so the file keeps its final newline.
-        const trailing = lines.length > 1 && lines.at(-1) === '';
-        // At an equal start a replacement is taken before an insertion: inserting before line k
-        // and replacing k..m do not overlap, whatever order they were sent in.
-        // n: the edit's place in the call, as the worker numbered it.
-        const bottomUp = (x: { start: number; end: number }, y: { start: number; end: number }) =>
-          y.start - x.start || Number(x.end === x.start - 1) - Number(y.end === y.start - 1);
-        const all = requested
-          .map((e, i) => ({
-            ...e,
-            n: i + 1,
-            ...(trailing && e.end === e.start - 1 && e.start === lines.length + 1
-              ? { start: lines.length, end: lines.length - 1 }
-              : {}),
-          }))
-          .sort(bottomUp);
-        for (const [i, e] of all.entries()) {
-          // end = start - 1 is an insertion before start (start = totalLines + 1 appends).
-          const insert = e.end === e.start - 1;
-          if (!insert && (e.end < e.start || e.end - e.start >= 2000))
-            throw new Error(
-              `Range ${e.start}..${e.end} must contain 1..2000 lines, or end = start - 1 to insert before start`,
-            );
-          if (insert && e.prepend)
-            throw new Error(`Range ${e.start}..${e.end} is an insertion; prepend applies to existing lines only`);
-          if (insert && !e.newText) throw new Error(`Range ${e.start}..${e.end} is an insertion and needs newText`);
-          if ((insert ? e.start - 1 : e.end) > lines.length)
-            throw new Error(`Range ${e.start}..${e.end} exceeds ${a.path} (${lines.length} lines)`);
-          const next = all[i + 1];
-          if (next && Math.max(next.end, next.start - 1) >= e.start && !(insert && next.end < e.start))
-            throw new Error(
-              `Ranges ${next.start}..${next.end} and ${e.start}..${e.end} overlap; merge them into one edit`,
-            );
-          if (e.prepend)
-            for (let n = e.start; n <= e.end; n++) {
-              const line = lines[n - 1] ?? '';
-              if (/^\s*$/.test(line))
-                throw new Error(`Line ${n} is blank; prepend "${e.prepend}" belongs on the declaration line`);
-              if (/^\s*(import|export)\b/.test(line) && /^\s*export\s*$/.test(e.prepend))
-                throw new Error(
-                  `Line ${n} already starts with ${line.trim().split(/\s+/)[0]} (${JSON.stringify(line.trim().slice(0, 60))}); export is prepended only to a declaration line`,
-                );
-              const lastWord = e.prepend.trim().split(/\s+/).pop() ?? '';
-              if (lastWord && line.trimStart().startsWith(`${lastWord} `))
-                throw new Error(
-                  `Line ${n} already starts with ${JSON.stringify(lastWord)} (${JSON.stringify(line.trim().slice(0, 60))}); prepend adds only what is missing, so use prepend ${JSON.stringify(e.prepend.trim().split(/\s+/).slice(0, -1).join(' ') + ' ')}`,
-                );
-            }
-        }
-        // An edit that leaves its lines as they are is skipped, not fatal: in a
-        // batch of forty deletions one redundant rewrite must not void the rest.
-        // Import lines the file already has (outside the replaced ranges) are
-        // dropped from the inserted text: the intent is met, so the edit is repaired.
-        const outsideText = lines
-          .filter((_, i) => !all.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end))
-          .join('\n');
-        const droppedImports: string[] = [];
-        const rendered = (e: { start: number; end: number; newText: string; prepend?: string }): string[] => {
-          if (e.prepend) return lines.slice(e.start - 1, e.end).map(l => `${e.prepend}${l}`);
-          if (e.newText === '') return [];
-          const { kept, dropped } = dropDuplicateImports(outsideText, e.newText.replace(/\n$/, '').split('\n'));
-          for (const d of dropped) if (!droppedImports.includes(d)) droppedImports.push(d);
-          return kept;
-        };
-        const same = (x: string[], y: string[]) => x.length === y.length && x.every((l, i) => l === y[i]);
-        // A deletion is never a no-op; a rewrite is one only when every line is unchanged.
-        const skipped = all.filter(
-          e =>
-            e.end >= e.start && !(e.newText === '' && !e.prepend) && same(lines.slice(e.start - 1, e.end), rendered(e)),
-        );
-        let edits = all.filter(e => !skipped.includes(e) && !(e.end < e.start && rendered(e).length === 0));
-        if (!edits.length)
-          throw new Error(
-            droppedImports.length
-              ? `replace_lines produced no change: the only new lines were imports ${a.path} already has (${droppedImports.map(l => l.trim()).join('; ')})`
-              : `replace_lines produced no change: every newText equals the current lines (${all.map(e => `${e.start}..${e.end}`).join(', ')})`,
-          );
-        // A harness-chosen rewrite (a region the code picked, validated before
-        // it got here) is applied as it is: the paste and retype rules are for
-        // the worker's own line edits.
-        const harness = a.harness === true;
-        const splice = (xs: typeof edits) => {
-          let out = lines;
-          let shift = 0;
-          for (const e of xs) {
-            const fresh = rendered(e);
-            const removed = Math.max(0, e.end - e.start + 1);
-            out = [...out.slice(0, e.start - 1), ...fresh, ...out.slice(e.start - 1 + removed)];
-            shift += fresh.length - removed;
-          }
-          return { text: out.join('\n'), delta: shift };
-        };
-        let { text: updated, delta } = splice(edits);
-        const passes = async (text: string) => {
-          try {
-            assertBalancePreserved(original, text, a.path);
-            await assertParses(a.path, original, text, this.parse);
-            return true;
-          } catch {
-            return false;
-          }
-        };
-        const described = (xs: typeof edits) =>
-          xs
-            .filter(e => !e.prepend)
-            .map(e => ({
-              label: `edit ${e.n} (${e.end < e.start ? `insert before line ${e.start}` : `lines ${e.start}..${e.end}`})`,
-              start: e.start,
-              end: e.end,
-              fresh: rendered(e),
-            }));
-        let repaired = '';
-        let applied: typeof requested | null = null;
-        if (!(await passes(updated))) {
-          // New text that repeats the lines just outside its range is the range drawn too
-          // small, or the text drawn too large: the file is the same either way, so when
-          // the repeat alone breaks it (without it the brackets match and the file parses)
-          // and no range moved by the repeat fits (below), it is not written, as a region
-          // rewrite's repeat is not. Of the 7 refusals in runs 49-76 with such a repeat, this
-          // writes 3: run 73 step 50 (its new text ended with line 38, the line after its
-          // range; redone by a 10.6 s whole-file rewrite),
-          // run 62 step 35 (redone by a rewrite to the same code) and run 49 step 34. The
-          // other 4 break the file without the repeat too and are refused with the facts.
-          // A trailing blank line is kept as one (newText drops a final line break).
-          const cut = new Map<number, { head: number; tail: number }>();
-          const trimmed = harness
-            ? edits
-            : edits
-                .map(e => {
-                  if (e.prepend || e.newText === '') return e;
-                  const fresh = rendered(e);
-                  const echo = rangeEchoes(lines, e, fresh, n =>
-                    edits.some(x => x !== e && n >= x.start && n <= x.end),
-                  );
-                  if (!echo.head && !echo.tail) return e;
-                  const kept = fresh.slice(echo.head, fresh.length - echo.tail);
-                  cut.set(e.n, echo);
-                  return { ...e, newText: `${kept.join('\n')}${kept.at(-1) === '' ? '\n' : ''}` };
-                })
-                .filter(e => !(e.end < e.start && rendered(e).length === 0));
-          const again = cut.size ? splice(trimmed) : null;
-          // The same repeat is what a range drawn k lines off shows (line numbers from an older
-          // read: run 76 step 10 sent line 6 for line 7): the text is then meant for the range
-          // moved k lines, which keeps the line the sent range loses at its other end. When that
-          // edit changes lines and passes the checks too, the two readings are two files, and the
-          // edit is refused with its facts. Moved one line down, run 73 step 50's text would follow
-          // the setValue line it rewrites, and 1 '{' would be unmatched: one reading.
-          const moved = async (xs: typeof edits, text: string) => {
-            for (const [n, c] of cut)
-              for (const k of [-c.head, c.tail].filter(Boolean)) {
-                const e = edits.find(x => x.n === n)!;
-                const m = { ...e, start: e.start + k, end: e.end + k };
-                const end = Math.max(m.end, m.start - 1);
-                const others = xs.filter(x => x.n !== n);
-                if (
-                  m.start < 1 ||
-                  end > lines.length ||
-                  (m.end >= m.start && same(lines.slice(m.start - 1, m.end), rendered(m))) ||
-                  others.some(x => x.start <= end && m.start <= Math.max(x.end, x.start - 1))
-                )
-                  continue;
-                const alt = splice([...others, m].sort(bottomUp)).text;
-                if (alt !== text && alt !== original && (await passes(alt))) return true;
-              }
-            return false;
-          };
-          if (again && again.text !== original && (await passes(again.text)) && !(await moved(trimmed, again.text))) {
-            const worse = worseBrackets(original, updated).map(w => w.said);
-            repaired = ` ${editFacts(lines, described([...edits].sort((x, y) => x.n - y.n)), [])
-              .map((f, i) => `${i ? f[0]!.toLowerCase() : f[0]}${f.slice(1, -1)}`)
-              .join(
-                '; ',
-              )}; ${[...cut.values()].reduce((k, c) => k + c.head + c.tail, 0) > 1 ? 'those lines were not written, since with them' : 'that line was not written, since with it'} ${a.path} would ${worse.length ? `have ${worse.join(', ')}` : 'no longer parse'}.`;
-            applied = requested.map((r, i) => {
-              const t = trimmed.find(e => e.n === i + 1);
-              return cut.has(i + 1) ? { ...r, newText: t ? t.newText : '' } : r;
-            });
-            edits = trimmed;
-            ({ text: updated, delta } = again);
-          } else {
-            // A refusal states each range's facts. For the brackets: what the replaced lines leave
-            // unmatched against what the new text does, and new text repeating the lines around its
-            // range, fitted to the error entry with the mapping this message may end with. For the
-            // parser: the lines the ranges held that the new text drops, the cause of an unclosed
-            // tag, not only where the parser noticed it; then new text repeating the lines around its
-            // range (run 72 step 20's edit 3 ended with line 33), last, where an entry already over its
-            // 600 characters keeps it; one that fits is not pushed over (run 57 step 52's, 562, whose
-            // dropped "5: <Layout>" is the opener of the "</Layout>" the parser names).
-            const told = described([...edits].sort((x, y) => x.n - y.n));
-            const reserved = mapped ? mapped.length + 90 : 0;
-            const room = 600 - 'Tool error: '.length - reserved;
-            const gone = droppedLines(
-              lines,
-              edits.filter(x => !x.prepend),
-              rendered,
-            );
-            // The lines dropped follow the bracket facts while they fit: run 76 step 10's cause was the
-            // dropped "6: export default defineConfig({", which the balance alone does not quote.
-            try {
-              assertBalancePreserved(original, updated, a.path, told, reserved);
-            } catch (e) {
-              const more = gone.length
-                ? ` The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.`
-                : '';
-              throw new Error(
-                (e as Error).message.length + more.length <= room
-                  ? `${(e as Error).message}${more}`
-                  : (e as Error).message,
-              );
-            }
-            try {
-              await assertParses(a.path, original, updated, this.parse);
-            } catch (e) {
-              const echoes = editFacts(lines, told, [])
-                .map(f => ` ${f}`)
-                .join('');
-              const said = gone.length
-                ? `${(e as Error).message} The replaced range(s) held line(s) the new text does not contain: ${gone.join('; ')}.`
-                : (e as Error).message;
-              throw new Error(said.length + echoes.length <= room || said.length > room ? `${said}${echoes}` : said);
-            }
-          }
-        }
-        const retypes: string[] = [];
-        if (!harness)
-          for (const e of edits)
-            if (!e.prepend && e.end >= e.start) {
-              const why = nearRetype(lines.slice(e.start - 1, e.end), rendered(e), e.start);
-              if (why) retypes.push(why);
-            }
-        // Retyping a range in place is a rewrite, not a paste: judge the inserted
-        // lines against the file without the ranges they replace.
-        const outside = lines
-          .filter((_, i) => !edits.some(e => e.end >= e.start && i + 1 >= e.start && i + 1 <= e.end))
-          .join('\n');
-        // The refusal states what the edit replaces and what stays, so a whole new
-        // file sent as a small range shows itself as that.
-        if (!harness)
-          try {
-            assertNoBulkDuplication(
-              outside,
-              edits.filter(e => !e.prepend).flatMap(e => rendered(e)),
-              a.path,
-            );
-          } catch (e) {
-            const removed = edits.reduce((n, x) => n + Math.max(0, x.end - x.start + 1), 0);
-            const added = edits
-              .filter(x => !x.prepend && x.newText)
-              .reduce((n, x) => n + x.newText.replace(/\n$/, '').split('\n').length, 0);
-            const total = lines.length - (trailing ? 1 : 0);
-            throw new Error(
-              `${(e as Error).message} This edit replaces ${removed} line(s) (${edits
-                .map(x => `${x.start}..${x.end}`)
-                .reverse()
-                .join(
-                  ', ',
-                )}) with ${added}; the other ${total - removed} line(s) of ${a.path} stay as they are. rewrite_file replaces a whole file.`,
-            );
-          }
-        const temp = `${path}.leana-${randomUUID()}.tmp`;
-        try {
-          const h = await open(temp, 'wx', (await stat(path)).mode & 0o777);
-          try {
-            await h.writeFile(updated);
-          } finally {
-            await h.close();
-          }
-          if (hash(await boundedRead(path)) !== base)
-            throw new StaleWriteError('File changed while preparing edit; read it again');
-          await rename(temp, path);
-        } finally {
-          await unlink(temp).catch(() => {});
-        }
-        const summary = edits
-          .map(e => `${e.start}..${e.end}`)
-          .reverse()
-          .join(', ');
-        const newLines = updated.split('\n');
-        const lo = Math.max(1, Math.min(...edits.map(e => e.start)) - 3);
-        const hi = Math.min(newLines.length, Math.max(...edits.map(e => e.end)) + delta + 3);
-        const region =
-          hi >= lo && hi - lo < 120
-            ? `\nThe file now reads, lines ${lo}..${hi}:\n${newLines
-                .slice(lo - 1, hi)
-                .map((l, i) => `${lo + i}: ${l}`)
-                .join('\n')}`
-            : '';
-        // Lines not written come first: the entry keeps this result's first 389 characters (run 49 step 34's
-        // note, after the skipped and dropped ones, was cut at "since wi").
-        const note = [
-          repaired,
-          skipped.length
-            ? ` Skipped ${skipped.length} unchanged range(s): ${skipped
-                .map(e => `${e.start}..${e.end}`)
-                .reverse()
-                .join(', ')}.`
-            : '',
-          droppedImports.length ? ` Dropped ${droppedImports.length} import line(s) the file already had.` : '',
-          retypes.length ? ` Note: ${retypes.join('; ')}.` : '',
-        ].join('');
-        this.record(
-          a.path,
-          'replace_lines',
-          base,
-          hash(updated),
-          edits.map(e => ({ start: e.start, end: Math.max(e.end, e.start - 1), count: rendered(e).length })),
-        );
-        return {
-          ok: true,
-          changed: [a.path],
-          hashes: { [a.path]: hash(updated) },
-          snapshots,
-          ...(mapped || applied ? { applied: { ...a, edits: applied ?? requested } } : {}),
-          text: `Replaced ${edits.length} range(s) ${summary} of ${a.path}; sha256=${hash(updated)} totalLines=${updated.split('\n').length}.${mapped}${note} Line numbers below the first edit shifted by ${delta} in total.${region} Run focused validation.`,
-        };
-      } catch (e) {
-        if (mapped && e instanceof Error && !(e instanceof StaleWriteError))
-          e.message = `${e.message}${mapped} Line numbers in this message are those of the current text, sha256=${base}.`;
-        throw e;
-      }
+  }
+  private async moveLines(a: Record<string, any>): Promise<ToolResult> {
+    // A plain cut and paste: the lines leave source and are appended to
+    // destination as they were. Nothing else in either file is changed.
+    if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
+    if (a.source === a.destination) throw new Error('source and destination must differ');
+    if (a.end < a.start || a.end - a.start >= 2000) throw new Error('move_lines ranges must contain 1..2000 lines');
+    if (/[\\/]$/.test(a.destination)) throw new Error('destination must be a regular file path');
+    const sourcePath = await safePath(this.root, a.source);
+    const destinationPath = await safePath(this.root, a.destination, true);
+    const original = await boundedRead(sourcePath);
+    if (hash(original) !== a.expectedHash)
+      throw new StaleWriteError(this.staleFacts(a.source, a.expectedHash, hash(original), original.split('\n').length));
+    const lines = original.split('\n');
+    if (a.end > lines.length) throw new Error(`Range ${a.start}..${a.end} exceeds ${a.source} (${lines.length} lines)`);
+    const snapshots: Record<string, string> = { [a.source]: await this.snapshot(a.source, original) };
+    let existing: string | null = null;
+    try {
+      existing = await boundedRead(destinationPath);
+    } catch (e: any) {
+      if (e.code !== 'ENOENT') throw e;
     }
-    if (route === 'move_lines') {
-      // A plain cut and paste: the lines leave source and are appended to
-      // destination as they were. Nothing else in either file is changed.
-      if (!this.config.allowWrite) throw new Error('Writes disabled; restart with --allow-write');
-      if (a.source === a.destination) throw new Error('source and destination must differ');
-      if (a.end < a.start || a.end - a.start >= 2000) throw new Error('move_lines ranges must contain 1..2000 lines');
-      if (/[\\/]$/.test(a.destination)) throw new Error('destination must be a regular file path');
-      const sourcePath = await safePath(this.root, a.source);
-      const destinationPath = await safePath(this.root, a.destination, true);
-      const original = await boundedRead(sourcePath);
-      if (hash(original) !== a.expectedHash)
-        throw new StaleWriteError(
-          this.staleFacts(a.source, a.expectedHash, hash(original), original.split('\n').length),
-        );
-      const lines = original.split('\n');
-      if (a.end > lines.length)
-        throw new Error(`Range ${a.start}..${a.end} exceeds ${a.source} (${lines.length} lines)`);
-      const snapshots: Record<string, string> = { [a.source]: await this.snapshot(a.source, original) };
-      let existing: string | null = null;
+    if (existing === null && a.destinationHash !== 'new')
+      throw new StaleWriteError(`${a.destination} does not exist; use destinationHash=new to create it`);
+    if (existing !== null && a.destinationHash === 'new')
+      throw new StaleWriteError(`${a.destination} exists: read it and use its sha256 as destinationHash`);
+    // Appending does not depend on the destination's content: a stale destination
+    // hash is noted, not refused, as long as the source (whose lines are cut) is current.
+    const destinationStale = existing !== null && hash(existing) !== a.destinationHash;
+    snapshots[a.destination] = existing !== null ? await this.snapshot(a.destination, existing) : '@new';
+    const moved = lines.slice(a.start - 1, a.end).join('\n');
+    const remaining = [...lines.slice(0, a.start - 1), ...lines.slice(a.end)].join('\n');
+    const output = existing === null || existing === '' ? `${moved}\n` : `${existing.replace(/\n?$/, '\n')}${moved}\n`;
+    await parentDirectory(destinationPath);
+    const temp = `${sourcePath}.leana-${randomUUID()}.tmp`;
+    try {
+      const h = await open(temp, 'wx', (await stat(sourcePath)).mode & 0o777);
       try {
-        existing = await boundedRead(destinationPath);
-      } catch (e: any) {
-        if (e.code !== 'ENOENT') throw e;
-      }
-      if (existing === null && a.destinationHash !== 'new')
-        throw new StaleWriteError(`${a.destination} does not exist; use destinationHash=new to create it`);
-      if (existing !== null && a.destinationHash === 'new')
-        throw new StaleWriteError(`${a.destination} exists: read it and use its sha256 as destinationHash`);
-      // Appending does not depend on the destination's content: a stale destination
-      // hash is noted, not refused, as long as the source (whose lines are cut) is current.
-      const destinationStale = existing !== null && hash(existing) !== a.destinationHash;
-      snapshots[a.destination] = existing !== null ? await this.snapshot(a.destination, existing) : '@new';
-      const moved = lines.slice(a.start - 1, a.end).join('\n');
-      const remaining = [...lines.slice(0, a.start - 1), ...lines.slice(a.end)].join('\n');
-      const output =
-        existing === null || existing === '' ? `${moved}\n` : `${existing.replace(/\n?$/, '\n')}${moved}\n`;
-      await parentDirectory(destinationPath);
-      const temp = `${sourcePath}.leana-${randomUUID()}.tmp`;
-      try {
-        const h = await open(temp, 'wx', (await stat(sourcePath)).mode & 0o777);
-        try {
-          await h.writeFile(remaining);
-        } finally {
-          await h.close();
-        }
-        const d = await open(destinationPath, existing === null ? 'wx' : 'w', 0o644);
-        try {
-          await d.writeFile(output);
-        } finally {
-          await d.close();
-        }
-        if (hash(await boundedRead(sourcePath)) !== a.expectedHash)
-          throw new StaleWriteError('File changed while preparing edit; read it again');
-        await rename(temp, sourcePath);
+        await h.writeFile(remaining);
       } finally {
-        await unlink(temp).catch(() => {});
+        await h.close();
       }
-      this.record(a.source, 'move_lines', a.expectedHash, hash(remaining), [{ start: a.start, end: a.end, count: 0 }]);
-      if (existing !== null)
-        this.record(
-          a.destination,
-          'move_lines',
-          hash(existing),
-          hash(output),
-          existing === ''
-            ? null
-            : [
-                existing.endsWith('\n')
-                  ? {
-                      start: existing.split('\n').length,
-                      end: existing.split('\n').length - 1,
-                      count: a.end - a.start + 1,
-                    }
-                  : {
-                      start: existing.split('\n').length + 1,
-                      end: existing.split('\n').length,
-                      count: a.end - a.start + 2,
-                    },
-              ],
-        );
-      return {
-        ok: true,
-        changed: [a.source, a.destination],
-        hashes: { [a.source]: hash(remaining), [a.destination]: hash(output) },
-        snapshots,
-        text:
-          `Moved lines ${a.start}..${a.end} (${a.end - a.start + 1} lines) from ${a.source} to the end of ${a.destination}, unchanged; nothing else in either file was changed. ` +
-          `${a.source} sha256=${hash(remaining)} totalLines=${remaining.split('\n').length}; ${a.destination} sha256=${hash(output)} totalLines=${output.split('\n').length}.` +
-          (destinationStale ? ` (destinationHash was stale; the current ${a.destination} was appended to.)` : ''),
-      };
+      const d = await open(destinationPath, existing === null ? 'wx' : 'w', 0o644);
+      try {
+        await d.writeFile(output);
+      } finally {
+        await d.close();
+      }
+      if (hash(await boundedRead(sourcePath)) !== a.expectedHash)
+        throw new StaleWriteError('File changed while preparing edit; read it again');
+      await rename(temp, sourcePath);
+    } finally {
+      await unlink(temp).catch(() => {});
     }
-    if (route === 'bash') {
-      if (!this.config.allowBash) throw new Error('Shell disabled; restart with --allow-bash');
-      // Preserve failures hidden by commands such as `pnpm test 2>&1 | tail`.
-      // Without pipefail, the tail process masks the test runner's exit code.
-      const prefix = this.commandPrefix ? await this.commandPrefix().catch(() => '') : '';
-      // A command that announces a local address and then goes quiet while still running is a
-      // server: a shell step cannot keep it alive, so it is stopped and said to be one. Never a check.
-      const settle =
-        a.check === true
-          ? undefined
-          : (output: string, quietMs: number) => {
-              const at = localAddresses(output);
-              return at.length && quietMs >= 5000
-                ? `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.`
-                : null;
-            };
-      const ran = await runCommand(
-        commandShell[0]!,
-        [...commandShell.slice(1), `${prefix}${a.command}`],
-        this.root,
-        this.config.commandTimeoutMs,
-        undefined,
-        settle,
+    this.record(a.source, 'move_lines', a.expectedHash, hash(remaining), [{ start: a.start, end: a.end, count: 0 }]);
+    if (existing !== null)
+      this.record(
+        a.destination,
+        'move_lines',
+        hash(existing),
+        hash(output),
+        existing === ''
+          ? null
+          : [
+              existing.endsWith('\n')
+                ? {
+                    start: existing.split('\n').length,
+                    end: existing.split('\n').length - 1,
+                    count: a.end - a.start + 1,
+                  }
+                : {
+                    start: existing.split('\n').length + 1,
+                    end: existing.split('\n').length,
+                    count: a.end - a.start + 2,
+                  },
+            ],
       );
-      const { leftRunning, ...r } = { ...ran, output: plainText(ran.output) };
-      // What the command started and left running when it ended was stopped with it: said, with what it was.
-      const stoppedAtEnd = leftRunning?.length
-        ? `When this command ended, ${leftRunning.length === 1 ? 'a process it started was' : `${leftRunning.length} processes it started were`} still running, and ${leftRunning.length === 1 ? 'it was' : 'they were'} stopped: ${describeProcesses(leftRunning)}. A shell step cannot keep a process alive: whatever it starts is stopped when it ends. The start command of an observe runs for the length of that observation.`
-        : undefined;
-      // With a configured check command, only that command is verification; the
-      // command words of the profiles are a fallback for sessions that did not declare one.
-      // A command is verification when the worker says so, or when it is the configured check; never by its words.
-      const looksLikeCheck =
-        a.check === true || Boolean(this.config.checkCommand && a.command.trim() === this.config.checkCommand.trim());
-      return {
-        ok: r.code === 0 && !r.truncated && !r.timedOut,
-        check: looksLikeCheck && r.code === 0 && !r.truncated && !r.timedOut,
-        verification: looksLikeCheck,
-        text: JSON.stringify({
-          command: a.command,
-          purpose: a.purpose,
-          ...(r.stoppedEarly ? { stoppedEarly: r.stoppedEarly } : {}),
-          ...(stoppedAtEnd ? { stoppedAtEnd } : {}),
-          ...r,
-        }),
-      };
-    }
-    throw new Error(`Not an executable filesystem tool: ${route}`);
+    return {
+      ok: true,
+      changed: [a.source, a.destination],
+      hashes: { [a.source]: hash(remaining), [a.destination]: hash(output) },
+      snapshots,
+      text:
+        `Moved lines ${a.start}..${a.end} (${a.end - a.start + 1} lines) from ${a.source} to the end of ${a.destination}, unchanged; nothing else in either file was changed. ` +
+        `${a.source} sha256=${hash(remaining)} totalLines=${remaining.split('\n').length}; ${a.destination} sha256=${hash(output)} totalLines=${output.split('\n').length}.` +
+        (destinationStale ? ` (destinationHash was stale; the current ${a.destination} was appended to.)` : ''),
+    };
   }
-}
-
-// A package script that only runs tsc against a solution tsconfig (references
-// and no include) checks nothing: the verification of record must be a config
-// that includes the sources.
-export async function solutionTsconfigReferences(root: string): Promise<string[] | null> {
-  let cfg: any;
-  try {
-    cfg = JSON.parse(
-      (await boundedRead(await safePath(root, 'tsconfig.json'))).replace(/\/\*[\s\S]*?\*\/|(^|\s)\/\/[^\n]*/g, ''),
+  private async bash(a: Record<string, any>): Promise<ToolResult> {
+    if (!this.config.allowBash) throw new Error('Shell disabled; restart with --allow-bash');
+    // Preserve failures hidden by commands such as `pnpm test 2>&1 | tail`.
+    // Without pipefail, the tail process masks the test runner's exit code.
+    const prefix = this.commandPrefix ? await this.commandPrefix().catch(() => '') : '';
+    // A command that announces a local address and then goes quiet while still running is a
+    // server: a shell step cannot keep it alive, so it is stopped and said to be one. Never a check.
+    const settle =
+      a.check === true
+        ? undefined
+        : (output: string, quietMs: number) => {
+            const at = localAddresses(output);
+            return at.length && quietMs >= 5000
+              ? `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.`
+              : null;
+          };
+    const ran = await runCommand(
+      commandShell[0]!,
+      [...commandShell.slice(1), `${prefix}${a.command}`],
+      this.root,
+      this.config.commandTimeoutMs,
+      undefined,
+      settle,
     );
-  } catch {
-    return null;
+    const { leftRunning, ...r } = { ...ran, output: plainText(ran.output) };
+    // What the command started and left running when it ended was stopped with it: said, with what it was.
+    const stoppedAtEnd = leftRunning?.length
+      ? `When this command ended, ${leftRunning.length === 1 ? 'a process it started was' : `${leftRunning.length} processes it started were`} still running, and ${leftRunning.length === 1 ? 'it was' : 'they were'} stopped: ${describeProcesses(leftRunning)}. A shell step cannot keep a process alive: whatever it starts is stopped when it ends. The start command of an observe runs for the length of that observation.`
+      : undefined;
+    // With a configured check command, only that command is verification; the
+    // command words of the profiles are a fallback for sessions that did not declare one.
+    // A command is verification when the worker says so, or when it is the configured check; never by its words.
+    const looksLikeCheck =
+      a.check === true || Boolean(this.config.checkCommand && a.command.trim() === this.config.checkCommand.trim());
+    return {
+      ok: r.code === 0 && !r.truncated && !r.timedOut,
+      check: looksLikeCheck && r.code === 0 && !r.truncated && !r.timedOut,
+      verification: looksLikeCheck,
+      text: JSON.stringify({
+        command: a.command,
+        purpose: a.purpose,
+        ...(r.stoppedEarly ? { stoppedEarly: r.stoppedEarly } : {}),
+        ...(stoppedAtEnd ? { stoppedAtEnd } : {}),
+        ...r,
+      }),
+    };
   }
-  const refs = Array.isArray(cfg?.references)
-    ? cfg.references.map((r: any) => String(r?.path ?? '')).filter(Boolean)
-    : [];
-  const includes =
-    (Array.isArray(cfg?.include) && cfg.include.length) || (Array.isArray(cfg?.files) && cfg.files.length);
-  return refs.length && !includes ? refs : null;
 }

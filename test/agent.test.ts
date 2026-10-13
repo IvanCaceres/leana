@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { defaults } from '../src/config.js';
 import { Agent, newSession } from '../src/agent.js';
 import { evidenceTokens } from '../src/context.js';
-import { hash } from '../src/tools.js';
+import { hash } from '../src/files.js';
 import { Store } from '../src/store.js';
 import { orient } from '../src/orient.js';
 import { findBrowser, renderFacts } from '../src/render.js';
@@ -56,9 +56,7 @@ function bonsaiOf(script: Scripted) {
   };
 }
 type JevScript = {
-  watch?: (
-    n: number,
-  ) => Partial<{
+  watch?: (n: number) => Partial<{
     progress: number;
     stuck: number;
     same_failure: number;
@@ -187,6 +185,13 @@ async function repo(t: any) {
   await store.init();
   return { root, store };
 }
+// The source of every module whose text a tool result prints: what tool results can say is read from them.
+const toolResultSources = async () =>
+  (
+    await Promise.all(
+      ['tools.ts', 'edit-checks.ts'].map(f => readFile(new URL(`../../src/${f}`, import.meta.url), 'utf8')),
+    )
+  ).join('\n');
 const events = async (store: Store) =>
   (await readFile(join(store.path, 'events.jsonl'), 'utf8'))
     .split('\n')
@@ -828,7 +833,7 @@ test('A manifest the worker changes is installed again by code before the next s
     ],
   });
   const s = await newSession(root, 'x');
-  const { hash: h1 } = await import('../src/tools.js');
+  const { hash: h1 } = await import('../src/files.js');
   const agent = new Agent(
     { ...config, maxSteps: 3 },
     store,
@@ -893,7 +898,7 @@ test('A file created before the modules it mentions exist is still generated: a 
 });
 test('Commands run without a terminal and say so: CI is set and the orientation tells the worker', async t => {
   const { root } = await repo(t);
-  const { runCommand } = await import('../src/tools.js');
+  const { runCommand } = await import('../src/commands.js');
   const r = await runCommand(
     'bash',
     ['-c', 'echo "ci=$CI yes=$npm_config_yes"; [ -t 0 ] && echo tty || echo notty'],
@@ -941,7 +946,7 @@ test('A command is the check only when the worker says so; a failing check carri
     root,
     'Bootstrap a react application:\n- a landing page\n- components, using best practices',
   );
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const result = await new Agent(
     { ...config, maxSteps: 9 },
     store,
@@ -987,7 +992,7 @@ test('An edit answers with the region as it now reads, so the next edit needs no
       },
     ],
   });
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const prompts: any[] = [];
   const filled = filling(bonsai, async p => hash(await readFile(join(root, p), 'utf8')));
   const result = await new Agent(
@@ -1612,7 +1617,7 @@ test('A repeated read stops nothing: it states which entries show the requested 
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'a.ts'), numbered(3));
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const sha = hash(await readFile(join(root, 'src', 'a.ts'), 'utf8'));
   const read = { files: [{ path: 'src/a.ts', start: 1, end: 3 }] };
   // The first read learns the file's hash, so the second is keyed with it; the third repeats the second exactly.
@@ -3956,7 +3961,7 @@ test('Every field the prompts name is one the model receives: descriptions, inst
     ...JSON.parse(file.at(-1)!.content).rules,
   ].join('\n');
   // Names a tool result prints (path sha256=… totalLines=…) are fields too; they must be printed by the tools.
-  const tools = await readFile(new URL('../../src/tools.ts', import.meta.url), 'utf8');
+  const tools = await toolResultSources();
   const printed = (name: string) => new RegExp(`\\b${name}=`).test(tools);
   for (const name of new Set(prose.match(/\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b/g) ?? []))
     assert(known.has(name) || printed(name), `the prompts name ${name}, which the model never receives`);
@@ -4018,9 +4023,7 @@ test('The prompts claim only what the harness does: an edit is not followed by a
     /re-?runs? the (check|verification)|check runs (next|automatically)|runs (the (check|verification)( command)?|it) (itself|automatically|after every edit)|harness (repairs|removes|imports|moves|rewrites|re-exports)|applies (itself|the fix)/i;
   const worded = [
     ...Object.values(pinned).flatMap((a: any) => [a.description, a.instructions]),
-    ...(await readFile(new URL('../../src/tools.ts', import.meta.url), 'utf8'))
-      .split('\n')
-      .filter(l => !/^\s*\/\//.test(l)),
+    ...(await toolResultSources()).split('\n').filter(l => !/^\s*\/\//.test(l)),
   ];
   for (const text of worded)
     assert(
@@ -4913,7 +4916,7 @@ test('A batch that edits one file twice from one read lands both edits in one ge
       },
     ],
   });
-  const { hash: h } = await import('../src/tools.js');
+  const { hash: h } = await import('../src/files.js');
   const agent = new Agent(
     { ...config, maxSteps: 3 },
     store,
@@ -4987,7 +4990,7 @@ test('Run 73 steps 48-50 and 58: an edit written without the line it repeated le
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'useLocalStorage.ts'), storage73);
   await writeFile(join(root, 'src', 'effect.tsx'), effect73);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const unclosed = {
     action: 'replace_lines',
     args: {
@@ -5073,7 +5076,7 @@ test('Run 56 steps 45-50: both edits of one file in one batch land; the same bat
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'Footer.tsx'), footer56);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const edit = (edits: object[]) => ({
     action: 'replace_lines',
     args: { path: 'src/Footer.tsx', expectedHash: 'FILL', edits },
@@ -5126,7 +5129,7 @@ test('A failed edit runs again with a new hash; with the same arguments on the u
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'Footer.tsx'), footer56);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const edit = (expectedHash: string) => ({
     thought: 'fix the links',
     action: 'replace_lines',
@@ -5169,7 +5172,7 @@ test('An edit that landed, sent again with the hash its own result reported, is 
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'D.ts'), 'dup();\ndup();\nkeep();\n');
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const del1 = {
     action: 'replace_lines',
     args: { path: 'src/D.ts', expectedHash: 'FILL', edits: [{ start: 1, end: 1, newText: '', prepend: '' }] },
@@ -5198,7 +5201,7 @@ test('The applied edit sent again with its pre-edit hash after a command changed
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'CTA.tsx'), footer56);
   await writeFile(join(root, 'orig.txt'), footer56);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const h0 = hash(footer56);
   const cta = {
     action: 'replace_lines',
@@ -5254,7 +5257,7 @@ test('The same failing edit asked for again and again still ends at four actions
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'T.ts'), lines14);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const same = {
     action: 'replace_lines',
     args: {
@@ -5292,7 +5295,7 @@ test('A batch that deletes a line and then edits a line below it with the same h
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'T.ts'), lines14);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const rl = (edits: object[]) => ({
     action: 'replace_lines',
     args: { path: 'src/T.ts', expectedHash: 'FILL', edits },
@@ -5335,7 +5338,7 @@ test('A block on a repeated identical failure holds the exact arguments: the sam
   const { root, store } = await repo(t);
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'Footer.tsx'), footer56);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const edit = (expectedHash: string) => ({
     thought: 'fix the links',
     action: 'replace_lines',
@@ -5368,7 +5371,7 @@ test('A check printed with colour reaches the worker as plain text: every file a
   const { root, store } = await repo(t);
   const files = ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts', 'src/f.ts', 'src/g.ts'];
   await mkdir(join(root, 'src'), { recursive: true });
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   const texts: string[] = [];
   for (const [i, f] of files.entries()) {
     const text = Array.from({ length: 40 }, (_, k) => `export const v${i}_${k + 1} = ${k + 1};`).join('\n') + '\n';
@@ -5420,7 +5423,7 @@ const rl = (path: string, expectedHash: string, edits: object[]) => ({
 });
 test('R1: an applied edit undone by a later edit, sent again on the file restored to what it found, runs again', async t => {
   const { root, store } = await repo(t);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   await mkdir(join(root, 'src'), { recursive: true });
   const h0text = 'const a = 1;\nconst b = 2;\nconst c = 3;\n';
   await writeFile(join(root, 'src', 'f.ts'), h0text);
@@ -5449,7 +5452,7 @@ test('R1: an applied edit undone by a later edit, sent again on the file restore
 });
 test('R2/R9: an applied edit sent again verbatim after later harness edits, or after a resume, is refused as a second application with the edits that followed', async t => {
   const { root, store } = await repo(t);
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   await mkdir(join(root, 'src'), { recursive: true });
   const text = 'a\nb\nc\n';
   await writeFile(join(root, 'src', 'f.ts'), text);
@@ -5495,7 +5498,7 @@ test('R2/R9: an applied edit sent again verbatim after later harness edits, or a
 test('R3/R4: a repeated applied edit followed by a plan, and one edit alternating between two stale hashes, both stop at four in a row', async t => {
   for (const shape of ['plan', 'alternating'] as const) {
     const { root, store } = await repo(t);
-    const { hash } = await import('../src/tools.js');
+    const { hash } = await import('../src/files.js');
     await mkdir(join(root, 'src'), { recursive: true });
     const text = 'a\nb\nc\n';
     await writeFile(join(root, 'src', 'f.ts'), text);
@@ -5600,7 +5603,7 @@ test('R8: a checkpoint from before exact keys keeps its blocked edit blocked aft
 });
 test('The source at the errors carries the hash an edit needs (a BOM file), and a file that does not fit is named, never cut mid-file', async t => {
   const { root, store } = await repo(t);
-  const { hash, boundedRead } = await import('../src/tools.js');
+  const { hash, boundedRead } = await import('../src/files.js');
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'bom.ts'), '﻿export const a: number = 1;\nexport const b: number = "x";\n');
   const many = Array.from({ length: 10 }, (_, f) => `src/m${f}.ts`);
@@ -5777,7 +5780,7 @@ test('After a clip marker in a multi-file read nothing is credited to the file b
   );
 });
 test('Re-reading files whose earlier reads were evicted is progress: the run goes on to its next edit (review B-1), and a read of a file that fits is paged through while each page restores lines', async t => {
-  const { hash } = await import('../src/tools.js');
+  const { hash } = await import('../src/files.js');
   {
     // Six files edited then read; small budget evicts the reads; the worker re-reads four of them one per turn, then edits.
     const { root, store } = await repo(t);

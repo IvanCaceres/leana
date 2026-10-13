@@ -4,7 +4,9 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaults } from '../src/config.js';
-import { ToolBox, hash, mapRange } from '../src/tools.js';
+import { ToolBox } from '../src/tools.js';
+import { hash } from '../src/files.js';
+import { mapRange } from '../src/edit-checks.js';
 
 // A repository with one file and a ToolBox recording a batch (journal = []), as the loop sets it.
 async function batch(t: any, text: string, path = 'src/Footer.tsx') {

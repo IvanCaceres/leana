@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { spawn } from 'node:child_process';
 import { readKey } from './cli.js';
-import { runCommand } from './tools.js';
+import { runCommand } from './commands.js';
 
 const source = `export function calculateSubtotal(items) {
   return items.reduce((total, item) => total + item.priceCents, 0);

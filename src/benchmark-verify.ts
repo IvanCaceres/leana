@@ -4,7 +4,8 @@ import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { channelNames, fixtureFiles, fixtureHash, benchmarkVersion, benchmarkPrompt } from './benchmark-fixture.js';
 import { snapshotFiles, fileDiff } from './live-test.js';
-import { hash, runCommand } from './tools.js';
+import { hash } from './files.js';
+import { runCommand } from './commands.js';
 
 function comparisonTests(repo: string, reference: string): string {
   return `import test from 'node:test';

@@ -85,6 +85,8 @@ interface RunBudget {
   turns: number;
   failures: number;
 }
+// What running one action came to.
+type Outcome = 'ok' | 'failed' | 'refused' | 'stop';
 type WatchReading = NonNullable<Session['watch']>['readings'][number];
 // A turn's thought as it is compared for repeats: its whitespace collapsed.
 const saidIn = (e: { text: string }) =>
@@ -2249,228 +2251,261 @@ export class Agent {
     this.observe({ kind: 'result', step: s.step, route, ok: true, ms: 0, chars: text.length, text: clip(text, 200) });
     return 'repeated';
   }
-  private async act(
+  private async act(s: Session, route: Route, args: Record<string, any>, thought: string): Promise<Outcome> {
+    switch (route) {
+      case 'plan':
+        return this.actPlan(s, args);
+      case 'observe':
+        return this.actObserve(s, route, args);
+      case 'ask_user':
+        return this.actAskUser(s, args);
+      case 'finish':
+        return this.actFinish(s, args);
+      case 'create_file':
+      case 'rewrite_file':
+        return this.actWriteFile(s, route, args, thought);
+      case 'bash':
+        return this.actBash(s, args);
+      default:
+        return this.actTool(s, route, args);
+    }
+  }
+  // An action that is not run: the reason is the evidence, and a duplicate of an earlier refusal is marked so.
+  private async refuseAction(
     s: Session,
     route: Route,
     args: Record<string, any>,
-    thought: string,
-  ): Promise<'ok' | 'failed' | 'refused' | 'stop'> {
-    const refuse = async (why: string, duplicate = false) => {
-      this.duplicate = duplicate;
-      this.observe({ kind: 'generation_error', step: s.step, message: why });
-      await this.store.log('refused', { step: s.step, route, args, why });
-      await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` });
-      return 'refused' as const;
+    why: string,
+    duplicate = false,
+  ): Promise<'refused'> {
+    this.duplicate = duplicate;
+    this.observe({ kind: 'generation_error', step: s.step, message: why });
+    await this.store.log('refused', { step: s.step, route, args, why });
+    await this.evidence(s, 'generation_error', { ok: false, text: `No action executed: ${why}` });
+    return 'refused' as const;
+  }
+  private async actPlan(s: Session, args: Record<string, any>): Promise<Outcome> {
+    s.notes = clip(String(args.notes ?? ''), 4000);
+    await this.store.log('plan', { step: s.step, notes: s.notes });
+    await this.evidence(s, 'plan', { ok: true, text: `Notes updated (${s.notes.split('\n').length} lines).` });
+    return 'ok';
+  }
+  private async actObserve(s: Session, route: Route, args: Record<string, any>): Promise<Outcome> {
+    if (!this.config.allowBash)
+      return this.refuseAction(s, route, args, 'observe needs --allow-bash (it starts and runs what it observes).');
+    const kind = String(args.kind ?? '');
+    const start = String(args.start ?? '');
+    const target = String(args.target ?? '');
+    const artifactPath = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-observe.png`);
+    const prefix = await shellPrefixFor(this.tools.root).catch(() => '');
+    const inputs = Array.isArray(args.inputs)
+      ? (args.inputs as any[])
+          .filter(i => i && typeof i === 'object')
+          .map(i => ({ do: String(i.do) as any, what: String(i.what ?? ''), ms: Number(i.ms) || 0 }))
+      : [];
+    const r = await observeResult(kind, start, target, {
+      root: this.tools.root,
+      artifactPath,
+      timeoutMs: this.config.commandTimeoutMs,
+      prefix,
+      files: s.knownFiles,
+      inputs,
+    });
+    await this.store.log('observe', {
+      step: s.step,
+      kind,
+      start,
+      target,
+      ...(inputs.length ? { inputs } : {}),
+      ok: r.ok,
+      text: clip(r.text, 4000),
+    });
+    s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 2600) };
+    await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
+    this.observe({
+      kind: 'result',
+      step: s.step,
+      route,
+      ok: r.ok,
+      ms: 0,
+      chars: r.text.length,
+      text: clip(r.text, 200),
+    });
+    return r.ok ? 'ok' : 'failed';
+  }
+  private async actAskUser(s: Session, args: Record<string, any>): Promise<Outcome> {
+    s.status = 'paused';
+    s.stopReason = String(args.question ?? 'The worker needs a decision from the user.');
+    await this.store.log('ask', { step: s.step, question: s.stopReason });
+    return 'stop';
+  }
+
+  // The worker's completion claim: refused before the gate when the check of record does not stand, else judged
+  // by the gate of a change or, with nothing written, checked or observed, the gate of an answer.
+  private async actFinish(s: Session, args: Record<string, any>): Promise<Outcome> {
+    const blocked = this.finishBlocked(s);
+    if (blocked) return this.refuseAction(s, 'finish', args, blocked.why, blocked.again);
+    // Nothing written, checked or observed: the finish is an answer, judged against what the worker
+    // read (see answerGate). A check or an observation is evidence the gate of a change reads.
+    const answer = s.lastWriteStep < 0 && !s.lastCheck && !s.lastObservation;
+    const summary = String(args.summary ?? '');
+    const verdict = answer ? await this.judgeAnswer(s, summary) : await this.judgeChange(s, summary);
+    await this.store.log('completion', { step: s.step, ...verdict });
+    this.observe({
+      kind: 'jev',
+      step: s.step,
+      ms: 0,
+      questions: 4,
+      stateBytes: 0,
+      route: [[verdict.route, 1]],
+      nouls: { matches: verdict.matches, unaddressed: verdict.unaddressed, supported: verdict.supported },
+    });
+    return this.settleFinish(s, summary, verdict, answer);
+  }
+  // Why a finish is refused before the gate runs, or null. A check of record that failed after the last write,
+  // or none at all, is a rejection the gate makes from code whatever Jev reads, so it is stated before the gate
+  // runs, with what decides it: which command the check of record is and how it is replaced. The same finish on
+  // the same state is a duplicate (again), so a streak of them raises the sampling temperature and ends at four
+  // in a row. (Run dk-country-3: the check of record was a throwaway Node mock that failed; told only "the
+  // verification did not pass after the last edit", the worker finished the same way 40 times.)
+  // With nothing written there is nothing for a check to verify: a read-only objective goes to the
+  // gate on what was read. (A review that changed nothing was refused six times, then paused as stuck.)
+  private finishBlocked(s: Session): { why: string; again: boolean } | null {
+    if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1))
+      return { why: `${s.lastCheckCommand} has not run since the last edit; run it, then finish.`, again: false };
+    if (!((!s.lastCheck && s.lastWriteStep >= 0) || s.lastCheck?.ok === false)) return null;
+    const c = s.lastCheck;
+    const quote = (x?: string) => `\`${clip((x ?? '').replace(/\s+/g, ' '), 120)}\``;
+    const passed =
+      s.lastPassedCheck && s.lastPassedCheck.step > s.lastWriteStep && s.lastPassedCheck.step !== c?.step
+        ? ` The last check that exited 0 was step ${s.lastPassedCheck.step}'s ${quote(s.lastPassedCheck.command)}, after that write; a later check replaced it.`
+        : '';
+    const state = `${c?.step ?? -1}:${s.lastWriteStep}`;
+    const again = s.finishRefused === state;
+    s.finishRefused = state;
+    return {
+      why: `finish was not judged: the check of record ${c ? `failed (step ${c.step}, ${quote(c.command ?? s.lastCheckCommand ?? '')}, exit ${c.summary.code ?? 'unknown'})` : 'has never run: no bash command has been run with check: true in this session'}. Finish is judged once the check of record exits 0 after the last write${s.lastWriteStep >= 0 ? ` (step ${s.lastWriteStep})` : ''}; the check of record is the last bash command run with check: true, so each one replaces the one before.${passed}${again ? ` This finish was refused at the same state before (nothing has been written or checked since).` : ''}`,
+      again,
     };
-    if (route === 'plan') {
-      s.notes = clip(String(args.notes ?? ''), 4000);
-      await this.store.log('plan', { step: s.step, notes: s.notes });
-      await this.evidence(s, 'plan', { ok: true, text: `Notes updated (${s.notes.split('\n').length} lines).` });
-      return 'ok';
-    }
-    if (route === 'observe') {
-      if (!this.config.allowBash) return refuse('observe needs --allow-bash (it starts and runs what it observes).');
-      const kind = String(args.kind ?? '');
-      const start = String(args.start ?? '');
-      const target = String(args.target ?? '');
-      const artifactPath = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-observe.png`);
-      const prefix = await shellPrefixFor(this.tools.root).catch(() => '');
-      const inputs = Array.isArray(args.inputs)
-        ? (args.inputs as any[])
-            .filter(i => i && typeof i === 'object')
-            .map(i => ({ do: String(i.do) as any, what: String(i.what ?? ''), ms: Number(i.ms) || 0 }))
-        : [];
-      const r = await observeResult(kind, start, target, {
-        root: this.tools.root,
-        artifactPath,
-        timeoutMs: this.config.commandTimeoutMs,
-        prefix,
-        files: s.knownFiles,
-        inputs,
-      });
-      await this.store.log('observe', {
-        step: s.step,
-        kind,
-        start,
-        target,
-        ...(inputs.length ? { inputs } : {}),
-        ok: r.ok,
-        text: clip(r.text, 4000),
-      });
-      s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 2600) };
-      await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
-      this.observe({
-        kind: 'result',
-        step: s.step,
-        route,
-        ok: r.ok,
-        ms: 0,
-        chars: r.text.length,
-        text: clip(r.text, 200),
-      });
-      return r.ok ? 'ok' : 'failed';
-    }
-    if (route === 'ask_user') {
-      s.status = 'paused';
-      s.stopReason = String(args.question ?? 'The worker needs a decision from the user.');
-      await this.store.log('ask', { step: s.step, question: s.stopReason });
+  }
+  private async judgeAnswer(s: Session, summary: string): Promise<GateVerdict> {
+    const evidence = answerEvidence(s);
+    const coverage = await answerCoverage(s);
+    await this.store.log('completion-facts', {
+      step: s.step,
+      facts: {
+        answer: true,
+        summary: clip(summary, 1500),
+        evidence: Object.keys(evidence),
+        read: coverage.read,
+        unread: coverage.unread.length,
+        files: coverage.files,
+      },
+    });
+    return answerGate(this.jev, s, summary, evidence, coverage);
+  }
+  private async judgeChange(s: Session, summary: string): Promise<GateVerdict> {
+    const facts = await this.completionFacts(s, summary);
+    await this.store.log('completion-facts', {
+      step: s.step,
+      facts: { ...facts, sources: Object.keys(facts.sources as object) },
+    });
+    return evidenceGate(this.jev, s, facts);
+  }
+  // What a verdict does: an accepted finish completes the session; a third answer not accepted, or a claim Jev
+  // routes to the user, pauses it for review; any other rejection goes back to the worker as feedback.
+  private async settleFinish(s: Session, summary: string, verdict: GateVerdict, answer: boolean): Promise<Outcome> {
+    if (verdict.accepted) {
+      s.status = 'complete';
+      ending(s, 'Complete: ', summary, 400);
       return 'stop';
     }
-    if (route === 'finish') {
-      if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1))
-        return refuse(`${s.lastCheckCommand} has not run since the last edit; run it, then finish.`);
-      // A check of record that failed after the last write, or none at all, is a rejection the gate
-      // makes from code whatever Jev reads, so it is stated before the gate runs, with what decides it:
-      // which command the check of record is and how it is replaced. The same finish on the same state
-      // is a duplicate, so a streak of them raises the sampling temperature and ends at four in a row.
-      // (Run dk-country-3: the check of record was a throwaway Node mock that failed; told only "the
-      // verification did not pass after the last edit", the worker finished the same way 40 times.)
-      // With nothing written there is nothing for a check to verify: a read-only objective goes to the
-      // gate on what was read. (A review that changed nothing was refused six times, then paused as stuck.)
-      if ((!s.lastCheck && s.lastWriteStep >= 0) || s.lastCheck?.ok === false) {
-        const c = s.lastCheck;
-        const quote = (x?: string) => `\`${clip((x ?? '').replace(/\s+/g, ' '), 120)}\``;
-        const passed =
-          s.lastPassedCheck && s.lastPassedCheck.step > s.lastWriteStep && s.lastPassedCheck.step !== c?.step
-            ? ` The last check that exited 0 was step ${s.lastPassedCheck.step}'s ${quote(s.lastPassedCheck.command)}, after that write; a later check replaced it.`
-            : '';
-        const state = `${c?.step ?? -1}:${s.lastWriteStep}`;
-        const again = s.finishRefused === state;
-        s.finishRefused = state;
-        return refuse(
-          `finish was not judged: the check of record ${c ? `failed (step ${c.step}, ${quote(c.command ?? s.lastCheckCommand ?? '')}, exit ${c.summary.code ?? 'unknown'})` : 'has never run: no bash command has been run with check: true in this session'}. Finish is judged once the check of record exits 0 after the last write${s.lastWriteStep >= 0 ? ` (step ${s.lastWriteStep})` : ''}; the check of record is the last bash command run with check: true, so each one replaces the one before.${passed}${again ? ` This finish was refused at the same state before (nothing has been written or checked since).` : ''}`,
-          again,
-        );
-      }
-      // Nothing written, checked or observed: the finish is an answer, judged against what the worker
-      // read (see answerGate). A check or an observation is evidence the gate of a change reads.
-      const answer = s.lastWriteStep < 0 && !s.lastCheck && !s.lastObservation;
-      let verdict: GateVerdict;
-      if (answer) {
-        const evidence = answerEvidence(s);
-        const coverage = await answerCoverage(s);
-        await this.store.log('completion-facts', {
-          step: s.step,
-          facts: {
-            answer: true,
-            summary: clip(String(args.summary ?? ''), 1500),
-            evidence: Object.keys(evidence),
-            read: coverage.read,
-            unread: coverage.unread.length,
-            files: coverage.files,
-          },
-        });
-        verdict = await answerGate(this.jev, s, String(args.summary ?? ''), evidence, coverage);
-      } else {
-        const facts = await this.completionFacts(s, String(args.summary ?? ''));
-        await this.store.log('completion-facts', {
-          step: s.step,
-          facts: { ...facts, sources: Object.keys(facts.sources as object) },
-        });
-        verdict = await evidenceGate(this.jev, s, facts);
-      }
-      await this.store.log('completion', { step: s.step, ...verdict });
-      this.observe({
-        kind: 'jev',
-        step: s.step,
-        ms: 0,
-        questions: 4,
-        stateBytes: 0,
-        route: [[verdict.route, 1]],
-        nouls: { matches: verdict.matches, unaddressed: verdict.unaddressed, supported: verdict.supported },
-      });
-      if (verdict.accepted) {
-        s.status = 'complete';
-        ending(s, 'Complete: ', String(args.summary ?? ''), 400);
-        return 'stop';
-      }
-      // An answer has no check or observation left to settle it: after answerReviews rejections it goes to the user,
-      // whose question it is, with Jev's readings, rather than round again. (Run 40c9a982: 45 answers to "form deep
-      // insights" rejected with flat readings, unaddressed near 0.8, while all 61 files had been read.)
-      if (answer && !verdict.accepted && (s.answerRejections = (s.answerRejections ?? 0) + 1) >= answerReviews) {
-        s.status = 'paused';
-        ending(
+    // An answer has no check or observation left to settle it: after answerReviews rejections it goes to the user,
+    // whose question it is, with Jev's readings, rather than round again. (Run 40c9a982: 45 answers to "form deep
+    // insights" rejected with flat readings, unaddressed near 0.8, while all 61 files had been read.)
+    if (answer && (s.answerRejections = (s.answerRejections ?? 0) + 1) >= answerReviews) {
+      s.status = 'paused';
+      ending(
+        s,
+        `Answer proposed; Jev did not accept it in ${answerReviews} readings (last: matches ${verdict.matches.toFixed(2)}, unanswered ${verdict.unaddressed.toFixed(2)}, supported ${verdict.supported.toFixed(2)}), so it goes to you for review; resume with guidance to continue: `,
+        summary,
+        400,
+      );
+      return 'stop';
+    }
+    if (verdict.route === 'human') {
+      s.status = 'paused';
+      ending(s, 'Completion proposed; Jev routes it to the user for review: ', summary, 400);
+      return 'stop';
+    }
+    s.completionFeedback = {
+      step: s.step,
+      text: `The completion proposed at step ${s.step} was not accepted: ${verdict.reason}. ${answer ? 'Address it' : 'Address it, verify,'} and finish again.`,
+      awaitingEvidence: true,
+    };
+    await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text });
+    return 'failed';
+  }
+
+  private async actWriteFile(s: Session, route: Route, args: Record<string, any>, thought: string): Promise<Outcome> {
+    // Under the tools form the content is the model's own, written in its call; it is written as generated content is, with the same facts.
+    const given = s.form === 'tools' && typeof args.content === 'string' ? args.content : undefined;
+    try {
+      if (given === undefined && route === 'create_file' && typeof args.content === 'string' && args.content.trim())
+        await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create');
+      else
+        await this.createFile(
           s,
-          `Answer proposed; Jev did not accept it in ${answerReviews} readings (last: matches ${verdict.matches.toFixed(2)}, unanswered ${verdict.unaddressed.toFixed(2)}, supported ${verdict.supported.toFixed(2)}), so it goes to you for review; resume with guidance to continue: `,
-          String(args.summary ?? ''),
-          400,
+          String(args.path),
+          String(args.purpose ?? ''),
+          thought,
+          route === 'rewrite_file',
+          { start: args.start, end: args.end },
+          Agent.actionKey(s, route, args, true),
+          given,
         );
-        return 'stop';
-      }
-      if (verdict.route === 'human') {
-        s.status = 'paused';
-        ending(s, 'Completion proposed; Jev routes it to the user for review: ', String(args.summary ?? ''), 400);
-        return 'stop';
-      }
-      s.completionFeedback = {
-        step: s.step,
-        text: `The completion proposed at step ${s.step} was not accepted: ${verdict.reason}. ${answer ? 'Address it' : 'Address it, verify,'} and finish again.`,
-        awaitingEvidence: true,
-      };
-      await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text });
-      return 'failed';
+    } catch (e) {
+      return this.refuseAction(s, route, args, (e as Error).message, (e as { duplicate?: boolean }).duplicate === true);
     }
-    if (route === 'create_file' || route === 'rewrite_file') {
-      // Under the tools form the content is the model's own, written in its call; it is written as generated content is, with the same facts.
-      const given = s.form === 'tools' && typeof args.content === 'string' ? args.content : undefined;
-      try {
-        if (given === undefined && route === 'create_file' && typeof args.content === 'string' && args.content.trim())
-          await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create');
-        else
-          await this.createFile(
-            s,
-            String(args.path),
-            String(args.purpose ?? ''),
-            thought,
-            route === 'rewrite_file',
-            { start: args.start, end: args.end },
-            Agent.actionKey(s, route, args, true),
-            given,
-          );
-      } catch (e) {
-        return refuse((e as Error).message, (e as { duplicate?: boolean }).duplicate === true);
-      }
-      return s.lastResultOk ? 'ok' : 'failed';
-    }
-    // A command the worker marks as its verification is the check of record from then on; its result is judged like any check.
-    if (route === 'bash') {
-      const command = String(args.command).trim();
-      const isCheck = args.check === true || command === s.lastCheckCommand;
-      let result = await this.execute(s, 'bash', { ...args, command, ...(isCheck ? { check: true } : {}) }, 'action');
-      if (!result.ok) {
-        const output = (() => {
-          try {
-            return String(JSON.parse(result.text).output ?? result.text);
-          } catch {
-            return result.text;
-          }
-        })();
-        const kind = await triage(this.jev, s, command, output).catch(() => ({
-          kind: 'unknown' as const,
-          probability: 0,
-        }));
-        await this.store.log('triage', { step: s.step, command: clip(command, 200), ...kind });
-        if (kind.kind === 'transient' && kind.probability >= 0.7) {
-          result = await this.execute(
-            s,
-            'bash',
-            { ...args, command, ...(isCheck ? { check: true } : {}) },
-            'auto-retry',
-          );
-          if (!result.ok) s.blockedActions!.push(Agent.actionKey(s, 'bash', args, true));
-        } else if (kind.kind === 'permission' && kind.probability >= 0.7) {
-          s.status = 'paused';
-          s.stopReason = `The command needs the user: ${clip(command, 200)}\n${clip(output, 500)}`;
-          return 'stop';
-        } else {
-          const e = s.entries.at(-1);
-          if (e) e.text += `\nJev reads this failure as: ${kind.kind} (${failureKindText(kind.kind)}).`;
+    return s.lastResultOk ? 'ok' : 'failed';
+  }
+  // A command the worker marks as its verification is the check of record from then on; its result is judged
+  // like any check. A failure is triaged by Jev: a transient one is retried once by code, a permission one goes
+  // to the user, any other is stated to the worker.
+  private async actBash(s: Session, args: Record<string, any>): Promise<Outcome> {
+    const command = String(args.command).trim();
+    const isCheck = args.check === true || command === s.lastCheckCommand;
+    let result = await this.execute(s, 'bash', { ...args, command, ...(isCheck ? { check: true } : {}) }, 'action');
+    if (!result.ok) {
+      const output = (() => {
+        try {
+          return String(JSON.parse(result.text).output ?? result.text);
+        } catch {
+          return result.text;
         }
+      })();
+      const kind = await triage(this.jev, s, command, output).catch(() => ({
+        kind: 'unknown' as const,
+        probability: 0,
+      }));
+      await this.store.log('triage', { step: s.step, command: clip(command, 200), ...kind });
+      if (kind.kind === 'transient' && kind.probability >= 0.7) {
+        result = await this.execute(s, 'bash', { ...args, command, ...(isCheck ? { check: true } : {}) }, 'auto-retry');
+        if (!result.ok) s.blockedActions!.push(Agent.actionKey(s, 'bash', args, true));
+      } else if (kind.kind === 'permission' && kind.probability >= 0.7) {
+        s.status = 'paused';
+        s.stopReason = `The command needs the user: ${clip(command, 200)}\n${clip(output, 500)}`;
+        return 'stop';
+      } else {
+        const e = s.entries.at(-1);
+        if (e) e.text += `\nJev reads this failure as: ${kind.kind} (${failureKindText(kind.kind)}).`;
       }
-      return result.ok ? 'ok' : 'failed';
     }
+    return result.ok ? 'ok' : 'failed';
+  }
+  // Any other tool. Many search hits: Jev keeps the ones that matter for what the worker is doing.
+  private async actTool(s: Session, route: Route, args: Record<string, any>): Promise<Outcome> {
     const result = await this.execute(s, route, args, 'action');
-    // Many search hits: Jev keeps the ones that matter for what the worker is doing.
     if (route === 'search_codebase' && result.ok) {
       let output = '';
       try {

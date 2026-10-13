@@ -119,12 +119,22 @@ function adapterViolations(files: Record<string, string>): string[] {
   };
   for (const c of channelNames) {
     const path = `src/channels/${c}.mjs`;
-    if (!files[path]) { violations.push(`${path} missing`); continue; }
+    if (!files[path]) {
+      violations.push(`${path} missing`);
+      continue;
+    }
     const ast = ts.createSourceFile(path, files[path], ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const visit = (node: ts.Node) => {
-      const member = ts.isPropertyAccessExpression(node) ? node.name.text : ts.isElementAccessExpression(node)
-        && node.argumentExpression && ts.isStringLiteral(node.argumentExpression) ? node.argumentExpression.text : null;
-      const receiver = ts.isPropertyAccessExpression(node) ? node.expression : ts.isElementAccessExpression(node) ? node.expression : null;
+      const member = ts.isPropertyAccessExpression(node)
+        ? node.name.text
+        : ts.isElementAccessExpression(node) && node.argumentExpression && ts.isStringLiteral(node.argumentExpression)
+          ? node.argumentExpression.text
+          : null;
+      const receiver = ts.isPropertyAccessExpression(node)
+        ? node.expression
+        : ts.isElementAccessExpression(node)
+          ? node.expression
+          : null;
       // Only accesses rooted in the adapter's input (order/item) are
       // duplicated business logic. Reading the corresponding field from the
       // shared invoice result is part of preserving the public API.
@@ -138,7 +148,12 @@ function adapterViolations(files: Record<string, string>): string[] {
 }
 export async function verifyBenchmark(runDir: string) {
   const manifest = JSON.parse(await readFile(join(runDir, 'manifest.json'), 'utf8'));
-  if (manifest.version !== benchmarkVersion || manifest.fixtureHash !== fixtureHash() || manifest.promptHash !== hash(benchmarkPrompt)) throw new Error('Benchmark version/hash mismatch; use the matching verifier version');
+  if (
+    manifest.version !== benchmarkVersion ||
+    manifest.fixtureHash !== fixtureHash() ||
+    manifest.promptHash !== hash(benchmarkPrompt)
+  )
+    throw new Error('Benchmark version/hash mismatch; use the matching verifier version');
   const repo = join(runDir, 'repo');
   const verificationDir = join(runDir, 'verification');
   await rm(verificationDir, { recursive: true, force: true });
@@ -149,7 +164,9 @@ export async function verifyBenchmark(runDir: string) {
   }
   const after = await snapshotFiles(repo);
   const before = fixtureFiles();
-  const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(k => before[k] !== after[k]).sort();
+  const changed = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter(k => before[k] !== after[k])
+    .sort();
   const protectedChanges = changed.filter(k => !k.startsWith('src/'));
   const violations = adapterViolations(after);
   const behaviorPath = join(verificationDir, 'behavior.test.mjs');
@@ -160,27 +177,47 @@ export async function verifyBenchmark(runDir: string) {
   await mkdir(probe, { recursive: true });
   await cp(join(repo, 'src'), join(probe, 'src'), { recursive: true, dereference: false });
   let missingModule: string | null = null;
-  for (const [file, fn] of [['validate-order', 'validateOrder'], ['price-order', 'priceOrder'], ['create-invoice', 'createInvoice']]) {
+  for (const [file, fn] of [
+    ['validate-order', 'validateOrder'],
+    ['price-order', 'priceOrder'],
+    ['create-invoice', 'createInvoice'],
+  ]) {
     const path = join(probe, `src/domain/${file}.mjs`);
     try {
       await rename(path, join(probe, `src/domain/original-${file}.mjs`));
-      await writeFile(path, `import { ${fn} as original } from './original-${file}.mjs';
+      await writeFile(
+        path,
+        `import { ${fn} as original } from './original-${file}.mjs';
 export function ${fn}(...args) {
   const counts = globalThis.__benchmarkCalls ??= {};
   counts.${fn} = (counts.${fn} ?? 0) + 1;
   return original(...args);
-}\n`);
-    } catch (e: any) { if (e.code !== 'ENOENT') throw e; missingModule = file!; break; }
+}\n`,
+      );
+    } catch (e: any) {
+      if (e.code !== 'ENOENT') throw e;
+      missingModule = file!;
+      break;
+    }
   }
   const architecturePath = join(verificationDir, 'architecture.test.mjs');
   await writeFile(architecturePath, architectureTests(probe));
-  const architecture = missingModule ? { code: 1, output: `Missing shared module: ${missingModule}\n`, timedOut: false, truncated: false }
+  const architecture = missingModule
+    ? { code: 1, output: `Missing shared module: ${missingModule}\n`, timedOut: false, truncated: false }
     : await runCommand(process.execPath, ['--test', architecturePath], repo, 30000);
   await writeFile(join(runDir, 'architecture-verification.txt'), architecture.output + violations.join('\n') + '\n');
   const behaviorPassed = behavior.code === 0 && !behavior.timedOut && !behavior.truncated;
-  const architecturePassed = architecture.code === 0 && !architecture.timedOut && !architecture.truncated && violations.length === 0;
-  const result = { passed: behaviorPassed && architecturePassed && protectedChanges.length === 0 && changed.length > 0,
-    behaviorPassed, architecturePassed, protectedFilesUnchanged: protectedChanges.length === 0, protectedChanges, violations, changedFiles: changed };
+  const architecturePassed =
+    architecture.code === 0 && !architecture.timedOut && !architecture.truncated && violations.length === 0;
+  const result = {
+    passed: behaviorPassed && architecturePassed && protectedChanges.length === 0 && changed.length > 0,
+    behaviorPassed,
+    architecturePassed,
+    protectedFilesUnchanged: protectedChanges.length === 0,
+    protectedChanges,
+    violations,
+    changedFiles: changed,
+  };
   await writeFile(join(runDir, 'after.json'), JSON.stringify(after, null, 2) + '\n');
   await writeFile(join(runDir, 'changes.diff'), fileDiff(before, after));
   await writeFile(join(runDir, 'verification.json'), JSON.stringify(result, null, 2) + '\n');

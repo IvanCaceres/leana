@@ -4,15 +4,25 @@
   "private": true,
   "description": "Jev-directed coding harness for local Bonsai inference",
   "type": "module",
-  "engines": { "node": ">=22" },
-  "bin": { "leana": "dist/src/cli.js" },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "leana": "dist/src/cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
     "test:live": "npm run build && node dist/src/live-test.js",
     "bench:refactor": "npm run build && node dist/src/benchmark.js",
-    "start": "node dist/src/cli.js"
+    "start": "node dist/src/cli.js",
+    "format": "prettier --write src test",
+    "format:check": "prettier --check src test"
   },
-  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.9.0" }
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "3.9.9",
+    "typescript": "^5.9.0"
+  }
 }

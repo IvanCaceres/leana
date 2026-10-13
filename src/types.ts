@@ -1,50 +1,151 @@
-export type Route = 'read_files' | 'search_codebase' | 'create_file' | 'write' | 'replace_lines' | 'move_lines' | 'bash' | 'plan' | 'observe' | 'rewrite_file' | 'finish' | 'ask_user';
+export type Route =
+  | 'read_files'
+  | 'search_codebase'
+  | 'create_file'
+  | 'write'
+  | 'replace_lines'
+  | 'move_lines'
+  | 'bash'
+  | 'plan'
+  | 'observe'
+  | 'rewrite_file'
+  | 'finish'
+  | 'ask_user';
 // One tool, one meaning: create_file creates, write replaces an anchor in an
 // existing file, replace_lines edits by line number, move_lines relocates.
 export const editRoutes: readonly Route[] = ['create_file', 'rewrite_file', 'write', 'replace_lines', 'move_lines'];
-export interface Coverage { total: number; ranges: [number, number][] }
+export interface Coverage {
+  total: number;
+  ranges: [number, number][];
+}
 // A check's exit code and the repository files its output names, with the
 // lines named for each; the output itself is in the check record's text.
-export interface CheckSummary { code: number | null; files: Record<string, number[]> }
-export interface CheckRecord { step: number; ok: boolean; text: string; summary: CheckSummary; fileHashes?: Record<string, string>; command?: string }
-export interface SourceEvidence { path: string; hash?: string; facts: Record<string, unknown>[]; excerpt?: string; error?: string; omitted?: number }
+export interface CheckSummary {
+  code: number | null;
+  files: Record<string, number[]>;
+}
+export interface CheckRecord {
+  step: number;
+  ok: boolean;
+  text: string;
+  summary: CheckSummary;
+  fileHashes?: Record<string, string>;
+  command?: string;
+}
+export interface SourceEvidence {
+  path: string;
+  hash?: string;
+  facts: Record<string, unknown>[];
+  excerpt?: string;
+  error?: string;
+  omitted?: number;
+}
 export type DeliverableKind = 'move' | 'create' | 'modify' | 'delete' | 'export' | 'import' | 'verify' | 'other';
 // exports and dependsOn are the design's contract for a file to create: what it
 // provides, and which other deliverables it imports, so creation can be ordered
 // and every prompt can carry the exact signatures a file may import. A derived
 // item was added by the harness for an import a generated file made.
-export interface Deliverable { packages?: string[]; command?: string; commandProbed?: boolean; id: string; kind: DeliverableKind; name?: string; from?: string; to?: string; detail: string; required: number; status: 'pending' | 'done' | 'unknown'; note?: string; unresolvable?: boolean; optional?: boolean; contents?: string[]; exports?: string[]; dependsOn?: string[]; derived?: boolean; attempts?: number; importer?: string; spec?: string; setAside?: boolean; placement?: string }
+export interface Deliverable {
+  packages?: string[];
+  command?: string;
+  commandProbed?: boolean;
+  id: string;
+  kind: DeliverableKind;
+  name?: string;
+  from?: string;
+  to?: string;
+  detail: string;
+  required: number;
+  status: 'pending' | 'done' | 'unknown';
+  note?: string;
+  unresolvable?: boolean;
+  optional?: boolean;
+  contents?: string[];
+  exports?: string[];
+  dependsOn?: string[];
+  derived?: boolean;
+  attempts?: number;
+  importer?: string;
+  spec?: string;
+  setAside?: boolean;
+  placement?: string;
+}
 export type Phase = 'inspect' | 'implement' | 'verify';
-export type Question = { type: 'noul'; instructions: string } |
-  { type: 'choice'; instructions: string; criteria: Record<string, string> };
-export type Answer = { type: 'noul'; noul: number } |
-  { type: 'choice'; choice: string; probabilities: Record<string, number>; confidence: number };
+export type Question =
+  { type: 'noul'; instructions: string } | { type: 'choice'; instructions: string; criteria: Record<string, string> };
+export type Answer =
+  | { type: 'noul'; noul: number }
+  | { type: 'choice'; choice: string; probabilities: Record<string, number>; confidence: number };
 export type Questions = Record<string, Question>;
 export type Answers = Record<string, Answer>;
-export interface Task { id: string; description: string; status: 'pending' | 'done'; evidence: string }
+export interface Task {
+  id: string;
+  description: string;
+  status: 'pending' | 'done';
+  evidence: string;
+}
 // A turn entry (kind 'turn') is the worker's own reasoning and actions for a
 // batch, shown back to it as an assistant message; the results of that batch
 // carry its id in turn, and outcomes (never rendered) feed the trail once the
 // group is evicted.
 // cites: the entries a harness statement in this entry names (a repeated read's answer).
-export interface Entry { id: string; step: number; kind: string; text: string; artifact: string; relevance: number; stale?: string; verification?: boolean; turn?: string; outcomes?: string[]; cites?: string[] }
-export interface EditEvidence { step: number; route: string; paths: string[]; artifact: string; text: string; applied?: string }
+export interface Entry {
+  id: string;
+  step: number;
+  kind: string;
+  text: string;
+  artifact: string;
+  relevance: number;
+  stale?: string;
+  verification?: boolean;
+  turn?: string;
+  outcomes?: string[];
+  cites?: string[];
+}
+export interface EditEvidence {
+  step: number;
+  route: string;
+  paths: string[];
+  artifact: string;
+  text: string;
+  applied?: string;
+}
 export interface Session {
-  version: 1; root: string; objective: string; instructions: string; step: number;
-  tasks: Task[]; focus: string | null; entries: Entry[]; lastCompact: number;
-  phase: Phase; knownFiles: string[]; inspectionCount: number; lastError: string | null;
-  lastRoute: Route | null; lastResultOk: boolean; lastWriteStale: boolean;
+  version: 1;
+  root: string;
+  objective: string;
+  instructions: string;
+  step: number;
+  tasks: Task[];
+  focus: string | null;
+  entries: Entry[];
+  lastCompact: number;
+  phase: Phase;
+  knownFiles: string[];
+  inspectionCount: number;
+  lastError: string | null;
+  lastRoute: Route | null;
+  lastResultOk: boolean;
+  lastWriteStale: boolean;
   // stopReason is bounded: it is read back by the model on resume. outcome, when set, is the same
   // ending with the summary it quotes in full, for the user.
-  status: 'running' | 'paused' | 'complete'; stopReason: string; outcome?: string;
+  status: 'running' | 'paused' | 'complete';
+  stopReason: string;
+  outcome?: string;
   // Answers (finishes with nothing written, checked or observed) Jev has not accepted in this invocation.
   answerRejections?: number;
-  writes: string[]; lastWriteStep: number; lastCheckStep: number;
-  repetitions: Record<string, number>; coverage: Record<string, Coverage>;
-  hashes: Record<string, string>; lastPromptTokens: number;
-  lastCheck: CheckRecord | null; previousCheck: CheckRecord | null;
+  writes: string[];
+  lastWriteStep: number;
+  lastCheckStep: number;
+  repetitions: Record<string, number>;
+  coverage: Record<string, Coverage>;
+  hashes: Record<string, string>;
+  lastPromptTokens: number;
+  lastCheck: CheckRecord | null;
+  previousCheck: CheckRecord | null;
   // The last check that exited 0, and the state a finish was last refused on (finishRefused, see Agent.act).
-  lastPassedCheck?: { step: number; command?: string }; finishRefused?: string;
+  lastPassedCheck?: { step: number; command?: string };
+  finishRefused?: string;
   // Pre-edit snapshots of files edited since the previous check, and the set
   // offered for rollback once the next check has judged those edits.
   editSnapshots: Record<string, string>;
@@ -56,42 +157,79 @@ export interface Session {
   // unmet: the deliverables the audit did not accept; unmetPending: those of
   // them that were pending by source facts at the time, the only ones whose
   // later completion by facts answers the rejection without an edit.
-  completionFeedback: { step: number; text: string; awaitingEvidence: boolean; addressed?: boolean; unmet?: string[]; unmetPending?: string[] } | null;
+  completionFeedback: {
+    step: number;
+    text: string;
+    awaitingEvidence: boolean;
+    addressed?: boolean;
+    unmet?: string[];
+    unmetPending?: string[];
+  } | null;
   // The passing check for which the harness already proposed a finish; one attempt per check.
   finishTriedAtCheck: number;
   // Coverage per content hash, so a rollback to known content restores read state.
-  coverageByHash: Record<string, Coverage>; repetitionSteps: Record<string, number>;
+  coverageByHash: Record<string, Coverage>;
+  repetitionSteps: Record<string, number>;
   // Harness-fetched context and harness-applied fixes, once per failing check.
-  focusReadAt: number; autoFixKeys: Record<string, string>;
+  focusReadAt: number;
+  autoFixKeys: Record<string, string>;
   // Edits of the current transaction (since the last check), and edits that a
   // rollback rejected: those must never be generated again verbatim.
-  transaction: { key: string; identity: string; step: number; route: string; paths: string[]; summary: string; kind?: string }[];
+  transaction: {
+    key: string;
+    identity: string;
+    step: number;
+    route: string;
+    paths: string[];
+    summary: string;
+    kind?: string;
+  }[];
   lastCheckCommand: string | null;
   // Harness-owned verification cycle: a check is due after every edit transaction,
   // and an objectively worse check rolls that transaction back without a vote.
   autoUndo: { files: Record<string, string>; reason: string } | null;
   inspectionsSinceAction: number;
-  rejectedEdits: { key: string; identity: string; step: number; undoneAt: number; route: string; summary: string; reason: string }[];
-  actions: Record<string, number>; searches: Record<string, string>; blockedRoute: Route | null;
+  rejectedEdits: {
+    key: string;
+    identity: string;
+    step: number;
+    undoneAt: number;
+    route: string;
+    summary: string;
+    reason: string;
+  }[];
+  actions: Record<string, number>;
+  searches: Record<string, string>;
+  blockedRoute: Route | null;
   // The last tool error per edit route: the same error twice in a row blocks the route.
   lastToolError: { route: Route; message: string; step: number } | null;
   // The harness's own deliverable list, classified by Jev; statuses come from source facts.
-  ledger: Deliverable[]; ledgerAttempts: number; ledgerBuilt: boolean; ledgerComplete: number;
+  ledger: Deliverable[];
+  ledgerAttempts: number;
+  ledgerBuilt: boolean;
+  ledgerComplete: number;
   // The worker's design for an open-ended objective: what the whole should be and the conventions every file follows.
   // composition: how the deliverables assemble into the whole; fixtures: the
   // literal data the result ships with, held in one module the others read.
   design: { summary: string; conventions: string; shared?: string; composition?: string; fixtures?: string } | null;
   // Verification selected from the repository when none is configured: attempts, the change count at the last one, and the configuration files' state at the last trial.
-  checkInferences: number; checkInferredFor: number; checkTrialKey?: string;
+  checkInferences: number;
+  checkInferredFor: number;
+  checkTrialKey?: string;
   // Dependencies installed by the harness when a check trial showed them missing:
   // once per manifest version; a failed install is fix work for the manifest.
   // setupKeys: per project (ecosystem and manifest directory), the manifests' state at its last install; setupErrors: the failed ones.
-  setupDone: boolean; setupKey?: string; setupError?: string | null; setupKeys?: Record<string, string>; setupErrors?: Record<string, string>;
+  setupDone: boolean;
+  setupKey?: string;
+  setupError?: string | null;
+  setupKeys?: Record<string, string>;
+  setupErrors?: Record<string, string>;
   // Git's view of the tree when the session began: changes already present are not the session's.
   baselineStatus: string[] | null;
   // The first pre-edit snapshot of each changed file, for the completion diff ('@new' for created files).
   baselineArtifacts: Record<string, string>;
-  readHashes: Record<string, string>; writeSteps: Record<string, number>;
+  readHashes: Record<string, string>;
+  writeSteps: Record<string, number>;
   editsSinceCheck: number;
   // Files the harness created that do not parse or miss a promised export:
   // repaired by a region rewrite before any model is asked to decide anything,
@@ -122,10 +260,25 @@ export interface Session {
   // as it learns), the orientation facts gathered by code at the start, its
   // last stated reasoning, the watchdog's readings, and action keys Jev found
   // repeating a failure, which are refused once.
-  notes?: string; orientation?: Record<string, unknown>; lastThought?: string;
+  notes?: string;
+  orientation?: Record<string, unknown>;
+  lastThought?: string;
   // The turn whose batch is running, so its results are grouped with it; one line per evicted turn, oldest first.
-  currentTurn?: string | null; trail?: string[];
-  watch?: { noProgress: number; readings: { step: number; progress: number; stuck: number; sameFailure: number; objective: number; needsUser: number; inScope?: number }[]; escalations: number };
+  currentTurn?: string | null;
+  trail?: string[];
+  watch?: {
+    noProgress: number;
+    readings: {
+      step: number;
+      progress: number;
+      stuck: number;
+      sameFailure: number;
+      objective: number;
+      needsUser: number;
+      inScope?: number;
+    }[];
+    escalations: number;
+  };
   blockedActions?: string[];
   // The last run of each edit the worker asked for, by its exact arguments (file hash
   // included), recorded after it ran: its step, whether it succeeded, the expectedHash it
@@ -157,24 +310,51 @@ export interface Session {
 export interface Config {
   // The model's provider: llama (a llama-server at baseUrl) or openrouter (OpenRouter's API at openrouterUrl, its key in
   // OPENROUTER_API_KEY or the file providerKeyFile). model is the model's id there.
-  provider: 'llama' | 'openrouter'; openrouterUrl: string; providerKeyFile: string; openrouterWorkingTokens: number; openrouterMaxTurns: number; promptForm: 'json' | 'text' | 'tools';
+  provider: 'llama' | 'openrouter';
+  openrouterUrl: string;
+  providerKeyFile: string;
+  openrouterWorkingTokens: number;
+  openrouterMaxTurns: number;
+  promptForm: 'json' | 'text' | 'tools';
   // Prompt caching through OpenRouter (openrouter.ts): auto marks where the prompt stops changing for a model that
   // caches (its catalogue lists a cache-read price) and keeps a run on one provider; off sends neither.
   promptCache: 'auto' | 'off';
-  baseUrl: string; model: string; contextWindow: number; maxTokens: number;
-  workingTokens: number; safetyTokens: number; jevUrl: string; jevModel: string;
-  routeProbability: number; routeMargin: number; compactProbability: number;
-  completeProbability: number; compactCooldown: number; maxSteps: number;
-  toolChars: number; commandTimeoutMs: number; allowWrite: boolean; allowBash: boolean; verbose: boolean;
+  baseUrl: string;
+  model: string;
+  contextWindow: number;
+  maxTokens: number;
+  workingTokens: number;
+  safetyTokens: number;
+  jevUrl: string;
+  jevModel: string;
+  routeProbability: number;
+  routeMargin: number;
+  compactProbability: number;
+  completeProbability: number;
+  compactCooldown: number;
+  maxSteps: number;
+  toolChars: number;
+  commandTimeoutMs: number;
+  allowWrite: boolean;
+  allowBash: boolean;
+  verbose: boolean;
   // Sampling. temperature divides the model's scores before they become
   // probabilities (low: near the top choice every time; high: more varied, more
   // mistakes); minP drops every token less likely than minP times the most
   // likely one. Reasoning turns (step) and file content (code) are set apart.
-  stepTemperature: number; stepMinP: number; codeTemperature: number; codeMinP: number;
+  stepTemperature: number;
+  stepMinP: number;
+  codeTemperature: number;
+  codeMinP: number;
   // Every sampling value is sent with each request, so the server's own flags never decide it. A step
   // that thinks (stepThinking) samples at stepThinkingTemperature, the model's thinking-mode setting;
   // stepTemperature is for steps that do not think. top_p and top_k apply to both kinds of step.
-  stepThinkingTemperature: number; stepTopP: number; stepTopK: number; codeTopP: number; codeTopK: number; codePresencePenalty: number;
+  stepThinkingTemperature: number;
+  stepTopP: number;
+  stepTopK: number;
+  codeTopP: number;
+  codeTopK: number;
+  codePresencePenalty: number;
   // The temperatures of the steps that follow turns which changed nothing (every
   // action refused or repeated what the evidence shows, notes as they were): the
   // k-th such turn in a row samples the next step at the k-th value (the last one
@@ -183,9 +363,11 @@ export interface Config {
   stepTemperatureEscalation: number[];
   // The model's own thinking before each step's reply (its template's <think> block at effort medium),
   // capped at stepThinkingBudget tokens, where the server closes it. false: the empty block is pre-filled.
-  stepThinking: boolean; stepThinkingBudget: number;
+  stepThinking: boolean;
+  stepThinkingBudget: number;
   // The model's own thinking before each file's code (create_file, rewrite_file), capped at codeThinkingBudget tokens.
-  codeThinking: boolean; codeThinkingBudget: number;
+  codeThinking: boolean;
+  codeThinkingBudget: number;
   // The template's reasoning effort for every thinking request (one value: its sentence is in the shared system message).
   thinkingEffort: string;
   // The verification command. When set, it is run as a baseline before any edit and
@@ -195,23 +377,68 @@ export interface Config {
   // rewrite (continued across chunks) and the design, which may think first.
   createTokens: number;
 }
-export interface GenerationMeta { ms: number; usage?: any; timings?: any; finishReason?: string; promptTokens: number; continuations?: number; reasoning?: string }
+export interface GenerationMeta {
+  ms: number;
+  usage?: any;
+  timings?: any;
+  finishReason?: string;
+  promptTokens: number;
+  continuations?: number;
+  reasoning?: string;
+}
 // A call of one of the model's tools, as an assistant message carries it, and its result as a tool message
 // (the tools form of the prompt; Session.form).
-export interface ToolCall { id: string; type: 'function'; function: { name: string; arguments: string } }
-export interface Message { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_calls?: ToolCall[]; tool_call_id?: string }
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+export interface Message {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+}
 export type JsonSchema = {
-  anyOf?: JsonSchema[]; const?: string;
+  anyOf?: JsonSchema[];
+  const?: string;
   type?: 'object' | 'array' | 'string' | 'integer' | 'boolean';
-  properties?: Record<string, JsonSchema>; required?: string[]; additionalProperties?: false;
-  items?: JsonSchema; minItems?: number; maxItems?: number; minLength?: number; maxLength?: number;
-  minimum?: number; maximum?: number; enum?: string[];
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  additionalProperties?: false;
+  items?: JsonSchema;
+  minItems?: number;
+  maxItems?: number;
+  minLength?: number;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+  enum?: string[];
 };
-export interface EditAttempt { step: number; ok: boolean; exact: string; what: string; sent?: string; error?: string; before: Record<string, string | null>; after: Record<string, string | null> }
-export interface ToolResult { text: string; ok: boolean; changed?: string[]; check?: boolean; verification?: boolean; stale?: boolean; hashes?: Record<string, string>; snapshots?: Record<string, string>;
+export interface EditAttempt {
+  step: number;
+  ok: boolean;
+  exact: string;
+  what: string;
+  sent?: string;
+  error?: string;
+  before: Record<string, string | null>;
+  after: Record<string, string | null>;
+}
+export interface ToolResult {
+  text: string;
+  ok: boolean;
+  changed?: string[];
+  check?: boolean;
+  verification?: boolean;
+  stale?: boolean;
+  hashes?: Record<string, string>;
+  snapshots?: Record<string, string>;
   // A created file reports what the parser found and what it imports, so the
   // harness can queue a repair and derive the deliverables its imports imply.
-  parseErrors?: string[]; imports?: { spec: string; names: string[] }[];
+  parseErrors?: string[];
+  imports?: { spec: string; names: string[] }[];
   // The arguments as applied when the tool changed them (ranges mapped through earlier edits of the batch).
-  applied?: Record<string, any> }
+  applied?: Record<string, any>;
+}
 export type Log = (type: string, data: unknown) => Promise<void>;

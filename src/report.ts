@@ -6,57 +6,195 @@ import { summarizeEvents, type Event } from './benchmark-metrics.js';
 // answered and how fast, the exact worker prompt and how the context was spent,
 // what Bonsai generated and at what speed, and what the tool returned.
 export interface StepView {
-  step: number; route?: string;
-  jev: { requestId: string; phase: string; questions: unknown; state: unknown; stateBytes: number; ms?: number; answers?: unknown; usage?: unknown; error?: string }[];
-  prompts: { attempt: number; route: string; tokens: number; workingTokens: number; contextWindow: number; breakdown: Record<string, number>; artifact: string; text?: string }[];
-  bonsai: { requestId: string; temperature?: number; promptTokens?: number; ms?: number; usage?: any; timings?: any; finishReason?: string; error?: string }[];
+  step: number;
+  route?: string;
+  jev: {
+    requestId: string;
+    phase: string;
+    questions: unknown;
+    state: unknown;
+    stateBytes: number;
+    ms?: number;
+    answers?: unknown;
+    usage?: unknown;
+    error?: string;
+  }[];
+  prompts: {
+    attempt: number;
+    route: string;
+    tokens: number;
+    workingTokens: number;
+    contextWindow: number;
+    breakdown: Record<string, number>;
+    artifact: string;
+    text?: string;
+  }[];
+  bonsai: {
+    requestId: string;
+    temperature?: number;
+    promptTokens?: number;
+    ms?: number;
+    usage?: any;
+    timings?: any;
+    finishReason?: string;
+    error?: string;
+  }[];
   action?: { route: string; args: unknown; rejected?: boolean };
   result?: { ok: boolean; ms: number; artifact?: string; text?: string };
-  compact?: unknown; undo?: unknown; paused?: string;
+  compact?: unknown;
+  undo?: unknown;
+  paused?: string;
 }
-const clipText = (t: string, n: number) => t.length <= n ? t : `${t.slice(0, n)}\n…[${t.length - n} more characters in the artifact]`;
+const clipText = (t: string, n: number) =>
+  t.length <= n ? t : `${t.slice(0, n)}\n…[${t.length - n} more characters in the artifact]`;
 export function collectSteps(events: Event[]): StepView[] {
   const steps = new Map<number, StepView>();
-  const at = (n: number): StepView => { let v = steps.get(n); if (!v) { v = { step: n, jev: [], prompts: [], bonsai: [] }; steps.set(n, v); } return v; };
+  const at = (n: number): StepView => {
+    let v = steps.get(n);
+    if (!v) {
+      v = { step: n, jev: [], prompts: [], bonsai: [] };
+      steps.set(n, v);
+    }
+    return v;
+  };
   const requestStep = new Map<string, number>();
   for (const e of events) {
     const d = e.data ?? {};
     switch (e.type) {
-      case 'jev-request': if (d.step) at(d.step).jev.push({ requestId: d.requestId, phase: d.phase, questions: d.questions, state: d.state, stateBytes: Buffer.byteLength(JSON.stringify(d.state ?? null)) }); break;
-      case 'jev': case 'jev-error': { const j = d.step && at(d.step).jev.find(x => x.requestId === d.requestId); if (j) Object.assign(j, e.type === 'jev' ? { ms: d.ms, answers: d.answers, usage: d.usage } : { ms: d.ms, error: d.error }); break; }
-      case 'prompt': at(d.step).prompts.push({ attempt: d.attempt, route: d.route, tokens: d.tokens, workingTokens: d.workingTokens, contextWindow: d.contextWindow, breakdown: d.breakdown, artifact: d.artifact }); at(d.step).route ??= d.route; break;
-      case 'bonsai-request': if (d.step) { requestStep.set(d.requestId, d.step); at(d.step).bonsai.push({ requestId: d.requestId, temperature: d.temperature, promptTokens: d.prompt?.tokens }); } break;
-      case 'bonsai': case 'bonsai-error': { const step = d.step ?? requestStep.get(d.requestId); const b = step && at(step).bonsai.find(x => x.requestId === d.requestId);
-        if (b) Object.assign(b, e.type === 'bonsai' ? { ms: d.ms, usage: d.usage, timings: d.timings, finishReason: d.finishReason } : { ms: d.ms, error: d.error }); break; }
-      case 'action': at(d.step).action = { route: d.route, args: d.args, rejected: d.rejected }; at(d.step).route = d.route; break;
-      case 'result': at(d.step).result = { ok: d.ok, ms: d.ms, artifact: d.artifact }; break;
-      case 'compact': at(d.step).compact = d; break;
-      case 'undo': at(d.step).undo = d; break;
-      case 'paused': at(d.step).paused = d.reason; break;
+      case 'jev-request':
+        if (d.step)
+          at(d.step).jev.push({
+            requestId: d.requestId,
+            phase: d.phase,
+            questions: d.questions,
+            state: d.state,
+            stateBytes: Buffer.byteLength(JSON.stringify(d.state ?? null)),
+          });
+        break;
+      case 'jev':
+      case 'jev-error': {
+        const j = d.step && at(d.step).jev.find(x => x.requestId === d.requestId);
+        if (j)
+          Object.assign(
+            j,
+            e.type === 'jev' ? { ms: d.ms, answers: d.answers, usage: d.usage } : { ms: d.ms, error: d.error },
+          );
+        break;
+      }
+      case 'prompt':
+        at(d.step).prompts.push({
+          attempt: d.attempt,
+          route: d.route,
+          tokens: d.tokens,
+          workingTokens: d.workingTokens,
+          contextWindow: d.contextWindow,
+          breakdown: d.breakdown,
+          artifact: d.artifact,
+        });
+        at(d.step).route ??= d.route;
+        break;
+      case 'bonsai-request':
+        if (d.step) {
+          requestStep.set(d.requestId, d.step);
+          at(d.step).bonsai.push({
+            requestId: d.requestId,
+            temperature: d.temperature,
+            promptTokens: d.prompt?.tokens,
+          });
+        }
+        break;
+      case 'bonsai':
+      case 'bonsai-error': {
+        const step = d.step ?? requestStep.get(d.requestId);
+        const b = step && at(step).bonsai.find(x => x.requestId === d.requestId);
+        if (b)
+          Object.assign(
+            b,
+            e.type === 'bonsai'
+              ? { ms: d.ms, usage: d.usage, timings: d.timings, finishReason: d.finishReason }
+              : { ms: d.ms, error: d.error },
+          );
+        break;
+      }
+      case 'action':
+        at(d.step).action = { route: d.route, args: d.args, rejected: d.rejected };
+        at(d.step).route = d.route;
+        break;
+      case 'result':
+        at(d.step).result = { ok: d.ok, ms: d.ms, artifact: d.artifact };
+        break;
+      case 'compact':
+        at(d.step).compact = d;
+        break;
+      case 'undo':
+        at(d.step).undo = d;
+        break;
+      case 'paused':
+        at(d.step).paused = d.reason;
+        break;
     }
   }
   return [...steps.values()].sort((a, b) => a.step - b.step);
 }
-export function speed(b: { ms?: number; usage?: any; timings?: any }): { generation: number | null; prompt: number | null; generated: number | null } {
+export function speed(b: { ms?: number; usage?: any; timings?: any }): {
+  generation: number | null;
+  prompt: number | null;
+  generated: number | null;
+} {
   const generated = b.usage?.completion_tokens ?? b.timings?.predicted_n ?? null;
   const generation = b.timings?.predicted_per_second ?? (generated && b.ms ? generated / (b.ms / 1000) : null);
   return { generation, prompt: b.timings?.prompt_per_second ?? null, generated };
 }
 export async function renderReport(dir: string): Promise<string> {
-  const events: Event[] = (await readFile(join(dir, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const events: Event[] = (await readFile(join(dir, 'events.jsonl'), 'utf8'))
+    .split('\n')
+    .filter(Boolean)
+    .map(l => JSON.parse(l));
   let checkpoint: any = null;
-  try { checkpoint = JSON.parse(await readFile(join(dir, 'checkpoint.json'), 'utf8')); } catch { /* not saved yet */ }
-  const artifact = async (ref?: string) => { if (!ref) return undefined; try { return await readFile(join(dir, 'artifacts', ref.replace(/^@artifact\//, '')), 'utf8'); } catch { return undefined; } };
+  try {
+    checkpoint = JSON.parse(await readFile(join(dir, 'checkpoint.json'), 'utf8'));
+  } catch {
+    /* not saved yet */
+  }
+  const artifact = async (ref?: string) => {
+    if (!ref) return undefined;
+    try {
+      return await readFile(join(dir, 'artifacts', ref.replace(/^@artifact\//, '')), 'utf8');
+    } catch {
+      return undefined;
+    }
+  };
   const steps = collectSteps(events);
   for (const s of steps) {
-    for (const p of s.prompts) { const text = await artifact(p.artifact); if (text) p.text = clipText(text, 60000); }
-    if (s.result) { const text = await artifact(s.result.artifact); if (text) s.result.text = clipText(text, 8000); }
+    for (const p of s.prompts) {
+      const text = await artifact(p.artifact);
+      if (text) p.text = clipText(text, 60000);
+    }
+    if (s.result) {
+      const text = await artifact(s.result.artifact);
+      if (text) s.result.text = clipText(text, 8000);
+    }
   }
   const start = events.find(e => e.type === 'start')?.data;
   const stop = events.filter(e => e.type === 'stop').at(-1)?.data;
-  const data = { dir, generatedAt: new Date().toISOString(), config: start?.config ?? null,
-    session: checkpoint ? { objective: checkpoint.objective, status: checkpoint.status, stopReason: checkpoint.stopReason, step: checkpoint.step, phase: checkpoint.phase, writes: checkpoint.writes, entries: checkpoint.entries?.length } : stop ?? null,
-    metrics: summarizeEvents(events), steps };
+  const data = {
+    dir,
+    generatedAt: new Date().toISOString(),
+    config: start?.config ?? null,
+    session: checkpoint
+      ? {
+          objective: checkpoint.objective,
+          status: checkpoint.status,
+          stopReason: checkpoint.stopReason,
+          step: checkpoint.step,
+          phase: checkpoint.phase,
+          writes: checkpoint.writes,
+          entries: checkpoint.entries?.length,
+        }
+      : (stop ?? null),
+    metrics: summarizeEvents(events),
+    steps,
+  };
   const html = template(JSON.stringify(data).replace(/<\/script/gi, '<\\/script'), stop === undefined);
   await writeFile(join(dir, 'report.html'), html);
   return html;

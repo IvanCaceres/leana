@@ -74,7 +74,7 @@ export function validate(schema: JsonSchema, value: unknown, path = 'args'): voi
     }
     case 'array':
       if (!Array.isArray(value)) fail('expected array');
-      if ((value as unknown[]).length < (schema.minItems ?? 0) || (value as unknown[]).length > (schema.maxItems ?? Infinity)) fail('array length');
+      if ((value as unknown[]).length < (schema.minItems ?? 0) || (value as unknown[]).length > (schema.maxItems ?? Infinity)) fail(`array length ${(value as unknown[]).length}, not ${schema.maxItems === undefined ? `at least ${schema.minItems ?? 0}` : `${schema.minItems ?? 0} to ${schema.maxItems}`} items`);
       (value as unknown[]).forEach((v, i) => validate(schema.items!, v, `${path}[${i}]`)); break;
     case 'string':
       if (typeof value !== 'string') fail('expected string');

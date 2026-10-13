@@ -34,7 +34,11 @@ export interface Session {
   tasks: Task[]; focus: string | null; entries: Entry[]; lastCompact: number;
   phase: Phase; knownFiles: string[]; inspectionCount: number; lastError: string | null;
   lastRoute: Route | null; lastResultOk: boolean; lastWriteStale: boolean;
-  status: 'running' | 'paused' | 'complete'; stopReason: string;
+  // stopReason is bounded: it is read back by the model on resume. outcome, when set, is the same
+  // ending with the summary it quotes in full, for the user.
+  status: 'running' | 'paused' | 'complete'; stopReason: string; outcome?: string;
+  // Answers (finishes with nothing written, checked or observed) Jev has not accepted in this invocation.
+  answerRejections?: number;
   writes: string[]; lastWriteStep: number; lastCheckStep: number;
   repetitions: Record<string, number>; coverage: Record<string, Coverage>;
   hashes: Record<string, string>; lastPromptTokens: number;
@@ -154,6 +158,9 @@ export interface Config {
   // The model's provider: llama (a llama-server at baseUrl) or openrouter (OpenRouter's API at openrouterUrl, its key in
   // OPENROUTER_API_KEY or the file providerKeyFile). model is the model's id there.
   provider: 'llama' | 'openrouter'; openrouterUrl: string; providerKeyFile: string; openrouterWorkingTokens: number; openrouterMaxTurns: number; promptForm: 'json' | 'text' | 'tools';
+  // Prompt caching through OpenRouter (openrouter.ts): auto marks where the prompt stops changing for a model that
+  // caches (its catalogue lists a cache-read price) and keeps a run on one provider; off sends neither.
+  promptCache: 'auto' | 'off';
   baseUrl: string; model: string; contextWindow: number; maxTokens: number;
   workingTokens: number; safetyTokens: number; jevUrl: string; jevModel: string;
   routeProbability: number; routeMargin: number; compactProbability: number;

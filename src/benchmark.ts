@@ -14,6 +14,7 @@ import { verifyBenchmark } from './benchmark-verify.js';
 import { comparisonMarkdown, summarizeEvents, type Event } from './benchmark-metrics.js';
 import { hash, runCommand } from './tools.js';
 import { snapshotFiles } from './live-test.js';
+import { killTree } from './shell.js';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const absolute = (path: string) => resolve(path.replace(/^~(?=\/)/, homedir()));
@@ -23,7 +24,7 @@ async function launch(args: string[], runDir: string, timeoutMs: number): Promis
   return new Promise((resolveRun, reject) => {
     const child = spawn(process.execPath, [fileURLToPath(new URL('./cli.js', import.meta.url)), ...args], { detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     let timedOut = false;
-    const kill = () => { try { if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { /* exited */ } };
+    const kill = () => killTree(child.pid);
     const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs);
     child.stdout.on('data', chunk => { process.stdout.write(chunk); transcript.write(chunk); });
     child.stderr.on('data', chunk => { process.stderr.write(chunk); transcript.write(chunk); });

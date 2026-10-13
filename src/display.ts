@@ -107,7 +107,7 @@ export function actionSummary(action: string, a: Record<string, any>): string {
     : a.path !== undefined ? `${a.path}${range(a)}` : action === 'plan' ? a.notes : action === 'finish' ? a.summary : action === 'ask_user' ? a.question
     : action === 'observe' ? [a.kind, a.target].filter(x => x !== undefined).join(' ') : '';
   const flat = plain(String(what ?? ''));
-  return flat ? `${action} ${short(flat, 70)}` : action;
+  return flat ? `${action} ${short(flat, 200)}` : action;
 }
 // Text for one terminal row: line breaks, tabs and the other spacing controls as one space, and control,
 // format and combining characters (escape sequences, zero-width joiners, bidi overrides, stacked accents)
@@ -189,7 +189,7 @@ export class Display {
   constructor(private out: Stream, private opts: { objective: string; session: string; verbose: boolean; model?: string; name?: string }) {
     if (out.isTTY) { this.timer = setInterval(() => this.render(), 1000); this.timer.unref?.(); }
   }
-  private width(): number { return Math.max(20, Math.min(160, this.out.columns ?? 100)); }
+  private width(): number { return Math.max(20, this.out.columns ?? 100); }
   // Never fill the last column: a full-width line makes the cursor wrap, which
   // adds a row the cursor-up count does not know about and leaks lines each tick.
   // One physical row per logical line (row), its width counted in cells.

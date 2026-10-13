@@ -373,9 +373,9 @@ test('The display shows a step\'s thought and actions as they are written and pr
   assert.equal(out.filter(l => l.startsWith('[2] thought: ')).length, 1, 'printed once');
   assert.equal(block.map(l => l.trim()).join(' '), `[2] thought: ${thought}`, 'word-wrapped, never cut');
   assert(block.length >= 3 && block.every(l => cells(l) <= 79), block.join('\n'));
-  const chose = '[2] actions: read_files src/App.tsx 1..40 | bash npm run build | bash printf "[2J"; npx vitest run --reporter=verbose src/components/Hero...';
+  const chose = '[2] actions: read_files src/App.tsx 1..40 | bash npm run build | bash printf "[2J"; npx vitest run --reporter=verbose src/components/Hero.test.tsx';
   const from = out.findIndex(l => l.startsWith('[2] actions: ')); const actions = [out[from]!]; for (let i = from + 1; /^ {13}\S/.test(out[i] ?? ''); i++) actions.push(out[i]!);
-  assert.equal(actions.map(l => l.trim()).join(' '), chose, 'every action, wrapped'); assert(actions.length === 2 && actions.every(l => l.length <= 79));
+  assert.equal(actions.map(l => l.trim()).join(' '), chose, 'every action, wrapped'); assert(actions.length >= 2 && actions.every(l => l.length <= 79));
   assert(!tty.join('').includes('\x1b[2J'), 'no escape sequence from the model reaches the terminal');
   // A file being written: its last lines numbered as in the file, tabs as spaces, a long line cut at its end
   // once whole and shown by its end while it is still being written.
@@ -455,7 +455,7 @@ test('A step and a file generation stream through the real Agent: the thought is
   assert.deepEqual(seen.filter(x => x.e.kind === 'generating' && x.e.prompt).map(x => (x.e as any).route), ['step', 'create_file'], 'how far each prompt has been read, before its first token');
   assert.deepEqual(seen.find(x => x.e.kind === 'generated' && x.e.route === 'create_file')?.e.kind === 'generated' && (seen.find(x => x.e.kind === 'generated' && x.e.route === 'create_file')!.e as any).file, { path: 'src/greet.ts', from: 1, lines: 3 });
   const shown = unescaped(screen);
-  assert.equal(shown.filter(l => l.startsWith('[1] thought: ')).length, 1); assert(shown.some(l => new RegExp(`^\\[1\\] generated src/greet\\.ts \\| 3 lines \\| ${[...`${file}\`\`\``].length} tokens \\| \\d+ms \\| 40\\.0 tok/s$`).test(l)), shown.join('\n'));
+  assert.equal(shown.filter(l => l.startsWith('[1] thought: ')).length, 1); assert(shown.some(l => new RegExp(`^\\[1\\] generated src/greet\\.ts \\| 3 lines \\| ${[...`${file}\`\`\``].length} tokens \\| (?:\\d+ms|[\\d.]+s) \\| 40\\.0 tok/s$`).test(l)), shown.join('\n'));
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.every(e => !['thinking', 'writing', 'generating'].includes(e.type)), 'nothing display-only is logged');
   const raw = events.filter(e => e.type === 'bonsai' && e.data.raw).at(-1).data; assert.deepEqual([raw.finishReason, raw.continuations, raw.usage.completion_tokens], ['stop', 0, [...`${file}\`\`\``].length]);

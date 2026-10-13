@@ -27,10 +27,14 @@ export interface ModelInfo {
   structured: boolean;
   reasoning: ReasoningInfo;
   // US dollars per token.
-  pricing?: { prompt: number; completion: number };
+  // cacheRead: what a prompt token read from the provider's cache costs, when the catalogue lists it (the model caches).
+  pricing?: { prompt: number; completion: number; cacheRead?: number };
   // Facts about the model the provider reports (size, quantization, template), for display only.
   details?: Record<string, string>;
 }
+// Whether a model caches a repeated prompt prefix: its catalogue lists a cache-read price below its prompt price.
+// Some providers cache on their own, others where the request marks it; either way it is the same fact.
+export const cachesPrompts = (m: ModelInfo): boolean => m.pricing?.cacheRead !== undefined && m.pricing.cacheRead < m.pricing.prompt;
 // The efforts OpenRouter's gateway accepts when a model lists none of its own.
 export const gatewayEfforts = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
 export const effortsOf = (r: ReasoningInfo): string[] => r.efforts ?? gatewayEfforts;
@@ -92,7 +96,7 @@ export function openrouterModelInfo(m: any): ModelInfo {
       ...(typeof r?.default_enabled === 'boolean' ? { defaultEnabled: r.default_enabled } : {}),
       budget: supported && r?.supports_max_tokens !== false,
     },
-    pricing: { prompt: price(m.pricing?.prompt), completion: price(m.pricing?.completion) },
+    pricing: { prompt: price(m.pricing?.prompt), completion: price(m.pricing?.completion), ...(m.pricing?.input_cache_read !== undefined ? { cacheRead: price(m.pricing.input_cache_read) } : {}) },
     details: { ...(arch.modality ? { modality: String(arch.modality) } : {}), ...(arch.tokenizer ? { tokenizer: String(arch.tokenizer) } : {}), ...(m.knowledge_cutoff ? { knowledgeCutoff: String(m.knowledge_cutoff) } : {}) },
   };
 }
@@ -195,6 +199,10 @@ export function modelOptions(m: ModelInfo): ModelOption[] {
   if (m.contextLength && m.provider === 'llama') out.push({ name: 'working-tokens', describe: working, values: `4000..${most}`, get: c => String(c.workingTokens), set: (_c, v) => ({ workingTokens: num(4000, most, true)(v) }) });
   else if (m.contextLength) out.push({ name: 'working-tokens', describe: `${working} (auto: a quarter of the window, at most 64000)`, values: `auto | 4000..${most}`,
     get: c => c.openrouterWorkingTokens ? String(c.openrouterWorkingTokens) : `auto (${fittedWorkingTokens(m)})`, set: (_c, v) => ({ openrouterWorkingTokens: /^(auto|0)$/i.test(v) ? 0 : num(4000, most, true)(v) }) });
+  if (m.provider === 'openrouter') out.push({ name: 'prompt-cache', describe: cachesPrompts(m)
+    ? `reuse the unchanged start of each prompt from the provider's cache (read at $${(m.pricing!.cacheRead! * 1e6).toFixed(3)} per million tokens, not $${(m.pricing!.prompt * 1e6).toFixed(3)}), on one provider for the run`
+    : 'keep a run on one provider (the catalogue lists no cache price for this model, so nothing is marked)',
+    values: 'auto | off', get: c => c.promptCache, set: (_c, v) => { if (!/^(auto|off)$/.test(v)) throw new Error('prompt-cache takes auto or off'); return { promptCache: v as 'auto' | 'off' }; } });
   return out;
 }
 // The settings the active model does not take, as one line each: a config that sets them on another

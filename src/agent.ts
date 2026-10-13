@@ -17,12 +17,38 @@ import { extractCode, schemas, stepSchema, actions, validate, withDefaults, tool
 import { generationFacts, missingRelativeModules, parseFact, parseInProcess, detectProjects, importSpelling, inProject, projectFor, shellPrefixFor, signaturesFor, sourceFile, undeclaredPackages, unresolvedImports, type Project } from './profiles.js';
 import { orient } from './orient.js';
 import { observeResult, observerFor } from './observe.js';
-import { evidenceGate, rankExcerpts, relevance, triage, watchdog, type Jev as JevLike } from './control.js';
+import { answerGate, evidenceGate, rankExcerpts, relevance, triage, watchdog, type AnswerCoverage, type GateVerdict, type Jev as JevLike } from './control.js';
 import type { Around, Bonsai, Echo, GenerationCut, StreamProgress } from './clients.js';
 import { repeatCut } from './clients.js';
 
 // A repository file's text, or null when it cannot be read: missing (the worker
 // may delete any file it wrote), outside the root, or not text. Never throws.
+// A session's ending that quotes the worker's summary (or notes): clipped in the stop reason the
+// model reads back on resume, whole in the outcome the user reads.
+function ending(s: Session, prefix: string, text: string, limit: number): void { s.stopReason = `${prefix}${clip(text, limit)}`; s.outcome = `${prefix}${text}`; }
+// What an answer rests on: the evidence the worker gathered (reads, searches, commands, observations)
+// still in its working set, newest first within a budget that keeps Jev's packet under its cap.
+function answerEvidence(s: Session, budget = 14000): Record<string, string> {
+  const out: [string, string][] = [];
+  for (const e of [...s.entries].reverse()) {
+    if (!['read_files', 'search_codebase', 'bash', 'observe'].includes(e.kind)) continue;
+    const text = clip(e.text, 1500); if (text.length > budget) break;
+    out.unshift([`${e.id} ${e.kind} (step ${e.step})`, text]); budget -= text.length;
+  }
+  return Object.fromEntries(out);
+}
+// What an answer covered, from the reads the session recorded: each file and how much of it, and the
+// repository's files (git's, else the tree's) never read.
+async function answerCoverage(s: Session): Promise<AnswerCoverage> {
+  const tracked = await runCommand('git', ['ls-files'], s.root, 10000).catch(() => null);
+  const files = tracked?.code === 0 ? tracked.output.split('\n').map(l => l.trim()).filter(Boolean) : await listRepoFiles(s.root).catch(() => [] as string[]);
+  const read: Record<string, string> = {};
+  for (const [p, c] of Object.entries(s.coverage).sort(([a], [b]) => a.localeCompare(b))) {
+    const lines = c.ranges.reduce((n, [a, b]) => n + b - a + 1, 0);
+    read[p] = lines >= c.total ? `whole (${c.total} lines)` : `lines ${c.ranges.map(([a, b]) => `${a}-${b}`).join(', ')} of ${c.total}`;
+  }
+  return { read, unread: files.filter(f => !(f in read)), files: files.length };
+}
 const readIfPresent = (root: string, path: string): Promise<string | null> => safePath(root, path).then(f => readFile(f, 'utf8')).catch(() => null);
 
 export async function newSession(root: string, objective: string): Promise<Session> {
@@ -554,7 +580,7 @@ export class Agent {
 
   // ---- the loop ----------------------------------------------------------------
   async run(s: Session): Promise<Session> {
-    s.status = 'running'; s.stopReason = '';
+    s.status = 'running'; s.stopReason = ''; delete s.outcome; s.answerRejections = 0;
     // The prompt is written for this run's model (a session resumed with another model is shown to it in its form).
     if (this.config.promptForm === 'json') delete s.form; else s.form = this.config.promptForm;
     s.watch ??= { noProgress: 0, readings: [], escalations: 0 }; s.blockedActions ??= []; s.notes ??= '';
@@ -583,7 +609,7 @@ export class Agent {
         const last = s.watch.readings.at(-1); const notes: string[] = [];
         if (last && last.stuck >= .9 && s.watch.noProgress >= 2) {
           s.watch.escalations++;
-          if (last.needsUser >= .5 || s.watch.escalations >= 2) { s.status = 'paused'; s.stopReason = `Jev reads the session as stuck (stuck ${last.stuck.toFixed(2)}, no progress for ${s.watch.noProgress} steps)${last.needsUser >= .5 ? ' and in need of the user' : ''}. Last error: ${clip(s.lastError ?? 'none', 300)}`; break; }
+          if (last.needsUser >= .5 || s.watch.escalations >= 2) { s.status = 'paused'; ending(s, `Jev reads the session as stuck (stuck ${last.stuck.toFixed(2)}, no progress for ${s.watch.noProgress} steps)${last.needsUser >= .5 ? ' and in need of the user' : ''}. Last error: `, s.lastError ?? 'none', 300); break; }
           // Every earlier turn is dropped, the results kept: the facts stay, the
           // line of thought the worker would copy and anchor on goes (a turn
           // before the streak often holds the same reasoning).
@@ -609,8 +635,8 @@ export class Agent {
           const verdict = await evidenceGate(this.jev, s, facts);
           await this.store.log('completion', { step: s.step, proposedBy: 'harness', ...verdict });
           this.observe({ kind: 'jev', step: s.step, ms: 0, questions: 4, stateBytes: 0, route: [[verdict.route, 1]], nouls: { matches: verdict.matches, unaddressed: verdict.unaddressed, supported: verdict.supported } });
-          if (verdict.accepted) { s.status = 'complete'; s.stopReason = `Complete: the objective is met by the facts and Jev's reading; ${clip(s.notes ?? '', 300)}`; break; }
-          if (verdict.route === 'human') { s.status = 'paused'; s.stopReason = `Completion proposed by the harness; Jev routes it to the user for review. ${clip(s.notes ?? '', 300)}`; break; }
+          if (verdict.accepted) { s.status = 'complete'; ending(s, 'Complete: the objective is met by the facts and Jev\'s reading; ', s.notes ?? '', 300); break; }
+          if (verdict.route === 'human') { s.status = 'paused'; ending(s, 'Completion proposed by the harness; Jev routes it to the user for review. ', s.notes ?? '', 300); break; }
           notes.push(`The harness proposed completion because Jev reads the objective as likely satisfied and your check passes; the evidence gate did not accept it: ${verdict.reason}. Address that, then finish.`);
         }
         if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1) && s.editsSinceCheck >= 3) notes.push(`${s.editsSinceCheck} edits have landed since your check last ran; run it when you want them judged.`);
@@ -886,20 +912,37 @@ export class Agent {
       // is a duplicate, so a streak of them raises the sampling temperature and ends at four in a row.
       // (Run dk-country-3: the check of record was a throwaway Node mock that failed; told only "the
       // verification did not pass after the last edit", the worker finished the same way 40 times.)
-      if (!s.lastCheck || s.lastCheck.ok === false) {
+      // With nothing written there is nothing for a check to verify: a read-only objective goes to the
+      // gate on what was read. (A review that changed nothing was refused six times, then paused as stuck.)
+      if ((!s.lastCheck && s.lastWriteStep >= 0) || s.lastCheck?.ok === false) {
         const c = s.lastCheck; const quote = (x?: string) => `\`${clip((x ?? '').replace(/\s+/g, ' '), 120)}\``;
         const passed = s.lastPassedCheck && s.lastPassedCheck.step > s.lastWriteStep && s.lastPassedCheck.step !== c?.step ? ` The last check that exited 0 was step ${s.lastPassedCheck.step}'s ${quote(s.lastPassedCheck.command)}, after that write; a later check replaced it.` : '';
         const state = `${c?.step ?? -1}:${s.lastWriteStep}`; const again = s.finishRefused === state; s.finishRefused = state;
         return refuse(`finish was not judged: the check of record ${c ? `failed (step ${c.step}, ${quote(c.command ?? s.lastCheckCommand ?? '')}, exit ${c.summary.code ?? 'unknown'})` : 'has never run: no bash command has been run with check: true in this session'}. Finish is judged once the check of record exits 0 after the last write${s.lastWriteStep >= 0 ? ` (step ${s.lastWriteStep})` : ''}; the check of record is the last bash command run with check: true, so each one replaces the one before.${passed}${again ? ` This finish was refused at the same state before (nothing has been written or checked since).` : ''}`, again);
       }
-      const facts = await this.completionFacts(s, String(args.summary ?? ''));
-      await this.store.log('completion-facts', { step: s.step, facts: { ...facts, sources: Object.keys(facts.sources as object) } });
-      const verdict = await evidenceGate(this.jev, s, facts);
+      // Nothing written, checked or observed: the finish is an answer, judged against what the worker
+      // read (see answerGate). A check or an observation is evidence the gate of a change reads.
+      const answer = s.lastWriteStep < 0 && !s.lastCheck && !s.lastObservation; let verdict: GateVerdict;
+      if (answer) {
+        const evidence = answerEvidence(s); const coverage = await answerCoverage(s);
+        await this.store.log('completion-facts', { step: s.step, facts: { answer: true, summary: clip(String(args.summary ?? ''), 1500), evidence: Object.keys(evidence), read: coverage.read, unread: coverage.unread.length, files: coverage.files } });
+        verdict = await answerGate(this.jev, s, String(args.summary ?? ''), evidence, coverage);
+      } else {
+        const facts = await this.completionFacts(s, String(args.summary ?? ''));
+        await this.store.log('completion-facts', { step: s.step, facts: { ...facts, sources: Object.keys(facts.sources as object) } });
+        verdict = await evidenceGate(this.jev, s, facts);
+      }
       await this.store.log('completion', { step: s.step, ...verdict });
       this.observe({ kind: 'jev', step: s.step, ms: 0, questions: 4, stateBytes: 0, route: [[verdict.route, 1]], nouls: { matches: verdict.matches, unaddressed: verdict.unaddressed, supported: verdict.supported } });
-      if (verdict.accepted) { s.status = 'complete'; s.stopReason = `Complete: ${clip(String(args.summary ?? ''), 400)}`; return 'stop'; }
-      if (verdict.route === 'human') { s.status = 'paused'; s.stopReason = `Completion proposed; Jev routes it to the user for review: ${clip(String(args.summary ?? ''), 400)}`; return 'stop'; }
-      s.completionFeedback = { step: s.step, text: `The completion proposed at step ${s.step} was not accepted: ${verdict.reason}. Address it, verify, and finish again.`, awaitingEvidence: true };
+      if (verdict.accepted) { s.status = 'complete'; ending(s, 'Complete: ', String(args.summary ?? ''), 400); return 'stop'; }
+      // An answer has no check or observation left to settle it: after answerReviews rejections it goes to the user,
+      // whose question it is, with Jev's readings, rather than round again. (Run 40c9a982: 45 answers to "form deep
+      // insights" rejected with flat readings, unaddressed near 0.8, while all 61 files had been read.)
+      if (answer && !verdict.accepted && (s.answerRejections = (s.answerRejections ?? 0) + 1) >= answerReviews) {
+        s.status = 'paused'; ending(s, `Answer proposed; Jev did not accept it in ${answerReviews} readings (last: matches ${verdict.matches.toFixed(2)}, unanswered ${verdict.unaddressed.toFixed(2)}, supported ${verdict.supported.toFixed(2)}), so it goes to you for review; resume with guidance to continue: `, String(args.summary ?? ''), 400); return 'stop';
+      }
+      if (verdict.route === 'human') { s.status = 'paused'; ending(s, 'Completion proposed; Jev routes it to the user for review: ', String(args.summary ?? ''), 400); return 'stop'; }
+      s.completionFeedback = { step: s.step, text: `The completion proposed at step ${s.step} was not accepted: ${verdict.reason}. ${answer ? 'Address it' : 'Address it, verify,'} and finish again.`, awaitingEvidence: true };
       await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text }); return 'failed';
     }
     if (route === 'create_file' || route === 'rewrite_file') {
@@ -962,6 +1005,8 @@ const textFailure = /Stale file hash|oldText must match|would no longer parse|un
 // replay cannot price: run 63 lost a render observation the model was acting on. So .3 stays.
 // A file request too large for the peak is fitted by a forced eviction, which cuts to evictTo as well.
 const evictAt = .6; const evictTo = .3;
+// The answers Jev may reject in an invocation before the last goes to the user.
+const answerReviews = 3;
 const failureKindText = (k: string): string => ({ code_bug: 'the code or configuration written is wrong', wrong_assumption: 'an assumption the output disproves', bad_command: 'the command itself', environment: 'a tool or service the machine lacks', dependency: 'a package missing, unresolvable or at a version that does not exist', permission: 'permission or credentials', transient: 'a network or timing failure', insufficient_context: 'acting without reading what was needed', unknown: 'unclear' } as Record<string, string>)[k] ?? k;
 export { boundedRead };
 // What is wrong with one call: an action that is not one of the step's, or arguments its schema refuses.

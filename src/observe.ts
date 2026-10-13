@@ -47,7 +47,7 @@ const page: Observer = {
     // Where each class name without a CSS rule is used, so the stylesheet can be completed without re-reading every component.
     const styles = /\.(?:css|scss|sass|less|styl)$/;
     const where: Record<string, string[]> = {};
-    const hits = await runCommand('rg', ['-l', '--color', 'never', '-F', '-g', '!node_modules/**', '-g', '!dist/**', '-g', '!build/**', ...r.unmatched.flatMap(c => ['-e', c]), '.'], ctx.root, 15000).catch(() => null);
+    const hits = await runCommand('rg', ['-l', '--color', 'never', '-F', ...(process.platform === 'win32' ? ['--path-separator', '/'] : []), '-g', '!node_modules/**', '-g', '!dist/**', '-g', '!build/**', ...r.unmatched.flatMap(c => ['-e', c]), '.'], ctx.root, 15000).catch(() => null);
     for (const f of (hits?.output ?? '').split('\n').map(l => l.replace(/^\.\//, '')).filter(Boolean).slice(0, 40)) {
       if (styles.test(f)) continue;
       const text = await readFile(join(ctx.root, f), 'utf8').catch(() => '');

@@ -51,6 +51,40 @@ export const gateQuestions: Questions = {
   verification_needed: { type: 'choice', instructions: 'How much verification does this change deserve before it is accepted as complete?', criteria: { deterministic_only: 'The passing check and the facts are enough: a small, low-risk change.', semantic_review: 'The facts are consistent but the change is substantial or the check is weak: accept only if the answers above are confident.', human: 'The user should look before this is called done: risky, ambiguous, or the verification is missing.' } },
 };
 export interface GateVerdict { accepted: boolean; matches: number; unaddressed: number; supported: number; route: string; reason: string }
+// A finish with nothing written, checked or observed is an answer, not a change: there is no result
+// to verify or to observe, and the files it rests on are the ones the worker read, not ones it wrote. It is
+// judged by the same three readings, asked of an answer against the evidence the worker gathered.
+// (A read-only review was shown no files and no verification, read as unsupported each time,
+// and paused as stuck.)
+export const answerQuestions: Questions = {
+  implementation_matches_request: { type: 'noul', instructions: 'Nothing was written: the summary is the worker\'s answer. Does it answer what the objective asks, as opposed to something adjacent, partial or invented?' },
+  requirement_unaddressed: { type: 'noul', instructions: 'Does any part of what the objective asks appear unanswered by the summary, given what was read (read: the files and lines the worker read; unread: files of the repository it never opened)?' },
+  claim_supported: { type: 'noul', instructions: 'Is the summary supported by the evidence shown (what the worker read, searched and ran, and the files and lines it read), rather than asserted?' },
+};
+// What an answer covered: each file read and how much of it, and the repository's files never read.
+export interface AnswerCoverage { read: Record<string, string>; unread: string[]; files: number }
+export async function answerGate(jev: Jev, s: Session, summary: string, evidence: Record<string, string>, coverage: AnswerCoverage): Promise<GateVerdict> {
+  const clauses = objectiveClauses(s.objective);
+  const read = Object.fromEntries(Object.entries(coverage.read).slice(0, 80));
+  const unread = coverage.unread.length > 80 ? [...coverage.unread.slice(0, 80), `… and ${coverage.unread.length - 80} more`] : coverage.unread;
+  const state = { objective: s.objective, clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])), notes: clip(s.notes ?? '', 1500), summary: clip(summary, 1500), repositoryFiles: coverage.files, read, unread, evidence: { ...evidence } };
+  // The packet is held under Jev's byte cap as JSON (escaped code is longer than its text): the oldest evidence goes first.
+  for (const k of Object.keys(evidence)) { if (Buffer.byteLength(JSON.stringify(state)) <= 21000) break; delete state.evidence[k]; }
+  const questions: Questions = { ...answerQuestions, ...Object.fromEntries(clauses.map((_, i) => [`clause_${i}`, { type: 'noul', instructions: `Is clause_${i} of the objective answered by the summary and the evidence shown?` }])) };
+  const a = await jev.decide(state, questions, { step: s.step, phase: 'answer-gate' });
+  const weak = clauses.map((c, i) => ({ c, p: noul(a[`clause_${i}`]) })).filter(x => x.p < .4);
+  const matches = noul(a.implementation_matches_request); const unaddressed = noul(a.requirement_unaddressed); const supported = noul(a.claim_supported);
+  const accepted = !weak.length && matches >= .75 && supported >= .6;
+  const reason = accepted ? 'Jev reads the answer as answering the objective, supported by what was read'
+    : weak.length ? `Jev reads these parts of the objective as not answered: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}`
+    : `Jev reads the answer as ${[matches < .75 ? `not answering what the objective asks (${matches.toFixed(2)})` : '', supported < .6 ? `not supported by the evidence read (${supported.toFixed(2)}): read what the summary states before finishing, or state only what was read` : ''].filter(Boolean).join(' and ')}`;
+  // Where Jev reads part of the objective as unanswered, what was not read is the fact the worker can act on.
+  const partly = Object.entries(coverage.read).filter(([, c]) => !c.startsWith('whole')).map(([p, c]) => `${p} (${c})`);
+  const gaps = !accepted && unaddressed >= .5 && (coverage.unread.length || partly.length)
+    ? `. Jev reads part of the objective as unanswered (${unaddressed.toFixed(2)}); of the repository's ${coverage.files} files, ${Object.keys(coverage.read).length} were read${partly.length ? `, these in part: ${partly.slice(0, 12).join(', ')}${partly.length > 12 ? ` and ${partly.length - 12} more` : ''}` : ''}${coverage.unread.length ? `; never read: ${coverage.unread.slice(0, 30).join(', ')}${coverage.unread.length > 30 ? ` and ${coverage.unread.length - 30} more` : ''}` : ''}`
+    : '';
+  return { accepted, matches, unaddressed, supported, route: accepted ? 'answer' : 'rejected', reason: reason + gaps };
+}
 // The items of an objective the user wrote as a list (bullets or numbered
 // lines), so an unaddressed one is named, not merely counted. Prose is not
 // split: Jev reads it whole through the questions above.

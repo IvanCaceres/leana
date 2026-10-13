@@ -189,7 +189,9 @@ async function repo(t: any) {
 const toolResultSources = async () =>
   (
     await Promise.all(
-      ['tools.ts', 'edit-checks.ts', 'line-edits.ts'].map(f => readFile(new URL(`../../src/${f}`, import.meta.url), 'utf8')),
+      ['tools.ts', 'edit-checks.ts', 'line-edits.ts'].map(f =>
+        readFile(new URL(`../../src/${f}`, import.meta.url), 'utf8'),
+      ),
     )
   ).join('\n');
 const events = async (store: Store) =>
@@ -1877,7 +1879,7 @@ test('The lines the evidence shows: numbered lines of the version asked for, fro
     entry('e1', `f.ts sha256=old totalLines=90 shown=1..90\n${body(1, 90)}`),
     entry(
       'e2',
-      `g.ts sha256=g1 totalLines=9 shown=1..9\n${body(1, 9)}\n\nf.ts sha256=new totalLines=80 shown=1..40\n${body(1, 40)}\n[â€¦truncated at the read budget after line 40; request lines 41..80 in a later read_files call or narrow the rangeâ€¦]`,
+      `g.ts sha256=g1 totalLines=9 shown=1..9\n${body(1, 9)}\n\nf.ts sha256=new totalLines=80 shown=1..40\n${body(1, 40)}\n[…truncated at the read budget after line 40; request lines 41..80 in a later read_files call or narrow the range…]`,
     ),
     entry('e3', clip(`f.ts sha256=new totalLines=80 shown=41..80\n${body(41, 80)}`, 1500)),
     entry('e4', `f.ts sha256=new totalLines=80 shown=1..80\n${body(1, 80)}`, 'edited at step 5'),
@@ -1890,7 +1892,7 @@ test('The lines the evidence shows: numbered lines of the version asked for, fro
     'the second file of a read, after another file; the budget marker ends it',
   );
   const text = s.entries[2]!.text.split('\n');
-  const at = text.findIndex(l => l.startsWith('[â€¦truncated; use'));
+  const at = text.findIndex(l => l.startsWith('[…truncated; use'));
   const before = Number(text[at - 1]!.match(/^(\d+):/)![1]);
   const after = Number(text[at + 2]!.match(/^(\d+):/)![1]);
   assert(by.get(41) === 'e3' && by.get(before - 1) === 'e3', 'the head of the clipped entry');
@@ -1956,7 +1958,7 @@ test('A line longer than any read shows whole is stated, never read again: the l
 
 test('A repeated read of a file whose text starts with a byte order mark, or whose path has a space, or of a range past its end, is answered from the evidence: the harness hashes it as read_files does', async t => {
   const { root, store } = await repo(t);
-  await writeFile(join(root, 'bom.ts'), 'ï»¿export const a = 1;\nexport const b = 2;\n');
+  await writeFile(join(root, 'bom.ts'), '﻿export const a = 1;\nexport const b = 2;\n');
   await writeFile(join(root, 'my file.ts'), 'export const c = 3;\n');
   const read = {
     files: [
@@ -2595,7 +2597,7 @@ test('A block rewrite by line numbers is refused when the file changed after the
 test('A render whose server announces a different address fails within seconds and names it, instead of waiting out the timeout', async t => {
   const { announcedElsewhere } = await import('../src/render.js');
   assert.deepEqual(
-    announcedElsewhere('  \u001b[32mâžœ\u001b[39m  Local:   http://localhost:5173/\n', 'http://localhost:3000'),
+    announcedElsewhere('  \u001b[32m➜\u001b[39m  Local:   http://localhost:5173/\n', 'http://localhost:3000'),
     ['http://localhost:5173/'],
   );
   assert.equal(
@@ -2603,7 +2605,7 @@ test('A render whose server announces a different address fails within seconds a
     null,
     'the requested port is announced: keep waiting',
   );
-  assert.equal(announcedElsewhere('startingâ€¦', 'http://localhost:3000'), null, 'nothing announced yet');
+  assert.equal(announcedElsewhere('starting…', 'http://localhost:3000'), null, 'nothing announced yet');
   assert.deepEqual(
     announcedElsewhere('Starting development server at http://127.0.0.1:8000/', 'http://localhost:3000'),
     ['http://127.0.0.1:8000/'],
@@ -3960,7 +3962,7 @@ test('Every field the prompts name is one the model receives: descriptions, inst
     step.at(-1) && JSON.parse(step.at(-1)!.content).role,
     ...JSON.parse(file.at(-1)!.content).rules,
   ].join('\n');
-  // Names a tool result prints (path sha256=â€¦ totalLines=â€¦) are fields too; they must be printed by the tools.
+  // Names a tool result prints (path sha256=… totalLines=…) are fields too; they must be printed by the tools.
   const tools = await toolResultSources();
   const printed = (name: string) => new RegExp(`\\b${name}=`).test(tools);
   for (const name of new Set(prose.match(/\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b/g) ?? []))
@@ -4586,7 +4588,7 @@ test('A generation cut inside a line is stated as facts about lines, and the cut
   const created = result.entries.find(e => e.kind === 'create_file')!;
   assert.match(
     created.text,
-    /the generation of src\/Footer\.tsx repeated itself inside line 3 \(`<path d="M12 0c-6\.626 0-12 5\.373-12 12 0 5\.302 3\.438 9\.8 8\.2â€¦`\): that line reached 4039 characters without ending, ending in one 888-character unit repeated verbatim; it was cut at the start of that line: the file holds lines 1\.\.2 as generated; nothing from line 3 on was written/,
+    /the generation of src\/Footer\.tsx repeated itself inside line 3 \(`<path d="M12 0c-6\.626 0-12 5\.373-12 12 0 5\.302 3\.438 9\.8 8\.2…`\): that line reached 4039 characters without ending, ending in one 888-character unit repeated verbatim; it was cut at the start of that line: the file holds lines 1\.\.2 as generated; nothing from line 3 on was written/,
   );
   assert.equal(
     await readFile(join(root, 'src', 'list.ts'), 'utf8'),
@@ -4596,7 +4598,7 @@ test('A generation cut inside a line is stated as facts about lines, and the cut
   const rewritten = result.entries.filter(e => e.kind === 'write').at(-1)!;
   assert.match(
     rewritten.text,
-    /reached the \d+-token budget inside line 3 \(`const icons = \[â€¦`\), which had reached 9000 characters without ending; that line was cut: lines 2\.\.2 hold the generated lines before it; the rest of the block was not written, and the lines that followed line 3 now start at line 3/,
+    /reached the \d+-token budget inside line 3 \(`const icons = \[…`\), which had reached 9000 characters without ending; that line was cut: lines 2\.\.2 hold the generated lines before it; the rest of the block was not written, and the lines that followed line 3 now start at line 3/,
   );
 });
 
@@ -5605,7 +5607,7 @@ test('The source at the errors carries the hash an edit needs (a BOM file), and 
   const { root, store } = await repo(t);
   const { hash, boundedRead } = await import('../src/files.js');
   await mkdir(join(root, 'src'), { recursive: true });
-  await writeFile(join(root, 'src', 'bom.ts'), 'ï»¿export const a: number = 1;\nexport const b: number = "x";\n');
+  await writeFile(join(root, 'src', 'bom.ts'), '﻿export const a: number = 1;\nexport const b: number = "x";\n');
   const many = Array.from({ length: 10 }, (_, f) => `src/m${f}.ts`);
   for (const [f, p] of many.entries())
     await writeFile(
@@ -5759,7 +5761,7 @@ test('After a clip marker in a multi-file read nothing is credited to the file b
   s.entries = [
     entry(
       'e2',
-      `src/app.ts sha256=A totalLines=150 shown=20..150\n${lines('app', 20, 23)}\n[â€¦truncated; use a narrower read or queryâ€¦]\n${lines('util', 103, 107)}`,
+      `src/app.ts sha256=A totalLines=150 shown=20..150\n${lines('app', 20, 23)}\n[…truncated; use a narrower read or query…]\n${lines('util', 103, 107)}`,
     ),
   ];
   assert.deepEqual(
@@ -6735,7 +6737,7 @@ test('Run 71 review: a rewrite that differs from the file only in trailing white
 });
 test('A rewrite of a file that starts with a byte-order mark lands: the file is read and hashed as the write tool reads it', async t => {
   const { root, store } = await repo(t);
-  await writeFile(join(root, 'a.ts'), 'ï»¿export const a = 1;\n');
+  await writeFile(join(root, 'a.ts'), '﻿export const a = 1;\n');
   const bonsai = bonsaiOf({
     steps: [{ thought: 'rewrite a', action: 'rewrite_file', args: { path: 'a.ts', purpose: 'a becomes 2' } }],
     files: { 'a.ts': 'export const a = 2;\n' },

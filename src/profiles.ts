@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { builtinModules, createRequire } from 'node:module';
 import type { CheckSummary } from './types.js';
+import { bashPathOf, venvBin, windowsExe } from './shell.js';
 import { boundedRead, exportedSignatures, hash, importCandidates, installCommand, problemAt, problemKey, installedPackages, manifestFailures, relativeImports, repositoryStatus, runCommand, safePath, solutionTsconfigReferences, syntaxErrors, topLevelDeclarations } from './tools.js';
 type RepositoryStatus = Awaited<ReturnType<typeof repositoryStatus>>;
 const nested = (repository: RepositoryStatus | undefined, ...manifests: string[]) => (repository?.packages ?? []).some(p => p.tools.some(f => manifests.includes(f)));
@@ -100,7 +101,8 @@ const node: EcosystemProfile = {
 };
 // Python installs into a virtual environment of the project: system Python
 // refuses installs (PEP 668), and the checks run with the environment's interpreter.
-const pythonBin = async (root: string) => await exists(join(root, '.venv', 'bin', 'python')) ? '.venv/bin/python' : 'python3';
+const venvPython = `.venv/${venvBin}/python`;
+const pythonBin = async (root: string) => await exists(join(root, '.venv', venvBin, windowsExe('python'))) ? venvPython : 'python3';
 // The project's declared dependencies and every extras group, one per line, read with the interpreter's own TOML parser.
 const declaredPython = "import tomllib,sys;d=tomllib.load(open('pyproject.toml','rb'));p=d.get('project',{});x=list(p.get('dependencies',[]))\nfor v in p.get('optional-dependencies',{}).values(): x+=list(v)\nfor v in d.get('dependency-groups',{}).values(): x+=[i for i in v if isinstance(i,str)]\nprint('\\n'.join(x))";
 // Whether the project has any source of its own outside its environment and tests.
@@ -124,8 +126,8 @@ const python: EcosystemProfile = {
   // itself as an editable install once it has sources. The marker records the
   // stage reached; a manifest change (force) rebuilds from the first.
   installCommand: async (root, dir, force) => {
-    const at = (p: string) => join(root, dir, p); const prefix = dir === '.' ? '' : `cd ${dir} && `; const py = '.venv/bin/python';
-    const venv = (await exists(at('.venv/bin/python'))) ? '' : 'python3 -m venv .venv && ';
+    const at = (p: string) => join(root, dir, p); const prefix = dir === '.' ? '' : `cd ${dir} && `; const py = venvPython;
+    const venv = (await exists(at(`.venv/${venvBin}/${windowsExe('python')}`))) ? '' : 'python3 -m venv .venv && ';
     const stage = venv ? '' : (await boundedRead(at('.venv/.leana-installed')).catch(() => '')).trim();
     const project = await exists(at('pyproject.toml')); const requirements = await exists(at('requirements.txt'));
     if (!project && !requirements) return null;
@@ -138,7 +140,7 @@ const python: EcosystemProfile = {
     const reached = project && !sources ? 'deps' : 'project';
     return `${prefix}${venv}${steps.join(' && ')} && printf '%s' '${reached}' > .venv/.leana-installed`;
   },
-  shellPrefix: async root => (await exists(join(root, '.venv', 'bin'))) ? `export PATH=${JSON.stringify(join(root, '.venv', 'bin'))}:"$PATH"; ` : '',
+  shellPrefix: async root => (await exists(join(root, '.venv', venvBin))) ? `export PATH=${JSON.stringify(bashPathOf(join(root, '.venv', venvBin)))}:"$PATH"; ` : '',
   errorLines: output => output.split('\n').filter(l => /ERROR|error|No matching|Could not/i.test(l)).slice(0, 6).join(' | ') || output,
   declared: async root => { try { const t = await boundedRead(join(root, 'requirements.txt')); return t.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#')).map(l => l.replace(/\s*(?:[<>=!~]=?.*)$/, '') + '@'); } catch { return []; } },
   verificationClass: (command, body) => classOf(`${command} ${body}`, [[/\bmypy\b|\bpyright\b/, 'static'], [/\bcompileall\b|py_compile/, 'build'], [/\bpytest\b|unittest/, 'test'], [/\bruff\b|\bflake8\b|\bpylint\b/, 'lint']]),
@@ -148,14 +150,14 @@ const python: EcosystemProfile = {
     const py = await pythonBin(root); const out: { command: string; source: string }[] = [];
     const pyproject = await boundedRead(join(root, 'pyproject.toml')).catch(() => '');
     const requirements = await boundedRead(join(root, 'requirements.txt')).catch(() => '');
-    const tool = async (name: string) => (await exists(join(root, '.venv', 'bin', name))) || new RegExp(`(^|[^\\w-])${name}\\b`, 'm').test(`${pyproject}\n${requirements}`);
+    const tool = async (name: string) => (await exists(join(root, '.venv', venvBin, windowsExe(name)))) || new RegExp(`(^|[^\\w-])${name}\\b`, 'm').test(`${pyproject}\n${requirements}`);
     if (/\[tool\.mypy\]/.test(pyproject) || await exists(join(root, 'mypy.ini')) || await tool('mypy')) out.push({ command: `${py} -m mypy .`, source: 'mypy in the environment or configuration' });
     if (await tool('pytest')) out.push({ command: `${py} -m pytest -q`, source: 'pytest in the environment or requirements' });
     out.push({ command: `${py} -m compileall -q -x '\\.venv' .`, source: 'python syntax check' });
     return out;
   },
-  lintCommand: async (root, path) => { const py = await pythonBin(root); return (await exists(join(root, '.venv', 'bin', 'ruff'))) ? `${py} -m ruff check --output-format concise ${JSON.stringify(path)}` : null; },
-  commandWords: ['python', 'python3', 'pip', 'pytest', 'mypy', 'ruff', '.venv/bin/python'],
+  lintCommand: async (root, path) => { const py = await pythonBin(root); return (await exists(join(root, '.venv', venvBin, windowsExe('ruff')))) ? `${py} -m ruff check --output-format concise ${JSON.stringify(path)}` : null; },
+  commandWords: ['python', 'python3', 'pip', 'pytest', 'mypy', 'ruff', venvPython],
 };
 const rust: EcosystemProfile = {
   id: 'rust', manifest: 'Cargo.toml', markers: ['Cargo.toml'], manifests: ['Cargo.toml', 'Cargo.lock'], configFiles: /(^|\/)(Cargo\.toml|rust-toolchain(?:\.toml)?|\.cargo\/config(?:\.toml)?)$/, sourceExtensions: /\.rs$/,
@@ -586,7 +588,11 @@ export async function syntaxCheck(root: string, path: string, text: string): Pro
   const dir = await mkdtemp(join(tmpdir(), 'leana-syntax-')); const file = join(dir, path.split('/').pop()!);
   try {
     await writeFile(file, text);
-    const r = await runCommand(tool.cmd, tool.args(file), root, 20000).catch(() => null); if (!r) return [];
+    // On Windows the program is found as a command finds it: bash's PATH lookup takes the shims and scripts a direct spawn does not
+    // (python3 alone is the Store's stub). A shim can be a .bat, through which a multi-line argument does not pass: a -c program goes as a file.
+    let args = tool.args(file);
+    if (process.platform === 'win32' && args[0] === '-c') { const program = join(dir, 'leana-check.py'); await writeFile(program, args[1]!); args = [program, ...args.slice(2)]; }
+    const r = await (process.platform === 'win32' ? runCommand('bash', ['--noprofile', '--norc', '-c', '"$0" "$@"', tool.cmd, ...args], root, 20000) : runCommand(tool.cmd, args, root, 20000)).catch(() => null); if (!r) return [];
     const lines = r.output.split('\n').map(l => l.replaceAll(file, path).trim()).filter(l => /error|expected|invalid|unexpected/i.test(l));
     return r.code === 0 ? [] : lines.length ? lines.slice(0, 6) : [`${path}: the ${tool.cmd} parser rejected the file (exit ${r.code})`];
   } finally { await rm(dir, { recursive: true, force: true }).catch(() => {}); }

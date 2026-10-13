@@ -4,6 +4,7 @@
 // that needs something running.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { connect } from 'node:net';
+import { bashPath, killTree, missingBash, runMark, shellEnv } from './shell.js';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 // Waits for the URL to answer. A server that announces its own address and it
@@ -44,10 +45,11 @@ export interface Started { ready: true | string[] | false; log: () => string; st
 // announced address accepts a connection in time.
 export async function startServer(root: string, command: string, url: string | null, timeoutMs: number): Promise<Started> {
   const out: string[] = [];
-  const child: ChildProcess = spawn('bash', ['--noprofile', '--norc', '-c', command], { cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CI: '1', FORCE_COLOR: '0', BROWSER: 'none' } });
+  const mark = runMark();
+  const child: ChildProcess = spawn(bashPath(), ['--noprofile', '--norc', '-c', command], { cwd: root, detached: process.platform !== 'win32', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: shellEnv({ ...process.env, CI: '1', FORCE_COLOR: '0', BROWSER: 'none', ...(mark ? { LEANA_RUN: mark } : {}) }) });
   child.stdout?.on('data', d => out.push(String(d))); child.stderr?.on('data', d => out.push(String(d)));
-  child.on('error', e => out.push(String(e.message)));
-  const stop = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ } setTimeout(() => { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* gone */ } }, 2000).unref(); } };
+  child.on('error', (e: NodeJS.ErrnoException) => out.push(e.code === 'ENOENT' ? missingBash() : String(e.message)));
+  const stop = () => { if (child.pid) { killTree(child.pid, 'SIGTERM', mark); if (process.platform !== 'win32') setTimeout(() => killTree(child.pid), 2000).unref(); } };
   const exited = () => child.exitCode ?? child.signalCode ?? (child.pid ? null : 'not started');
   const ready = url ? await waitForUrl(url, timeoutMs, () => announcedElsewhere(out.join(''), url)) : await waitForStart(timeoutMs, () => out.join(''), exited);
   return { ready, log: () => out.join(''), stop, exited };

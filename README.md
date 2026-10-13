@@ -8,6 +8,8 @@ This is a working prototype, with explicit limits and inspectable traces. Its ad
 
 Install ripgrep if `rg --version` does not work in your terminal. On openSUSE, run `sudo zypper install ripgrep`. Codex's bundled copy may be available inside Codex while absent from your normal terminal's `PATH`.
 
+On Windows, install [Git for Windows](https://git-scm.com/download/win) as well (`winget install Git.Git`): commands run with its bash, which Leana finds from the `git` on your `PATH` or its default install location, without needing bash on the `PATH` (set `LEANA_BASH` to use another). The worker is told it is on Windows with Git Bash. Python projects get their venv in `.venv/Scripts`. Since Windows has no process groups, each command's shell carries a mark in its environment (`LEANA_RUN`), and what a command leaves running is found by that mark and stopped, as on Linux. That lookup adds about a quarter of a second to every shell step.
+
 ```bash
 npm ci
 npm run build

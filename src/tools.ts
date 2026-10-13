@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { open, readFile, realpath, rename, stat, unlink, mkdir, readdir } from 'node:fs/promises';
 import { dirname, isAbsolute, posix, relative, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
+import { bashPath, bashPathOf, commandEnv, killTree, missingBash, runMark, windowsLeft } from './shell.js';
 import { builtinModules } from 'node:module';
 import type { CheckSummary, Config, Route, SourceEvidence, ToolResult } from './types.js';
 import { clip } from './context.js';
@@ -397,6 +398,13 @@ export async function summarizeCheck(text: string, root: string, known: string[]
   let output = text; let code: number | null = null;
   try { const parsed = JSON.parse(text); if (typeof parsed?.output === 'string') output = parsed.output; if (typeof parsed?.code === 'number') code = parsed.code; } catch { /* plain text */ }
   const prefix = `${root.replace(/\/$/, '')}/`;
+  // On Windows a tool names a file of the repository by its Windows path (C:\repo\src\a.py, C:/repo/...,
+  // or /c/repo/... from bash): it is read with forward slashes, relative to the root.
+  if (process.platform === 'win32') {
+    const forward = (s: string) => s.replace(/\\/g, '/');
+    output = forward(output);
+    for (const r of new Set([forward(root), bashPathOf(root)])) output = output.replace(new RegExp(`${r.replace(/\/$/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`, 'gi'), '');
+  }
   const files: Record<string, number[]> = {}; const resolved = new Map<string, string | null>();
   const resolvePath = async (token: string): Promise<string | null> => {
     if (resolved.has(token)) return resolved.get(token)!;
@@ -621,7 +629,7 @@ export interface GroupProcess { pid: number; ppid: number; args: string }
 // The live processes of a process group (zombies left out), read from the process
 // table: Linux's /proc, ps elsewhere (macOS, the BSDs, whose /proc differs or is absent)
 // and wherever /proc cannot be read. An empty group is known without reading the
-// table: signal 0 to it fails.
+// table: signal 0 to it fails. Windows has no groups (runCommand finds what a command left there by its mark).
 export async function groupProcesses(pgid: number, via: 'proc' | 'ps' = process.platform === 'linux' ? 'proc' : 'ps'): Promise<GroupProcess[]> {
   if (process.platform === 'win32' || !(pgid > 0)) return [];
   try { process.kill(-pgid, 0); } catch { return []; }
@@ -672,22 +680,20 @@ const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
 // returned as leftRunning, so the caller can say what was stopped.
 export async function runCommand(command: string, args: string[], cwd: string, timeout: number, limit = 1024 * 1024, settle?: (output: string, quietMs: number) => string | null): Promise<{ stoppedEarly?: string; leftRunning?: GroupProcess[]; output: string; code: number | null; truncated: boolean; timedOut: boolean }> {
   return new Promise((resolveResult, reject) => {
-    const env: NodeJS.ProcessEnv = {};
-    for (const key of ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM'])
-      if (process.env[key]) env[key] = process.env[key];
+    const env = commandEnv();
     // No terminal is attached: tools that would prompt are told so, the way
     // continuous integration tells them, and npm's own prompts are pre-answered.
     // NO_COLOR as well as FORCE_COLOR=0: some tools read FORCE_COLOR's presence,
     // whatever its value, as "force" (TypeScript 6's tsc, picocolors), and NO_COLOR
     // takes precedence in them.
     Object.assign(env, { CI: '1', FORCE_COLOR: '0', NO_COLOR: '1', npm_config_yes: 'true', DEBIAN_FRONTEND: 'noninteractive' });
-    const child = spawn(command, args, { cwd, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+    // On Windows the shell carries a mark everything it starts inherits: what is left is found by it (see windowsLeft).
+    const started = Date.now(); const mark = runMark(); if (mark) env.LEANA_RUN = mark;
+    const child = spawn(command === 'bash' ? bashPath() : command, args, { cwd, env, detached: process.platform !== 'win32', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: Buffer[] = []; let size = 0; let truncated = false; let timedOut = false; let lastOutput = Date.now(); let stoppedEarly: string | undefined;
     let exitCode: number | null = null; let finished = false; let drain: NodeJS.Timeout | null = null;
-    const kill = () => {
-      if (!child.pid) return;
-      try { if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { /* already exited */ }
-    };
+    const kill = () => killTree(child.pid, 'SIGKILL', mark);
+    const left = () => (mark ? windowsLeft(mark, started) : groupProcesses(child.pid!)).catch(() => [] as GroupProcess[]);
     const timer = setTimeout(() => { timedOut = true; kill(); }, timeout);
     // A command can say it has become something that will not exit (a server): settle decides from its output and how long it has been quiet.
     const watch = settle ? setInterval(() => { const why = settle(Buffer.concat(chunks).toString('utf8'), Date.now() - lastOutput); if (why) { stoppedEarly = why; kill(); } }, 1000) : null;
@@ -702,7 +708,7 @@ export async function runCommand(command: string, args: string[], cwd: string, t
       clearTimeout(timer); if (watch) clearInterval(watch); if (drain) clearTimeout(drain);
       reject(e.code === 'ENOENT' && command === 'rg'
         ? new Error('ripgrep (rg) was not found in PATH. Install ripgrep, confirm rg --version works in this terminal, then retry.')
-        : e);
+        : e.code === 'ENOENT' && command === 'bash' ? new Error(missingBash()) : e);
     });
     const finish = async () => {
       if (finished) return; finished = true;
@@ -710,17 +716,29 @@ export async function runCommand(command: string, args: string[], cwd: string, t
       // Stopped by the harness (timeout, a server, too much output): the group was killed on purpose, and that is the fact already.
       let leftRunning: GroupProcess[] = [];
       if (child.pid && !timedOut && !stoppedEarly && !truncated) {
-        const first = await groupProcesses(child.pid).catch(() => []);
-        if (first.length) { await pause(250); leftRunning = await groupProcesses(child.pid).catch(() => []); }
+        const first = await left();
+        if (first.length) { await pause(250); leftRunning = await left(); }
       }
-      kill();
+      // On Windows stopping is a search for the mark: made when the command was stopped or left something.
+      if (!mark || timedOut || stoppedEarly || truncated || leftRunning.length) kill();
       // Stopped means gone: a killed process holds its ports until it has exited, so what was named is waited for (briefly).
-      for (let i = 0; leftRunning.length && i < 40 && (await groupProcesses(child.pid!).catch(() => [])).length; i++) await pause(50);
-      resolveResult({ output: Buffer.concat(chunks).toString('utf8'), code: exitCode, truncated, timedOut, ...(stoppedEarly ? { stoppedEarly } : {}), ...(leftRunning.length ? { leftRunning } : {}) });
+      for (let i = 0; leftRunning.length && i < 40 && (await left()).length; i++) await pause(50);
+      // Windows programs end lines with CRLF; the output is read as lines, the same as elsewhere.
+      const text = Buffer.concat(chunks).toString('utf8');
+      resolveResult({ output: process.platform === 'win32' ? text.replace(/\r\n/g, '\n') : text, code: exitCode, truncated, timedOut, ...(stoppedEarly ? { stoppedEarly } : {}), ...(leftRunning.length ? { leftRunning } : {}) });
     };
     child.on('exit', code => { exitCode = code; drain = setTimeout(() => { void finish(); }, 1500); });
     child.on('close', code => { exitCode = code; void finish(); });
   });
+}
+// Makes the directories a file is written into. Where one of them is a file, Linux
+// says ENOTDIR and Windows EEXIST ("file already exists"), which reads as if the file
+// being written existed; Windows' is said as Linux says it.
+export async function parentDirectory(path: string): Promise<void> {
+  try { await mkdir(dirname(path), { recursive: true }); } catch (e: any) {
+    if (process.platform === 'win32' && e?.code === 'EEXIST') throw Object.assign(new Error(`ENOTDIR: not a directory, mkdir '${e.path ?? dirname(path)}'`), { code: 'ENOTDIR' });
+    throw e;
+  }
 }
 export async function boundedRead(path: string, limit = 1024 * 1024): Promise<string> {
   const handle = await open(path, 'r');
@@ -809,6 +827,8 @@ export class ToolBox {
       const exclusions = ['!.git/**', '!.leana/**', '!node_modules/**', '!.env', '!.env.*', '!*.pem', '!*.key', '!id_rsa', '!id_ed25519'];
       const args = a.mode === 'files' ? ['--files'] : ['-n', '--no-heading', '--color', 'never', '-F', '--max-count', '50'];
       args.push('--max-filesize', '1M', ...exclusions.flatMap(g => ['--glob', g]));
+      // Paths as the rest of the harness names them, with forward slashes, on Windows too.
+      if (process.platform === 'win32') args.push('--path-separator', '/');
       if (a.mode === 'text') args.push('-e', a.query);
       args.push('--', relative(searchRoot, path) || '.');
       const r = await runCommand('rg', args, searchRoot, 10000);
@@ -829,7 +849,7 @@ export class ToolBox {
       const path = await safePath(this.root, a.path, true);
       let exists = true; try { await stat(path); } catch (e: any) { if (e.code !== 'ENOENT') throw e; exists = false; }
       if (exists) throw new Error(`${a.path} already exists; edit it with replace_lines or write instead of creating it`);
-      await mkdir(dirname(path), { recursive: true });
+      await parentDirectory(path);
       await safePath(this.root, a.path, true);
       const handle = await open(path, 'wx', 0o644);
       try { await handle.writeFile(content); } finally { await handle.close(); }
@@ -1090,7 +1110,7 @@ export class ToolBox {
       const moved = lines.slice(a.start - 1, a.end).join('\n');
       const remaining = [...lines.slice(0, a.start - 1), ...lines.slice(a.end)].join('\n');
       const output = existing === null || existing === '' ? `${moved}\n` : `${existing.replace(/\n?$/, '\n')}${moved}\n`;
-      await mkdir(dirname(destinationPath), { recursive: true });
+      await parentDirectory(destinationPath);
       const temp = `${sourcePath}.leana-${randomUUID()}.tmp`;
       try {
         const h = await open(temp, 'wx', (await stat(sourcePath)).mode & 0o777);

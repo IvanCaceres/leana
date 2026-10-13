@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { createServer, type ServerResponse } from 'node:http';
 import { defaults, loadConfig, loadSettings } from '../src/config.js';
@@ -15,7 +16,7 @@ import { schemas, stepSchema, toolSchema, withDefaults } from '../src/schema.js'
 import { AGENT_SYSTEM, agentSystem, stepMessages } from '../src/context.js';
 import type { Answers, Config, Questions } from '../src/types.js';
 
-const fixtures = new URL('../../test/fixtures/openrouter/', import.meta.url).pathname;
+const fixtures = fileURLToPath(new URL('../../test/fixtures/openrouter/', import.meta.url));
 const catalogue = async () => JSON.parse(await readFile(join(fixtures, 'models.json'), 'utf8'));
 const body = async (req: AsyncIterable<any>) => { let b = ''; for await (const c of req) b += c; return b ? JSON.parse(b) : {}; };
 // OpenRouter's stream: a keep-alive comment, a role delta, then the pieces, the finish, a usage chunk and [DONE].

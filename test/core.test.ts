@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, mkdir, readdir, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { bashPath, runMark, shellEnv, stopMarked, venvBin, windowsArgs, windowsExe, windowsLeft } from '../src/shell.js';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { defaults as baseDefaults, loadConfig } from '../src/config.js';
@@ -125,7 +127,7 @@ test('Sampling comes from the config: reasoning turns and file content each send
   assert.deepEqual([bodies.chat![1].temperature, bodies.chat![1].min_p], [.7, .1]); assert.deepEqual([bodies.completion![1].temperature, bodies.completion![1].min_p], [.6, .08]);
   await assert.rejects(loadConfig(undefined, { stepMinP: 1 }), /stepMinP must be between 0 and 1/);
   await assert.rejects(loadConfig(undefined, { codeTemperature: 3 }), /codeTemperature must be above 0 and at most 2/);
-  const example = await loadConfig(new URL('../../leana.example.json', import.meta.url).pathname);
+  const example = await loadConfig(fileURLToPath(new URL('../../leana.example.json', import.meta.url)));
   assert.equal(example.codeMinP, .05, 'the example config loads');
 });
 
@@ -226,7 +228,7 @@ test('A generation request is allowed the time to process a cold prompt, and a b
   assert.equal(requestTimeoutMs(0, 1024, 123), requestTimeoutMs(0, 1024, 60), 'a measured 123 tok/s from accepted drafts counts as 60');
 });
 // Recorded generations of this model (fixtures/cycling): in-line loops as the chunk that showed them ended, and a Footer that finished normally.
-const cycling = new URL('../../test/fixtures/cycling/', import.meta.url).pathname;
+const cycling = fileURLToPath(new URL('../../test/fixtures/cycling/', import.meta.url));
 const cyclingMeta = JSON.parse(readFileSync(`${cycling}meta.json`, 'utf8')) as { loops: { file: string; id: string; tokens: number; previousBoundaryChars: number; cutAt: number }[]; legit: { file: string; why: string }[] };
 const cyclingStart = (text: string) => cyclingLine(text)?.start ?? -1;
 test('cyclingLine cuts each recorded in-line loop at the start of its line, at the first 1024-token chunk that shows the cycle over 3,000 characters', () => {
@@ -442,7 +444,7 @@ test('A prompt counted to fit it is not rendered and tokenized again when it is 
   assert.deepEqual([calls['/apply-template'], calls['/tokenize']], [5 + 1, 6]);
 });
 test('echoOf and trimContext: a block repeating the lines after its region, compared without blank lines, is cut where the repeat starts; single bracket lines and runs the file holds twice are not taken', () => {
-  const echoes = new URL('../../test/fixtures/echo/', import.meta.url).pathname;
+  const echoes = fileURLToPath(new URL('../../test/fixtures/echo/', import.meta.url));
   const old = readFileSync(`${echoes}react-demo-73-step70-old.tsx.txt`, 'utf8').replace(/\n$/, '').split('\n'); const block = readFileSync(`${echoes}react-demo-73-step70-block.tsx.txt`, 'utf8');
   const around = { before: old.slice(0, 84).join('\n'), region: old.slice(84, 100).join('\n'), after: old.slice(100).join('\n') };
   // Run 73 step 70: old lines 102..244 without blank lines 101 and 115; line for line only its first line matches.
@@ -472,23 +474,24 @@ test('Profiles carry the ecosystem, language and stack knowledge: detected from 
   const py = ecosystems.find(e => e.id === 'python')!; const rs = ecosystems.find(e => e.id === 'rust')!; const go = ecosystems.find(e => e.id === 'go')!;
   // System pip refuses installs on managed machines (PEP 668): the profile keeps a project venv. The install is staged: the
   // declared dependencies as soon as the manifest exists (the project has no sources yet), the project itself once it has.
-  const deps = `.venv/bin/python -c "import tomllib,sys;d=tomllib.load(open('pyproject.toml','rb'));p=d.get('project',{});x=list(p.get('dependencies',[]))\nfor v in p.get('optional-dependencies',{}).values(): x+=list(v)\nfor v in d.get('dependency-groups',{}).values(): x+=[i for i in v if isinstance(i,str)]\nprint('\\n'.join(x))" | xargs -r -d '\\n' .venv/bin/python -m pip install`;
+  const vpy = `.venv/${venvBin}/python`;
+  const deps = `${vpy} -c "import tomllib,sys;d=tomllib.load(open('pyproject.toml','rb'));p=d.get('project',{});x=list(p.get('dependencies',[]))\nfor v in p.get('optional-dependencies',{}).values(): x+=list(v)\nfor v in d.get('dependency-groups',{}).values(): x+=[i for i in v if isinstance(i,str)]\nprint('\\n'.join(x))" | xargs -r -d '\\n' ${vpy} -m pip install`;
   assert.equal(await py.installCommand(root, '.', false), `python3 -m venv .venv && ${deps} && printf '%s' 'deps' > .venv/.leana-installed`, 'no sources yet: the dependencies only, and the stage is recorded');
   await writeFile(join(root, 'requirements.txt'), 'requests>=2\n# c\nflask==3.0\n');
-  assert.equal(await py.installCommand(root, '.', true), `python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt && ${deps} && printf '%s' 'deps' > .venv/.leana-installed`);
+  assert.equal(await py.installCommand(root, '.', true), `python3 -m venv .venv && ${vpy} -m pip install -r requirements.txt && ${deps} && printf '%s' 'deps' > .venv/.leana-installed`);
 
-  await mkdir(join(root, '.venv', 'bin'), { recursive: true }); await writeFile(join(root, '.venv', 'bin', 'python'), ''); await writeFile(join(root, '.venv', '.leana-installed'), 'deps');
+  await mkdir(join(root, '.venv', venvBin), { recursive: true }); await writeFile(join(root, '.venv', venvBin, windowsExe('python')), ''); await writeFile(join(root, '.venv', '.leana-installed'), 'deps');
   assert.equal(await py.installCommand(root, '.', false), null, 'dependencies installed and still no sources: nothing to do');
   await mkdir(join(root, 'src', 'x'), { recursive: true }); await writeFile(join(root, 'src', 'x', '__init__.py'), '');
-  assert.equal(await py.installCommand(root, '.', false), `.venv/bin/python -m pip install --no-deps -e . && printf '%s' 'project' > .venv/.leana-installed`, 'sources exist now: the project is installed, once');
+  assert.equal(await py.installCommand(root, '.', false), `${vpy} -m pip install --no-deps -e . && printf '%s' 'project' > .venv/.leana-installed`, 'sources exist now: the project is installed, once');
   await writeFile(join(root, '.venv', '.leana-installed'), 'project');
   assert.equal(await py.installCommand(root, '.', false), null, 'installed once, not again');
-  assert.equal(await py.installCommand(root, '.', true), `.venv/bin/python -m pip install -r requirements.txt && ${deps} && .venv/bin/python -m pip install --no-deps -e . && printf '%s' 'project' > .venv/.leana-installed`, 'a manifest change installs again into the same venv');
-  assert.deepEqual((await py.verificationCandidates(root)).map(c => c.command), [".venv/bin/python -m compileall -q -x '\\.venv' ."], 'no test tool in the venv or the requirements: the interpreter syntax pass');
-  await writeFile(join(root, '.venv', 'bin', 'pytest'), ''); await writeFile(join(root, '.venv', 'bin', 'mypy'), '');
-  assert.deepEqual((await py.verificationCandidates(root)).map(c => c.command).slice(0, 2), ['.venv/bin/python -m mypy .', '.venv/bin/python -m pytest -q'], 'the tools the venv has, static before test');
-  await rm(join(root, '.venv', 'bin', 'pytest')); await appendFile(join(root, 'requirements.txt'), 'pytest>=8\n');
-  assert((await py.verificationCandidates(root)).some(c => c.command === '.venv/bin/python -m pytest -q'), 'a declared test runner is a candidate before it is installed');
+  assert.equal(await py.installCommand(root, '.', true), `${vpy} -m pip install -r requirements.txt && ${deps} && ${vpy} -m pip install --no-deps -e . && printf '%s' 'project' > .venv/.leana-installed`, 'a manifest change installs again into the same venv');
+  assert.deepEqual((await py.verificationCandidates(root)).map(c => c.command), [`${vpy} -m compileall -q -x '\\.venv' .`], 'no test tool in the venv or the requirements: the interpreter syntax pass');
+  await writeFile(join(root, '.venv', venvBin, windowsExe('pytest')), ''); await writeFile(join(root, '.venv', venvBin, windowsExe('mypy')), '');
+  assert.deepEqual((await py.verificationCandidates(root)).map(c => c.command).slice(0, 2), [`${vpy} -m mypy .`, `${vpy} -m pytest -q`], 'the tools the venv has, static before test');
+  await rm(join(root, '.venv', venvBin, windowsExe('pytest'))); await appendFile(join(root, 'requirements.txt'), 'pytest>=8\n');
+  assert((await py.verificationCandidates(root)).some(c => c.command === `${vpy} -m pytest -q`), 'a declared test runner is a candidate before it is installed');
   assert.deepEqual(await py.declared(root), ['requests@', 'flask@', 'pytest@']);
   assert.deepEqual(await rs.declared(root), ['serde@']);
   assert.equal(verificationClass('npm run typecheck', 'tsc --noEmit'), 'static'); assert.equal(verificationClass('npm run build', 'vite build'), 'build'); assert.equal(verificationClass('npm test', 'vitest run'), 'test');
@@ -917,7 +920,7 @@ test('The processes a command left running are described by what it started, and
   assert.equal(describeProcesses([{ pid: 10, ppid: 1, args: 'a' }, { pid: 20, ppid: 1, args: 'b' }, { pid: 21, ppid: 20, args: 'c' }]), '"a" (pid 10), "b" (pid 20) and 1 process started by them');
 });
 
-test('A process group is read from the process table (/proc or ps): its live members with their command lines; an empty group is empty', async () => {
+test('A process group is read from the process table (/proc or ps): its live members with their command lines; an empty group is empty', { skip: process.platform === 'win32' && 'Windows has no process groups' }, async () => {
   const { spawn } = await import('node:child_process');
   const child = spawn('bash', ['-c', 'sleep 30 & sleep 30'], { detached: true, stdio: 'ignore' });
   try {
@@ -956,4 +959,27 @@ test('lineDiff (review): CRLF endings are not line changes, and a middle too lar
   assert.deepEqual(lineDiff('a\r\nb\r\nc\r\n', 'a\nB\nc\n'), { removed: 1, added: 1, exact: true });
   const big = (n: number, p: string) => Array.from({ length: n }, (_, i) => `${p}${i}`).join('\n') + '\n';
   assert.equal(lineDiff(big(2100, 'x'), big(2100, 'y')).exact, false);
+});
+
+test('On Windows what a command left running is found by the mark its shell passed down, named as elsewhere: the fork Git Bash keeps for a program is the program, and a bash it ran is found after every process between has exited', { skip: process.platform !== 'win32' && 'Windows only' }, async () => {
+  assert.equal(windowsArgs('"C:\\Program Files\\nodejs\\node.exe" -e "setInterval(() => {}, 1000)"'), 'node -e setInterval(() => {}, 1000)');
+  assert.equal(windowsArgs('C:\\x\\node.exe idle.mjs'), 'node idle.mjs');
+  assert.equal(windowsArgs('python.exe -c "print(\\"a b\\")"'), 'python -c print("a b")');
+  const { spawn } = await import('node:child_process');
+  const run = async (command: string) => {
+    const mark = runMark()!; const since = Date.now();
+    const child = spawn(bashPath(), ['--noprofile', '--norc', '-o', 'pipefail', '-c', command], { stdio: 'ignore', env: shellEnv({ ...process.env, LEANA_RUN: mark }) });
+    await new Promise(r => child.on('exit', r)); await new Promise(r => setTimeout(r, 300));
+    return { mark, found: await windowsLeft(mark, since) };
+  };
+  const a = await run('node -e "setInterval(() => {}, 1000)" >/dev/null 2>&1 & echo started');
+  const b = await run('bash -c "sleep 30 & node -e \'setInterval(() => {}, 1000)\' & wait" >/dev/null 2>&1 & echo started');
+  try {
+    assert.deepEqual(a.found.map(p => p.args), ['node -e setInterval(() => {}, 1000)'], 'the program, not the fork that waits on it nor the console host');
+    const nested = b.found.map(p => p.args).sort();
+    assert.deepEqual(nested, ['bash -c sleep 30 & node -e \'setInterval(() => {}, 1000)\' & wait', 'node -e setInterval(() => {}, 1000)', 'sleep 30'].sort(), nested.join(' | '));
+    const shell = b.found.find(p => p.args.startsWith('bash -c'))!;
+    assert(b.found.filter(p => p !== shell).every(p => p.ppid === shell.pid), 'what the bash started is under it');
+  } finally { stopMarked(a.mark); stopMarked(b.mark); }
+  assert.deepEqual(await windowsLeft(b.mark, Date.now()), [], 'stopped: nothing carries the mark');
 });

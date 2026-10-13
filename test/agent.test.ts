@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { venvBin, windowsExe } from '../src/shell.js';
 import { join } from 'node:path';
 import { defaults } from '../src/config.js';
 import { Agent, newSession } from '../src/agent.js';
@@ -212,7 +214,7 @@ test('A created file is checked against the repository as facts: an undeclared p
   await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'x', dependencies: { react: '^19' } })); await mkdir(join(root, 'node_modules'), { recursive: true });
   await mkdir(join(root, 'src'), { recursive: true }); await writeFile(join(root, 'src', 'util.py'), 'def helper():\n    pass\n'); await writeFile(join(root, 'pyproject.toml'), '[project]\nname="x"\n');
   // Both projects are detected; the Python one is already installed, so the one step goes to the worker.
-  await mkdir(join(root, '.venv', 'bin'), { recursive: true }); await writeFile(join(root, '.venv', 'bin', 'python'), ''); await writeFile(join(root, '.venv', '.leana-installed'), 'project');
+  await mkdir(join(root, '.venv', venvBin), { recursive: true }); await writeFile(join(root, '.venv', venvBin, windowsExe('python')), ''); await writeFile(join(root, '.venv', '.leana-installed'), 'project');
   const bonsai = bonsaiOf({ steps: [{ thought: 'write', action: 'create_file', args: { path: 'src/app.tsx', purpose: 'the app' } }],
     files: { 'src/app.tsx': "import { useState } from 'react';\nimport clsx from 'clsx';\nexport function App() { return null; }\n" } });
   const result = await new Agent({ ...config, maxSteps: 1 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
@@ -1674,7 +1676,7 @@ test('A cut that leaves no line writes nothing, a region cut after echoed contex
 });
 
 // Run 73 step 70, as recorded: the old file is the write's oldText, the generated block new lines 85..226.
-const echoFixtures = new URL('../../test/fixtures/echo/', import.meta.url).pathname;
+const echoFixtures = fileURLToPath(new URL('../../test/fixtures/echo/', import.meta.url));
 test('A region block that repeats the lines after the region is not written twice: a block of nothing but that repeat removes the region, and the facts say what was generated, dropped and kept (run 73 step 70)', async t => {
   const { root, store } = await repo(t);
   const old = await readFile(join(echoFixtures, 'react-demo-73-step70-old.tsx.txt'), 'utf8'); const block = await readFile(join(echoFixtures, 'react-demo-73-step70-block.tsx.txt'), 'utf8');
@@ -2014,7 +2016,7 @@ test('A repeated two-file read whose other file was removed outside the harness 
   const result = await new Agent({ ...config, maxSteps: 20 }, store, jevOf({}), bonsai, root, () => {}, () => {}).run(await newSession(root, 'x'));
   assert.match(result.stopReason, /four (actions|turns) in a row/, result.stopReason);
   assert(result.step <= 8, `stopped at step ${result.step}`);
-  assert((await events(store)).some(e => e.type === 'refused' && /failed at step \d+ .*dist\/out\.js/.test(e.data.why)), 'the identical request is refused with the failure');
+  assert((await events(store)).some(e => e.type === 'refused' && /failed at step \d+ .*dist[\\/]out\.js/.test(e.data.why)), 'the identical request is refused with the failure');
 });
 test('A repeated read followed by the same plan each turn stops at four in a row', async t => {
   const { root, store } = await repo(t);
@@ -2447,7 +2449,7 @@ test('observe takes a repository file by its path: index.html, ./index.html and 
   const { root } = await repo(t); await writeFile(join(root, 'index.html'), '<!doctype html><title>T</title><h1>Hi</h1>');
   const { observeResult } = await import('../src/observe.js');
   const ctx = { root, artifactPath: join(root, 'shot.png'), timeoutMs: 20000, prefix: '', files: ['index.html'] };
-  for (const target of ['index.html', './index.html', 'file://index.html', 'file:///index.html']) assert.match((await observeResult('page', '', target, ctx)).text, new RegExp(`^Rendered file://${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/index\\.html: no exception`), target);
+  for (const target of ['index.html', './index.html', 'file://index.html', 'file:///index.html']) assert.match((await observeResult('page', '', target, ctx)).text, new RegExp(`^Rendered ${pathToFileURL(join(root, 'index.html')).href.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: no exception`), target);
   assert.match((await observeResult('page', '', 'missing.html', ctx)).text, /^missing\.html is not a URL, and no file of the repository has that path/);
 });
 

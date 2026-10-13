@@ -9,12 +9,18 @@
 // over Chrome's debugging pipe; no library, no network port.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { runCommand } from './tools.js';
 import { announcedElsewhere, notAnswering, startServer, type Started } from './serve.js';
 export { announcedElsewhere };
 
 const candidates = ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'chrome'];
+// On Windows browsers are not on the PATH: they are where their installers put them. Edge is Chromium too.
+const windowsBrowsers = () => [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA].filter((d): d is string => Boolean(d))
+  .flatMap(d => [join(d, 'Google', 'Chrome', 'Application', 'chrome.exe'), join(d, 'Chromium', 'Application', 'chrome.exe'), join(d, 'Microsoft', 'Edge', 'Application', 'msedge.exe')]);
 export async function findBrowser(): Promise<string | null> {
+  if (process.platform === 'win32') { const at = windowsBrowsers().find(p => existsSync(p)); if (at) return at; }
   const r = await runCommand('bash', ['--noprofile', '--norc', '-c', `for b in ${candidates.join(' ')}; do if command -v -- "$b" >/dev/null 2>&1; then echo "$b"; exit 0; fi; done; exit 1`], process.cwd(), 5000).catch(() => null);
   return r && r.code === 0 ? r.output.trim().split('\n')[0]! : null;
 }

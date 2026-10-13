@@ -455,7 +455,7 @@ test('A step and a file generation stream through the real Agent: the thought is
   assert.deepEqual(seen.filter(x => x.e.kind === 'generating' && x.e.prompt).map(x => (x.e as any).route), ['step', 'create_file'], 'how far each prompt has been read, before its first token');
   assert.deepEqual(seen.find(x => x.e.kind === 'generated' && x.e.route === 'create_file')?.e.kind === 'generated' && (seen.find(x => x.e.kind === 'generated' && x.e.route === 'create_file')!.e as any).file, { path: 'src/greet.ts', from: 1, lines: 3 });
   const shown = unescaped(screen);
-  assert.equal(shown.filter(l => l.startsWith('[1] thought: ')).length, 1); assert(shown.some(l => new RegExp(`^\\[1\\] generated src/greet\\.ts \\| 3 lines \\| ${[...`${file}\`\`\``].length} tokens \\| \\d+ms \\| 40\\.0 tok/s$`).test(l)), shown.join('\n'));
+  assert.equal(shown.filter(l => l.startsWith('[1] thought: ')).length, 1); assert(shown.some(l => new RegExp(`^\\[1\\] generated src/greet\\.ts \\| 3 lines \\| ${[...`${file}\`\`\``].length} tokens \\| (?:\\d+ms|[\\d.]+s) \\| 40\\.0 tok/s$`).test(l)), shown.join('\n'));
   const events = (await readFile(join(store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
   assert(events.every(e => !['thinking', 'writing', 'generating'].includes(e.type)), 'nothing display-only is logged');
   const raw = events.filter(e => e.type === 'bonsai' && e.data.raw).at(-1).data; assert.deepEqual([raw.finishReason, raw.continuations, raw.usage.completion_tokens], ['stop', 0, [...`${file}\`\`\``].length]);

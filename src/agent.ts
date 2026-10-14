@@ -89,6 +89,20 @@ interface RunBudget {
 type Outcome = 'ok' | 'failed' | 'refused' | 'stop';
 type WatchReading = NonNullable<Session['watch']>['readings'][number];
 // A turn's thought as it is compared for repeats: its whitespace collapsed.
+// The file a step's reply is writing as it streams: its last action so far, a create_file or rewrite_file whose
+// content has begun (under the tools form the file is written inside the call). from: the first line it writes.
+export function fileBeingWritten(reply: any): { route: string; path: string; from: number; content: string } | null {
+  const last = Array.isArray(reply?.actions) ? reply.actions.at(-1) : undefined;
+  const a = last?.args;
+  if (!a || (last.action !== 'create_file' && last.action !== 'rewrite_file')) return null;
+  if (typeof a.path !== 'string' || typeof a.content !== 'string' || !a.content) return null;
+  return {
+    route: last.action,
+    path: a.path,
+    from: typeof a.start === 'number' && a.start > 0 ? a.start : 1,
+    content: a.content,
+  };
+}
 const saidIn = (e: { text: string }) =>
   String(JSON.parse(e.text).thought ?? '')
     .replace(/\s+/g, ' ')
@@ -881,24 +895,37 @@ export class Agent {
       undefined,
       every(100, (p: StreamProgress) => {
         const reply = route === 'step' && !p.prompt ? partialJson(p.text) : undefined;
+        // Under the tools form a file is written inside its call: while that call is the one being written,
+        // its content so far is shown as a generated file is.
+        const writing = fileBeingWritten(reply);
         this.observe(
           p.reasoning && !p.text
             ? { kind: 'reasoning', step: s.step, text: p.reasoning, tokens: p.tokens }
-            : typeof reply?.thought === 'string'
+            : writing
               ? {
-                  kind: 'thinking',
+                  kind: 'writing',
                   step: s.step,
-                  text: reply.thought,
+                  route: writing.route,
+                  path: writing.path,
+                  from: writing.from,
+                  ...tailLines(writing.content, liveHeight),
                   tokens: p.tokens,
-                  ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}),
                 }
-              : {
-                  kind: 'generating',
-                  step: s.step,
-                  route,
-                  attempt: 1,
-                  ...(p.prompt ? { prompt: p.prompt } : { tokens: p.tokens }),
-                },
+              : typeof reply?.thought === 'string'
+                ? {
+                    kind: 'thinking',
+                    step: s.step,
+                    text: reply.thought,
+                    tokens: p.tokens,
+                    ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}),
+                  }
+                : {
+                    kind: 'generating',
+                    step: s.step,
+                    route,
+                    attempt: 1,
+                    ...(p.prompt ? { prompt: p.prompt } : { tokens: p.tokens }),
+                  },
         );
       }),
       thinking,

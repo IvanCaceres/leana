@@ -17,7 +17,7 @@ import {
 import { OpenRouter, parseJson } from '../src/openrouter.js';
 import { forModel } from '../src/session.js';
 import { App } from '../src/app.js';
-import { Agent, argsProblem, newSession } from '../src/agent.js';
+import { Agent, argsProblem, fileBeingWritten, newSession } from '../src/agent.js';
 import { Store } from '../src/store.js';
 import { schemas, stepSchema, toolSchema, withDefaults } from '../src/schema.js';
 import { AGENT_SYSTEM, agentSystem, stepMessages } from '../src/context.js';
@@ -1090,4 +1090,41 @@ test('Prompt caching through OpenRouter: the cache points are marked where the m
   assert.deepEqual(await client.generate(prompt, schema), { content: 'ok' });
   assert.deepEqual(refusing.bodies.map(marked), [[1, 3], [], []], 'refused once, then sent unmarked');
   assert.equal(logged.filter(x => x === 'cache-markers-off').length, 1);
+});
+
+test('Under the tools form a file written inside its call is shown as it is written: the content so far of the last call, when that call writes a file, by its path and the line it starts at', async () => {
+  const { partialJson } = await import('../src/display.js');
+  // The step reply as it streams: the thought, then each call as far as it has come.
+  const streaming = (calls: string) => partialJson(`{"thought":"Write the module.","actions":[${calls}`);
+  const create = streaming(
+    '{"action":"plan","args":{"notes":"n"}},{"action":"create_file","args":{"path":"src/a.ts","content":"export const a = 1;\\nexport function f() {\\n  return a +',
+  );
+  assert.deepEqual(fileBeingWritten(create), {
+    route: 'create_file',
+    path: 'src/a.ts',
+    from: 1,
+    content: 'export const a = 1;\nexport function f() {\n  return a +',
+  });
+  assert.deepEqual(
+    fileBeingWritten(
+      streaming('{"action":"rewrite_file","args":{"path":"src/b.ts","start":40,"end":52,"content":"  x();\\n'),
+    ),
+    { route: 'rewrite_file', path: 'src/b.ts', from: 40, content: '  x();\n' },
+    'a block of a file is numbered from the line it starts at',
+  );
+  assert.equal(
+    fileBeingWritten(streaming('{"action":"create_file","args":{"path":"src/a.ts","content":"')),
+    null,
+    'nothing written yet',
+  );
+  assert.equal(
+    fileBeingWritten(
+      streaming(
+        '{"action":"create_file","args":{"path":"src/a.ts","content":"x"}},{"action":"bash","args":{"command":"npm t',
+      ),
+    ),
+    null,
+    'a later call is being written: the file is done',
+  );
+  assert.equal(fileBeingWritten(streaming('')), null);
 });

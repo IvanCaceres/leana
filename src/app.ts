@@ -18,6 +18,7 @@ import {
 } from './models.js';
 import { elapsed, forModel, providerKey, runSession, sessionsOf } from './session.js';
 import type { Agent } from './agent.js';
+import { usageLine } from './display.js';
 
 const usd = (perToken: number) => (perToken ? `$${(perToken * 1e6).toFixed(perToken * 1e6 < 1 ? 3 : 2)}` : 'free');
 export interface AppOptions {
@@ -358,7 +359,7 @@ export class App {
       });
       const s = outcome.session;
       this.write(
-        `\n${s.status.toUpperCase()}: ${s.outcome ?? s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps\nSession: ${outcome.store.path}`,
+        `\n${s.status.toUpperCase()}: ${s.outcome ?? s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}\nSession: ${outcome.store.path}`,
       );
     } finally {
       this.agent = null;

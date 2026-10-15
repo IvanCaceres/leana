@@ -12,7 +12,7 @@ import { describeModel, effortsOf, fitToModel, unsupportedSettings, type ModelIn
 import { Agent, newSession } from './agent.js';
 import { Store, runsDir, stateDir } from './store.js';
 import { runCommand } from './commands.js';
-import { Display } from './display.js';
+import { Display, type Usage } from './display.js';
 
 // A key file holds one key, or NAME=key (TYPESAFE_API_KEY, OPENROUTER_API_KEY, any NAME).
 export async function readKey(path: string): Promise<string> {
@@ -126,6 +126,8 @@ export interface RunOutcome {
   store: Store;
   elapsedMs: number;
   steps: number;
+  // What the invocation's generations consumed, as the provider reported it.
+  usage: Usage;
   model: ModelInfo;
   notes: string[];
 }
@@ -221,6 +223,7 @@ export async function runSession(req: RunRequest): Promise<RunOutcome> {
       store,
       elapsedMs: Date.now() - startedAt,
       steps: result.step - stepsBefore,
+      usage: display.usage,
       model,
       notes,
     };

@@ -53,7 +53,7 @@ import { dirtySessionConflict } from '../src/cli.js';
 import { extractCode, focusedEditSchema, samplingSchema, schemas, validate } from '../src/schema.js';
 import { Store } from '../src/store.js';
 import { collectSteps, renderReport, speed } from '../src/report.js';
-import { Display, describe, generationSpeed } from '../src/display.js';
+import { addUsage, Display, describe, generationSpeed, noUsage, usageLine, usageOf } from '../src/display.js';
 import {
   commandWords,
   configFile,
@@ -435,7 +435,25 @@ test('The terminal display redraws a status panel in place and falls back to lin
     /Context +\[#####\.{15}\] 3\.0k \/ 12\.0k working \(25%\) \| window 48\.0k \(6%\) \| 0 entries \| files 1\.2k/,
   );
   assert.match(panel, /Bonsai +2\.0s \| 70 tokens @ 35\.5 tok\/s \| prompt @ 430 tok\/s \| 500 cached/);
-  assert.match(panel, /avg 35\.5 tok\/s \| 70 generated \| 3\.0k prompt tokens sent/);
+  assert.match(panel, /avg 35\.5 tok\/s \| 70 generated \| last 3\.0k in \(500 cached, 17%\) \| 70 out/);
+  assert.match(
+    panel,
+    /Usage +1 request \| 3\.0k in \(500 cached, 17%\) \| 70 out$/m,
+    'what the provider reported; no cost from llama-server',
+  );
+  // A provider that states the cost (OpenRouter): the requests summed, the cost with them.
+  const total = noUsage();
+  for (const cost of [0.0021, 0.0042])
+    addUsage(
+      total,
+      usageOf({
+        ms: 1,
+        promptTokens: 1,
+        usage: { prompt_tokens: 50000, completion_tokens: 900, prompt_tokens_details: { cached_tokens: 45000 }, cost },
+      })!,
+    );
+  assert.equal(usageLine(total), '2 requests | 100.0k in (90.0k cached, 90%) | 1.8k out | $0.006');
+  assert.equal(usageOf({ ms: 1, promptTokens: 1 }), null, 'no usage reported: nothing counted');
   assert.match(panel, /Last +\[1\] read_files ok 12ms -> 114 chars: a\.ts sha256=x/);
   assert.match(panel, /Totals +read_files 1 \| 0 edits \| 0 commands \| 0 failures \| 0 undo/);
   assert(

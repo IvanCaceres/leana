@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { hash } from './tools.js';
+import { hash } from './files.js';
 
 export const benchmarkVersion = 'order-refactor-v1';
 export const benchmarkPrompt = `Refactor this order-processing project to remove duplicated business logic across checkout, subscription renewal, and quotation. Preserve all existing public APIs, returned fields, error messages, rounding rules, input immutability, and injected-clock behavior.
@@ -36,8 +36,13 @@ const pricing = `  const subtotalCents = lines.reduce((sum, item) => sum + item.
   const totalCents = taxableCents + taxCents;
 `;
 export const channelNames = ['checkout', 'renewal', 'quotation'] as const;
-function adapter(channel: typeof channelNames[number]): string {
-  const extra = channel === 'checkout' ? "paymentStatus: order.prepaid ? 'paid' : 'due'" : channel === 'renewal' ? 'cycle: order.cycle ?? 1' : "expiresAt: new Date(Date.parse(issuedAt) + 7 * 86400000).toISOString()";
+function adapter(channel: (typeof channelNames)[number]): string {
+  const extra =
+    channel === 'checkout'
+      ? "paymentStatus: order.prepaid ? 'paid' : 'due'"
+      : channel === 'renewal'
+        ? 'cycle: order.cycle ?? 1'
+        : 'expiresAt: new Date(Date.parse(issuedAt) + 7 * 86400000).toISOString()';
   return `// Public ${channel} entry point. Preserve its return shape during extraction.
 export function ${channel}(order, options = {}) {
 ${validation}${pricing}  const clock = options.clock ?? (() => new Date());
@@ -106,8 +111,14 @@ test('reports preserve grouping and totals', () => {
 
 export function fixtureFiles(): Record<string, string> {
   const files: Record<string, string> = {
-    'package.json': JSON.stringify({ name: benchmarkVersion, private: true, type: 'module', scripts: { test: 'node --test test/*.test.mjs' } }, null, 2) + '\n',
-    'AGENTS.md': 'Refactor only src/. Preserve APIs and behavior. Do not edit tests, package.json, README.md, or these instructions. No dependencies. Validate with node --test test/*.test.mjs. Read README.md for the architecture target.\n',
+    'package.json':
+      JSON.stringify(
+        { name: benchmarkVersion, private: true, type: 'module', scripts: { test: 'node --test test/*.test.mjs' } },
+        null,
+        2,
+      ) + '\n',
+    'AGENTS.md':
+      'Refactor only src/. Preserve APIs and behavior. Do not edit tests, package.json, README.md, or these instructions. No dependencies. Validate with node --test test/*.test.mjs. Read README.md for the architecture target.\n',
     'README.md': `# Order-processing refactor benchmark\n\n${benchmarkPrompt.replace('Read README.md for the contracts and test commands.', '')}\n\n## Contracts\n\nMoney uses integer cents. Discounts and taxes use integer basis points. Round discount first, then calculate tax on discounted subtotal plus shipping, using Math.round. Trim SKU only; retain customer and order ID verbatim. Retain error type, message, and validation order. Do not mutate orders, items, or options. options.clock returns a Date. Quotes expire seven days after issuedAt. Renewal's cycle defaults only for null/undefined. checkout paymentStatus follows prepaid truthiness. Default clocks must remain fresh per invocation.\n\n## Consumers\n\nsrc/index.mjs is the public barrel. Receipt, renewal batch, quotation email, and grouped report all rely on exact adapter shapes. The initial behavioral tests pass; the independent benchmark additionally verifies the shared architecture and generated edge cases.\n\n## Verification\n\nnode --test test/*.test.mjs\n`,
     'src/index.mjs': channelNames.map(c => `export { ${c} } from './channels/${c}.mjs';`).join('\n') + '\n',
     'src/consumers/receipt.mjs': `import { checkout } from '../channels/checkout.mjs';
@@ -153,7 +164,13 @@ export function quoteEmail(order, options) {
   return files;
 }
 export function fixtureHash(files = fixtureFiles()): string {
-  return hash(JSON.stringify(Object.keys(files).sort().map(k => [k, files[k]])));
+  return hash(
+    JSON.stringify(
+      Object.keys(files)
+        .sort()
+        .map(k => [k, files[k]]),
+    ),
+  );
 }
 export async function prepareBenchmark(parent: string, label: string): Promise<{ runDir: string; repo: string }> {
   await mkdir(parent, { recursive: true });
@@ -166,7 +183,20 @@ export async function prepareBenchmark(parent: string, label: string): Promise<{
   }
   await writeFile(join(runDir, 'before.json'), JSON.stringify(files, null, 2) + '\n');
   await writeFile(join(runDir, 'PROMPT.md'), benchmarkPrompt + '\n');
-  await writeFile(join(runDir, 'manifest.json'), JSON.stringify({ version: benchmarkVersion, fixtureHash: fixtureHash(), promptHash: hash(benchmarkPrompt), label, createdAt: new Date().toISOString() }, null, 2) + '\n');
+  await writeFile(
+    join(runDir, 'manifest.json'),
+    JSON.stringify(
+      {
+        version: benchmarkVersion,
+        fixtureHash: fixtureHash(),
+        promptHash: hash(benchmarkPrompt),
+        label,
+        createdAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    ) + '\n',
+  );
   return { runDir, repo };
 }
 
@@ -192,7 +222,12 @@ export function createInvoice(order, options = {}) {
 `,
   };
   for (const c of channelNames) {
-    const extra = c === 'checkout' ? "paymentStatus: order.prepaid ? 'paid' : 'due'" : c === 'renewal' ? 'cycle: order.cycle ?? 1' : 'expiresAt: new Date(Date.parse(invoice.issuedAt) + 7 * 86400000).toISOString()';
+    const extra =
+      c === 'checkout'
+        ? "paymentStatus: order.prepaid ? 'paid' : 'due'"
+        : c === 'renewal'
+          ? 'cycle: order.cycle ?? 1'
+          : 'expiresAt: new Date(Date.parse(invoice.issuedAt) + 7 * 86400000).toISOString()';
     result[`src/channels/${c}.mjs`] = `import { createInvoice } from '../domain/create-invoice.mjs';
 export function ${c}(order, options = {}) {
   const invoice = createInvoice(order, options);

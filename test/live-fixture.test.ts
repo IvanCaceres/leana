@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createFixture, verifyFixture } from '../src/live-test.js';
-import { runCommand } from '../src/tools.js';
+import { runCommand } from '../src/commands.js';
 
 async function fixture(t: any) {
   const parent = await mkdtemp(join(tmpdir(), 'leana-live-fixture-'));
@@ -21,7 +21,10 @@ test('Live fixture starts failing and independent verifier rejects the bug', asy
 test('Independent live verifier accepts the real fix and creates verification output', async t => {
   const { repo, runDir } = await fixture(t);
   const path = join(repo, 'src/cart.mjs');
-  await writeFile(path, (await readFile(path, 'utf8')).replace('total + item.priceCents', 'total + item.priceCents * item.quantity'));
+  await writeFile(
+    path,
+    (await readFile(path, 'utf8')).replace('total + item.priceCents', 'total + item.priceCents * item.quantity'),
+  );
   const result = await verifyFixture(runDir);
   assert.equal(result.passed, true);
   assert.equal(result.testsUnchanged, true);

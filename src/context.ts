@@ -1,4 +1,15 @@
-import type { Deliverable, Answers, Config, Coverage, Entry, Message, Questions, Route, Session, SourceEvidence } from './types.js';
+import type {
+  Deliverable,
+  Answers,
+  Config,
+  Coverage,
+  Entry,
+  Message,
+  Questions,
+  Route,
+  Session,
+  SourceEvidence,
+} from './types.js';
 import { editRoutes } from './types.js';
 import { focusedEditSchema, schemas, toolSchema } from './schema.js';
 import { referenceContext } from './references.js';
@@ -9,14 +20,15 @@ import { contentLines, echoOf, substantive, type Around, type Echo } from './cli
 // a compiler's first diagnostics its first.
 export function clipEnds(text: string, limit: number): string {
   if (text.length <= limit) return text;
-  const head = Math.floor(limit * 0.55); const tail = limit - head - 3;
+  const head = Math.floor(limit * 0.55);
+  const tail = limit - head - 3;
   return `${text.slice(0, head)}\n…\n${text.slice(text.length - tail)}`;
 }
 const clipMarker = '\n[…truncated; use a narrower read or query…]\n';
 export function clip(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const room = Math.max(0, limit - clipMarker.length);
-  return text.slice(0, Math.ceil(room * .7)) + clipMarker + text.slice(-Math.floor(room * .3));
+  return text.slice(0, Math.ceil(room * 0.7)) + clipMarker + text.slice(-Math.floor(room * 0.3));
 }
 // The entry, newest first, that shows every part of text a clip kept (clipEnds and clip cut at
 // their markers), as written or as the content of a JSON string (a command's output sits in its
@@ -28,20 +40,37 @@ export function clip(text: string, limit: number): string {
 // run and the retry both as e<step> (run 60 step 43, npm run dev), and 3 lastErrors of runs 49-76 would have named such an id.
 export function shownIn(entries: { id: string; kind?: string; text: string }[], text: string): string | undefined {
   const parts = text.split('\n…\n').flatMap(p => p.split(clipMarker));
-  return [...entries].reverse().find(e => e.kind !== 'turn' && entries.filter(x => x.id === e.id).length === 1 && parts.every(p => e.text.includes(p) || e.text.includes(JSON.stringify(p).slice(1, -1))))?.id;
+  return [...entries]
+    .reverse()
+    .find(
+      e =>
+        e.kind !== 'turn' &&
+        entries.filter(x => x.id === e.id).length === 1 &&
+        parts.every(p => e.text.includes(p) || e.text.includes(JSON.stringify(p).slice(1, -1))),
+    )?.id;
 }
 // What a tail field carries: where the prompt shows text, when saying so is the shorter (a check that prints "ok").
-const named = (text: string, at: string | undefined): string => { const p = at === 'harnessNote' ? 'stated in harnessNote' : `shown in evidence ${at}`; return at && p.length < text.length ? p : text; };
+const named = (text: string, at: string | undefined): string => {
+  const p = at === 'harnessNote' ? 'stated in harnessNote' : `shown in evidence ${at}`;
+  return at && p.length < text.length ? p : text;
+};
 export const routeDescriptions: Record<Route, string> = {
-  rewrite_file: 'Regenerate an existing file, or one block of it, as code: name its path and what must change. With start and end only lines start..end are generated anew and spliced in (end = start - 1 inserts before line start; start = totalLines + 1 appends), so adding or replacing a block costs only that block; without them the whole file is regenerated. The current content is in front of you either way. For any change larger than a few lines.',
+  rewrite_file:
+    'Regenerate an existing file, or one block of it, as code: name its path and what must change. With start and end only lines start..end are generated anew and spliced in (end = start - 1 inserts before line start; start = totalLines + 1 appends), so adding or replacing a block costs only that block; without them the whole file is regenerated. The current content is in front of you either way. For any change larger than a few lines.',
   plan: 'Replace your running notes: the plan, what is done, what is known, what is next.',
   observe: `See the result as its user meets it, which no build, type check or test shows. ${observerCatalog.map(o => `kind ${o.kind}: ${o.what}.`).join(' ')}`,
-  read_files: 'Read a requirements document, an uninspected file, or an exact source range already located by search or diagnostics; retrieve a stored artifact from @artifact/name. To locate named declarations in an already-read large source file, choose search_codebase instead of rereading its beginning or paging through it.',
-  search_codebase: 'Locate files, definitions, references or tests using a text query or file listing; text matches return file:line, which is the one-step way to find where a symbol is defined in a large file before reading that range. Search path @artifacts for archived evidence.',
-  create_file: 'Create a file that does not exist yet: name its path and purpose here; its complete content is then generated as code in a separate step.',
-  write: 'Replace one short anchor with new text in an already-read existing file; never for blocks or moves, which replace_lines and move_lines do by line number without retyping, and never to create a file (create_file does that).',
-  replace_lines: 'For small, local edits only: newText is part of this JSON reply and the whole reply is limited in length, so a large replacement is cut off and lost; use rewrite_file for anything larger. Replace, delete or prefix up to 40 line ranges of an already-read file in one step, addressed by line numbers instead of exact anchors; the way to remove many unused-import lines at once, to export many declarations at once (prepend), or to rewrite a region.',
-  move_lines: 'Cut a contiguous line range from an already-read file and append it, unchanged, to another file (created when it does not exist), without retyping it.',
+  read_files:
+    'Read a requirements document, an uninspected file, or an exact source range already located by search or diagnostics; retrieve a stored artifact from @artifact/name. To locate named declarations in an already-read large source file, choose search_codebase instead of rereading its beginning or paging through it.',
+  search_codebase:
+    'Locate files, definitions, references or tests using a text query or file listing; text matches return file:line, which is the one-step way to find where a symbol is defined in a large file before reading that range. Search path @artifacts for archived evidence.',
+  create_file:
+    'Create a file that does not exist yet: name its path and purpose here; its complete content is then generated as code in a separate step.',
+  write:
+    'Replace one short anchor with new text in an already-read existing file; never for blocks or moves, which replace_lines and move_lines do by line number without retyping, and never to create a file (create_file does that).',
+  replace_lines:
+    'For small, local edits only: newText is part of this JSON reply and the whole reply is limited in length, so a large replacement is cut off and lost; use rewrite_file for anything larger. Replace, delete or prefix up to 40 line ranges of an already-read file in one step, addressed by line numbers instead of exact anchors; the way to remove many unused-import lines at once, to export many declarations at once (prepend), or to rewrite a region.',
+  move_lines:
+    'Cut a contiguous line range from an already-read file and append it, unchanged, to another file (created when it does not exist), without retyping it.',
   bash: 'Run a shell command, including tests, builds or diagnostics, with explicit execution permission.',
   finish: 'Report completion when the objective is met and the supplied evidence supports completion.',
   ask_user: 'Pause because essential user information or a permission is missing; no other action fits.',
@@ -55,11 +84,18 @@ export function relevantFiles(s: Session, limit = 80): string[] {
   const score = (path: string): number => {
     const segments = path.toLowerCase().split('/');
     const base = segments.at(-1)!;
-    return (text.includes(path.toLowerCase()) ? 100 : 0) + segments.filter(x => tokens.has(x)).length +
-      (tokens.has(base.replace(/\.[^.]+$/, '')) ? 1 : 0);
+    return (
+      (text.includes(path.toLowerCase()) ? 100 : 0) +
+      segments.filter(x => tokens.has(x)).length +
+      (tokens.has(base.replace(/\.[^.]+$/, '')) ? 1 : 0)
+    );
   };
-  const ranked = s.knownFiles.map(path => ({ path, score: score(path) })).filter(f => f.score > 0)
-    .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path)).slice(0, limit).map(f => f.path);
+  const ranked = s.knownFiles
+    .map(path => ({ path, score: score(path) }))
+    .filter(f => f.score > 0)
+    .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+    .slice(0, limit)
+    .map(f => f.path);
   return ranked.slice(0, limit);
 }
 export function repoOverview(s: Session, limit = 60): Record<string, number> {
@@ -69,33 +105,56 @@ export function repoOverview(s: Session, limit = 60): Record<string, number> {
     const key = parts.length > 2 ? `${parts[0]}/${parts[1]}/` : parts.length === 2 ? `${parts[0]}/` : '.';
     counts[key] = (counts[key] ?? 0) + 1;
   }
-  return Object.fromEntries(Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, limit));
+  return Object.fromEntries(
+    Object.entries(counts)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, limit),
+  );
 }
 export function coverageSummary(s: Session, limit = 30): Record<string, string> {
-  return Object.fromEntries(Object.entries(s.coverage).slice(-limit)
-    .map(([path, c]) => [path, `read ${c.ranges.map(([a, b]) => `${a}-${b}`).join(',')} of ${c.total} lines`]));
+  return Object.fromEntries(
+    Object.entries(s.coverage)
+      .slice(-limit)
+      .map(([path, c]) => [path, `read ${c.ranges.map(([a, b]) => `${a}-${b}`).join(',')} of ${c.total} lines`]),
+  );
 }
 export function mergeCoverage(c: Coverage | undefined, total: number, start: number, end: number): Coverage {
-  const ranges = [...(c?.total === total ? c.ranges : []), [start, end] as [number, number]].sort((a, b) => a[0] - b[0]);
+  const ranges = [...(c?.total === total ? c.ranges : []), [start, end] as [number, number]].sort(
+    (a, b) => a[0] - b[0],
+  );
   const merged: [number, number][] = [];
   for (const r of ranges) {
     const last = merged.at(-1);
-    if (last && r[0] <= last[1] + 1) last[1] = Math.max(last[1], r[1]); else merged.push([r[0], r[1]]);
+    if (last && r[0] <= last[1] + 1) last[1] = Math.max(last[1], r[1]);
+    else merged.push([r[0], r[1]]);
   }
   return { total, ranges: merged };
 }
 // Files edited after the last check: its line numbers no longer match them.
 export function staleFor(s: Session): string[] {
-  return s.lastCheck ? Object.entries(s.writeSteps).filter(([, step]) => step > s.lastCheck!.step).map(([path]) => path) : [];
+  return s.lastCheck
+    ? Object.entries(s.writeSteps)
+        .filter(([, step]) => step > s.lastCheck!.step)
+        .map(([path]) => path)
+    : [];
 }
 // Bounded views of the volatile fields. Whatever the working budget, these must
 // stay small: they sit after the evidence in the prompt, change every step and
 // are therefore reprocessed by the server on every step.
-export function compactRejected(s: Session, limit: number): { step: number; route: string; args: string; reason: string }[] {
-  return s.rejectedEdits.slice(-limit).map(r => ({ step: r.step, route: r.route, args: clip(r.summary, 120), reason: clip(r.reason, 140) }));
+export function compactRejected(
+  s: Session,
+  limit: number,
+): { step: number; route: string; args: string; reason: string }[] {
+  return s.rejectedEdits
+    .slice(-limit)
+    .map(r => ({ step: r.step, route: r.route, args: clip(r.summary, 120), reason: clip(r.reason, 140) }));
 }
 export function compactSearched(s: Session, limit: number): Record<string, string> {
-  return Object.fromEntries(Object.entries(s.searches).slice(-limit).map(([k, v]) => [clip(k, 80), clip(v, 100)]));
+  return Object.fromEntries(
+    Object.entries(s.searches)
+      .slice(-limit)
+      .map(([k, v]) => [clip(k, 80), clip(v, 100)]),
+  );
 }
 // Old checks and failed generation attempts are history, not current blockers.
 // Keep their text unchanged for prompt caching, but mark them stale: evictOne takes them first
@@ -106,15 +165,34 @@ export function retireEvidence(s: Session): void {
     let verification = e.verification;
     if (verification === undefined && e.kind === 'bash' && s.lastCheckCommand) {
       const command = e.text.match(/^\{"command":("(?:[^"\\]|\\.)*")/);
-      if (command) { try { verification = JSON.parse(command[1]!) === s.lastCheckCommand; } catch { /* incomplete legacy entry */ } }
+      if (command) {
+        try {
+          verification = JSON.parse(command[1]!) === s.lastCheckCommand;
+        } catch {
+          /* incomplete legacy entry */
+        }
+      }
     }
     const supersededCheck = verification && s.lastCheck && e.step < s.lastCheck.step;
     // A repeat's statement that a file is unchanged holds until the next write or check.
-    const historicalAttempt = (e.kind === 'generation_error' || e.kind === 'repeat') && e.step < Math.max(s.lastWriteStep, s.lastCheck?.step ?? -1);
+    const historicalAttempt =
+      (e.kind === 'generation_error' || e.kind === 'repeat') &&
+      e.step < Math.max(s.lastWriteStep, s.lastCheck?.step ?? -1);
     // A check followed by edits describes files as they were: its errors may already be fixed.
-    const editedAfter = verification && !supersededCheck ? Object.entries(s.writeSteps).filter(([, step]) => step > e.step).map(([p]) => p) : [];
+    const editedAfter =
+      verification && !supersededCheck
+        ? Object.entries(s.writeSteps)
+            .filter(([, step]) => step > e.step)
+            .map(([p]) => p)
+        : [];
     if (!e.stale && (supersededCheck || historicalAttempt || editedAfter.length)) {
-      e.stale = supersededCheck ? `superseded by verification at step ${s.lastCheck!.step}` : editedAfter.length ? `files edited since this check (${editedAfter.slice(0, 6).join(', ')}): its errors describe them as they were` : e.kind === 'repeat' ? 'stated before later edits or verification ran' : 'historical generation attempt; later edits or verification have run';
+      e.stale = supersededCheck
+        ? `superseded by verification at step ${s.lastCheck!.step}`
+        : editedAfter.length
+          ? `files edited since this check (${editedAfter.slice(0, 6).join(', ')}): its errors describe them as they were`
+          : e.kind === 'repeat'
+            ? 'stated before later edits or verification ran'
+            : 'historical generation attempt; later edits or verification have run';
     }
   }
 }
@@ -122,25 +200,41 @@ export function retireEvidence(s: Session): void {
 // sha256 (any version when undefined: an archived output never changes): from every read
 // result still in the prompt and not marked stale, each line with the entry that shows it.
 // A line a clip cut into is not counted as shown.
-export function shownLines(s: Session, path: string, sha: string | undefined): { total: number | null; by: Map<number, string> } {
-  const by = new Map<number, string>(); let total: number | null = null;
+export function shownLines(
+  s: Session,
+  path: string,
+  sha: string | undefined,
+): { total: number | null; by: Map<number, string> } {
+  const by = new Map<number, string>();
+  let total: number | null = null;
   const esc = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const header = new RegExp(`^${esc} sha256=(\\w+) totalLines=(\\d+) shown=(\\d+)\\.\\.(\\d+)$`);
   // clip() keeps a result's two ends around a marker line; the line each side of it is cut.
   const marker = '[…truncated; use a narrower read';
   for (const e of s.entries) {
     if (e.kind !== 'read_files' || e.stale) continue;
-    const lines = e.text.split('\n'); let next = -1;
+    const lines = e.text.split('\n');
+    let next = -1;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
       const h = i === 0 || lines[i - 1] === '' ? line.match(header) : null;
-      if (h) { next = sha === undefined || h[1] === sha ? Number(h[3]) : -1; if (next > 0) total = Number(h[2]); continue; }
+      if (h) {
+        next = sha === undefined || h[1] === sha ? Number(h[3]) : -1;
+        if (next > 0) total = Number(h[2]);
+        continue;
+      }
       if (next < 0) continue;
       // After a clip marker the text may belong to another file of the same read: nothing is
       // credited until the next complete header.
-      if (line.startsWith(marker)) { next = -1; continue; }
+      if (line.startsWith(marker)) {
+        next = -1;
+        continue;
+      }
       const n = Number(line.match(/^(\d+): /)?.[1] ?? NaN);
-      if (n !== next) { next = -1; continue; }
+      if (n !== next) {
+        next = -1;
+        continue;
+      }
       if (!lines[i + 1]?.startsWith(marker)) by.set(n, e.id);
       next++;
     }
@@ -152,26 +246,62 @@ export function shownLines(s: Session, path: string, sha: string | undefined): {
 // compared without their endings (a CRLF line equals its LF copy). A middle too large to compare
 // line by line counts whole, and exact is false (the counts are then upper bounds).
 export function lineDiff(before: string, after: string): { removed: number; added: number; exact: boolean } {
-  const split = (t: string) => t === '' ? [] : t.replace(/\r?\n$/, '').split('\n').map(l => l.replace(/\r$/, ''));
-  const a = split(before); const b = split(after); let pre = 0; while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
-  let suf = 0; while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
-  const x = a.slice(pre, a.length - suf); const y = b.slice(pre, b.length - suf);
+  const split = (t: string) =>
+    t === ''
+      ? []
+      : t
+          .replace(/\r?\n$/, '')
+          .split('\n')
+          .map(l => l.replace(/\r$/, ''));
+  const a = split(before);
+  const b = split(after);
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const x = a.slice(pre, a.length - suf);
+  const y = b.slice(pre, b.length - suf);
   if (!x.length || !y.length) return { removed: x.length, added: y.length, exact: true };
   if (x.length * y.length > 4_000_000) return { removed: x.length, added: y.length, exact: false };
   let row = new Array<number>(y.length + 1).fill(0);
-  for (const line of x) { const next = new Array<number>(y.length + 1).fill(0); for (let j = 1; j <= y.length; j++) next[j] = line === y[j - 1] ? row[j - 1]! + 1 : Math.max(row[j]!, next[j - 1]!); row = next; }
+  for (const line of x) {
+    const next = new Array<number>(y.length + 1).fill(0);
+    for (let j = 1; j <= y.length; j++) next[j] = line === y[j - 1] ? row[j - 1]! + 1 : Math.max(row[j]!, next[j - 1]!);
+    row = next;
+  }
   const common = row[y.length]!;
   return { removed: x.length - common, added: y.length - common, exact: true };
 }
 // Line numbers as ranges: [1, 2, 3, 7] -> [[1, 3], [7, 7]].
 export function lineRanges(ns: number[]): [number, number][] {
   const out: [number, number][] = [];
-  for (const n of [...ns].sort((a, b) => a - b)) { const last = out.at(-1); if (last && n === last[1] + 1) last[1] = n; else if (!last || n > last[1]) out.push([n, n]); }
+  for (const n of [...ns].sort((a, b) => a - b)) {
+    const last = out.at(-1);
+    if (last && n === last[1] + 1) last[1] = n;
+    else if (!last || n > last[1]) out.push([n, n]);
+  }
   return out;
 }
-export function rememberEdit(s: Session, step: number, route: string, paths: string[], artifact: string, text: string, args?: Record<string, any>): void {
-  const applied = args ? clip(JSON.stringify({ ...args, expectedHash: undefined, destinationHash: undefined }), 700) : undefined;
-  s.editEvidence.push({ step, route, paths, artifact, text: clip(text.replace(/sha256=\w+/g, 'sha256=[recorded in artifact]'), 400), applied });
+export function rememberEdit(
+  s: Session,
+  step: number,
+  route: string,
+  paths: string[],
+  artifact: string,
+  text: string,
+  args?: Record<string, any>,
+): void {
+  const applied = args
+    ? clip(JSON.stringify({ ...args, expectedHash: undefined, destinationHash: undefined }), 700)
+    : undefined;
+  s.editEvidence.push({
+    step,
+    route,
+    paths,
+    artifact,
+    text: clip(text.replace(/sha256=\w+/g, 'sha256=[recorded in artifact]'), 400),
+    applied,
+  });
   s.editEvidence = s.editEvidence.slice(-20);
 }
 export function confidentChoice(a: Answers[string] | undefined, c: Config): string | null {
@@ -197,19 +327,45 @@ export function evictOne(s: Session, from = 0, only?: string, allowCited = false
   // The freshest entry is never evicted, nor while it is the freshest the entries it names.
   // The entries it names give way when nothing else can go (their citing statement is then marked).
   let protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined, ...(s.entries.at(-1)?.cites ?? [])]);
-  const endsTurn = (e: Entry) => e.kind === 'turn' || (e.turn !== undefined && s.entries.some(t => t.kind === 'turn' && t.id === e.turn) && !s.entries.some(x => x !== e && x.turn === e.turn));
-  const pick = () => s.entries.filter((e, i) => (only === undefined || e.id === only) && i >= from && !(from > 0 && endsTurn(e)) && (s.entries.length === 1 || !protectedIds.has(e.id)) && !(e.kind === 'turn' && hasResults(e)));
+  const endsTurn = (e: Entry) =>
+    e.kind === 'turn' ||
+    (e.turn !== undefined &&
+      s.entries.some(t => t.kind === 'turn' && t.id === e.turn) &&
+      !s.entries.some(x => x !== e && x.turn === e.turn));
+  const pick = () =>
+    s.entries.filter(
+      (e, i) =>
+        (only === undefined || e.id === only) &&
+        i >= from &&
+        !(from > 0 && endsTurn(e)) &&
+        (s.entries.length === 1 || !protectedIds.has(e.id)) &&
+        !(e.kind === 'turn' && hasResults(e)),
+    );
   let candidates = pick();
-  if (!candidates.length && allowCited && s.entries.at(-1)?.cites?.length) { protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]); candidates = pick(); }
+  if (!candidates.length && allowCited && s.entries.at(-1)?.cites?.length) {
+    protectedIds = new Set([s.entries.at(-1)?.id, s.currentTurn ?? undefined]);
+    candidates = pick();
+  }
   // Stale entries that hold nothing current go first, oldest first; then the least relevant, then the oldest.
   const gone = new Map(candidates.map(e => [e, Boolean(e.stale) && !holdsCurrent(s, e)]));
-  const candidate = [...candidates].sort((a, b) => Number(gone.get(b)) - Number(gone.get(a)) || (gone.get(a) ? 0 : a.relevance - b.relevance) || a.step - b.step)[0];
+  const candidate = [...candidates].sort(
+    (a, b) =>
+      Number(gone.get(b)) - Number(gone.get(a)) || (gone.get(a) ? 0 : a.relevance - b.relevance) || a.step - b.step,
+  )[0];
   if (!candidate) return undefined;
   s.entries = s.entries.filter(e => e !== candidate);
   // A repeat's answer that names the entry no longer describes the prompt: it is marked, not removed (nothing before it changes).
-  for (const e of s.entries) if (e.kind === 'repeat' && !e.stale && e.cites?.includes(candidate.id)) e.stale = `names ${candidate.id}, which has left the prompt`;
-  const turn = candidate.kind === 'turn' ? candidate : s.entries.find(e => e.kind === 'turn' && e.id === candidate.turn);
-  if (turn && !hasResults(turn) && turn.id !== s.currentTurn) { s.entries = s.entries.filter(e => e !== turn); s.trail = [...(s.trail ?? []), trailLine(turn)].sort((a, b) => Number(a.match(/^step (\d+)/)?.[1]) - Number(b.match(/^step (\d+)/)?.[1])).slice(-12); }
+  for (const e of s.entries)
+    if (e.kind === 'repeat' && !e.stale && e.cites?.includes(candidate.id))
+      e.stale = `names ${candidate.id}, which has left the prompt`;
+  const turn =
+    candidate.kind === 'turn' ? candidate : s.entries.find(e => e.kind === 'turn' && e.id === candidate.turn);
+  if (turn && !hasResults(turn) && turn.id !== s.currentTurn) {
+    s.entries = s.entries.filter(e => e !== turn);
+    s.trail = [...(s.trail ?? []), trailLine(turn)]
+      .sort((a, b) => Number(a.match(/^step (\d+)/)?.[1]) - Number(b.match(/^step (\d+)/)?.[1]))
+      .slice(-12);
+  }
   return candidate;
 }
 // A stale entry can still be the only place something is shown as it is. A read goes stale when
@@ -223,14 +379,28 @@ export function evictOne(s: Session, from = 0, only?: string, allowCited = false
 // a file not edited since, or none. Such an entry is evicted as the result it is.
 function holdsCurrent(s: Session, e: Entry): boolean {
   if (e.verification) {
-    if (!s.lastCheck) return true; if (e.step < s.lastCheck.step) return false;
-    const since = staleFor(s); const files = Object.keys(s.lastCheck.summary.files);
-    return !s.lastCheck.ok && (!files.length || files.some(f => !since.some(w => w === f || w.endsWith(`/${f}`) || f.endsWith(`/${w}`))));
+    if (!s.lastCheck) return true;
+    if (e.step < s.lastCheck.step) return false;
+    const since = staleFor(s);
+    const files = Object.keys(s.lastCheck.summary.files);
+    return (
+      !s.lastCheck.ok &&
+      (!files.length || files.some(f => !since.some(w => w === f || w.endsWith(`/${f}`) || f.endsWith(`/${w}`))))
+    );
   }
   if (e.kind !== 'read_files') return false;
-  const blocks = (x: Entry) => [...x.text.matchAll(/(?:^|\n\n)(\S+) sha256=\w+ totalLines=\d+ shown=(\d+)\.\.(\d+)/g)].map(m => ({ path: m[1]!, start: Number(m[2]), end: Number(m[3]) }));
+  const blocks = (x: Entry) =>
+    [...x.text.matchAll(/(?:^|\n\n)(\S+) sha256=\w+ totalLines=\d+ shown=(\d+)\.\.(\d+)/g)].map(m => ({
+      path: m[1]!,
+      start: Number(m[2]),
+      end: Number(m[3]),
+    }));
   const later = s.entries.filter(x => x !== e && x.kind === 'read_files' && x.step > e.step).flatMap(blocks);
-  return blocks(e).some(b => !((s.writeSteps[b.path] ?? -1) > e.step) && !later.some(l => l.path === b.path && l.start <= b.start && l.end >= b.end));
+  return blocks(e).some(
+    b =>
+      !((s.writeSteps[b.path] ?? -1) > e.step) &&
+      !later.some(l => l.path === b.path && l.start <= b.start && l.end >= b.end),
+  );
 }
 // Once the prompt changes at index at, every entry behind it is reprocessed anyway: the stale
 // entries there that hold nothing current go too, at no cost of their own, and each later step
@@ -238,14 +408,23 @@ function holdsCurrent(s: Session, e: Entry): boolean {
 // the trail already changed (at 0).
 export function evictStaleBehind(s: Session, at: number): Entry[] {
   const out: Entry[] = [];
-  for (const e of s.entries.slice(at)) if (s.entries.includes(e) && e.stale && !holdsCurrent(s, e)) { const x = evictOne(s, at, e.id); if (x) out.push(x); }
+  for (const e of s.entries.slice(at))
+    if (s.entries.includes(e) && e.stale && !holdsCurrent(s, e)) {
+      const x = evictOne(s, at, e.id);
+      if (x) out.push(x);
+    }
   return out;
 }
 // The entries the next batched eviction would take, in its order, down to target
 // tokens: evictOne's own global order, run on a copy of the session.
 export function plannedEviction(s: Session, target: number): string[] {
-  const copy = structuredClone(s); const ids: string[] = [];
-  while (evidenceTokens(copy) > target) { const e = evictOne(copy); if (!e) break; ids.push(e.id); }
+  const copy = structuredClone(s);
+  const ids: string[] = [];
+  while (evidenceTokens(copy) > target) {
+    const e = evictOne(copy);
+    if (!e) break;
+    ids.push(e.id);
+  }
   return ids;
 }
 // An eviction that rides on a change the prompt already makes at index at: it
@@ -259,7 +438,8 @@ export function evictBehind(s: Session, at: number, target: number): Entry[] {
     const i = s.entries.findIndex(e => e.id === id);
     if (i < 0) continue;
     if (i < at) break;
-    const e = evictOne(s, at, id); if (!e) break;
+    const e = evictOne(s, at, id);
+    if (!e) break;
     out.push(e);
   }
   return out;
@@ -269,23 +449,60 @@ export function evictBehind(s: Session, at: number, target: number): Entry[] {
 export function compactArgs(v: unknown): unknown {
   if (typeof v === 'string') return v.length > 240 ? `${v.slice(0, 160)}… [${v.length} chars]` : v;
   if (Array.isArray(v)) return v.map(compactArgs);
-  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).filter(([k]) => k !== 'expectedHash' && k !== 'destinationHash').map(([k, x]) => [k, compactArgs(x)]));
+  if (v && typeof v === 'object')
+    return Object.fromEntries(
+      Object.entries(v)
+        .filter(([k]) => k !== 'expectedHash' && k !== 'destinationHash')
+        .map(([k, x]) => [k, compactArgs(x)]),
+    );
   return v;
 }
 // The worker's reasoning and actions for a batch, exactly in the shape it
 // generated them, recorded before the batch runs so that the prefix only grows.
 // whole: the calls as the model made them (the tools form, where a file's content is in its call and the
 // turn is how the model knows what it wrote), not compacted.
-export function turnEntry(step: number, thought: string, batch: { action: string; args: Record<string, any> }[], whole = false): Entry {
-  return { id: `t${step}`, step, kind: 'turn', artifact: '', relevance: .5, outcomes: [],
-    text: JSON.stringify({ thought: whole ? thought : cut(thought, 600), actions: batch.map(b => ({ action: b.action, args: whole ? b.args : compactArgs(b.args) })) }) };
+export function turnEntry(
+  step: number,
+  thought: string,
+  batch: { action: string; args: Record<string, any> }[],
+  whole = false,
+): Entry {
+  return {
+    id: `t${step}`,
+    step,
+    kind: 'turn',
+    artifact: '',
+    relevance: 0.5,
+    outcomes: [],
+    text: JSON.stringify({
+      thought: whole ? thought : cut(thought, 600),
+      actions: batch.map(b => ({ action: b.action, args: whole ? b.args : compactArgs(b.args) })),
+    }),
+  };
 }
-const cut = (text: string, n: number) => text.length > n ? `${text.slice(0, n - 1)}…` : text;
+const cut = (text: string, n: number) => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
 function trailLine(turn: Entry): string {
   let actions: { action: string; args: Record<string, any> }[] = [];
-  try { actions = JSON.parse(turn.text).actions ?? []; } catch { /* not a turn */ }
-  const named = actions.map(a => { const x = a.args ?? {}; const what = x.path ?? x.command ?? x.query ?? x.url ?? x.source ?? (Array.isArray(x.files) ? x.files.map((f: any) => f.path).join(',') : ''); return `${a.action}${what ? ` ${cut(String(what), 70)}` : ''}`; });
-  return cut(`step ${turn.step}: ${named.join('; ')} -> ${turn.outcomes?.length ? turn.outcomes.join('; ') : 'no result'}`, 240);
+  try {
+    actions = JSON.parse(turn.text).actions ?? [];
+  } catch {
+    /* not a turn */
+  }
+  const named = actions.map(a => {
+    const x = a.args ?? {};
+    const what =
+      x.path ??
+      x.command ??
+      x.query ??
+      x.url ??
+      x.source ??
+      (Array.isArray(x.files) ? x.files.map((f: any) => f.path).join(',') : '');
+    return `${a.action}${what ? ` ${cut(String(what), 70)}` : ''}`;
+  });
+  return cut(
+    `step ${turn.step}: ${named.join('; ')} -> ${turn.outcomes?.length ? turn.outcomes.join('; ') : 'no result'}`,
+    240,
+  );
 }
 // The evidence's share of the prompt, estimated from its rendered length; the
 // batched eviction is decided on it, the hard budget by the server's count.
@@ -299,30 +516,71 @@ export function breakIndex(before: { ids: string[]; trail: string[] }, s: Sessio
   return i < 0 ? null : i;
 }
 export function evidenceTokens(s: Session): number {
-  return Math.ceil(agentPrefix(s).slice(2).filter(m => !m.content.startsWith('{"earlierSteps"')).reduce((n, m) => n + m.content.length, 0) / 3.5);
+  return Math.ceil(
+    agentPrefix(s)
+      .slice(2)
+      .filter(m => !m.content.startsWith('{"earlierSteps"'))
+      .reduce((n, m) => n + m.content.length, 0) / 3.5,
+  );
 }
 const details: Record<Route, string> = {
-  rewrite_file: 'path is an existing file; purpose says what the new content must contain and change. Its current content is put in front of you when the block or the file is generated, so there is no need to read it first to append to it or change it. start and end (optional, 1-based, inclusive, numbered as in the latest read or edit result of the file) limit the regeneration to that block: give them whenever most of the file stays as it is (appending rules, adding a component, replacing one function); omit them only when most of the file changes. Never put file content in the arguments: it is generated next, as code, from the current content, your thought and purpose.',
+  rewrite_file:
+    'path is an existing file; purpose says what the new content must contain and change. Its current content is put in front of you when the block or the file is generated, so there is no need to read it first to append to it or change it. start and end (optional, 1-based, inclusive, numbered as in the latest read or edit result of the file) limit the regeneration to that block: give them whenever most of the file stays as it is (appending rules, adding a component, replacing one function); omit them only when most of the file changes. Never put file content in the arguments: it is generated next, as code, from the current content, your thought and purpose.',
   observe: `kind is one of ${observerCatalog.map(o => o.kind).join(', ')}: whichever is how the objective's user meets the result. start is the shell command that starts what is observed and keeps running (a server on a fixed port with no browser opening, a service), stopped afterwards; "" when it already runs or nothing needs starting. target is what is observed: a URL, or the command to run with its arguments. inputs plays a page as its user would, in order (page only; [] for none): press a key (what: Enter, Space, Escape, an arrow, a letter), hold one for ms, type text into what has focus, click the element a CSS selector names, or wait; each is followed by ms of watching, and what it did is stated: exceptions thrown, frames drawn, how much of each canvas changed and where, text that came or went. Everything runs in the repository root.`,
   plan: 'notes is the whole of your notes, replaced: a short plan with what is done, what you have learned (versions, commands that work, decisions), and what comes next. Keep it under forty lines.',
-  read_files: 'When verification.files names lines in the file being fixed, read around those lines rather than from line 1. Use exact regular repository-relative file paths; globs, directories, and wildcard paths are invalid. Use 1-based inclusive start/end; a read shows as many lines of the range as fit in the read budget (shared across the requested files; the result reports the last line shown), so a long file is read in a few large ranges, or located first with search_codebase and read around the definition; readCoverage shows what was already read, and reading it again yields nothing new. Output is cut at line boundaries within a character budget shared across the requested files and reports the last line shown; continue from the next line in a later read. Use @artifact/NAME to retrieve prior outputs. Read before editing.',
-  search_codebase: 'Use a narrow literal query or mode files. Text matches are returned as path:line:text, so a query such as "const DEFAULT_DEPENDENCIES" gives the exact line to read next. searched lists every query already run and what it found; never repeat one, search for the next symbol the objective still needs. The path is a repository-relative directory, usually "."; use "@artifacts" to search archived tool outputs. Do not use search results as read_files paths unless they are exact regular files.',
-  replace_lines: 'Each edit is { start, end, newText, prepend }. To insert lines without replacing any, use end = start - 1: the newText is inserted before line start (start = totalLines + 1 appends); this is how imports are added, never by retyping an existing line. With prepend non-empty (for example "export ") every line in start..end keeps its text and gets that prefix; newText must be "" and nothing is retyped. This is how declarations are exported: one edit per declaration line, all in one call. With prepend "", the range is replaced by newText ("" deletes it). Edits that would leave the file unparseable are refused with the parser message. An error at a line means that line needs fixing in place: a missing import is added at the top of the file, never by overwriting the line that uses the name. The file must have been read since it last changed: expectedHash must equal the sha256 of that read. edits is a list of up to 40 non-overlapping ranges {start, end, newText} (1-based, inclusive) of path, all numbered as in that read, never from a check that ran before the latest edit of the file (verification.writtenSince names the files edited after that check ran); the harness applies them bottom-up so they never shift each other. expectedHash comes from fileHashes. newText may be empty to delete the lines. Only new text is generated, so this is the way to remove many unused import lines in one step (one edit per reported line) or rewrite a region. After it runs, line numbers below the first edit have shifted: its result gives the new sha256 and the lines as they now read. Line numbers are always those of the text whose sha256 is expectedHash: a later edit of the same file in the same batch that carries the same hash is numbered as in that same text, and the harness maps its ranges through the batch\'s earlier edits (the result states old -> new ranges; a range an earlier edit changed is refused with the facts).',
-  move_lines: 'Cut lines start..end (1-based, inclusive, at most 2000) from source and append them unchanged to the end of destination; take the numbers from read_files or search_codebase. expectedHash is the current source sha256 from fileHashes; destinationHash is the destination sha256 from fileHashes, or "new" only when the destination does not exist yet. Nothing else is changed in either file: whatever the moved lines need in their new place (imports, exports, references) is yours to add with an edit.',
-  create_file: 'path is the repository-relative path of a file that does not exist yet (never an existing file: those are edited with write or replace_lines); purpose says in one sentence what the file must contain. The content itself is not written here: the harness asks for it as code in the next generation.',
-  write: 'For a short anchor only (a few lines) in a file that exists: for a region of many lines use replace_lines, and to relocate a block use move_lines. expectedHash must be the current sha256 of the path from fileHashes (the same value the latest read_files or edit result reported). oldText is a small unique anchor (a few consecutive lines) copied exactly from that read; never paste a truncated excerpt or an entire file. newText replaces the anchor and must differ from it. Never overwrite an unread file; a new file is made with create_file.',
+  read_files:
+    'When verification.files names lines in the file being fixed, read around those lines rather than from line 1. Use exact regular repository-relative file paths; globs, directories, and wildcard paths are invalid. Use 1-based inclusive start/end; a read shows as many lines of the range as fit in the read budget (shared across the requested files; the result reports the last line shown), so a long file is read in a few large ranges, or located first with search_codebase and read around the definition; readCoverage shows what was already read, and reading it again yields nothing new. Output is cut at line boundaries within a character budget shared across the requested files and reports the last line shown; continue from the next line in a later read. Use @artifact/NAME to retrieve prior outputs. Read before editing.',
+  search_codebase:
+    'Use a narrow literal query or mode files. Text matches are returned as path:line:text, so a query such as "const DEFAULT_DEPENDENCIES" gives the exact line to read next. searched lists every query already run and what it found; never repeat one, search for the next symbol the objective still needs. The path is a repository-relative directory, usually "."; use "@artifacts" to search archived tool outputs. Do not use search results as read_files paths unless they are exact regular files.',
+  replace_lines:
+    'Each edit is { start, end, newText, prepend }. To insert lines without replacing any, use end = start - 1: the newText is inserted before line start (start = totalLines + 1 appends); this is how imports are added, never by retyping an existing line. With prepend non-empty (for example "export ") every line in start..end keeps its text and gets that prefix; newText must be "" and nothing is retyped. This is how declarations are exported: one edit per declaration line, all in one call. With prepend "", the range is replaced by newText ("" deletes it). Edits that would leave the file unparseable are refused with the parser message. An error at a line means that line needs fixing in place: a missing import is added at the top of the file, never by overwriting the line that uses the name. The file must have been read since it last changed: expectedHash must equal the sha256 of that read. edits is a list of up to 40 non-overlapping ranges {start, end, newText} (1-based, inclusive) of path, all numbered as in that read, never from a check that ran before the latest edit of the file (verification.writtenSince names the files edited after that check ran); the harness applies them bottom-up so they never shift each other. expectedHash comes from fileHashes. newText may be empty to delete the lines. Only new text is generated, so this is the way to remove many unused import lines in one step (one edit per reported line) or rewrite a region. After it runs, line numbers below the first edit have shifted: its result gives the new sha256 and the lines as they now read. Line numbers are always those of the text whose sha256 is expectedHash: a later edit of the same file in the same batch that carries the same hash is numbered as in that same text, and the harness maps its ranges through the batch\'s earlier edits (the result states old -> new ranges; a range an earlier edit changed is refused with the facts).',
+  move_lines:
+    'Cut lines start..end (1-based, inclusive, at most 2000) from source and append them unchanged to the end of destination; take the numbers from read_files or search_codebase. expectedHash is the current source sha256 from fileHashes; destinationHash is the destination sha256 from fileHashes, or "new" only when the destination does not exist yet. Nothing else is changed in either file: whatever the moved lines need in their new place (imports, exports, references) is yours to add with an edit.',
+  create_file:
+    'path is the repository-relative path of a file that does not exist yet (never an existing file: those are edited with write or replace_lines); purpose says in one sentence what the file must contain. The content itself is not written here: the harness asks for it as code in the next generation.',
+  write:
+    'For a short anchor only (a few lines) in a file that exists: for a region of many lines use replace_lines, and to relocate a block use move_lines. expectedHash must be the current sha256 of the path from fileHashes (the same value the latest read_files or edit result reported). oldText is a small unique anchor (a few consecutive lines) copied exactly from that read; never paste a truncated excerpt or an entire file. newText replaces the anchor and must differ from it. Never overwrite an unread file; a new file is made with create_file.',
   bash: 'check is true only when this command is the verification of the work (a build, a type check, a test run): from then on it is the check of record, and running that same command again is a check too; false for installs, scaffolds, inspections and everything else. The harness never runs the check by itself: run it after edits when you want them judged, and before finish, which is refused while an edit is newer than the last check. command runs with bash in the repository root (the harness already sets cwd; use repository-relative paths and do not cd into a subdirectory or to /workspace). Explain its purpose. Use it for diagnostics too. A command that succeeded is not run again until something is written or installed, because its output is already in the evidence. Do not start background processes or servers.',
-  finish: 'summary reports the final code structure, the verification from verification, and limitations concisely. Once anything has been written, finish is refused while verificationAfterLastWrite is false: run the check first. With nothing written there is nothing to verify: the summary is your answer, judged against what you read, so state what the evidence you gathered shows. The evidence gate reads the changed files as they are now, the diff and the last observation; your earlier turns show what was done. Missing history proves neither that a requested procedure was followed nor that it was skipped. Do not infer a procedural violation from absent records. Report only what the evidence establishes.',
+  finish:
+    'summary reports the final code structure, the verification from verification, and limitations concisely. Once anything has been written, finish is refused while verificationAfterLastWrite is false: run the check first. With nothing written there is nothing to verify: the summary is your answer, judged against what you read, so state what the evidence you gathered shows. The evidence gate reads the changed files as they are now, the diff and the last observation; your earlier turns show what was done. Missing history proves neither that a requested procedure was followed nor that it was skipped. Do not infer a procedural violation from absent records. Report only what the evidence establishes.',
   ask_user: 'Ask one concise question that explains the missing information.',
 };
-export const language = (path: string): string => ({ ts: 'ts', tsx: 'tsx', js: 'js', jsx: 'jsx', mjs: 'js', cjs: 'js', json: 'json', css: 'css', scss: 'scss', html: 'html', md: 'md', yml: 'yaml', yaml: 'yaml', toml: 'toml', py: 'python', rs: 'rust', go: 'go', sh: 'bash' } as Record<string, string>)[path.split('.').pop() ?? ''] ?? '';
+export const language = (path: string): string =>
+  (
+    ({
+      ts: 'ts',
+      tsx: 'tsx',
+      js: 'js',
+      jsx: 'jsx',
+      mjs: 'js',
+      cjs: 'js',
+      json: 'json',
+      css: 'css',
+      scss: 'scss',
+      html: 'html',
+      md: 'md',
+      yml: 'yaml',
+      yaml: 'yaml',
+      toml: 'toml',
+      py: 'python',
+      rs: 'rust',
+      go: 'go',
+      sh: 'bash',
+    }) as Record<string, string>
+  )[path.split('.').pop() ?? ''] ?? '';
 // The fence for a file's code block: four backticks for documents that may
 // themselves contain fenced blocks, so the closing fence is unambiguous.
-export const fenceFor = (path: string): string => /\.(md|mdx|markdown)$/i.test(path) ? '````' + language(path) : '```' + language(path);
+export const fenceFor = (path: string): string =>
+  /\.(md|mdx|markdown)$/i.test(path) ? '````' + language(path) : '```' + language(path);
 // What a file to create may rely on: for each dependency, the path to import
 // it from and its exported surface (parsed from the file when it exists, from
 // the design when it is still planned), and who will import this file.
-export interface FileContract { path: string; importPath: string; status: 'exists' | 'planned'; exports: string[] }
+export interface FileContract {
+  path: string;
+  importPath: string;
+  status: 'exists' | 'planned';
+  exports: string[];
+}
 // A rewritten region that repeats lines around it is trimmed to the region: the
 // worker's intent is unambiguous, so the output is repaired. Lines are compared
 // trimmed and without blank lines, as a copy is made, and a repeat takes the blank
@@ -336,18 +594,31 @@ export interface FileContract { path: string; importPath: string; status: 'exist
 // taken as repeated context.
 export function trimContext(output: string, around: Around, cut = false): { text: string; echo: Echo | null } {
   let lines = output === '' ? [] : output.replace(/\n$/, '').split('\n');
-  const b = contentLines(around.before).map(x => x.t); const g = contentLines(lines.join('\n'));
-  for (let n = Math.min(b.length, g.length - (cut ? 0 : 1)); n > 0; n--) if (g.slice(0, n).every((x, i) => x.t === b[b.length - n + i]) && (n >= 2 || substantive(g[0]!.t))) { lines = lines.slice(n < g.length ? g[n]!.i : lines.length); break; }
-  const text = lines.length ? `${lines.join('\n')}\n` : ''; const echo = echoOf(text, around);
+  const b = contentLines(around.before).map(x => x.t);
+  const g = contentLines(lines.join('\n'));
+  for (let n = Math.min(b.length, g.length - (cut ? 0 : 1)); n > 0; n--)
+    if (g.slice(0, n).every((x, i) => x.t === b[b.length - n + i]) && (n >= 2 || substantive(g[0]!.t))) {
+      lines = lines.slice(n < g.length ? g[n]!.i : lines.length);
+      break;
+    }
+  const text = lines.length ? `${lines.join('\n')}\n` : '';
+  const echo = echoOf(text, around);
   return { text: !echo ? text : echo.line > 1 ? `${lines.slice(0, echo.line - 1).join('\n')}\n` : '', echo };
 }
 // Every field of the prompt merged into one object, for inspection and tests.
 export function promptFields(prompt: Message[]): Record<string, any> {
-  const out: Record<string, any> = {}; const evidence: unknown[] = [];
+  const out: Record<string, any> = {};
+  const evidence: unknown[] = [];
   for (const m of prompt.slice(1)) {
-    let parsed: any; try { parsed = JSON.parse(m.content); } catch { continue; }
+    let parsed: any;
+    try {
+      parsed = JSON.parse(m.content);
+    } catch {
+      continue;
+    }
     if (m.role === 'assistant') continue;
-    if (parsed && typeof parsed === 'object' && 'evidence' in parsed && Object.keys(parsed).length === 1) evidence.push(parsed.evidence);
+    if (parsed && typeof parsed === 'object' && 'evidence' in parsed && Object.keys(parsed).length === 1)
+      evidence.push(parsed.evidence);
     else Object.assign(out, parsed);
   }
   out.evidence = evidence;
@@ -361,11 +632,29 @@ export function promptFields(prompt: Message[]): Record<string, any> {
 // or produce the arguments of the action just chosen, or write a file.
 // The agent's system message; named for the model when it has a name of its own here (Bonsai, served
 // locally), otherwise it is just the coding agent.
-export const agentSystem = (name?: string): string => `You are ${name ? `${name}, a` : 'a'} coding agent working in a repository through tools. Each step you reason briefly about the objective, what you know and what you just observed, then name the actions to take. Your own earlier turns are the assistant messages, each followed by the results of its actions; steps whose evidence was dropped for room are summarised in earlierSteps. You decide what to read, what to run (scaffolders, package managers, checks), what to write and in what order; the harness executes your action, verifies what it can, and shows you what happened. Prefer acting on facts you have over reading what is already shown. Keep your notes current with the plan action.`;
+export const agentSystem = (name?: string): string =>
+  `You are ${name ? `${name}, a` : 'a'} coding agent working in a repository through tools. Each step you reason briefly about the objective, what you know and what you just observed, then name the actions to take. Your own earlier turns are the assistant messages, each followed by the results of its actions; steps whose evidence was dropped for room are summarised in earlierSteps. You decide what to read, what to run (scaffolders, package managers, checks), what to write and in what order; the harness executes your action, verifies what it can, and shows you what happened. Prefer acting on facts you have over reading what is already shown. Keep your notes current with the plan action.`;
 export const AGENT_SYSTEM = agentSystem('Bonsai');
 export function orientationBlock(s: Session, allowed?: string[]): Record<string, unknown> {
-  return { objective: s.objective, repositoryInstructions: s.instructions || undefined, orientation: s.orientation ?? undefined,
-    ...(allowed ? { actions: Object.fromEntries(allowed.map(a => [a, { description: routeDescriptions[a as Route], instructions: details[a as Route], argumentSchema: schemas[a as Route] }])) } : {}) };
+  return {
+    objective: s.objective,
+    repositoryInstructions: s.instructions || undefined,
+    orientation: s.orientation ?? undefined,
+    ...(allowed
+      ? {
+          actions: Object.fromEntries(
+            allowed.map(a => [
+              a,
+              {
+                description: routeDescriptions[a as Route],
+                instructions: details[a as Route],
+                argumentSchema: schemas[a as Route],
+              },
+            ]),
+          ),
+        }
+      : {}),
+  };
 }
 // note: the request's harnessNote. The loop's notes state unaddressed completion feedback every step, so
 // the field would be a second copy of it (runs 49-76: in 43 of 43 step prompts; 3.6k tokens in run 76).
@@ -373,12 +662,19 @@ export function agentRequestBase(s: Session, note = ''): Record<string, unknown>
   const staleEvidence = Object.fromEntries(s.entries.filter(e => e.stale).map(e => [e.id, e.stale]));
   // The failed result the error comes from is the freshest entry, right above the tail (runs 49-76: shown in it
   // in 201 of 214 step prompts). A rejected finish is clipped there to 600 characters, and harnessNote states it whole (9 of the 13).
-  const lastError = s.lastError && clip(s.lastError, 700); const errorAt = lastError ? shownIn([{ id: 'harnessNote', text: note }, ...s.entries], lastError) : undefined;
+  const lastError = s.lastError && clip(s.lastError, 700);
+  const errorAt = lastError ? shownIn([{ id: 'harnessNote', text: note }, ...s.entries], lastError) : undefined;
   return {
-    changedFiles: s.writes.slice(-30), fileCount: s.knownFiles.length, staleEvidence,
+    changedFiles: s.writes.slice(-30),
+    fileCount: s.knownFiles.length,
+    staleEvidence,
     ...(s.referenceEvidence.length ? { referenceEvidence: referenceContext(s, 3000) } : {}),
-    ...(s.completionFeedback && !s.completionFeedback.addressed && !note.includes(s.completionFeedback.text) ? { completionFeedback: s.completionFeedback.text } : {}),
-    readCoverage: coverageSummary(s, 12), searched: compactSearched(s, 8), fileHashes: Object.fromEntries(Object.entries(s.hashes).slice(-12)),
+    ...(s.completionFeedback && !s.completionFeedback.addressed && !note.includes(s.completionFeedback.text)
+      ? { completionFeedback: s.completionFeedback.text }
+      : {}),
+    readCoverage: coverageSummary(s, 12),
+    searched: compactSearched(s, 8),
+    fileHashes: Object.fromEntries(Object.entries(s.hashes).slice(-12)),
     rejectedEdits: compactRejected(s, 3),
     lastError: lastError && named(lastError, errorAt),
   };
@@ -395,9 +691,36 @@ export function verificationBlock(s: Session, point = true): Record<string, unkn
   // While the check's own entry shows the output, the output is named, not restated: the step prompts of runs 49-76
   // carried it 349 times, with that entry in the prompt every time (holdsCurrent keeps a failed check of record) and showing all of it in 336.
   // The entries of the check's step are its own (ids are e<step>): a retry at that step leaves two, and it is restated.
-  const c = s.lastCheck; const output = c && !since.length ? clipEnds(c.text, 1200) : '';
-  const at = output && point ? shownIn(s.entries.filter(e => e.step === c!.step), output) : undefined;
-  return { verification: c ? { command: c.command ?? s.lastCheckCommand, step: c.step, ok: c.ok, exitCode: c.summary.code, ...(since.length ? { writtenSince: since } : {}), files: Object.fromEntries(Object.entries(c.summary.files).filter(([f]) => !edited(f)).slice(0, 8)), ...(since.length ? { outputWithheld: `files were edited after this check ran (${since.join(', ')}); what it said about them no longer describes them, so it is not shown: run the check again to see them as they are` } : { output: named(output, at) }) } : { command: s.lastCheckCommand, step: null, ok: null } };
+  const c = s.lastCheck;
+  const output = c && !since.length ? clipEnds(c.text, 1200) : '';
+  const at =
+    output && point
+      ? shownIn(
+          s.entries.filter(e => e.step === c!.step),
+          output,
+        )
+      : undefined;
+  return {
+    verification: c
+      ? {
+          command: c.command ?? s.lastCheckCommand,
+          step: c.step,
+          ok: c.ok,
+          exitCode: c.summary.code,
+          ...(since.length ? { writtenSince: since } : {}),
+          files: Object.fromEntries(
+            Object.entries(c.summary.files)
+              .filter(([f]) => !edited(f))
+              .slice(0, 8),
+          ),
+          ...(since.length
+            ? {
+                outputWithheld: `files were edited after this check ran (${since.join(', ')}); what it said about them no longer describes them, so it is not shown: run the check again to see them as they are`,
+              }
+            : { output: named(output, at) }),
+        }
+      : { command: s.lastCheckCommand, step: null, ok: null },
+  };
 }
 // The prompt is ordered by how often each part changes, because the server
 // reuses its cache only up to the first changed message: the system message and
@@ -405,7 +728,9 @@ export function verificationBlock(s: Session, point = true): Record<string, unkn
 // entry is removed only by a batched eviction); the notes, the file list, the
 // check state and the request change every turn and come last. Every call, a
 // reasoning turn or a file generation, shares this prefix.
-export function agentAllowed(s: Session): string[] | undefined { return s.allowedActions; }
+export function agentAllowed(s: Session): string[] | undefined {
+  return s.allowedActions;
+}
 function agentPrefix(s: Session): Message[] {
   return [
     { role: 'system', content: s.form ? agentSystem() : AGENT_SYSTEM },
@@ -414,7 +739,9 @@ function agentPrefix(s: Session): Message[] {
     // The trail changes only when evidence is evicted, which already reprocesses from the
     // oldest entry, so it sits before the evidence rather than being reprocessed every step.
     ...(s.trail?.length ? [{ role: 'user' as const, content: JSON.stringify({ earlierSteps: s.trail }) }] : []),
-    ...(s.form === 'tools' ? toolTranscript(s) : s.entries.map(e => e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : evidenceMessage(e))),
+    ...(s.form === 'tools'
+      ? toolTranscript(s)
+      : s.entries.map(e => (e.kind === 'turn' ? { role: 'assistant' as const, content: e.text } : evidenceMessage(e)))),
   ];
 }
 // Where a prompt stops changing, for a provider that caches a prefix where the request marks it: after the
@@ -424,27 +751,45 @@ function agentPrefix(s: Session): Message[] {
 export function cachePoints(messages: Message[]): number[] {
   if (messages[0]?.role !== 'system' || messages.length < 4) return [];
   // A marker goes on text: an assistant turn that only calls tools has none, so its point is the message before it.
-  let end = messages.length - 3; while (end > 1 && !messages[end]!.content) end--;
+  let end = messages.length - 3;
+  while (end > 1 && !messages[end]!.content) end--;
   return [...new Set([1, end])];
 }
-const evidenceContent = (e: Entry): string => JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } });
+const evidenceContent = (e: Entry): string =>
+  JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } });
 const evidenceMessage = (e: Entry): Message => ({ role: 'user', content: evidenceContent(e) });
 // The file actions as the model's own tools: the content is written in the call (toolForms).
 const toolDescriptions: Partial<Record<Route, string>> = {
   create_file: 'Create a file that does not exist yet, with its complete content.',
-  rewrite_file: 'Replace the whole content of an existing file, or one block of it (start and end). For any change larger than a few lines.',
-  write: 'Replace one exact piece of an existing file\'s text with new text: the way to change a few lines without retyping the file.',
-  replace_lines: 'Replace, delete or prefix up to 40 line ranges of an already-read file in one call, addressed by line numbers instead of exact text; the way to remove many unused-import lines at once, or to export many declarations at once (prepend).',
+  rewrite_file:
+    'Replace the whole content of an existing file, or one block of it (start and end). For any change larger than a few lines.',
+  write:
+    "Replace one exact piece of an existing file's text with new text: the way to change a few lines without retyping the file.",
+  replace_lines:
+    'Replace, delete or prefix up to 40 line ranges of an already-read file in one call, addressed by line numbers instead of exact text; the way to remove many unused-import lines at once, or to export many declarations at once (prepend).',
 };
 const toolDetails: Partial<Record<Route, string>> = {
-  create_file: 'path is the repository-relative path of a file that does not exist yet (an existing file is changed with rewrite_file or write). content is the whole file: working code with no placeholders, TODOs or omitted sections, importing repository modules by the names they export and packages the manifest declares. A large file goes in a call of its own: a reply is limited in length, and a call cut off by the limit is not run.',
-  rewrite_file: 'path is an existing file. Without start and end, content is its whole new content. With start and end (1-based, inclusive, numbered as in the latest read or edit result of the file), content is the new text of lines start..end only, and the rest of the file stays as it is (end = start - 1 inserts before line start; start = totalLines + 1 appends): give them whenever most of the file stays. Lines numbered from a version of the file you have not seen are refused.',
-  write: 'oldText is copied exactly from the file as you last read or wrote it and occurs in it once; newText replaces it and differs from it. expectedHash (optional) is the file\'s sha256 from fileHashes; without it the file as it is now is edited, and oldText must match it exactly. A new file is made with create_file.',
+  create_file:
+    'path is the repository-relative path of a file that does not exist yet (an existing file is changed with rewrite_file or write). content is the whole file: working code with no placeholders, TODOs or omitted sections, importing repository modules by the names they export and packages the manifest declares. A large file goes in a call of its own: a reply is limited in length, and a call cut off by the limit is not run.',
+  rewrite_file:
+    'path is an existing file. Without start and end, content is its whole new content. With start and end (1-based, inclusive, numbered as in the latest read or edit result of the file), content is the new text of lines start..end only, and the rest of the file stays as it is (end = start - 1 inserts before line start; start = totalLines + 1 appends): give them whenever most of the file stays. Lines numbered from a version of the file you have not seen are refused.',
+  write:
+    "oldText is copied exactly from the file as you last read or wrote it and occurs in it once; newText replaces it and differs from it. expectedHash (optional) is the file's sha256 from fileHashes; without it the file as it is now is edited, and oldText must match it exactly. A new file is made with create_file.",
 };
 // An action as one of the model's tools (the tools form): its name, its description and instructions, its arguments' schema.
-export function actionTool(action: string): { type: 'function'; function: { name: string; description: string; parameters: Record<string, unknown> } } {
+export function actionTool(action: string): {
+  type: 'function';
+  function: { name: string; description: string; parameters: Record<string, unknown> };
+} {
   const a = action as Route;
-  return { type: 'function', function: { name: action, description: `${toolDescriptions[a] ?? routeDescriptions[a]} ${toolDetails[a] ?? details[a]}`, parameters: toolSchema(a) as unknown as Record<string, unknown> } };
+  return {
+    type: 'function',
+    function: {
+      name: action,
+      description: `${toolDescriptions[a] ?? routeDescriptions[a]} ${toolDetails[a] ?? details[a]}`,
+      parameters: toolSchema(a) as unknown as Record<string, unknown>,
+    },
+  };
 }
 // The evidence as the model's own tool-calling transcript: a turn is an assistant message, its thought as the
 // text and one call per action; right after it, one tool message per call. Action i of a turn ran at the turn's
@@ -453,64 +798,165 @@ export function actionTool(action: string): { type: 'function'; function: { name
 // it is being written), it is the one the request is for, or it runs later. Entries of no turn shown, and the
 // results of a turn that left, stay user messages where they are.
 function toolTranscript(s: Session): Message[] {
-  const shown = new Set(s.entries.filter(e => e.kind === 'turn').map(e => e.id)); const out: Message[] = [];
+  const shown = new Set(s.entries.filter(e => e.kind === 'turn').map(e => e.id));
+  const out: Message[] = [];
   for (const e of s.entries) {
-    if (e.kind !== 'turn') { if (!e.turn || !shown.has(e.turn)) out.push(evidenceMessage(e)); continue; }
-    let turn: { thought?: unknown; actions?: { action: string; args?: unknown }[] } = {}; try { turn = JSON.parse(e.text); } catch { /* not a turn */ }
-    const calls = (Array.isArray(turn.actions) ? turn.actions : []).map((a, i) => ({ id: `${e.id}_${i}`, type: 'function' as const, function: { name: String(a.action), arguments: JSON.stringify(a.args ?? {}) } }));
-    out.push({ role: 'assistant', content: String(turn.thought ?? ''), ...(calls.length ? { tool_calls: calls } : {}) });
-    const results = s.entries.filter(r => r.kind !== 'turn' && r.turn === e.id); const ran = e.outcomes?.length ?? 0;
+    if (e.kind !== 'turn') {
+      if (!e.turn || !shown.has(e.turn)) out.push(evidenceMessage(e));
+      continue;
+    }
+    let turn: { thought?: unknown; actions?: { action: string; args?: unknown }[] } = {};
+    try {
+      turn = JSON.parse(e.text);
+    } catch {
+      /* not a turn */
+    }
+    const calls = (Array.isArray(turn.actions) ? turn.actions : []).map((a, i) => ({
+      id: `${e.id}_${i}`,
+      type: 'function' as const,
+      function: { name: String(a.action), arguments: JSON.stringify(a.args ?? {}) },
+    }));
+    out.push({
+      role: 'assistant',
+      content: String(turn.thought ?? ''),
+      ...(calls.length ? { tool_calls: calls } : {}),
+    });
+    const results = s.entries.filter(r => r.kind !== 'turn' && r.turn === e.id);
+    const ran = e.outcomes?.length ?? 0;
     const running = s.currentTurn === e.id ? s.step - e.step : -1;
     calls.forEach((c, i) => {
       const mine = results.filter(r => Math.min(Math.max(r.step - e.step, 0), calls.length - 1) === i);
-      const content = mine.length ? mine.map(evidenceContent).join('\n') : i === running ? 'Running: the request below is for this call.' : running >= 0 && i > running ? 'Not run yet: it runs after the calls before it.'
-        : i < ran ? 'Ran; its result has left the evidence (earlierSteps summarises it).' : 'Not run: the batch stopped at an earlier call.';
+      const content = mine.length
+        ? mine.map(evidenceContent).join('\n')
+        : i === running
+          ? 'Running: the request below is for this call.'
+          : running >= 0 && i > running
+            ? 'Not run yet: it runs after the calls before it.'
+            : i < ran
+              ? 'Ran; its result has left the evidence (earlierSteps summarises it).'
+              : 'Not run: the batch stopped at an earlier call.';
       out.push({ role: 'tool', tool_call_id: c.id, content });
     });
   }
   return out;
 }
 export function volatile(s: Session, point = true): Message[] {
-  return [{ role: 'user', content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s, point) }) }];
+  return [
+    {
+      role: 'user',
+      content: JSON.stringify({ notes: s.notes ?? '', files: relevantFiles(s, 40), ...verificationBlock(s, point) }),
+    },
+  ];
 }
 export function stepMessages(s: Session, allowed: string[], note?: string): Message[] {
   // The pinned block lists the session's actions: allowedActions is sent only when a step allows fewer
   // (runs 49-76: equal in 729 of 729 prompts), and the request then names it.
-  const pinned = agentAllowed(s) ?? []; const narrowed = allowed.length !== pinned.length || allowed.some(a => !pinned.includes(a));
-  const request = { role: s.form === 'tools' ? `Reason, then act. Write one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then call the tools for one to eight actions, in order. The harness runs the calls in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one call when its result decides what comes next.` : `Reason, then act. Write thought: one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then actions: an ordered list of one to eight actions (each an action name from ${narrowed ? 'allowedActions' : 'the pinned block\'s actions'} with its args under that action's schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one action when its result decides what comes next.`,
-    ...agentRequestBase(s, note), ...(narrowed && s.form !== 'tools' ? { allowedActions: allowed } : {}), ...(note ? { harnessNote: note } : {}) };
-  return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify({ ...request, verificationAfterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep) }) }];
+  const pinned = agentAllowed(s) ?? [];
+  const narrowed = allowed.length !== pinned.length || allowed.some(a => !pinned.includes(a));
+  const request = {
+    role:
+      s.form === 'tools'
+        ? `Reason, then act. Write one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then call the tools for one to eight actions, in order. The harness runs the calls in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one call when its result decides what comes next.`
+        : `Reason, then act. Write thought: one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then actions: an ordered list of one to eight actions (each an action name from ${narrowed ? 'allowedActions' : "the pinned block's actions"} with its args under that action's schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one action when its result decides what comes next.`,
+    ...agentRequestBase(s, note),
+    ...(narrowed && s.form !== 'tools' ? { allowedActions: allowed } : {}),
+    ...(note ? { harnessNote: note } : {}),
+  };
+  return [
+    ...agentPrefix(s),
+    ...volatile(s),
+    {
+      role: 'user',
+      content: JSON.stringify({
+        ...request,
+        verificationAfterLastWrite: Boolean(s.lastCheck && s.lastCheck.step > s.lastWriteStep),
+      }),
+    },
+  ];
 }
 // How the code is written: into the block the harness opened (Bonsai), or as the reply's one fenced code block.
-const opened = (s: Session, what: string): string => s.form ? `Reply with ${what} as one fenced code block and nothing outside it.` : `The harness has opened the code block; write only ${what} and close the block.`;
+const opened = (s: Session, what: string): string =>
+  s.form
+    ? `Reply with ${what} as one fenced code block and nothing outside it.`
+    : `The harness has opened the code block; write only ${what} and close the block.`;
 // One block of an existing file, written as code: the block as it is now, the
 // lines around it, and the whole file when it is small enough to read cheaply.
 // Only the block is generated; the harness splices it in.
-export function regionMessages(s: Session, path: string, purpose: string, current: string, start: number, end: number, contracts: FileContract[], declared: string[], shrink = 0, markup: Record<string, unknown> = {}): Message[] {
+export function regionMessages(
+  s: Session,
+  path: string,
+  purpose: string,
+  current: string,
+  start: number,
+  end: number,
+  contracts: FileContract[],
+  declared: string[],
+  shrink = 0,
+  markup: Record<string, unknown> = {},
+): Message[] {
   const lines = (current.endsWith('\n') ? current.slice(0, -1) : current).split('\n');
-  const total = current === '' ? 0 : lines.length; const window = shrink ? 20 : 40;
+  const total = current === '' ? 0 : lines.length;
+  const window = shrink ? 20 : 40;
   const request = {
     role: `Write the new content for lines ${start}..${end} of ${path} as code: only those lines, which replace the ones in region (${end < start ? 'an insertion: region is empty' : `${end - start + 1} line(s)`}). Everything outside them stays as it is. ${opened(s, 'the new lines')}`,
-    file: path, purpose, lines: `${start}..${end} of ${total}`,
-    before: lines.slice(Math.max(0, start - 1 - window), start - 1).join('\n'), region: lines.slice(start - 1, end).join('\n'), after: lines.slice(end, end + window).join('\n'),
+    file: path,
+    purpose,
+    lines: `${start}..${end} of ${total}`,
+    before: lines.slice(Math.max(0, start - 1 - window), start - 1).join('\n'),
+    region: lines.slice(start - 1, end).join('\n'),
+    after: lines.slice(end, end + window).join('\n'),
     // The whole file only when before, region and after do not already show all of it.
-    ...(!shrink && current.length <= 16000 && !(start - 1 - window <= 0 && end + window >= total) ? { currentContent: current } : {}),
-    modules: contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
-    declaredPackages: declared.slice(0, 60), ...markup,
-    rules: [`Write only the new lines ${start}..${end} of ${path}: working code with no placeholders, and nothing from before or after (they stay in the file).`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', s.form ? 'Reply with the lines in one fenced code block; no explanation before or after it.' : 'Write the lines only, then the closing fence; no explanation before or after them.'],
+    ...(!shrink && current.length <= 16000 && !(start - 1 - window <= 0 && end + window >= total)
+      ? { currentContent: current }
+      : {}),
+    modules: contracts
+      .slice(0, shrink ? 4 : 12)
+      .map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
+    declaredPackages: declared.slice(0, 60),
+    ...markup,
+    rules: [
+      `Write only the new lines ${start}..${end} of ${path}: working code with no placeholders, and nothing from before or after (they stay in the file).`,
+      'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.',
+      s.form
+        ? 'Reply with the lines in one fenced code block; no explanation before or after it.'
+        : 'Write the lines only, then the closing fence; no explanation before or after them.',
+    ],
   };
   return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify(request) }];
 }
 // A new file, written as code: the worker's purpose (its reasoning is the turn in the prefix), the real
 // exported signatures of the repository modules it names, and the packages
 // the manifest declares, so nothing is invented.
-export function newFileMessages(s: Session, path: string, purpose: string, contracts: FileContract[], declared: string[], shrink = 0, current?: string, markup: Record<string, unknown> = {}): Message[] {
+export function newFileMessages(
+  s: Session,
+  path: string,
+  purpose: string,
+  contracts: FileContract[],
+  declared: string[],
+  shrink = 0,
+  current?: string,
+  markup: Record<string, unknown> = {},
+): Message[] {
   const request = {
-    role: current === undefined ? `Write the complete file ${path} as code. ${opened(s, 'the file content')}` : `Rewrite the complete file ${path} as code: its whole new content, keeping what should stay and changing what purpose asks. ${opened(s, 'the file content')}`,
-    file: path, purpose, ...(current !== undefined ? { currentContent: shrink ? clip(current, 6000) : current } : {}),
-    modules: contracts.slice(0, shrink ? 4 : 12).map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
-    declaredPackages: declared.slice(0, 60), ...markup,
-    rules: [`Write the complete content of ${path}: working code with no placeholders, TODOs or omitted sections.`, 'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.', s.form ? 'Reply with the file content in one fenced code block; no explanation before or after it.' : 'Write the file content only, then the closing fence; no explanation before or after it.'],
+    role:
+      current === undefined
+        ? `Write the complete file ${path} as code. ${opened(s, 'the file content')}`
+        : `Rewrite the complete file ${path} as code: its whole new content, keeping what should stay and changing what purpose asks. ${opened(s, 'the file content')}`,
+    file: path,
+    purpose,
+    ...(current !== undefined ? { currentContent: shrink ? clip(current, 6000) : current } : {}),
+    modules: contracts
+      .slice(0, shrink ? 4 : 12)
+      .map(c => ({ import: c.importPath, file: c.path, exports: shrink ? c.exports.slice(0, 6) : c.exports })),
+    declaredPackages: declared.slice(0, 60),
+    ...markup,
+    rules: [
+      `Write the complete content of ${path}: working code with no placeholders, TODOs or omitted sections.`,
+      'Import repository modules only as listed in modules, with the names they export; import packages only from declaredPackages, or add them to the manifest first.',
+      s.form
+        ? 'Reply with the file content in one fenced code block; no explanation before or after it.'
+        : 'Write the file content only, then the closing fence; no explanation before or after it.',
+    ],
   };
   return [...agentPrefix(s), ...volatile(s), { role: 'user', content: JSON.stringify(request) }];
 }

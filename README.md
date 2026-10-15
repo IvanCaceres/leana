@@ -32,6 +32,21 @@ node dist/src/cli.js resume /path/to/repository/.leana/runs/SESSION \
   --message "Continue; the intended behavior is ..."
 ```
 
+### The app
+
+`leana` with no command starts the app. On a terminal it is a full-screen UI with no dependencies of its own: a status bar (model, turn and step, context fill, tokens in with the cached share, tokens out, cost, time, state), the conversation as blocks (your messages, each step's thought and actions, each tool's result, each edit as a coloured diff, warnings, the outcome), and an input box that stays at the bottom.
+
+| Key | Between runs | During a run |
+| --- | --- | --- |
+| Enter | Run the objective typed, or a `/command` | Guide the run: the text joins the objective and the next step is told of it |
+| Tab | Complete a `/command`; otherwise browse the conversation's blocks | Browse the blocks |
+| Up / Down | Recall earlier input (while browsing: select a block) | The same |
+| Enter / Space, `a` (browsing) | Fold or unfold the selected block; fold or unfold all | The same |
+| PgUp / PgDn, mouse wheel | Scroll back through the conversation; Esc returns to its end | The same |
+| Ctrl-C | Twice to leave | Stop after the current step; twice to leave at once |
+
+`--plain` (or output that is not a terminal) keeps the line prompt and the status panel; `NO_COLOR` turns colour off. `leana run` and `leana resume` print to the terminal as before.
+
 Alternatively, supply `TYPESAFE_API_KEY` in the environment or `--env-file PATH`. The optional `LOCAL_API_KEY` defaults to `local`. The key is neither copied into the project nor written to event logs. `--key-file` takes precedence over the environment. `npm link` is optional if you want a global `leana` command.
 
 Defaults match the supplied server: `http://127.0.0.1:8080/v1`, model `bonsai-27b`, 48,000 total context tokens, 4,096 maximum output tokens, and reasoning disabled with `chat_template_kwargs.enable_thinking=false`. Configure with `--config leana.example.json`.

@@ -9,7 +9,7 @@ import { runCommand } from './commands.js';
 import { renderReport } from './report.js';
 import { describeModel, effortsOf, listModels, modelOptions } from './models.js';
 import { elapsed, forModel, modelClient, providerKey, readKey, runSession } from './session.js';
-import { startApp } from './app.js';
+import { startApp, startTui } from './app.js';
 import { usageLine } from './display.js';
 export { readKey, dirtySessionConflict } from './session.js';
 
@@ -25,7 +25,7 @@ const usage = `Leana — a coding agent: the model reasons and acts, Jev guards 
 
 Model:   --provider llama|openrouter, --model ID, --reasoning on|off, --file-reasoning on|off,
          --effort LEVEL, --reasoning-budget N  (only what the model takes is accepted; see leana model)
-Other:   --key-file PATH (Jev), --env-file PATH, --config PATH, --max-steps N (turns through OpenRouter), --allow-dirty, --verbose,
+Other:   --plain (the prompt and status panel instead of the full-screen app), --key-file PATH (Jev), --env-file PATH, --config PATH, --max-steps N (turns through OpenRouter), --allow-dirty, --verbose,
          --check "command" (the verification; run as a baseline first and after every edit)
 Keys:    OpenRouter's from OPENROUTER_API_KEY or providerKeyFile in the config; Jev's from --key-file or TYPESAFE_API_KEY.
 Default: the model writes files and runs shell commands, unsandboxed with your user privileges (including
@@ -58,6 +58,7 @@ async function main(): Promise<void> {
       'allow-dirty': { type: 'boolean' },
       verbose: { type: 'boolean', short: 'v' },
       follow: { type: 'boolean' },
+      plain: { type: 'boolean' },
       check: { type: 'string' },
       provider: { type: 'string' },
       model: { type: 'string' },
@@ -124,8 +125,10 @@ async function main(): Promise<void> {
       : settings.config;
   const config = await loadConfig(v.config, { ...kept, ...flags });
   const jevKey = v['key-file'] ? await readKey(v['key-file']) : (process.env.TYPESAFE_API_KEY ?? '');
+  // On a terminal the app is the full-screen UI; --plain (or output that is not a terminal) keeps the prompt.
+  const tui = !v.plain && process.stdin.isTTY && process.stdout.isTTY;
   if (!command)
-    return startApp({
+    return (tui ? startTui : startApp)({
       base: config,
       settings,
       jevKey,

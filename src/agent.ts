@@ -71,6 +71,7 @@ import {
 } from './control.js';
 import type { Around, Bonsai, Echo, GenerationCut, StreamProgress } from './clients.js';
 import { repeatCut } from './clients.js';
+import { diffLines } from './diff.js';
 // A worker's turn: its reasoning and the ordered actions it named (problem: what is wrong with the call itself).
 type Batch = { action: Route; args: Record<string, any>; problem?: string }[];
 interface Turn {
@@ -242,6 +243,11 @@ export class Agent {
   private current = 0;
   // Set by stop(): the run pauses before its next step (the step under way finishes; its result is kept).
   private stopRequested = false;
+  // Guidance the user gave while the run went on, taken at the start of the next step (takeGuidance).
+  private guidance: string[] = [];
+  guide(text: string): void {
+    if (text.trim()) this.guidance.push(text.trim());
+  }
   stop(): void {
     this.stopRequested = true;
   }
@@ -600,6 +606,7 @@ export class Agent {
     if (result.ok && editRoutes.includes(route) && result.changed?.length) {
       const facts = await this.parseFacts(result.changed, replaced);
       if (facts.length) result.text += `\nHarness: ${facts.join(' | ')}`;
+      await this.showEdits(s, result.changed, replaced);
     }
     s.lastRoute = route;
     s.lastResultOk = result.ok;
@@ -611,7 +618,7 @@ export class Agent {
       ok: result.ok,
       ms: performance.now() - started,
       chars: result.text.length,
-      text: clip(result.text, 200),
+      text: clip(result.text, 1500),
     });
     await this.store.log('result', {
       step: s.step,
@@ -623,6 +630,24 @@ export class Agent {
     return result;
   }
 
+  // Each file an edit changed, as a diff against the content it replaced, for whoever watches the run.
+  private async showEdits(s: Session, paths: string[], replaced: Map<string, string | null>): Promise<void> {
+    for (const path of paths) {
+      const after = await readIfPresent(this.tools.root, path).catch(() => null);
+      if (after === null) continue;
+      const before = replaced.get(path) ?? null;
+      const d = diffLines(before ?? '', after);
+      this.observe({
+        kind: 'edit',
+        step: s.step,
+        path,
+        created: before === null,
+        added: d.added,
+        removed: d.removed,
+        hunks: d.hunks,
+      });
+    }
+  }
   // Every file a command created, modified or deleted is an edit of this step,
   // except what the check of record writes (a build's output is not an edit it
   // must be run again for). The file list follows the tree either way.
@@ -1513,6 +1538,7 @@ export class Agent {
         await this.pinObjectiveFiles(s);
         const notes = await this.standingNotes(s);
         if (notes === 'stop') break;
+        notes.unshift(...(await this.takeGuidance(s)));
         const allowed: Route[] = [...actions].filter(
           a =>
             (this.config.allowWrite || !editRoutes.includes(a as Route)) &&
@@ -1544,6 +1570,20 @@ export class Agent {
     return s;
   }
 
+  // Guidance given during the run joins the objective as a resume's message does (the gate judges the run against
+  // it), and the next step is told of it at once.
+  private async takeGuidance(s: Session): Promise<string[]> {
+    const given = this.guidance.splice(0);
+    for (const text of given) {
+      s.objective += `\nUser update: ${text}`;
+      await this.store.log('guidance', { step: s.step, text });
+      this.observe({ kind: 'guidance', step: s.step, text });
+    }
+    return given.map(
+      text =>
+        `The user added to the objective while you worked: "${text}". It is part of the objective from now on; take it into account from this step.`,
+    );
+  }
   // The session made ready for an invocation, and the invocation's budget.
   private async begin(s: Session): Promise<RunBudget> {
     s.status = 'running';

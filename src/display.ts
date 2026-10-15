@@ -1,4 +1,6 @@
 import type { GenerationMeta, Phase } from './types.js';
+import type { Hunk } from './diff.js';
+import { k, secs, plural, short, row, plain, fitTo, wrap } from './text.js';
 
 // Structured progress from the runner. The display turns it into a live panel
 // on a terminal, or plain lines when output is not a terminal.
@@ -71,15 +73,11 @@ export type ProgressEvent =
   | { kind: 'result'; step: number; route: string; ok: boolean; ms: number; chars: number; text: string }
   | { kind: 'undo'; step: number; files: string[] }
   | { kind: 'warning'; step: number; text: string }
+  // An edit as it landed: the file's diff against the content it had (created: it had none).
+  | { kind: 'edit'; step: number; path: string; created: boolean; added: number; removed: number; hunks: Hunk[] }
+  // Guidance the user gave while the run went on, as it reaches the run.
+  | { kind: 'guidance'; step: number; text: string }
   | { kind: 'stop'; step: number; status: string; reason: string };
-
-const k = (n: number | null | undefined) =>
-  n == null ? '-' : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(Math.round(n));
-const secs = (ms: number | null | undefined) =>
-  ms == null ? '-' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
-const plural = (n: number, what: string) => `${k(n)} ${what}${n === 1 ? '' : 's'}`;
-// A shown value cut to n characters (clip's marker is an instruction to the model, not for the screen).
-const short = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 3)}...` : s);
 const quantile = (xs: number[], q: number) =>
   xs.length ? [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.ceil(xs.length * q) - 1)]! : null;
 export const generationSpeed = (
@@ -241,54 +239,6 @@ export function actionSummary(action: string, a: Record<string, any>): string {
   const flat = plain(String(what ?? ''));
   return flat ? `${action} ${short(flat, 200)}` : action;
 }
-// Text for one terminal row: line breaks, tabs and the other spacing controls as one space, and control,
-// format and combining characters (escape sequences, zero-width joiners, bidi overrides, stacked accents)
-// and unpaired surrogates dropped. Spaces stay as they are, so labels keep their columns.
-const row = (s: string) => s.replace(/[\t\n\v\f\r\x85\u2028\u2029]+/g, ' ').replace(/[\p{Cc}\p{Cf}\p{M}\p{Cs}]/gu, '');
-// The same, words separated by single spaces, for text that is wrapped.
-const plain = (s: string) => row(s).replace(/ +/g, ' ').trim();
-// The cells a row takes, counting any character but ASCII as two: no terminal draws one wider (wide CJK and
-// emoji take two, ambiguous-width ones one or two), so a row counted under the width never wraps.
-const cellsOf = (c: string) => (c < '\x7f' ? 1 : 2);
-const cells = (s: string) => {
-  let n = 0;
-  for (const c of s) n += cellsOf(c);
-  return n;
-};
-// The longest start of s (or end) that takes at most w cells.
-function take(s: string, w: number, end = false): string {
-  const cs = [...s];
-  let n = 0;
-  let i = 0;
-  for (; i < cs.length; i++) {
-    n += cellsOf(cs[end ? cs.length - 1 - i : i]!);
-    if (n > w) break;
-  }
-  return end ? cs.slice(cs.length - i).join('') : cs.slice(0, i).join('');
-}
-// A row fitted to w cells: its start, or its end (a line still being written grows there), marked where cut.
-const fitTo = (s: string, w: number, end = false) =>
-  cells(s) <= w ? s : end ? `...${take(s, w - 3, true)}` : `${take(s, w - 3)}...`;
-// Rows of at most width cells broken at spaces (a longer word is broken inside it), each after the first indented.
-export function wrap(s: string, width: number, indent = 0): string[] {
-  const rows: string[] = [];
-  let row = '';
-  const room = () => Math.max(2, width - (rows.length ? indent : 0));
-  for (let word of s.split(' ')) {
-    if (row && cells(row) + 1 + cells(word) > room()) {
-      rows.push(row);
-      row = '';
-    }
-    while (!row && cells(word) > room()) {
-      const head = take(word, room());
-      rows.push(head);
-      word = word.slice(head.length);
-    }
-    row = row ? `${row} ${word}` : word;
-  }
-  rows.push(row);
-  return rows.map((r, i) => (i ? ' '.repeat(indent) + r : r));
-}
 // The same facts as plain lines, one per phase, for logs and non-terminal output.
 export function describe(e: ProgressEvent, verbose: boolean): string | null {
   const p = `[${e.step}]  `;
@@ -348,6 +298,10 @@ export function describe(e: ProgressEvent, verbose: boolean): string | null {
       return `${e.reasoning ? `[${e.step}] reasoning: ${plain(e.reasoning)}\n` : ''}[${e.step}] thought: ${plain(e.thought)}\n[${e.step}] actions: ${e.actions.map(a => actionSummary(a.action, a.args)).join(' | ')}`;
     case 'warning':
       return `warning | ${e.text}`;
+    case 'edit':
+      return `[${e.step}] ${e.created ? 'created' : 'edited'} ${e.path} (+${e.added} -${e.removed})`;
+    case 'guidance':
+      return `[${e.step}] the user added: ${plain(e.text)}`;
     default:
       return null;
   }
@@ -404,7 +358,21 @@ export function usageLine(u: Usage, requests = true): string {
 }
 // A status panel redrawn in place at the bottom of the terminal, with a
 // scrolling log of completed steps above it.
-export class Display {
+// What shows a run as it goes: every progress event and log line, the usage it adds up, and its end.
+export interface RunView {
+  update(e: ProgressEvent): void;
+  log(line: string): void;
+  close(): void;
+  readonly usage: Usage;
+}
+export interface RunViewOptions {
+  objective: string;
+  session: string;
+  verbose: boolean;
+  model?: string;
+  name?: string;
+}
+export class Display implements RunView {
   private started = Date.now();
   private jevMs: number[] = [];
   private tps: number[] = [];
@@ -441,7 +409,7 @@ export class Display {
   }
   constructor(
     private out: Stream,
-    private opts: { objective: string; session: string; verbose: boolean; model?: string; name?: string },
+    private opts: RunViewOptions,
   ) {
     if (out.isTTY) {
       this.timer = setInterval(() => this.render(), 1000);

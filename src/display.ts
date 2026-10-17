@@ -1,4 +1,6 @@
 import type { GenerationMeta, Phase } from './types.js';
+import type { Hunk } from './diff.js';
+import { k, secs, plural, short, row, plain, fitTo, wrap } from './text.js';
 
 // Structured progress from the runner. The display turns it into a live panel
 // on a terminal, or plain lines when output is not a terminal.
@@ -68,18 +70,24 @@ export type ProgressEvent =
       file?: { path: string; from: number; lines: number };
     }
   | { kind: 'generation_error'; step: number; message: string }
-  | { kind: 'result'; step: number; route: string; ok: boolean; ms: number; chars: number; text: string }
+  // saved: the file the whole result was archived to (the session's artifact for this step).
+  | {
+      kind: 'result';
+      step: number;
+      route: string;
+      ok: boolean;
+      ms: number;
+      chars: number;
+      text: string;
+      saved?: string;
+    }
   | { kind: 'undo'; step: number; files: string[] }
   | { kind: 'warning'; step: number; text: string }
+  // An edit as it landed: the file's diff against the content it had (created: it had none).
+  | { kind: 'edit'; step: number; path: string; created: boolean; added: number; removed: number; hunks: Hunk[] }
+  // Guidance the user gave while the run went on, as it reaches the run.
+  | { kind: 'guidance'; step: number; text: string }
   | { kind: 'stop'; step: number; status: string; reason: string };
-
-const k = (n: number | null | undefined) =>
-  n == null ? '-' : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(Math.round(n));
-const secs = (ms: number | null | undefined) =>
-  ms == null ? '-' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
-const plural = (n: number, what: string) => `${k(n)} ${what}${n === 1 ? '' : 's'}`;
-// A shown value cut to n characters (clip's marker is an instruction to the model, not for the screen).
-const short = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 3)}...` : s);
 const quantile = (xs: number[], q: number) =>
   xs.length ? [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.ceil(xs.length * q) - 1)]! : null;
 export const generationSpeed = (
@@ -241,54 +249,6 @@ export function actionSummary(action: string, a: Record<string, any>): string {
   const flat = plain(String(what ?? ''));
   return flat ? `${action} ${short(flat, 200)}` : action;
 }
-// Text for one terminal row: line breaks, tabs and the other spacing controls as one space, and control,
-// format and combining characters (escape sequences, zero-width joiners, bidi overrides, stacked accents)
-// and unpaired surrogates dropped. Spaces stay as they are, so labels keep their columns.
-const row = (s: string) => s.replace(/[\t\n\v\f\r\x85\u2028\u2029]+/g, ' ').replace(/[\p{Cc}\p{Cf}\p{M}\p{Cs}]/gu, '');
-// The same, words separated by single spaces, for text that is wrapped.
-const plain = (s: string) => row(s).replace(/ +/g, ' ').trim();
-// The cells a row takes, counting any character but ASCII as two: no terminal draws one wider (wide CJK and
-// emoji take two, ambiguous-width ones one or two), so a row counted under the width never wraps.
-const cellsOf = (c: string) => (c < '\x7f' ? 1 : 2);
-const cells = (s: string) => {
-  let n = 0;
-  for (const c of s) n += cellsOf(c);
-  return n;
-};
-// The longest start of s (or end) that takes at most w cells.
-function take(s: string, w: number, end = false): string {
-  const cs = [...s];
-  let n = 0;
-  let i = 0;
-  for (; i < cs.length; i++) {
-    n += cellsOf(cs[end ? cs.length - 1 - i : i]!);
-    if (n > w) break;
-  }
-  return end ? cs.slice(cs.length - i).join('') : cs.slice(0, i).join('');
-}
-// A row fitted to w cells: its start, or its end (a line still being written grows there), marked where cut.
-const fitTo = (s: string, w: number, end = false) =>
-  cells(s) <= w ? s : end ? `...${take(s, w - 3, true)}` : `${take(s, w - 3)}...`;
-// Rows of at most width cells broken at spaces (a longer word is broken inside it), each after the first indented.
-export function wrap(s: string, width: number, indent = 0): string[] {
-  const rows: string[] = [];
-  let row = '';
-  const room = () => Math.max(2, width - (rows.length ? indent : 0));
-  for (let word of s.split(' ')) {
-    if (row && cells(row) + 1 + cells(word) > room()) {
-      rows.push(row);
-      row = '';
-    }
-    while (!row && cells(word) > room()) {
-      const head = take(word, room());
-      rows.push(head);
-      word = word.slice(head.length);
-    }
-    row = row ? `${row} ${word}` : word;
-  }
-  rows.push(row);
-  return rows.map((r, i) => (i ? ' '.repeat(indent) + r : r));
-}
 // The same facts as plain lines, one per phase, for logs and non-terminal output.
 export function describe(e: ProgressEvent, verbose: boolean): string | null {
   const p = `[${e.step}]  `;
@@ -348,6 +308,10 @@ export function describe(e: ProgressEvent, verbose: boolean): string | null {
       return `${e.reasoning ? `[${e.step}] reasoning: ${plain(e.reasoning)}\n` : ''}[${e.step}] thought: ${plain(e.thought)}\n[${e.step}] actions: ${e.actions.map(a => actionSummary(a.action, a.args)).join(' | ')}`;
     case 'warning':
       return `warning | ${e.text}`;
+    case 'edit':
+      return `[${e.step}] ${e.created ? 'created' : 'edited'} ${e.path} (+${e.added} -${e.removed})`;
+    case 'guidance':
+      return `[${e.step}] the user added: ${plain(e.text)}`;
     default:
       return null;
   }
@@ -366,13 +330,65 @@ interface Stream {
 }
 // The rows the generation under way takes under the panel: a thought's last rows and its actions, or a file's last lines.
 export const liveHeight = 7;
+// What a run's generations consumed, as the provider reported it: requests, prompt tokens (cached: of them, read
+// from the provider's cache), completion tokens, and the cost when the provider states one (OpenRouter does).
+export interface Usage {
+  requests: number;
+  input: number;
+  cached: number;
+  output: number;
+  cost: number | null;
+}
+export const noUsage = (): Usage => ({ requests: 0, input: 0, cached: 0, output: 0, cost: null });
+// One request's usage as the provider reported it, or null.
+export function usageOf(meta: GenerationMeta | null | undefined): Usage | null {
+  const u = meta?.usage;
+  if (!u || typeof u.prompt_tokens !== 'number') return null;
+  const cost = Number(u.cost);
+  return {
+    requests: 1,
+    input: u.prompt_tokens,
+    cached: Number(u.prompt_tokens_details?.cached_tokens) || 0,
+    output: Number(u.completion_tokens) || 0,
+    cost: Number.isFinite(cost) && u.cost !== undefined ? cost : null,
+  };
+}
+export function addUsage(total: Usage, u: Usage): void {
+  total.requests += u.requests;
+  total.input += u.input;
+  total.cached += u.cached;
+  total.output += u.output;
+  if (u.cost !== null) total.cost = (total.cost ?? 0) + u.cost;
+}
+const dollars = (n: number) => `$${n.toFixed(n < 1 ? 3 : 2)}`;
+// Usage in words: "12.3k in (10.1k cached, 82%) | 1.2k out | $0.004", with the request count for a total.
+export function usageLine(u: Usage, requests = true): string {
+  const share = u.input ? Math.round((100 * u.cached) / u.input) : 0;
+  return `${requests ? `${u.requests} request${u.requests === 1 ? '' : 's'} | ` : ''}${k(u.input)} in${u.cached ? ` (${k(u.cached)} cached, ${share}%)` : ''} | ${k(u.output)} out${u.cost !== null ? ` | ${dollars(u.cost)}` : ''}`;
+}
 // A status panel redrawn in place at the bottom of the terminal, with a
 // scrolling log of completed steps above it.
-export class Display {
+// What shows a run as it goes: every progress event and log line, the usage it adds up, and its end.
+export interface RunView {
+  update(e: ProgressEvent): void;
+  log(line: string): void;
+  close(): void;
+  readonly usage: Usage;
+}
+export interface RunViewOptions {
+  objective: string;
+  session: string;
+  verbose: boolean;
+  model?: string;
+  name?: string;
+}
+export class Display implements RunView {
   private started = Date.now();
   private jevMs: number[] = [];
   private tps: number[] = [];
-  private promptTokens = 0;
+  // What the run's generations consumed so far, and the last one's, as the provider reported them.
+  readonly usage: Usage = noUsage();
+  private lastUsage = '';
   private generatedTokens = 0;
   private routes: Record<string, number> = {};
   private edits = 0;
@@ -403,7 +419,7 @@ export class Display {
   }
   constructor(
     private out: Stream,
-    private opts: { objective: string; session: string; verbose: boolean; model?: string; name?: string },
+    private opts: RunViewOptions,
   ) {
     if (out.isTTY) {
       this.timer = setInterval(() => this.render(), 1000);
@@ -465,7 +481,6 @@ export class Display {
         break;
       case 'context': {
         this.contextFill = e.tokens / e.workingTokens;
-        this.promptTokens += e.tokens;
         const top = Object.entries(e.breakdown)
           .sort((a, b) => b[1] - a[1])
           .slice(0, 5)
@@ -504,6 +519,11 @@ export class Display {
         const s = generationSpeed(e.meta);
         if (s.perSecond) this.tps.push(s.perSecond);
         if (s.generated) this.generatedTokens += s.generated;
+        const used = usageOf(e.meta);
+        if (used) {
+          addUsage(this.usage, used);
+          this.lastUsage = usageLine(used, false);
+        }
         this.bonsai = `${e.meta ? secs(e.meta.ms) : '-'} | ${s.generated ?? '?'} tokens${s.perSecond ? ` @ ${s.perSecond.toFixed(1)} tok/s` : ''}${s.promptPerSecond ? ` | prompt @ ${s.promptPerSecond.toFixed(0)} tok/s` : ''}${s.cached ? ` | ${s.cached} cached` : ''} | ${short(JSON.stringify(e.args), 90)}`;
         this.now = `running ${e.route}`;
         break;
@@ -519,7 +539,7 @@ export class Display {
         if (['create_file', 'write', 'replace_lines', 'move_lines'].includes(e.route) && e.ok) this.edits++;
         if (e.route === 'bash') this.checks++;
         if (!e.ok) this.failures++;
-        this.last = `[${e.step}] ${e.route} ${e.ok ? 'ok' : 'FAILED'} ${secs(e.ms)} -> ${k(e.chars)} chars: ${e.text.replace(/\s+/g, ' ')}`;
+        this.last = `[${e.step}] ${e.route} ${e.ok ? 'ok' : 'FAILED'} ${secs(e.ms)} -> ${k(e.chars)} chars: ${e.text.slice(0, 1000).replace(/\s+/g, ' ')}`;
         this.now = 'asking Jev for the next action';
         break;
       }
@@ -563,7 +583,8 @@ export class Display {
       `           median ${secs(quantile(this.jevMs, 0.5))} | p95 ${secs(quantile(this.jevMs, 0.95))} | ${this.jevMs.length} calls`,
       `Context    ${this.bar(this.contextFill)} ${this.context || '-'}`,
       `${this.who.slice(0, 10).padEnd(11)}${this.bonsai || '-'}`,
-      `           avg ${avgTps ? `${avgTps.toFixed(1)} tok/s` : '-'} | ${k(this.generatedTokens)} generated | ${k(this.promptTokens)} prompt tokens sent`,
+      `           avg ${avgTps ? `${avgTps.toFixed(1)} tok/s` : '-'} | ${k(this.generatedTokens)} generated | last ${this.lastUsage || '-'}`,
+      `Usage      ${this.usage.requests ? usageLine(this.usage) : '-'}`,
       `Now        ${this.now === 'stopped' ? '' : `${spinner} `}${this.now}`,
       `Last       ${this.last || '-'}`,
       `Totals     ${routes || '-'} | ${this.edits} edits | ${this.checks} commands | ${this.failures} failures | ${this.undos} undo`,

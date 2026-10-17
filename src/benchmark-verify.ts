@@ -204,12 +204,12 @@ export function ${fn}(...args) {
   const architecturePath = join(verificationDir, 'architecture.test.mjs');
   await writeFile(architecturePath, architectureTests(probe));
   const architecture = missingModule
-    ? { code: 1, output: `Missing shared module: ${missingModule}\n`, timedOut: false, truncated: false }
+    ? { code: 1, output: `Missing shared module: ${missingModule}\n`, timedOut: false, omitted: 0 }
     : await runCommand(process.execPath, ['--test', architecturePath], repo, 30000);
   await writeFile(join(runDir, 'architecture-verification.txt'), architecture.output + violations.join('\n') + '\n');
-  const behaviorPassed = behavior.code === 0 && !behavior.timedOut && !behavior.truncated;
+  const behaviorPassed = behavior.code === 0 && !behavior.timedOut;
   const architecturePassed =
-    architecture.code === 0 && !architecture.timedOut && !architecture.truncated && violations.length === 0;
+    architecture.code === 0 && !architecture.timedOut && violations.length === 0;
   const result = {
     passed: behaviorPassed && architecturePassed && protectedChanges.length === 0 && changed.length > 0,
     behaviorPassed,

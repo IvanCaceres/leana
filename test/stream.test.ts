@@ -7,7 +7,8 @@ import { createServer, type ServerResponse } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { defaults } from '../src/config.js';
 import { Bonsai, post, repeatCut, streamEvents, thinkingBudgetMessage, type StreamProgress } from '../src/clients.js';
-import { Display, describe, partialJson, wrap, type ProgressEvent } from '../src/display.js';
+import { Display, describe, partialJson, type ProgressEvent } from '../src/display.js';
+import { wrap } from '../src/text.js';
 import { Agent, newSession } from '../src/agent.js';
 import { Store } from '../src/store.js';
 import { stepSchema } from '../src/schema.js';
@@ -926,12 +927,12 @@ test("The display shows a step's thought and actions as they are written and pri
     'labels keep their column',
   );
   const panelRows = d.panel().length;
-  assert.equal(panelRows, 11, 'no live rows before a generation streams');
+  assert.equal(panelRows, 12, 'no live rows before a generation streams');
   both([
     { kind: 'thinking', step: 2, text: thought.slice(0, 40), tokens: 12 },
     { kind: 'thinking', step: 2, text: thought.slice(0, 200), tokens: 1 },
   ]);
-  let live = d.panel().slice(11);
+  let live = d.panel().slice(12);
   assert.equal(live.length, 7, 'the live rows take a fixed height');
   const rows = live.filter(Boolean);
   assert(rows.length >= 2 && rows.length <= 7 && rows[0]!.startsWith('Thinking   '), live.join('\n'));
@@ -946,7 +947,7 @@ test("The display shows a step's thought and actions as they are written and pri
       actions: [{ action: 'read_files', args: { files: [{ path: 'src/App.tsx', start: 1, end: 40 }] } }, {}],
     },
   ]);
-  live = d.panel().slice(11).filter(Boolean);
+  live = d.panel().slice(12).filter(Boolean);
   assert.deepEqual(
     live.slice(-2),
     ['Action 1   read_files src/App.tsx 1..40', 'Action 2   '],
@@ -977,7 +978,7 @@ test("The display shows a step's thought and actions as they are written and pri
       ],
     },
   ]);
-  assert.deepEqual(d.panel().slice(11), Array(7).fill(''), 'the live rows stay, blank, so the panel does not jump');
+  assert.deepEqual(d.panel().slice(12), Array(7).fill(''), 'the live rows stay, blank, so the panel does not jump');
   const out = unescaped(tty);
   const at = out.findIndex(l => l.startsWith('[2] thought: '));
   const block: string[] = [out[at]!];
@@ -1024,7 +1025,7 @@ test("The display shows a step's thought and actions as they are written and pri
     'Bonsai writing src/components/Hero.tsx | 120 lines | 1.5k token...',
     'the path once, with how far it has come, fitted to the width',
   );
-  live = d.panel().slice(11);
+  live = d.panel().slice(12);
   assert.deepEqual(
     live.map(l => l.slice(0, 19)),
     ['Writing      114 | ', ...[115, 116, 117, 118, 119, 120].map(n => `             ${n} | `)],
@@ -1080,7 +1081,7 @@ test("The display shows a step's thought and actions as they are written and pri
     { kind: 'result', step: 3, route: 'create_file', ok: true, ms: 3, chars: 10, text: 'ok' },
     { kind: 'generation_error', step: 4, message: 'fetch failed' },
   ]);
-  assert.deepEqual(d.panel().slice(11), Array(7).fill(''), 'the live block goes when the generation ends');
+  assert.deepEqual(d.panel().slice(12), Array(7).fill(''), 'the live block goes when the generation ends');
   const after = unescaped(tty);
   const w = after.findIndex(l => l.startsWith('warning | '));
   assert.equal(
@@ -1163,7 +1164,7 @@ test('The panel fits the screen: on a short terminal the live rows take only the
     }
     assert.deepEqual(
       heights.slice(1, 4),
-      Array(3).fill(Math.min(rows - 1, 18)),
+      Array(3).fill(Math.min(rows - 1, 19)),
       `${columns}x${rows}: one height while generating and after`,
     );
     d.close();

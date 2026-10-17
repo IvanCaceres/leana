@@ -1,5 +1,6 @@
-// Running a command: bounded output and time, no terminal, and what it left running stopped with it.
+// Running a command: bounded memory and time, no terminal, and what it left running stopped with it.
 import { readFile, stat, readdir } from 'node:fs/promises';
+import { createWriteStream, type WriteStream } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { bashPath, commandEnv, killTree, missingBash, runMark, windowsLeft } from './shell.js';
 import { clip } from './context.js';
@@ -97,19 +98,27 @@ const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
 // is named as stopped). Whatever of its process group is still alive then (after
 // a moment for processes already on their way out) is stopped with it, and
 // returned as leftRunning, so the caller can say what was stopped.
+// Output is never a reason to stop a command (only its time is): past keep bytes,
+// output holds its first and last halves with the count left out between them, and
+// the whole of it goes to the spill file when one is given (written only then).
+export interface RunOptions {
+  keep?: number;
+  spill?: { path: string; name: string };
+  settle?: (output: string, quietMs: number) => string | null;
+}
 export async function runCommand(
   command: string,
   args: string[],
   cwd: string,
   timeout: number,
-  limit = 1024 * 1024,
-  settle?: (output: string, quietMs: number) => string | null,
+  { keep = 1024 * 1024, spill, settle }: RunOptions = {},
 ): Promise<{
   stoppedEarly?: string;
   leftRunning?: GroupProcess[];
   output: string;
   code: number | null;
-  truncated: boolean;
+  omitted: number;
+  spilled?: string;
   timedOut: boolean;
 }> {
   return new Promise((resolveResult, reject) => {
@@ -138,9 +147,14 @@ export async function runCommand(
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let truncated = false;
+    // All of the output while it fits in keep; past that, its start (head) and its latest bytes (tail).
+    let chunks: Buffer[] = [];
+    let head: Buffer | null = null;
+    let tail: Buffer[] = [];
+    let tailSize = 0;
+    let total = 0;
+    let out: WriteStream | null = null;
+    let spillFailed = false;
     let timedOut = false;
     let lastOutput = Date.now();
     let stoppedEarly: string | undefined;
@@ -157,26 +171,49 @@ export async function runCommand(
     // A command can say it has become something that will not exit (a server): settle decides from its output and how long it has been quiet.
     const watch = settle
       ? setInterval(() => {
-          const why = settle(Buffer.concat(chunks).toString('utf8'), Date.now() - lastOutput);
+          const why = settle(kept(), Date.now() - lastOutput);
           if (why) {
             stoppedEarly = why;
             kill();
           }
         }, 1000)
       : null;
+    const headRoom = Math.floor(keep / 2);
+    const tailRoom = keep - headRoom;
     const collect = (data: Buffer) => {
-      const room = Math.max(0, limit - size);
-      if (room) {
-        const part = data.subarray(0, room);
-        chunks.push(part);
-        size += part.length;
-      }
-      if (data.length > room) {
-        truncated = true;
-        kill();
-      }
       lastOutput = Date.now();
+      total += data.length;
+      out?.write(data);
+      if (!head) {
+        chunks.push(data);
+        if (total <= keep) return;
+        const all = Buffer.concat(chunks);
+        chunks = [];
+        if (spill) {
+          out = createWriteStream(spill.path, { mode: 0o600 });
+          out.on('error', () => {
+            spillFailed = true;
+          });
+          out.write(all);
+        }
+        head = Buffer.from(all.subarray(0, headRoom));
+        tail = [all.subarray(headRoom)];
+        tailSize = all.length - headRoom;
+      } else {
+        tail.push(data);
+        tailSize += data.length;
+      }
+      while (tail.length > 1 && tailSize - tail[0]!.length >= tailRoom) tailSize -= tail.shift()!.length;
+      if (tailSize > tailRoom) {
+        tail[0] = tail[0]!.subarray(tailSize - tailRoom);
+        tailSize = tailRoom;
+      }
     };
+    const omitted = () => (head ? total - head.length - tailSize : 0);
+    const kept = () =>
+      head
+        ? `${head.toString('utf8')}\n[… ${omitted()} bytes of output left out here${out && !spillFailed ? `; the whole output is in ${spill!.name}` : ''} …]\n${Buffer.concat(tail).toString('utf8')}`
+        : Buffer.concat(chunks).toString('utf8');
     child.stdout.on('data', collect);
     child.stderr.on('data', collect);
     child.on('error', (e: NodeJS.ErrnoException) => {
@@ -199,9 +236,9 @@ export async function runCommand(
       clearTimeout(timer);
       if (watch) clearInterval(watch);
       if (drain) clearTimeout(drain);
-      // Stopped by the harness (timeout, a server, too much output): the group was killed on purpose, and that is the fact already.
+      // Stopped by the harness (timeout, a server): the group was killed on purpose, and that is the fact already.
       let leftRunning: GroupProcess[] = [];
-      if (child.pid && !timedOut && !stoppedEarly && !truncated) {
+      if (child.pid && !timedOut && !stoppedEarly) {
         const first = await left();
         if (first.length) {
           await pause(250);
@@ -209,15 +246,18 @@ export async function runCommand(
         }
       }
       // On Windows stopping is a search for the mark: made when the command was stopped or left something.
-      if (!mark || timedOut || stoppedEarly || truncated || leftRunning.length) kill();
+      if (!mark || timedOut || stoppedEarly || leftRunning.length) kill();
       // Stopped means gone: a killed process holds its ports until it has exited, so what was named is waited for (briefly).
       for (let i = 0; leftRunning.length && i < 40 && (await left()).length; i++) await pause(50);
       // Windows programs end lines with CRLF; the output is read as lines, the same as elsewhere.
-      const text = Buffer.concat(chunks).toString('utf8');
+      const text = kept();
+      const spilled = out as WriteStream | null;
+      if (spilled) await new Promise<void>(done => spilled.end(() => done()));
       resolveResult({
         output: process.platform === 'win32' ? text.replace(/\r\n/g, '\n') : text,
         code: exitCode,
-        truncated,
+        omitted: omitted(),
+        ...(spilled && !spillFailed ? { spilled: spill!.path } : {}),
         timedOut,
         ...(stoppedEarly ? { stoppedEarly } : {}),
         ...(leftRunning.length ? { leftRunning } : {}),

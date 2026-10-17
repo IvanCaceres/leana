@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { open, rename, stat, unlink } from 'node:fs/promises';
-import { relative } from 'node:path';
+import { join, relative } from 'node:path';
 import type { Config, Route, ToolResult } from './types.js';
 import { clip } from './context.js';
 import { localAddresses } from './serve.js';
@@ -16,7 +16,7 @@ import {
   dropDuplicateImports,
   mapRange,
 } from './edit-checks.js';
-import { boundedRead, hash, parentDirectory, safePath } from './files.js';
+import { boundedRead, hash, parentDirectory, readLines, safePath } from './files.js';
 import { commandShell, describeProcesses, plainText, runCommand } from './commands.js';
 import { LineEditPlan, type LineEdit } from './line-edits.js';
 // Replaces a file's content whole or not at all: written to a temporary file with the original's mode, then
@@ -58,6 +58,8 @@ export class ToolBox {
   // batch is numbered as in that text, and the harness knows exactly how it changed.
   journal: EditRecord[] | null = null;
   step = 0;
+  // Commands run, numbering the files their whole outputs are saved to.
+  private commands = 0;
   constructor(
     readonly root: string,
     readonly artifacts: string,
@@ -124,17 +126,17 @@ export class ToolBox {
       // No line cap of its own: the character budget below decides how much of the range is shown.
       const artifact = f.path.startsWith('@artifact/');
       const path = artifact ? await safePath(this.artifacts, f.path.slice(10)) : await safePath(this.root, f.path);
-      const text = await boundedRead(path, artifact ? 8 * 1024 * 1024 : 1024 * 1024);
-      const lines = text.split('\n');
-      if (!artifact) hashes[f.path] = hash(text);
-      const end = Math.min(f.end, lines.length);
       // Reserve room for the header line and the continuation marker.
       const budget = Math.max(400, share - f.path.length - 240);
+      // Streamed: a file of any size is read in ranges; only the range is held.
+      const { lines, totalLines, sha } = await readLines(path, f.start, f.end, budget);
+      if (!artifact) hashes[f.path] = sha;
+      const end = Math.min(f.end, totalLines);
       const body: string[] = [];
       let size = 0;
       let shown = f.start - 1;
-      for (let n = f.start; n <= end; n++) {
-        const line = `${n}: ${lines[n - 1]}`;
+      for (let n = f.start; n < f.start + lines.length; n++) {
+        const line = `${n}: ${lines[n - f.start]}`;
         if (body.length && size + line.length + 1 > budget) break;
         body.push(clip(line, budget));
         size += line.length + 1;
@@ -146,7 +148,7 @@ export class ToolBox {
           ? `\n[…truncated at the read budget after line ${shown}; request lines ${shown + 1}..${end} in a later read_files call or narrow the range…]`
           : '';
       results.push(
-        `${f.path} sha256=${hash(text)} totalLines=${lines.length} shown=${f.start}..${shown}\n${body.join('\n') || '(no lines in range)'}${cut}`,
+        `${f.path} sha256=${sha} totalLines=${totalLines} shown=${f.start}..${shown}\n${body.join('\n') || '(no lines in range)'}${cut}`,
       );
     }
     return { ok: true, text: results.join('\n\n'), hashes };
@@ -167,7 +169,8 @@ export class ToolBox {
     ];
     const args =
       a.mode === 'files' ? ['--files'] : ['-n', '--no-heading', '--color', 'never', '-F', '--max-count', '50'];
-    args.push('--max-filesize', '1M', ...exclusions.flatMap(g => ['--glob', g]));
+    // Only files no one reads as source (a data dump, a database) are past this.
+    args.push('--max-filesize', '50M', ...exclusions.flatMap(g => ['--glob', g]));
     // Paths as the rest of the harness names them, with forward slashes, on Windows too.
     if (process.platform === 'win32') args.push('--path-separator', '/');
     if (a.mode === 'text') args.push('-e', a.query);
@@ -186,7 +189,7 @@ export class ToolBox {
         ? '(no matches in the repository)'
         : `(no matches under ${a.path}; the text may live in another file, search path "." to check the whole repository)`;
     return {
-      ok: !r.timedOut && !r.truncated && (r.code === 0 || r.code === 1),
+      ok: !r.timedOut && (r.code === 0 || r.code === 1),
       text: JSON.stringify({ ...r, output: output || none }),
     };
   }
@@ -500,15 +503,16 @@ export class ToolBox {
               ? `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.`
               : null;
           };
+    // Output past what is kept in memory is saved whole, as an artifact read_files and search_codebase can read.
+    const saved = `${String(this.step).padStart(5, '0')}-command-${++this.commands}.log`;
     const ran = await runCommand(
       commandShell[0]!,
       [...commandShell.slice(1), `${prefix}${a.command}`],
       this.root,
       this.config.commandTimeoutMs,
-      undefined,
-      settle,
+      { settle, spill: { path: join(this.artifacts, saved), name: `@artifact/${saved}` } },
     );
-    const { leftRunning, ...r } = { ...ran, output: plainText(ran.output) };
+    const { leftRunning, spilled, ...r } = { ...ran, output: plainText(ran.output) };
     // What the command started and left running when it ended was stopped with it: said, with what it was.
     const stoppedAtEnd = leftRunning?.length
       ? `When this command ended, ${leftRunning.length === 1 ? 'a process it started was' : `${leftRunning.length} processes it started were`} still running, and ${leftRunning.length === 1 ? 'it was' : 'they were'} stopped: ${describeProcesses(leftRunning)}. A shell step cannot keep a process alive: whatever it starts is stopped when it ends. The start command of an observe runs for the length of that observation.`
@@ -518,13 +522,15 @@ export class ToolBox {
     // A command is verification when the worker says so, or when it is the configured check; never by its words.
     const looksLikeCheck =
       a.check === true || Boolean(this.config.checkCommand && a.command.trim() === this.config.checkCommand.trim());
+    // Judged by how it ended, never by how much it printed.
     return {
-      ok: r.code === 0 && !r.truncated && !r.timedOut,
-      check: looksLikeCheck && r.code === 0 && !r.truncated && !r.timedOut,
+      ok: r.code === 0 && !r.timedOut,
+      check: looksLikeCheck && r.code === 0 && !r.timedOut,
       verification: looksLikeCheck,
       text: JSON.stringify({
         command: a.command,
         purpose: a.purpose,
+        ...(spilled ? { wholeOutput: `@artifact/${saved}` } : {}),
         ...(r.stoppedEarly ? { stoppedEarly: r.stoppedEarly } : {}),
         ...(stoppedAtEnd ? { stoppedAtEnd } : {}),
         ...r,

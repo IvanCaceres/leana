@@ -6876,3 +6876,57 @@ test('A cut of whole repeated lines says what repeated and how many times in a r
   const r = repeatCut(text)!;
   assert.deepEqual([r.cut.kind, r.cut.line, r.cut.block, r.cut.times], ['lines', 3, 1, 13]);
 });
+
+test('Guidance given while the run goes on joins the objective at the next step, which is told of it; an edit is shown as its diff', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'a.ts'), 'export const a = 1;\n');
+  const shown: any[] = [];
+  const prompts: Message[][] = [];
+  const base = bonsaiOf({
+    steps: [
+      { thought: 'read', action: 'read_files', args: { files: [{ path: 'a.ts', start: 1, end: 1 }] } },
+      {
+        thought: 'change it',
+        action: 'write',
+        args: { path: 'a.ts', expectedHash: 'FILL', oldText: '= 1', newText: '= 2' },
+      },
+    ],
+  });
+  let agent: Agent | null = null;
+  const bonsai = filling(
+    {
+      ...base,
+      generate: async (m: Message[], schema: any) => {
+        prompts.push(m);
+        // The user types while the first step is being generated.
+        if (prompts.length === 1) agent!.guide('also export b');
+        return base.generate(m, schema);
+      },
+    },
+    async p => hash(await readFile(join(root, p), 'utf8')),
+  );
+  agent = new Agent(
+    { ...config, maxSteps: 2 },
+    store,
+    jevOf({}),
+    bonsai,
+    root,
+    () => {},
+    e => shown.push(e),
+  );
+  const s = await agent.run(await newSession(root, 'Change a'));
+  assert.match(s.objective, /^Change a\nUser update: also export b$/, 'as a resume message joins it');
+  assert(shown.some(e => e.kind === 'guidance' && e.text === 'also export b' && e.step === 2));
+  assert.match(
+    JSON.parse(prompts[1]!.at(-1)!.content).harnessNote,
+    /The user added to the objective while you worked: "also export b"/,
+    'the next step is told',
+  );
+  assert(!JSON.parse(prompts[0]!.at(-1)!.content).harnessNote, 'not the step already under way');
+  const edit = shown.find(e => e.kind === 'edit');
+  assert.deepEqual([edit.path, edit.created, edit.added, edit.removed], ['a.ts', false, 1, 1]);
+  assert.deepEqual(
+    edit.hunks[0].lines.map((l: any) => `${l.kind}${l.text}`),
+    ['-export const a = 1;', '+export const a = 2;'],
+  );
+});

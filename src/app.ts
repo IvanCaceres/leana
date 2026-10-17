@@ -18,6 +18,9 @@ import {
 } from './models.js';
 import { elapsed, forModel, providerKey, runSession, sessionsOf } from './session.js';
 import type { Agent } from './agent.js';
+import { usageLine } from './display.js';
+import type { RunView, RunViewOptions } from './display.js';
+import { TerminalUI } from './tui/view.js';
 
 const usd = (perToken: number) => (perToken ? `$${(perToken * 1e6).toFixed(perToken * 1e6 < 1 ? 3 : 2)}` : 'free');
 export interface AppOptions {
@@ -28,6 +31,8 @@ export interface AppOptions {
   configPath?: string;
   settingsPath?: string;
   write?: (text: string) => void;
+  // What shows a run (the terminal UI); the status panel on stderr by default.
+  view?: (o: RunViewOptions) => RunView;
 }
 export class App {
   settings: Settings;
@@ -73,6 +78,12 @@ export class App {
     this.settings.config = { ...this.settings.config, ...change } as Partial<Config>;
     await loadConfig(this.opts.configPath, { ...this.settings.config }); // refuses an inconsistent combination before it is kept
     await saveSettings(this.settings, this.opts.settingsPath);
+  }
+  // Guidance for the run under way: it reaches the run at its next step.
+  guide(text: string): boolean {
+    if (!this.agent) return false;
+    this.agent.guide(text);
+    return true;
   }
   stop(): boolean {
     if (!this.agent) return false;
@@ -355,10 +366,11 @@ export class App {
           this.agent = a;
         },
         out: l => this.write(l),
+        ...(this.opts.view ? { view: this.opts.view } : {}),
       });
       const s = outcome.session;
       this.write(
-        `\n${s.status.toUpperCase()}: ${s.outcome ?? s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps\nSession: ${outcome.store.path}`,
+        `\n${s.status.toUpperCase()}: ${s.outcome ?? s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}\nSession: ${outcome.store.path}`,
       );
     } finally {
       this.agent = null;
@@ -410,4 +422,74 @@ export async function startApp(opts: AppOptions): Promise<void> {
     rl.prompt();
   }
   rl.close();
+}
+
+// The app as a full-screen terminal UI: the conversation, the status bar and an input box that stays. Between
+// runs the input takes an objective or a /command; during a run, guidance (Enter) or a stop (Ctrl-C, which a
+// second press makes leave at once). Ctrl-C twice between runs leaves.
+export async function startTui(opts: AppOptions): Promise<void> {
+  let ui: TerminalUI | null = null;
+  const app = new App({
+    ...opts,
+    write: t => ui?.message(t, /^\n*(COMPLETE|PAUSED):/.test(t) ? 'outcome' : 'info'),
+    view: o => ui!.run(o),
+  });
+  const c = await app.config();
+  return new Promise<void>(resolve => {
+    let armed = false;
+    const quit = () => {
+      ui!.stop();
+      resolve();
+    };
+    const showModel = async () => {
+      const now = await app.config();
+      ui!.setModel(`${now.provider}:${now.model}`);
+    };
+    ui = new TerminalUI({
+      title: app.repo,
+      model: `${c.provider}:${c.model}`,
+      complete: line => app.complete(line),
+      submit: line => {
+        armed = false;
+        if (app.running && line.startsWith('/')) {
+          ui!.message(
+            `${line.split(/\s/)[0]} waits until the run ends (Ctrl-C stops it after its step); the text was not sent to the run.`,
+            'warn',
+          );
+          return;
+        }
+        if (app.running) {
+          ui!.message(app.guide(line) ? `You: ${line} (the run takes it at its next step)` : `You: ${line}`, 'user');
+          return;
+        }
+        ui!.message(line, 'user');
+        app
+          .handle(line)
+          .then(r => {
+            // A run stopped with Ctrl-C has ended: the next Ctrl-C asks again before leaving.
+            armed = false;
+            return r === 'quit' ? quit() : showModel();
+          })
+          .catch(e => ui!.message((e as Error).message, 'warn'));
+      },
+      interrupt: () => {
+        if (app.running) {
+          if (armed) {
+            ui!.stop();
+            process.exit(130);
+          }
+          armed = true;
+          if (app.stop()) ui!.stopping();
+          ui!.message('Stopping after the current step; Ctrl-C again to leave now.', 'warn');
+        } else if (armed) quit();
+        else {
+          armed = true;
+          ui!.message('Press Ctrl-C again to leave.');
+        }
+      },
+    });
+    ui.start();
+    ui.message(`Leana: ${c.provider}:${c.model} in ${app.repo}. Type an objective, or /help.`);
+    app.model().catch(e => ui!.message(`(model facts unavailable: ${(e as Error).message})`, 'warn'));
+  });
 }

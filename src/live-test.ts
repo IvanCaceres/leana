@@ -154,7 +154,7 @@ export async function verifyFixture(
     () => false,
   );
   return {
-    passed: result.code === 0 && !result.timedOut && !result.truncated && testsUnchanged && implementationChanged,
+    passed: result.code === 0 && !result.timedOut && testsUnchanged && implementationChanged,
     implementationChanged,
     testsUnchanged,
     exitCode: result.code,
@@ -200,7 +200,7 @@ async function main(): Promise<void> {
   console.log(`\nLive coding test: cart subtotal\nDisposable repository: ${repo}\n`);
   const baseline = await runCommand(process.execPath, ['--test', 'test/cart.test.mjs'], repo, 15000);
   await writeFile(join(runDir, 'baseline.txt'), baseline.output);
-  if (baseline.code !== 1 || baseline.timedOut || baseline.truncated)
+  if (baseline.code !== 1 || baseline.timedOut)
     throw new Error(`Unexpected baseline result; inspect ${join(runDir, 'baseline.txt')}`);
   console.log('BEFORE: failing tests reproduced (expected).');
   if (v['prepare-only']) {

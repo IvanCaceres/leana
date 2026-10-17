@@ -71,6 +71,7 @@ import {
 } from './control.js';
 import type { Around, Bonsai, Echo, GenerationCut, StreamProgress } from './clients.js';
 import { repeatCut } from './clients.js';
+import { diffLines } from './diff.js';
 // A worker's turn: its reasoning and the ordered actions it named (problem: what is wrong with the call itself).
 type Batch = { action: Route; args: Record<string, any>; problem?: string }[];
 interface Turn {
@@ -89,6 +90,20 @@ interface RunBudget {
 type Outcome = 'ok' | 'failed' | 'refused' | 'stop';
 type WatchReading = NonNullable<Session['watch']>['readings'][number];
 // A turn's thought as it is compared for repeats: its whitespace collapsed.
+// The file a step's reply is writing as it streams: its last action so far, a create_file or rewrite_file whose
+// content has begun (under the tools form the file is written inside the call). from: the first line it writes.
+export function fileBeingWritten(reply: any): { route: string; path: string; from: number; content: string } | null {
+  const last = Array.isArray(reply?.actions) ? reply.actions.at(-1) : undefined;
+  const a = last?.args;
+  if (!a || (last.action !== 'create_file' && last.action !== 'rewrite_file')) return null;
+  if (typeof a.path !== 'string' || typeof a.content !== 'string' || !a.content) return null;
+  return {
+    route: last.action,
+    path: a.path,
+    from: typeof a.start === 'number' && a.start > 0 ? a.start : 1,
+    content: a.content,
+  };
+}
 const saidIn = (e: { text: string }) =>
   String(JSON.parse(e.text).thought ?? '')
     .replace(/\s+/g, ' ')
@@ -228,6 +243,11 @@ export class Agent {
   private current = 0;
   // Set by stop(): the run pauses before its next step (the step under way finishes; its result is kept).
   private stopRequested = false;
+  // Guidance the user gave while the run went on, taken at the start of the next step (takeGuidance).
+  private guidance: string[] = [];
+  guide(text: string): void {
+    if (text.trim()) this.guidance.push(text.trim());
+  }
   stop(): void {
     this.stopRequested = true;
   }
@@ -586,10 +606,12 @@ export class Agent {
     if (result.ok && editRoutes.includes(route) && result.changed?.length) {
       const facts = await this.parseFacts(result.changed, replaced);
       if (facts.length) result.text += `\nHarness: ${facts.join(' | ')}`;
+      await this.showEdits(s, result.changed, replaced);
     }
     s.lastRoute = route;
     s.lastResultOk = result.ok;
     await this.evidence(s, route, result, args);
+    const saved = s.entries.at(-1)?.artifact;
     this.observe({
       kind: 'result',
       step: s.step,
@@ -597,7 +619,8 @@ export class Agent {
       ok: result.ok,
       ms: performance.now() - started,
       chars: result.text.length,
-      text: clip(result.text, 200),
+      text: result.text,
+      ...(saved ? { saved: join(this.store.artifacts, saved.replace(/^@artifact\//, '')) } : {}),
     });
     await this.store.log('result', {
       step: s.step,
@@ -609,6 +632,24 @@ export class Agent {
     return result;
   }
 
+  // Each file an edit changed, as a diff against the content it replaced, for whoever watches the run.
+  private async showEdits(s: Session, paths: string[], replaced: Map<string, string | null>): Promise<void> {
+    for (const path of paths) {
+      const after = await readIfPresent(this.tools.root, path).catch(() => null);
+      if (after === null) continue;
+      const before = replaced.get(path) ?? null;
+      const d = diffLines(before ?? '', after);
+      this.observe({
+        kind: 'edit',
+        step: s.step,
+        path,
+        created: before === null,
+        added: d.added,
+        removed: d.removed,
+        hunks: d.hunks,
+      });
+    }
+  }
   // Every file a command created, modified or deleted is an edit of this step,
   // except what the check of record writes (a build's output is not an edit it
   // must be run again for). The file list follows the tree either way.
@@ -717,7 +758,7 @@ export class Agent {
         ['--noprofile', '--norc', '-o', 'pipefail', '-c', install],
         this.tools.root,
         Math.max(this.config.commandTimeoutMs, 300000),
-      ).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
+      ).catch(e => ({ code: -1, output: String((e as Error).message), omitted: 0, timedOut: false }));
       await this.store.log('setup', { step: s.step, command: install, code: r.code, output: clip(r.output, 800) });
       this.observe({ kind: 'warning', step: s.step, text: `setup: ${install} (exit ${r.code})` });
       await this.evidence(s, 'setup', {
@@ -881,24 +922,37 @@ export class Agent {
       undefined,
       every(100, (p: StreamProgress) => {
         const reply = route === 'step' && !p.prompt ? partialJson(p.text) : undefined;
+        // Under the tools form a file is written inside its call: while that call is the one being written,
+        // its content so far is shown as a generated file is.
+        const writing = fileBeingWritten(reply);
         this.observe(
           p.reasoning && !p.text
             ? { kind: 'reasoning', step: s.step, text: p.reasoning, tokens: p.tokens }
-            : typeof reply?.thought === 'string'
+            : writing
               ? {
-                  kind: 'thinking',
+                  kind: 'writing',
                   step: s.step,
-                  text: reply.thought,
+                  route: writing.route,
+                  path: writing.path,
+                  from: writing.from,
+                  ...tailLines(writing.content, liveHeight),
                   tokens: p.tokens,
-                  ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}),
                 }
-              : {
-                  kind: 'generating',
-                  step: s.step,
-                  route,
-                  attempt: 1,
-                  ...(p.prompt ? { prompt: p.prompt } : { tokens: p.tokens }),
-                },
+              : typeof reply?.thought === 'string'
+                ? {
+                    kind: 'thinking',
+                    step: s.step,
+                    text: reply.thought,
+                    tokens: p.tokens,
+                    ...(Array.isArray(reply.actions) ? { actions: reply.actions } : {}),
+                  }
+                : {
+                    kind: 'generating',
+                    step: s.step,
+                    route,
+                    attempt: 1,
+                    ...(p.prompt ? { prompt: p.prompt } : { tokens: p.tokens }),
+                  },
         );
       }),
       thinking,
@@ -1486,6 +1540,7 @@ export class Agent {
         await this.pinObjectiveFiles(s);
         const notes = await this.standingNotes(s);
         if (notes === 'stop') break;
+        notes.unshift(...(await this.takeGuidance(s)));
         const allowed: Route[] = [...actions].filter(
           a =>
             (this.config.allowWrite || !editRoutes.includes(a as Route)) &&
@@ -1517,6 +1572,20 @@ export class Agent {
     return s;
   }
 
+  // Guidance given during the run joins the objective as a resume's message does (the gate judges the run against
+  // it), and the next step is told of it at once.
+  private async takeGuidance(s: Session): Promise<string[]> {
+    const given = this.guidance.splice(0);
+    for (const text of given) {
+      s.objective += `\nUser update: ${text}`;
+      await this.store.log('guidance', { step: s.step, text });
+      this.observe({ kind: 'guidance', step: s.step, text });
+    }
+    return given.map(
+      text =>
+        `The user added to the objective while you worked: "${text}". It is part of the objective from now on; take it into account from this step.`,
+    );
+  }
   // The session made ready for an invocation, and the invocation's budget.
   private async begin(s: Session): Promise<RunBudget> {
     s.status = 'running';
@@ -2083,7 +2152,7 @@ export class Agent {
         p,
         await (
           p.startsWith('@artifact/')
-            ? safePath(this.tools.artifacts, p.slice(10)).then(f => boundedRead(f, 8 * 1024 * 1024))
+            ? safePath(this.tools.artifacts, p.slice(10)).then(f => boundedRead(f))
             : safePath(this.tools.root, p).then(f => boundedRead(f))
         ).catch(() => null),
       );

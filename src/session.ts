@@ -12,7 +12,7 @@ import { describeModel, effortsOf, fitToModel, unsupportedSettings, type ModelIn
 import { Agent, newSession } from './agent.js';
 import { Store, runsDir, stateDir } from './store.js';
 import { runCommand } from './commands.js';
-import { Display } from './display.js';
+import { Display, type RunView, type RunViewOptions, type Usage } from './display.js';
 
 // A key file holds one key, or NAME=key (TYPESAFE_API_KEY, OPENROUTER_API_KEY, any NAME).
 export async function readKey(path: string): Promise<string> {
@@ -116,6 +116,8 @@ export interface RunRequest {
   repo?: string;
   sessionDir?: string;
   message?: string;
+  // What shows the run as it goes; the status panel on stderr by default.
+  view?: (o: RunViewOptions) => RunView;
   allowDirty?: boolean;
   // Called with the agent once it runs, so the caller can stop it.
   started?: (agent: Agent) => void;
@@ -126,6 +128,8 @@ export interface RunOutcome {
   store: Store;
   elapsedMs: number;
   steps: number;
+  // What the invocation's generations consumed, as the provider reported it.
+  usage: Usage;
   model: ModelInfo;
   notes: string[];
 }
@@ -191,13 +195,14 @@ export async function runSession(req: RunRequest): Promise<RunOutcome> {
       `Model: ${model.provider} ${model.id} | reasoning ${config.stepThinking || model.reasoning.mandatory ? `on${effortsOf(model.reasoning).length ? ` (${config.thinkingEffort})` : ''}` : 'off'} | window ${config.contextWindow} tokens, working ${config.workingTokens}${config.promptForm === 'tools' ? ' | native tool calls' : config.promptForm === 'text' ? ' | JSON replies (no tools)' : ''}`,
     );
     if (config.allowBash) say('Shell enabled: commands run unsandboxed with your user privileges.');
-    const display = new Display(process.stderr, {
+    const viewOptions: RunViewOptions = {
       objective: session.objective,
       session: basename(store.path),
       verbose: config.verbose,
       model: `${model.provider}:${model.id}`,
       name: model.provider === 'llama' ? 'Bonsai' : model.id.split('/').pop()!,
-    });
+    };
+    const display = req.view ? req.view(viewOptions) : new Display(process.stderr, viewOptions);
     const startedAt = Date.now();
     const stepsBefore = session.step;
     const agent = new Agent(
@@ -221,6 +226,7 @@ export async function runSession(req: RunRequest): Promise<RunOutcome> {
       store,
       elapsedMs: Date.now() - startedAt,
       steps: result.step - stepsBefore,
+      usage: display.usage,
       model,
       notes,
     };

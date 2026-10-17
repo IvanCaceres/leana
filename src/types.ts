@@ -294,7 +294,10 @@ export interface Session {
   // key, hash and request are not generated again.
   reproduced?: Record<string, { step: number; sha: string; request: string; ms?: number; tokens?: number }>;
   // The last observation of the result as its user meets it (a page, a service, a program run), as facts.
-  lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string };
+  // start: the command the observation started it with, if any.
+  lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string; start?: string };
+  // The start command a finish was told has no script (see Agent.finishBlocked): told once.
+  startNoted?: string;
   // The actions this session may take, fixed at its start so the pinned block never changes.
   allowedActions?: string[];
   // How the prompt is written for the model of the current run (Config.promptForm): undefined for Bonsai

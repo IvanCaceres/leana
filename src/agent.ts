@@ -618,7 +618,7 @@ export class Agent {
       ok: result.ok,
       ms: performance.now() - started,
       chars: result.text.length,
-      text: clip(result.text, 1500),
+      text: result.text,
     });
     await this.store.log('result', {
       step: s.step,

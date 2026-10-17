@@ -296,7 +296,7 @@ test('The app as a terminal UI: a status bar, the conversation as blocks, an inp
   ui.stop();
 });
 
-test("A result shows the model's cut marker as an ellipsis, and a diff block holds at most 400 lines, the rest counted", () => {
+test('A result is shown whole, as the tool returned it: a command as its command, its exit and its output as lines, then the notes the harness added; only a result past 200,000 characters is cut, with how much was left; a diff block holds at most 400 lines', () => {
   const f = fakeTerminal(100, 40);
   const ui = new TerminalUI({
     terminal: f.term,
@@ -308,17 +308,33 @@ test("A result shows the model's cut marker as an ellipsis, and a diff block hol
   });
   ui.start();
   const run = ui.run({ objective: 'o', session: 's', verbose: false });
+  const output = Array.from({ length: 300 }, (_, i) => `test ${i} passed`).join('\n') + '\nnot ok 301 parser\n';
   run.update({
     kind: 'result',
     step: 1,
-    route: 'read_files',
-    ok: true,
-    ms: 1,
-    chars: 30,
-    text: 'a.ts head\n[…truncated; use a narrower read or query…]\ntail',
+    route: 'bash',
+    ok: false,
+    ms: 5200,
+    chars: 9000,
+    text: `${JSON.stringify({ command: 'npm test', purpose: 'check', output, code: 1, truncated: false, timedOut: false })}\nJev reads this failure as: code_bug (the code or configuration written is wrong).`,
   });
   const result = ui.transcript.list.at(-1)!;
-  assert.equal(result.title, 'read_files ok | 1ms | a.ts head … tail');
+  assert.equal(result.title, 'bash failed | 5.2s | $ npm test | exit 1');
+  assert.equal(result.body.length, 302, 'every line of the output, and the note');
+  assert.equal(result.body[300], 'not ok 301 parser');
+  assert.match(String(result.body.at(-1)), /^Jev reads this failure as: code_bug/);
+  run.update({
+    kind: 'result',
+    step: 2,
+    route: 'bash',
+    ok: true,
+    ms: 1,
+    chars: 300000,
+    text: JSON.stringify({ command: 'cat big.log', output: 'x'.repeat(1000).concat('\n').repeat(300), code: 0 }),
+  });
+  const big = ui.transcript.list.at(-1)!;
+  assert.equal(big.body.length, 200, 'as much as 200,000 characters hold');
+  assert.match(String(big.body.at(-1)), /^\.\.\. \d+ more characters of this result are not shown$/);
   const content = Array.from({ length: 1000 }, (_, i) => `line ${i}`).join('\n') + '\n';
   run.update({
     kind: 'edit',

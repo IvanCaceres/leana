@@ -529,7 +529,7 @@ export class Display implements RunView {
         if (['create_file', 'write', 'replace_lines', 'move_lines'].includes(e.route) && e.ok) this.edits++;
         if (e.route === 'bash') this.checks++;
         if (!e.ok) this.failures++;
-        this.last = `[${e.step}] ${e.route} ${e.ok ? 'ok' : 'FAILED'} ${secs(e.ms)} -> ${k(e.chars)} chars: ${e.text.replace(/\s+/g, ' ')}`;
+        this.last = `[${e.step}] ${e.route} ${e.ok ? 'ok' : 'FAILED'} ${secs(e.ms)} -> ${k(e.chars)} chars: ${e.text.slice(0, 1000).replace(/\s+/g, ' ')}`;
         this.now = 'asking Jev for the next action';
         break;
       }

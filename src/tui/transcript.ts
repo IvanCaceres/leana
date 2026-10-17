@@ -135,27 +135,25 @@ export function renderBlock(b: Block, width: number, selected: boolean, s: Style
   const mark = !b.body.length ? ' ' : b.collapsed && foldable ? '+' : '-';
   const head = fitTo(`${mark} ${icons[b.tone]} ${row(b.title)}`, w);
   out.push(selected ? s.inverse(head) : toneStyle(b.tone, s)(head));
-  const body: string[] = [];
-  for (const line of b.body) {
-    if (typeof line === 'string') {
-      for (const r of wrap(row(line), w - 4)) body.push(`    ${r}`);
-      continue;
-    }
-    if (line.mark === '@') {
-      body.push(s.dim(fitTo(`    ${line.text}`, w)));
-      continue;
-    }
-    const gutter = line.number === undefined ? '     ' : String(line.number).padStart(5);
-    const text = fitTo(`${gutter} ${line.mark} ${row(line.text.replace(/\t/g, '  '))}`, w);
-    body.push(line.mark === '+' ? s.green(text) : line.mark === '-' ? s.red(text) : s.dim(text));
-  }
   if (b.collapsed && foldable) {
-    out.push(...body.slice(0, b.preview));
-    const more = body.length - b.preview;
+    // Folded: only the rows shown are rendered, however long the body (a command's output can be a megabyte).
+    let used = 0;
+    const shown: string[] = [];
+    while (used < b.body.length && shown.length < b.preview) shown.push(...renderLine(b.body[used++]!, w, s));
+    out.push(...shown.slice(0, b.preview));
+    const more = b.body.length - used;
     if (more > 0)
       out.push(s.dim(fitTo(`    ... ${more} more line${more === 1 ? '' : 's'} (Tab, then Enter to unfold)`, w)));
-  } else out.push(...body);
+  } else for (const line of b.body) out.push(...renderLine(line, w, s));
   return out.map(r => (cells(stripStyles(r)) > w ? fitTo(stripStyles(r), w) : r));
+}
+// A body line's rows: text wrapped under the title, a diff line fitted with its number and mark.
+function renderLine(line: BodyLine, w: number, s: Styles): string[] {
+  if (typeof line === 'string') return wrap(row(line), w - 4).map(r => `    ${r}`);
+  if (line.mark === '@') return [s.dim(fitTo(`    ${line.text}`, w))];
+  const gutter = line.number === undefined ? '     ' : String(line.number).padStart(5);
+  const text = fitTo(`${gutter} ${line.mark} ${row(line.text.replace(/\t/g, '  '))}`, w);
+  return [line.mark === '+' ? s.green(text) : line.mark === '-' ? s.red(text) : s.dim(text)];
 }
 // A row without its style codes, to measure it.
 export const stripStyles = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');

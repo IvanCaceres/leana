@@ -35,6 +35,40 @@ interface Status {
   now: string;
 }
 const spinner = ['|', '/', '-', '\\'];
+// The most of one result a block holds (a command's output can be a megabyte): what is left out is counted.
+const resultChars = 200_000;
+// A tool's result as the conversation shows it: whole, as the tool returned it (the model's own copy is clipped to
+// its context budget; this is not). Commands and searches answer in JSON ({command, output, code, ...}): they are
+// shown as the command and its exit, and the output as its lines; notes the harness added follow.
+export function resultView(route: string, text: string): { head: string; lines: string[] } {
+  const [first = '', ...notes] = text.split('\n');
+  let head = first;
+  let lines = notes;
+  try {
+    const r = JSON.parse(first);
+    if (r && typeof r === 'object' && typeof r.output === 'string') {
+      const output = r.output.replace(/\n$/, '').split('\n');
+      head =
+        route === 'bash'
+          ? `$ ${String(r.command ?? '')} | exit ${r.code ?? '?'}${r.timedOut ? ' (timed out)' : ''}${r.truncated ? ' (output cut at its limit)' : ''}`
+          : `${output.length} line${output.length === 1 ? '' : 's'}`;
+      const said = [r.stoppedEarly, r.stoppedAtEnd].filter((x): x is string => typeof x === 'string');
+      lines = [...output, ...said, ...notes];
+    }
+  } catch {
+    /* not JSON: the first line is the head */
+  }
+  let room = resultChars;
+  const kept: string[] = [];
+  for (const l of lines) {
+    if (l.length > room) break;
+    kept.push(l);
+    room -= l.length + 1;
+  }
+  const left = lines.slice(kept.length).reduce((n, l) => n + l.length + 1, 0);
+  if (left > 0) kept.push(`... ${left} more characters of this result are not shown`);
+  return { head, lines: kept };
+}
 // A diff block holds at most this many lines (a whole new file can be thousands): the rest is counted.
 const diffRows = 400;
 const bounded = (lines: BodyLine[]): BodyLine[] =>
@@ -226,13 +260,15 @@ export class TerminalUI {
         break;
       }
       case 'result': {
-        // The model's own cut marker (an instruction to it) reads as a plain ellipsis here.
-        const lines = e.text.replace(/\n?\[…truncated[^\]\n]*\]\n?/g, ' … ').split('\n');
+        const shown = resultView(e.route, e.text);
         t.add(
           e.ok ? 'ok' : 'fail',
-          `${e.route} ${e.ok ? 'ok' : 'failed'} | ${secs(e.ms)} | ${lines[0] ?? ''}`,
-          lines.slice(1),
-          { collapsed: true, preview: e.ok ? 0 : 4 },
+          `${e.route} ${e.ok ? 'ok' : 'failed'} | ${secs(e.ms)} | ${shown.head}`,
+          shown.lines,
+          {
+            collapsed: true,
+            preview: e.ok ? 0 : 6,
+          },
         );
         break;
       }

@@ -451,6 +451,13 @@ export async function startTui(opts: AppOptions): Promise<void> {
       complete: line => app.complete(line),
       submit: line => {
         armed = false;
+        if (app.running && line.startsWith('/')) {
+          ui!.message(
+            `${line.split(/\s/)[0]} waits until the run ends (Ctrl-C stops it after its step); the text was not sent to the run.`,
+            'warn',
+          );
+          return;
+        }
         if (app.running) {
           ui!.message(app.guide(line) ? `You: ${line} (the run takes it at its next step)` : `You: ${line}`, 'user');
           return;
@@ -458,7 +465,11 @@ export async function startTui(opts: AppOptions): Promise<void> {
         ui!.message(line, 'user');
         app
           .handle(line)
-          .then(r => (r === 'quit' ? quit() : showModel()))
+          .then(r => {
+            // A run stopped with Ctrl-C has ended: the next Ctrl-C asks again before leaving.
+            armed = false;
+            return r === 'quit' ? quit() : showModel();
+          })
           .catch(e => ui!.message((e as Error).message, 'warn'));
       },
       interrupt: () => {

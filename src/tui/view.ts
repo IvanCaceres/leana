@@ -35,6 +35,15 @@ interface Status {
   now: string;
 }
 const spinner = ['|', '/', '-', '\\'];
+// A diff block holds at most this many lines (a whole new file can be thousands): the rest is counted.
+const diffRows = 400;
+const bounded = (lines: BodyLine[]): BodyLine[] =>
+  lines.length <= diffRows
+    ? lines
+    : [
+        ...lines.slice(0, diffRows),
+        { mark: '@', text: `... ${lines.length - diffRows} more lines of the diff are not shown` },
+      ];
 const clock = (ms: number) => {
   const sec = Math.floor(ms / 1000);
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
@@ -217,7 +226,8 @@ export class TerminalUI {
         break;
       }
       case 'result': {
-        const lines = e.text.split('\n');
+        // The model's own cut marker (an instruction to it) reads as a plain ellipsis here.
+        const lines = e.text.replace(/\n?\[…truncated[^\]\n]*\]\n?/g, ' … ').split('\n');
         t.add(
           e.ok ? 'ok' : 'fail',
           `${e.route} ${e.ok ? 'ok' : 'failed'} | ${secs(e.ms)} | ${lines[0] ?? ''}`,
@@ -230,10 +240,12 @@ export class TerminalUI {
         t.add(
           'diff',
           `${e.created ? 'Created' : 'Edited'} ${e.path} (+${e.added} -${e.removed})`,
-          e.hunks.flatMap((h): BodyLine[] => [
-            { mark: '@', text: `@@ -${h.oldStart} +${h.newStart} @@` },
-            ...h.lines.map((l): BodyLine => ({ mark: l.kind, text: l.text, number: l.kind === '-' ? l.old : l.new })),
-          ]),
+          bounded(
+            e.hunks.flatMap((h): BodyLine[] => [
+              { mark: '@', text: `@@ -${h.oldStart} +${h.newStart} @@` },
+              ...h.lines.map((l): BodyLine => ({ mark: l.kind, text: l.text, number: l.kind === '-' ? l.old : l.new })),
+            ]),
+          ),
           { collapsed: e.added + e.removed > 40, preview: 24 },
         );
         break;

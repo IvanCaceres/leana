@@ -295,3 +295,43 @@ test('The app as a terminal UI: a status bar, the conversation as blocks, an inp
   assert.match(f.term.screen[0]!, /\| done +$/);
   ui.stop();
 });
+
+test("A result shows the model's cut marker as an ellipsis, and a diff block holds at most 400 lines, the rest counted", () => {
+  const f = fakeTerminal(100, 40);
+  const ui = new TerminalUI({
+    terminal: f.term,
+    color: false,
+    title: '/repo',
+    model: 'm',
+    submit: () => {},
+    interrupt: () => {},
+  });
+  ui.start();
+  const run = ui.run({ objective: 'o', session: 's', verbose: false });
+  run.update({
+    kind: 'result',
+    step: 1,
+    route: 'read_files',
+    ok: true,
+    ms: 1,
+    chars: 30,
+    text: 'a.ts head\n[…truncated; use a narrower read or query…]\ntail',
+  });
+  const result = ui.transcript.list.at(-1)!;
+  assert.equal(result.title, 'read_files ok | 1ms | a.ts head … tail');
+  const content = Array.from({ length: 1000 }, (_, i) => `line ${i}`).join('\n') + '\n';
+  run.update({
+    kind: 'edit',
+    step: 2,
+    path: 'big.ts',
+    created: true,
+    added: 1000,
+    removed: 0,
+    hunks: diffLines('', content).hunks,
+  });
+  const diff = ui.transcript.list.at(-1)!;
+  assert.equal(diff.body.length, 401);
+  assert.deepEqual(diff.body.at(-1), { mark: '@', text: '... 601 more lines of the diff are not shown' });
+  run.close();
+  ui.stop();
+});

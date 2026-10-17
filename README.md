@@ -101,17 +101,17 @@ Jev relevance questions are batched with routing when there are at least eight a
 
 Before inference, the harness calls llama-server `/apply-template` and `/tokenize` to count the actual rendered prompt. The default active working limit is **12,000 tokens**, independently of the **48,000-token context ceiling**. Old evidence is evicted until the prompt fits; 4,096 output tokens and 1,024 safety tokens are reserved. If tokenization endpoints are unavailable, UTF-8 byte length is used as a conservative bound for byte-level tokenizers. The harness refuses inference when pinned material cannot fit. This fallback is intended for compatible text models, not arbitrary tokenizers or unknown server-side prompt injection.
 
-Full retained outputs live outside the prompt. Use `read_files` with `@artifact/00001.txt` to recover one, or `search_codebase` with `path: "@artifacts"` to search archived evidence. This allows recovery after eviction. A command that exceeds the output cap is killed, so artifacts do not contain output the command never produced or output discarded at the cap.
+Full retained outputs live outside the prompt. Use `read_files` with `@artifact/00001.txt` to recover one, or `search_codebase` with `path: "@artifacts"` to search archived evidence. This allows recovery after eviction. A command is never stopped for how much it prints, only for its time limit. Its first and last 512 KiB are kept in the result; when it printed more, the whole output is saved as `@artifact/<step>-command-<n>.log`, named in the result as `wholeOutput`.
 
 ## Tools and execution boundaries
 
 | Action | Behavior |
 | --- | --- |
-| `read_files` | Up to three files, 250 lines and 20,000 returned characters each, 1 MiB per source file (8 MiB for artifacts). Returns line numbers and full-file SHA-256. Invalid UTF-8 is rejected. |
-| `search_codebase` | Literal ripgrep search or file listing; respects normal ignore rules, excludes common secrets and session directories. |
+| `read_files` | Up to three files, 250 lines and 20,000 returned characters each. Files of any size are read by streaming, holding only the requested range. Returns line numbers and full-file SHA-256. Invalid UTF-8 is rejected. Edits hold a file whole, up to 16 MiB. |
+| `search_codebase` | Literal ripgrep search or file listing; respects normal ignore rules, excludes common secrets and session directories, and skips files over 50 MB. |
 | `create_file` | Exclusive creation of a file that does not exist. On the decided path the content is generated as code from the file's contract; on the free path the worker names the path and purpose and the content is generated next. The file is parsed as it lands and its relative imports are reported; it is never rolled back. |
 | `write` | One unique exact text replacement with a matching SHA-256 in a file that exists, using a temporary file and rename. Import lines the file already has are dropped from the replacement. A `write` aimed at a path that does not exist is executed as `create_file`. |
-| `bash` | One foreground command with timeout, bounded combined output and process-group cleanup. |
+| `bash` | One foreground command with timeout and process-group cleanup. Judged by its exit code; large output is saved whole as an artifact. |
 | `plan` | The worker's running notes, replaced whole: its plan, what it has learned, what comes next. Under forty lines. |
 | `finish` | The worker's completion claim with a summary. Gated on facts (the diff, the verification after the last edit, the sources) and Jev's reading of them; never on the summary text alone. |
 | `ask_user` | Persists the session and returns the question to the terminal. Resume with `--message`. |

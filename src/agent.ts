@@ -611,6 +611,7 @@ export class Agent {
     s.lastRoute = route;
     s.lastResultOk = result.ok;
     await this.evidence(s, route, result, args);
+    const saved = s.entries.at(-1)?.artifact;
     this.observe({
       kind: 'result',
       step: s.step,
@@ -619,6 +620,7 @@ export class Agent {
       ms: performance.now() - started,
       chars: result.text.length,
       text: result.text,
+      ...(saved ? { saved: join(this.store.artifacts, saved.replace(/^@artifact\//, '')) } : {}),
     });
     await this.store.log('result', {
       step: s.step,
@@ -756,7 +758,7 @@ export class Agent {
         ['--noprofile', '--norc', '-o', 'pipefail', '-c', install],
         this.tools.root,
         Math.max(this.config.commandTimeoutMs, 300000),
-      ).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
+      ).catch(e => ({ code: -1, output: String((e as Error).message), omitted: 0, timedOut: false }));
       await this.store.log('setup', { step: s.step, command: install, code: r.code, output: clip(r.output, 800) });
       this.observe({ kind: 'warning', step: s.step, text: `setup: ${install} (exit ${r.code})` });
       await this.evidence(s, 'setup', {
@@ -2150,7 +2152,7 @@ export class Agent {
         p,
         await (
           p.startsWith('@artifact/')
-            ? safePath(this.tools.artifacts, p.slice(10)).then(f => boundedRead(f, 8 * 1024 * 1024))
+            ? safePath(this.tools.artifacts, p.slice(10)).then(f => boundedRead(f))
             : safePath(this.tools.root, p).then(f => boundedRead(f))
         ).catch(() => null),
       );

@@ -62,7 +62,7 @@ async function launch(
 async function baseline(runDir: string, repo: string): Promise<void> {
   const result = await runCommand(process.execPath, ['--test', 'test/behavior.test.mjs'], repo, 30000);
   await writeFile(join(runDir, 'baseline.txt'), result.output);
-  if (result.code !== 0 || result.timedOut || result.truncated)
+  if (result.code !== 0 || result.timedOut)
     throw new Error(`Baseline behavior failed; inspect ${join(runDir, 'baseline.txt')}`);
   console.log('Baseline behavior tests: PASS. The shared architecture has not been implemented yet.');
 }

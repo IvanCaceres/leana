@@ -70,7 +70,17 @@ export type ProgressEvent =
       file?: { path: string; from: number; lines: number };
     }
   | { kind: 'generation_error'; step: number; message: string }
-  | { kind: 'result'; step: number; route: string; ok: boolean; ms: number; chars: number; text: string }
+  // saved: the file the whole result was archived to (the session's artifact for this step).
+  | {
+      kind: 'result';
+      step: number;
+      route: string;
+      ok: boolean;
+      ms: number;
+      chars: number;
+      text: string;
+      saved?: string;
+    }
   | { kind: 'undo'; step: number; files: string[] }
   | { kind: 'warning'; step: number; text: string }
   // An edit as it landed: the file's diff against the content it had (created: it had none).

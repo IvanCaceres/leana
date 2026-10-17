@@ -187,7 +187,7 @@ const program: Observer = {
         [...commandShell.slice(1), `${ctx.prefix}${target}`],
         ctx.root,
         ctx.timeoutMs,
-      ).catch(e => ({ code: -1, output: String((e as Error).message), truncated: false, timedOut: false }));
+      ).catch(e => ({ code: -1, output: String((e as Error).message), omitted: 0, timedOut: false }));
       const ok = r.code === 0 && !r.timedOut;
       const left =
         'leftRunning' in r && r.leftRunning?.length

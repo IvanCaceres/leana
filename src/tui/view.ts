@@ -2,6 +2,7 @@
 // as blocks that scroll and fold, and an input box that stays at the bottom. Between runs the input takes an
 // objective or a /command; during a run it takes guidance, which reaches the run at its next step. Frames are
 // drawn at most every 16 ms, whatever arrives in between, and only the rows that changed are written.
+import { dirname, join } from 'node:path';
 import { actionSummary, addUsage, noUsage, usageLine, usageOf } from '../display.js';
 import type { ProgressEvent, RunView, RunViewOptions, Usage } from '../display.js';
 import { cells, fitTo, k, plural, row, secs } from '../text.js';
@@ -35,24 +36,32 @@ interface Status {
   now: string;
 }
 const spinner = ['|', '/', '-', '\\'];
-// The most of one result a block holds (a command's output can be a megabyte): what is left out is counted.
+// The most of one result a block holds (a command's output can be a megabyte): what is left out is counted, and
+// the file holding all of it named.
 const resultChars = 200_000;
 // A tool's result as the conversation shows it: whole, as the tool returned it (the model's own copy is clipped to
 // its context budget; this is not). Commands and searches answer in JSON ({command, output, code, ...}): they are
-// shown as the command and its exit, and the output as its lines; notes the harness added follow.
-export function resultView(route: string, text: string): { head: string; lines: string[] } {
+// shown as the command and its exit, and the output as its lines; notes the harness added follow. saved is the file
+// the result was archived to; a command's output too long to keep in memory was saved whole beside it.
+export function resultView(route: string, text: string, saved?: string): { head: string; lines: string[] } {
   const [first = '', ...notes] = text.split('\n');
   let head = first;
   let lines = notes;
+  let whole = saved;
   try {
     const r = JSON.parse(first);
     if (r && typeof r === 'object' && typeof r.output === 'string') {
       const output = r.output.replace(/\n$/, '').split('\n');
       head =
         route === 'bash'
-          ? `$ ${String(r.command ?? '')} | exit ${r.code ?? '?'}${r.timedOut ? ' (timed out)' : ''}${r.truncated ? ' (output cut at its limit)' : ''}`
+          ? `$ ${String(r.command ?? '')} | exit ${r.code ?? '?'}${r.timedOut ? ' (timed out)' : ''}`
           : `${output.length} line${output.length === 1 ? '' : 's'}`;
       const said = [r.stoppedEarly, r.stoppedAtEnd].filter((x): x is string => typeof x === 'string');
+      // Output too long to keep was saved whole: where, said first (it would be past the cap below).
+      if (typeof r.wholeOutput === 'string') {
+        whole = saved ? join(dirname(saved), r.wholeOutput.replace(/^@artifact\//, '')) : r.wholeOutput;
+        output.unshift(`The whole output is saved at ${whole}; ${r.omitted} bytes of it are left out below`);
+      }
       lines = [...output, ...said, ...notes];
     }
   } catch {
@@ -66,7 +75,8 @@ export function resultView(route: string, text: string): { head: string; lines: 
     room -= l.length + 1;
   }
   const left = lines.slice(kept.length).reduce((n, l) => n + l.length + 1, 0);
-  if (left > 0) kept.push(`... ${left} more characters of this result are not shown`);
+  if (left > 0)
+    kept.push(`... ${left} more characters of this result are not shown${whole ? `; all of it is in ${whole}` : ''}`);
   return { head, lines: kept };
 }
 // A diff block holds at most this many lines (a whole new file can be thousands): the rest is counted.
@@ -260,7 +270,7 @@ export class TerminalUI {
         break;
       }
       case 'result': {
-        const shown = resultView(e.route, e.text);
+        const shown = resultView(e.route, e.text, e.saved);
         t.add(
           e.ok ? 'ok' : 'fail',
           `${e.route} ${e.ok ? 'ok' : 'failed'} | ${secs(e.ms)} | ${shown.head}`,

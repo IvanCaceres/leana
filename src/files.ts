@@ -26,13 +26,10 @@ export async function listRepoFiles(root: string): Promise<string[]> {
 // disk now, not what it ignores (build output, caches, other worktrees checked out inside it); elsewhere the
 // whole tree. The same exclusions as listRepoFiles (dependency folders, .env files, keys).
 export async function visibleRepoFiles(root: string): Promise<string[]> {
-  const r = await runCommand(
-    'git',
-    ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-    root,
-    10000,
-  ).catch(() => null);
-  if (!r || r.code !== 0 || r.truncated) return listRepoFiles(root);
+  const r = await runCommand('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], root, 10000, {
+    keep: 64 * 1024 * 1024,
+  }).catch(() => null);
+  if (!r || r.code !== 0 || r.omitted) return listRepoFiles(root);
   const excluded = /(^|\/)(\.git|\.leana|node_modules)\/|(^|\/)\.env(\.[^/]*)?$|\.(pem|key)$/i;
   const listed = [...new Set(r.output.split('\0').filter(Boolean))].filter(f => !excluded.test(f));
   const present = await Promise.all(
@@ -113,7 +110,7 @@ export async function treeChanges(
 // records (size and modification time): a file is read only when its signature has
 // not been hashed yet, so what a command did to content costs the files it touched.
 // A file whose signature moved while it was read is not recorded, nor one past the
-// read limit or the budget: for those the content before or after is not known.
+// whole-file limit or the budget: for those the content before or after is not known.
 export class TreeHashes {
   private known = new Map<string, { sig: string; hash: string }>();
   at(path: string, sig: string | undefined): string | null {
@@ -126,7 +123,7 @@ export class TreeHashes {
       if (this.known.get(p)?.sig === sig) continue;
       this.known.delete(p);
       const size = Number(sig.slice(0, sig.indexOf(':')));
-      if (!(size <= 1024 * 1024) || spent + size > budget) continue;
+      if (!(size <= fileLimit) || spent + size > budget) continue;
       spent += size;
       const path = resolve(root, p);
       try {
@@ -187,15 +184,76 @@ export async function parentDirectory(path: string): Promise<void> {
     throw e;
   }
 }
-export async function boundedRead(path: string, limit = 1024 * 1024): Promise<string> {
+// The most of a file held whole in memory (to edit it, hash it, or check it); read_files reads a range of any size.
+export const fileLimit = 16 * 1024 * 1024;
+export async function boundedRead(path: string, limit = fileLimit): Promise<string> {
+  const handle = await open(path, 'r');
+  try {
+    const { size, isFile } = await handle.stat().then(st => ({ size: st.size, isFile: st.isFile() }));
+    if (!isFile) throw new Error('Only regular files may be read');
+    if (size > limit)
+      throw new Error(
+        `File is ${mib(size)} MiB, past the ${mib(limit)} MiB a file can be held whole (to edit it); read_files reads any range of it`,
+      );
+    const buffer = Buffer.alloc(Math.min(size, limit) + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > size) throw new Error('File grew while it was read; read it again');
+    if (buffer.subarray(0, bytesRead).includes(0)) throw new Error('Binary file excluded');
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
+  } finally {
+    await handle.close();
+  }
+}
+const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0);
+// Lines start..end of a file of any size, read by streaming through it: only those lines are held (as many as fit in
+// maxChars, and at least the first, whole up to fileLimit characters). With the file's content hash and line count,
+// the same as a whole read gives (the same decoding: UTF-8, a byte-order mark dropped, a NUL byte refused as binary).
+export async function readLines(
+  path: string,
+  start: number,
+  end: number,
+  maxChars: number,
+): Promise<{ lines: string[]; totalLines: number; sha: string }> {
   const handle = await open(path, 'r');
   try {
     if (!(await handle.stat()).isFile()) throw new Error('Only regular files may be read');
-    const buffer = Buffer.alloc(limit + 1);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (bytesRead > limit) throw new Error('File exceeds read byte limit; narrow with search or split it externally');
-    if (buffer.subarray(0, bytesRead).includes(0)) throw new Error('Binary file excluded');
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
+    const digest = createHash('sha256');
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const buffer = Buffer.alloc(1024 * 1024);
+    const lines: string[] = [];
+    let size = 0;
+    let full = false;
+    let n = 1;
+    let partial = '';
+    const wanted = () => n >= start && n <= end && !full;
+    const line = (text: string) => {
+      if (wanted()) {
+        if (lines.length && size + text.length + 1 > maxChars) full = true;
+        else {
+          lines.push(text);
+          size += text.length + 1;
+        }
+      }
+      n++;
+    };
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      const bytes = buffer.subarray(0, bytesRead);
+      if (bytes.includes(0)) throw new Error('Binary file excluded');
+      const text = decoder.decode(bytes, { stream: true });
+      digest.update(text);
+      const parts = (partial + text).split('\n');
+      partial = parts.pop()!;
+      for (const p of parts) line(p);
+      // A line not yet ended is held only when it is wanted: the rest of the file is counted and hashed, not kept.
+      if (!wanted()) partial = '';
+      else if (partial.length > fileLimit) partial = partial.slice(0, fileLimit);
+    }
+    const rest = decoder.decode();
+    digest.update(rest);
+    line(partial + rest);
+    return { lines, totalLines: n - 1, sha: digest.digest('hex').slice(0, 16) };
   } finally {
     await handle.close();
   }

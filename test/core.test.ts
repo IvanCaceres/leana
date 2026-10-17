@@ -100,7 +100,7 @@ import {
   dropDuplicateImports,
   rangeEchoes,
 } from '../src/edit-checks.js';
-import { hash, safePath, treeChanges, treeSnapshot, TreeHashes } from '../src/files.js';
+import { fileLimit, hash, safePath, treeChanges, treeSnapshot, TreeHashes } from '../src/files.js';
 import { runCommand, describeProcesses, groupProcesses } from '../src/commands.js';
 import { ToolBox } from '../src/tools.js';
 import {
@@ -1550,7 +1550,7 @@ test("A file's content hash is known by its size and modification time: rewritte
   await mkdir(join(root, 'src'), { recursive: true });
   await writeFile(join(root, 'src', 'same.svelte'), '{@each pets as pet}\n');
   await writeFile(join(root, 'src', 'other.ts'), 'a\n');
-  await writeFile(join(root, 'big.bin'), Buffer.alloc(1024 * 1024 + 1));
+  await writeFile(join(root, 'big.txt'), Buffer.alloc(fileLimit + 1, 'a'));
   const past = new Date(Date.now() - 60000);
   for (const f of ['src/same.svelte', 'src/other.ts']) await utimes(join(root, f), past, past);
   const hashes = new TreeHashes();
@@ -1561,7 +1561,7 @@ test("A file's content hash is known by its size and modification time: rewritte
     hash('{@each pets as pet}\n'),
     'the hash read_files shows',
   );
-  assert.equal(hashes.at('big.bin', before.get('big.bin')), null, 'past the read limit: not known');
+  assert.equal(hashes.at('big.txt', before.get('big.txt')), null, 'past the whole-file limit: not known');
   const r = await runCommand(
     'bash',
     ['-c', "cat > src/same.svelte <<'EOF'\n{@each pets as pet}\nEOF\nprintf 'b\\n' > src/other.ts"],

@@ -316,7 +316,7 @@ test('A result is shown whole, as the tool returned it: a command as its command
     ok: false,
     ms: 5200,
     chars: 9000,
-    text: `${JSON.stringify({ command: 'npm test', purpose: 'check', output, code: 1, truncated: false, timedOut: false })}\nJev reads this failure as: code_bug (the code or configuration written is wrong).`,
+    text: `${JSON.stringify({ command: 'npm test', purpose: 'check', output, code: 1, omitted: 0, timedOut: false })}\nJev reads this failure as: code_bug (the code or configuration written is wrong).`,
   });
   const result = ui.transcript.list.at(-1)!;
   assert.equal(result.title, 'bash failed | 5.2s | $ npm test | exit 1');

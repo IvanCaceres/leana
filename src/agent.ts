@@ -15,6 +15,7 @@ import { boundedRead, hash, listRepoFiles, safePath, treeChanges, treeSnapshot, 
 import { droppedLines } from './edit-checks.js';
 import { repositoryStatus, sourceHashes, summarizeCheck, unscriptedStart } from './repository.js';
 import { runCommand } from './commands.js';
+import { repairCalls } from './repair.js';
 import {
   breakIndex,
   clip,
@@ -1785,11 +1786,17 @@ export class Agent {
         temperature,
       );
       const thought = String(gen.thought ?? '').trim();
-      const batch: Batch = (gen.actions as any[]).map(a => ({
-        action: String(a.action) as Route,
+      // Calls written in a shape that reads one way only are made into the calls meant (repairCalls): under the
+      // tools form, where a call's arguments are the model's to shape and are checked after (argsProblem). Bonsai's
+      // grammar holds its calls to the schema as they are generated, so its batch is taken as written.
+      const written = (gen.actions as any[]).map(a => ({
+        action: String(a.action),
         args: (a.args ?? {}) as Record<string, any>,
         ...(typeof a.problem === 'string' ? { problem: a.problem } : {}),
       }));
+      const { calls, repairs } = s.form === 'tools' ? repairCalls(written) : { calls: written, repairs: [] };
+      if (repairs.length) await this.store.log('repaired', { step: s.step, repairs });
+      const batch = calls as Batch;
       s.lastThought = thought;
       await this.store.log('thought', {
         step: s.step,

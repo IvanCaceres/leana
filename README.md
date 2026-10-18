@@ -51,6 +51,8 @@ Alternatively, supply `TYPESAFE_API_KEY` in the environment or `--env-file PATH`
 
 Defaults match the supplied server: `http://127.0.0.1:8080/v1`, model `bonsai-27b`, 48,000 total context tokens, 4,096 maximum output tokens, and reasoning disabled with `chat_template_kwargs.enable_thinking=false`. Configure with `--config leana.example.json`.
 
+Reasoning (`stepThinking`, `codeThinking`) defaults to `auto`, decided for the model when a run starts: **on** for an OpenRouter model that can reason, **off** for one that cannot and for the local server. Off measured better on Bonsai. Through OpenRouter with Claude Haiku 5.5, the same 3D-scene objective took 54 s, 6 steps and $0.006 with reasoning, against about 63 s, 14 steps and $0.007–0.008 without. `--reasoning on|off`, `--file-reasoning on|off`, the app's `/set reasoning on|off|auto` and the config file override it.
+
 ## Control flow
 
 ```mermaid

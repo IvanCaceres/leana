@@ -232,6 +232,9 @@ const onOff = (v: string): boolean => {
   if (/^(off|false|no|0)$/i.test(v)) return false;
   throw new Error('expected on or off');
 };
+// Reasoning: on, off, or auto (decided for the model: on through OpenRouter when it reasons).
+const onOffAuto = (v: string): boolean | 'auto' => (/^auto$/i.test(v) ? 'auto' : onOff(v));
+const shown = (v: boolean | 'auto') => (v === 'auto' ? 'auto' : v ? 'on' : 'off');
 export function modelOptions(m: ModelInfo): ModelOption[] {
   const out: ModelOption[] = [];
   const has = (p: string) => m.params.includes(p);
@@ -251,16 +254,16 @@ export function modelOptions(m: ModelInfo): ModelOption[] {
       out.push({
         name: 'reasoning',
         describe: "reason before each step's reply",
-        values: 'on | off',
-        get: c => (c.stepThinking ? 'on' : 'off'),
-        set: (_c, v) => ({ stepThinking: onOff(v) }),
+        values: 'on | off | auto',
+        get: c => shown(c.stepThinking),
+        set: (_c, v) => ({ stepThinking: onOffAuto(v) }),
       });
       out.push({
         name: 'file-reasoning',
         describe: 'reason before writing each file',
-        values: 'on | off',
-        get: c => (c.codeThinking ? 'on' : 'off'),
-        set: (_c, v) => ({ codeThinking: onOff(v) }),
+        values: 'on | off | auto',
+        get: c => shown(c.codeThinking),
+        set: (_c, v) => ({ codeThinking: onOffAuto(v) }),
       });
     }
     const efforts = effortsOf(r);

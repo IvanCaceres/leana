@@ -2624,6 +2624,53 @@ test('A render whose server announces a different address fails within seconds a
   assert(Date.now() - t0 < 15000, `failed fast (${Date.now() - t0} ms), not after the 45 s timeout`);
 });
 
+test('read_files calls written in a shape that reads one way only are run as meant, not refused: five files as two reads, a bare path as a read from its start (run react-demo-7: refused four times in a row and stopped)', async t => {
+  const { root, store } = await repo(t);
+  for (const n of ['a', 'b', 'c', 'd', 'e']) await writeFile(join(root, `${n}.ts`), `export const ${n} = 1;\n`);
+  const whole = (path: string) => ({ path, start: 1, end: 1000000 });
+  const bonsai = bonsaiOf({
+    steps: [
+      {
+        thought: 'Read the scaffold.',
+        action: 'read_files',
+        batch: [{ action: 'read_files', args: { files: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'].map(whole) } }],
+      },
+      { thought: 'And one more.', action: 'read_files', batch: [{ action: 'read_files', args: { path: 'a.ts' } }] },
+      { thought: 'Ask.', action: 'ask_user', args: { question: 'done reading' } },
+    ],
+  });
+  const s = await newSession(root, 'read the scaffold');
+  const agent = new Agent(
+    { ...config, promptForm: 'tools' },
+    store,
+    jevOf({}),
+    bonsai as any,
+    root,
+    () => {},
+    () => {},
+  );
+  const result = await agent.run(s);
+  assert.equal(result.status, 'paused', result.stopReason);
+  assert.equal(result.stopReason, 'done reading', 'stopped where the worker asked, not by four refusals');
+  const ev = await events(store);
+  assert.deepEqual(
+    ev.filter(e => e.type === 'refused'),
+    [],
+    'nothing refused',
+  );
+  const reads = ev
+    .filter(e => e.type === 'action' && e.data.route === 'read_files')
+    .map(e => e.data.args.files.map((f: any) => f.path));
+  assert.deepEqual(reads, [['a.ts', 'b.ts', 'c.ts'], ['d.ts', 'e.ts'], ['a.ts']]);
+  assert.deepEqual(
+    ev.filter(e => e.type === 'repaired').map(e => e.data.repairs),
+    [
+      ['read_files named 5 files, read as 2 reads'],
+      ['read_files named its file outside files', 'read_files named a file without its range, read from its start'],
+    ],
+  );
+});
+
 test('A read shows as much of the range as the character budget allows, not a fixed number of lines', async t => {
   const { root } = await repo(t);
   await writeFile(

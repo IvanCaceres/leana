@@ -5,7 +5,8 @@
 // retrieval, and gates completion claims. Nothing here decides how to
 // implement anything.
 import { readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import type { Answers, Config, EditAttempt, Entry, Message, Questions, Route, Session, ToolResult } from './types.js';
 import { editRoutes } from './types.js';
 import { liveHeight, partialJson, tailLines, type ProgressEvent } from './display.js';
@@ -1817,7 +1818,14 @@ export class Agent {
         args: (a.args ?? {}) as Record<string, any>,
         ...(typeof a.problem === 'string' ? { problem: a.problem } : {}),
       }));
-      const { calls, repairs } = s.form === 'tools' ? repairCalls(written) : { calls: written, repairs: [] };
+      const exists = (p: string) => {
+        try {
+          return statSync(resolve(this.tools.root, p)).isFile();
+        } catch {
+          return false;
+        }
+      };
+      const { calls, repairs } = s.form === 'tools' ? repairCalls(written, exists) : { calls: written, repairs: [] };
       if (repairs.length) await this.store.log('repaired', { step: s.step, repairs });
       const batch = calls as Batch;
       s.lastThought = thought;

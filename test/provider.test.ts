@@ -368,7 +368,7 @@ test("A file through OpenRouter is the reply's fenced code block, asked for with
   );
 });
 
-test('Calls are repaired only where they read one way: paths for file entries, a missing range end, a bare path, too many files; anything else is left for the schema to refuse', async () => {
+test('Calls are repaired only where they read one way: paths for file entries, a bare path, too many files, write with a whole file; anything else is left for the schema to refuse', async () => {
   const { repairCalls } = await import('../src/repair.js');
   const r = (args: any, action = 'read_files') => repairCalls([{ action, args }]);
   const range = (path: string, start = 1, end = 1000000) => ({ path, start, end });
@@ -377,15 +377,34 @@ test('Calls are repaired only where they read one way: paths for file entries, a
     { calls: [{ action: 'read_files', args: { files: [range('a.ts', 3, 9)] } }], repairs: [] },
     'a call as it should be: untouched',
   );
+  // A range left out is the whole file by the tool's own defaults (withDefaults): not a repair.
   assert.deepEqual(r({ files: ['a.ts', { path: 'b.ts', start: 40 }] }).calls, [
-    { action: 'read_files', args: { files: [range('a.ts'), range('b.ts', 40)] } },
+    { action: 'read_files', args: { files: [{ path: 'a.ts' }, { path: 'b.ts', start: 40 }] } },
   ]);
-  assert.deepEqual(r({ path: 'a.ts', start: 5, end: 8 }).calls, [
+  assert.deepEqual(r({ path: 'a.ts', start: 5, end: 8, purpose: 'x' }).calls, [
     { action: 'read_files', args: { files: [range('a.ts', 5, 8)] } },
   ]);
   assert.deepEqual(r({ paths: ['a.ts', 'b.ts'] }).calls, [
-    { action: 'read_files', args: { files: [range('a.ts'), range('b.ts')] } },
+    { action: 'read_files', args: { files: [{ path: 'a.ts' }, { path: 'b.ts' }] } },
   ]);
+  // write with a whole file and nothing to replace: by whether the file exists.
+  const w = (args: any, exists: boolean) => repairCalls([{ action: 'write', args }], () => exists).calls;
+  assert.deepEqual(w({ path: 'a.ts', content: 'x', expectedHash: 'h' }, true), [
+    { action: 'rewrite_file', args: { path: 'a.ts', content: 'x' } },
+  ]);
+  assert.deepEqual(w({ path: 'n.ts', content: 'x' }, false), [
+    { action: 'create_file', args: { path: 'n.ts', content: 'x' } },
+  ]);
+  assert.deepEqual(
+    w({ path: 'a.ts', content: 'x', oldText: 'y' }, true),
+    [{ action: 'write', args: { path: 'a.ts', content: 'x', oldText: 'y' } }],
+    'text to replace named: left for the schema',
+  );
+  assert.deepEqual(
+    w({ path: 'a.ts', oldText: 'y', newText: 'z' }, true),
+    [{ action: 'write', args: { path: 'a.ts', oldText: 'y', newText: 'z' } }],
+    'a write as it should be: untouched',
+  );
   assert.deepEqual(
     r({ files: ['1', '2', '3', '4', '5', '6', '7'].map(p => range(p)) }).calls.map(c => c.args.files.length),
     [3, 3, 1],
@@ -403,8 +422,17 @@ test('Calls are repaired only where they read one way: paths for file entries, a
     'another action: untouched',
   );
   const { argsProblem } = await import('../src/agent.js');
-  for (const c of r({ files: ['1', '2', '3', '4'].map(p => range(p)) }).calls)
-    assert.equal(argsProblem(c.action, c.args, ['read_files']), undefined, 'every repaired call passes the schema');
+  for (const c of [
+    ...r({ files: ['1', '2', '3', '4'] }).calls,
+    ...r({ path: 'a.ts', purpose: 'x' }).calls,
+    ...w({ path: 'a.ts', content: 'x', expectedHash: 'h' }, true),
+    ...w({ path: 'n.ts', content: 'x' }, false),
+  ])
+    assert.equal(
+      argsProblem(c.action, c.args, ['read_files', 'rewrite_file', 'create_file']),
+      undefined,
+      'every repaired call passes the schema',
+    );
 });
 
 test("Under the tools form a step is the model's own tool calling: each action a tool, the text the thought, the calls the batch, files written in the calls and kept whole in the transcript; every call gets its result; a bad call is refused alone; turns are counted; the working budget is the model's", async t => {

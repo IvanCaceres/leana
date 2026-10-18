@@ -2624,7 +2624,7 @@ test('A render whose server announces a different address fails within seconds a
   assert(Date.now() - t0 < 15000, `failed fast (${Date.now() - t0} ms), not after the 45 s timeout`);
 });
 
-test('read_files calls written in a shape that reads one way only are run as meant, not refused: five files as two reads, a bare path as a read from its start (run react-demo-7: refused four times in a row and stopped)', async t => {
+test('Calls written in a shape that reads one way only are run as meant, not refused: five files as two reads, a bare path as a read, write with a whole file as rewrite_file or create_file (runs react-demo-7 and supermarket-1: refused until the run stopped)', async t => {
   const { root, store } = await repo(t);
   for (const n of ['a', 'b', 'c', 'd', 'e']) await writeFile(join(root, `${n}.ts`), `export const ${n} = 1;\n`);
   const whole = (path: string) => ({ path, start: 1, end: 1000000 });
@@ -2636,6 +2636,14 @@ test('read_files calls written in a shape that reads one way only are run as mea
         batch: [{ action: 'read_files', args: { files: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'].map(whole) } }],
       },
       { thought: 'And one more.', action: 'read_files', batch: [{ action: 'read_files', args: { path: 'a.ts' } }] },
+      {
+        thought: 'Replace a whole file, and add one.',
+        action: 'write',
+        batch: [
+          { action: 'write', args: { path: 'b.ts', content: 'export const b = 2;\n' } },
+          { action: 'write', args: { path: 'f.ts', content: 'export const f = 1;\n' } },
+        ],
+      },
       { thought: 'Ask.', action: 'ask_user', args: { question: 'done reading' } },
     ],
   });
@@ -2662,11 +2670,17 @@ test('read_files calls written in a shape that reads one way only are run as mea
     .filter(e => e.type === 'action' && e.data.route === 'read_files')
     .map(e => e.data.args.files.map((f: any) => f.path));
   assert.deepEqual(reads, [['a.ts', 'b.ts', 'c.ts'], ['d.ts', 'e.ts'], ['a.ts']]);
+  assert.equal(await readFile(join(root, 'b.ts'), 'utf8'), 'export const b = 2;\n', 'rewritten whole');
+  assert.equal(await readFile(join(root, 'f.ts'), 'utf8'), 'export const f = 1;\n', 'created');
   assert.deepEqual(
     ev.filter(e => e.type === 'repaired').map(e => e.data.repairs),
     [
       ['read_files named 5 files, read as 2 reads'],
-      ['read_files named its file outside files', 'read_files named a file without its range, read from its start'],
+      ['read_files named its file outside files'],
+      [
+        "write carried b.ts's whole content, written as rewrite_file",
+        "write carried f.ts's whole content, written as create_file",
+      ],
     ],
   );
 });

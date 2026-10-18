@@ -996,6 +996,72 @@ test('Under the tools form a call may leave out what has a default: the tool sch
   );
 });
 
+test('A screenshot reaches a model that takes images as text and image parts after the cache points, which stay where they were; a model that does not take images is sent the prompt without it', async t => {
+  const [claude, , ling] = (await catalogue()).data.map(openrouterModelInfo);
+  assert.deepEqual([claude.images, ling.images], [true, false], 'from the catalogue: image input');
+  assert(
+    modelOptions(claude).some(o => o.name === 'screenshots') && !modelOptions(ling).some(o => o.name === 'screenshots'),
+  );
+  const { loadConfig } = await import('../src/config.js');
+  await assert.rejects(loadConfig(undefined, { screenshots: 'sometimes' as any }), /screenshots must be auto or off/);
+  const dir = await mkdtemp(join(tmpdir(), 'leana-shot-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const png = join(dir, 'shot.png');
+  await writeFile(png, Buffer.from('89504e470d0a1a0a', 'hex'));
+  const msg = (role: 'system' | 'user' | 'assistant', content: string) => ({ role, content });
+  const prompt = [
+    msg('system', 'You are the worker.'),
+    msg('user', '{"objective":"x"}'),
+    msg('assistant', '{"thought":"a","actions":[]}'),
+    msg('user', '{"evidence":[]}'),
+    msg('assistant', '{"thought":"b","actions":[]}'),
+    msg('user', '{"request":"next"}'),
+  ];
+  const schema = {
+    type: 'object' as const,
+    properties: { content: { type: 'string' as const } },
+    required: ['content'],
+    additionalProperties: false as const,
+  };
+  const reply = async (_b: any, _n: number, res: ServerResponse) => sse(res, [{ content: '{"content":"ok"}' }]);
+  const withShot = [...prompt, { role: 'user' as const, content: 'Attached: the screenshot', images: [png] }];
+  const seen = await mock(t, reply);
+  const or = new OpenRouter(cfg(seen.url, claude.id), 'k', async () => {});
+  assert.equal(await or.seesImages(), true);
+  await or.generate(withShot, schema);
+  await or.generate(prompt, schema);
+  const [shown, after] = seen.bodies;
+  const last = shown.messages.at(-1);
+  assert.deepEqual(last.content, [
+    { type: 'text', text: 'Attached: the screenshot' },
+    {
+      type: 'image_url',
+      image_url: { url: `data:image/png;base64,${Buffer.from('89504e470d0a1a0a', 'hex').toString('base64')}` },
+    },
+  ]);
+  assert.equal(last.images, undefined, 'the path stays here');
+  const points = (b: any) =>
+    b.messages
+      .map((m: any, i: number) => (Array.isArray(m.content) && m.content.some((p: any) => p.cache_control) ? i : -1))
+      .filter((i: number) => i >= 0);
+  assert(points(after).length > 0, 'a prompt the cache points are marked in');
+  assert.deepEqual(points(shown), points(after), 'the cache points where every other request puts them');
+  assert.deepEqual(shown.messages.slice(0, -1), after.messages, 'everything before it the same');
+  assert.equal(
+    new OpenRouter(cfg(seen.url, claude.id, { screenshots: 'off' }), 'k', async () => {}).config.screenshots,
+    'off',
+  );
+  assert.equal(
+    await new OpenRouter(cfg(seen.url, claude.id, { screenshots: 'off' }), 'k', async () => {}).seesImages(),
+    false,
+  );
+  const textOnly = await mock(t, reply);
+  const plain = new OpenRouter(cfg(textOnly.url, ling.id), 'k', async () => {});
+  assert.equal(await plain.seesImages(), false);
+  await plain.generate(withShot, schema);
+  assert.equal(textOnly.bodies[0].messages.length, prompt.length, 'sent without it');
+});
+
 test('Prompt caching through OpenRouter: the cache points are marked where the model caches, a run keeps one session for provider routing, a model without a cache price is not marked, off sends neither, and a provider that refuses the markers is asked again without them', async t => {
   const { cachePoints } = await import('../src/context.js');
   const msg = (role: any, content: string) => ({ role, content });
@@ -1127,70 +1193,4 @@ test('Under the tools form a file written inside its call is shown as it is writ
     'a later call is being written: the file is done',
   );
   assert.equal(fileBeingWritten(streaming('')), null);
-});
-
-test('A screenshot reaches a model that takes images as text and image parts after the cache points, which stay where they were; a model that does not take images is sent the prompt without it', async t => {
-  const [claude, , ling] = (await catalogue()).data.map(openrouterModelInfo);
-  assert.deepEqual([claude.images, ling.images], [true, false], 'from the catalogue: image input');
-  assert(
-    modelOptions(claude).some(o => o.name === 'screenshots') && !modelOptions(ling).some(o => o.name === 'screenshots'),
-  );
-  const { loadConfig } = await import('../src/config.js');
-  await assert.rejects(loadConfig(undefined, { screenshots: 'sometimes' as any }), /screenshots must be auto or off/);
-  const dir = await mkdtemp(join(tmpdir(), 'leana-shot-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
-  const png = join(dir, 'shot.png');
-  await writeFile(png, Buffer.from('89504e470d0a1a0a', 'hex'));
-  const msg = (role: 'system' | 'user' | 'assistant', content: string) => ({ role, content });
-  const prompt = [
-    msg('system', 'You are the worker.'),
-    msg('user', '{"objective":"x"}'),
-    msg('assistant', '{"thought":"a","actions":[]}'),
-    msg('user', '{"evidence":[]}'),
-    msg('assistant', '{"thought":"b","actions":[]}'),
-    msg('user', '{"request":"next"}'),
-  ];
-  const schema = {
-    type: 'object' as const,
-    properties: { content: { type: 'string' as const } },
-    required: ['content'],
-    additionalProperties: false as const,
-  };
-  const reply = async (_b: any, _n: number, res: ServerResponse) => sse(res, [{ content: '{"content":"ok"}' }]);
-  const withShot = [...prompt, { role: 'user' as const, content: 'Attached: the screenshot', images: [png] }];
-  const seen = await mock(t, reply);
-  const or = new OpenRouter(cfg(seen.url, claude.id), 'k', async () => {});
-  assert.equal(await or.seesImages(), true);
-  await or.generate(withShot, schema);
-  await or.generate(prompt, schema);
-  const [shown, after] = seen.bodies;
-  const last = shown.messages.at(-1);
-  assert.deepEqual(last.content, [
-    { type: 'text', text: 'Attached: the screenshot' },
-    {
-      type: 'image_url',
-      image_url: { url: `data:image/png;base64,${Buffer.from('89504e470d0a1a0a', 'hex').toString('base64')}` },
-    },
-  ]);
-  assert.equal(last.images, undefined, 'the path stays here');
-  const points = (b: any) =>
-    b.messages
-      .map((m: any, i: number) => (Array.isArray(m.content) && m.content.some((p: any) => p.cache_control) ? i : -1))
-      .filter((i: number) => i >= 0);
-  assert(points(after).length > 0, 'a prompt the cache points are marked in');
-  assert.deepEqual(points(shown), points(after), 'the cache points where every other request puts them');
-  assert.deepEqual(shown.messages.slice(0, -1), after.messages, 'everything before it the same');
-  assert.equal(
-    new OpenRouter(cfg(seen.url, claude.id, { screenshots: 'off' }), 'k', async () => {}).config.screenshots,
-    'off',
-  );
-  assert.equal(
-    await new OpenRouter(cfg(seen.url, claude.id, { screenshots: 'off' }), 'k', async () => {}).seesImages(),
-    false,
-  );
-  const textOnly = await mock(t, reply);
-  const plain = new OpenRouter(cfg(textOnly.url, ling.id), 'k', async () => {});
-  assert.equal(await plain.seesImages(), false);
-  await plain.generate(withShot, schema);
-  assert.equal(textOnly.bodies[0].messages.length, prompt.length, 'sent without it');
 });

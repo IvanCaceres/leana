@@ -129,7 +129,7 @@ const http: Observer = {
     const wait = Math.min(ctx.timeoutMs, 45000);
     const started = start.trim() ? await startServer(ctx.root, start, target, wait) : null;
     try {
-      if (started && started.ready !== true) return { ok: false, text: notAnswering(start, target, started, wait) };
+      if (started && started.ready !== true) return { ok: false, text: await notAnswering(start, target, started, wait) };
       const t0 = performance.now();
       let r: Response;
       try {

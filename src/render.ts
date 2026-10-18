@@ -326,7 +326,7 @@ export async function renderFacts(
     if (serve && serve.trim()) {
       const wait = Math.min(timeoutMs, 45000);
       server = await startServer(root, serve, url, wait);
-      if (server.ready !== true) return { ok: false, text: notAnswering(serve, url, server, wait) };
+      if (server.ready !== true) return { ok: false, text: await notAnswering(serve, url, server, wait) };
     }
     const child = spawn(
       browser,

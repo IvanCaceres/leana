@@ -99,3 +99,24 @@ test('A start command its package has no script for is found: the package of its
     assert.equal(await at(`cd ${shell}/app && npx vite`), null, "Git Bash's /c/... spelling is the same directory");
   }
 });
+
+test("A server is not started where another already listens: what answers there is that server, so the observation is refused and names a free port (run brunner2: another project's Vite server answered, and the run was accepted on it)", async t => {
+  const { createServer } = await import('node:http');
+  const { startServer, notAnswering } = await import('../src/serve.js');
+  const root = await scratch(t);
+  const other = createServer((q, r) => r.end('<title>another project</title>'));
+  await new Promise<void>(done => other.listen(0, '127.0.0.1', () => done()));
+  t.after(() => other.close());
+  const url = `http://127.0.0.1:${(other.address() as { port: number }).port}/`;
+  await writeFile(join(root, 'started.txt'), '');
+  const started = await startServer(root, 'echo started > started.txt', url, 5000);
+  assert.equal(started.ready, 'occupied');
+  assert.equal(started.exited?.(), 'not started');
+  const said = await notAnswering('npx vite --port 5173 --strictPort', url, started, 5000);
+  assert.match(
+    said,
+    /^Something was already listening at 127\.0\.0\.1:\d+ before "npx vite --port 5173 --strictPort" was started, so it was not started: .* \(\d+ is free now\): change the port in both start and target\.$/,
+  );
+  const { readFile } = await import('node:fs/promises');
+  assert.equal(await readFile(join(root, 'started.txt'), 'utf8'), '', 'the command never ran');
+});

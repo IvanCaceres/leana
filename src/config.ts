@@ -19,6 +19,8 @@ export const defaults: Config = {
   openrouterMaxTurns: 120,
   // Prompt caching through OpenRouter: auto for a model whose catalogue lists a cache-read price, or off.
   promptCache: 'auto',
+  // A page observation's screenshot, shown to a model that takes images with the next step: auto, or off.
+  screenshots: 'auto',
   // How the prompt is written (Session.form): json for Bonsai; fitted to an OpenRouter model, tools when it takes them, else text.
   promptForm: 'json',
   jevUrl: 'https://api.typesafe.ai/v1/systemone',
@@ -121,6 +123,7 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   if (!/^[a-z]+$/.test(c.thinkingEffort)) throw new Error('thinkingEffort must be one word, such as medium');
   if (!['json', 'text', 'tools'].includes(c.promptForm)) throw new Error('promptForm must be json, text or tools');
   if (!['auto', 'off'].includes(c.promptCache)) throw new Error('promptCache must be auto or off');
+  if (!['auto', 'off'].includes(c.screenshots)) throw new Error('screenshots must be auto or off');
   if (
     !Number.isSafeInteger(c.openrouterWorkingTokens) ||
     (c.openrouterWorkingTokens && c.openrouterWorkingTokens < 2000)
@@ -171,6 +174,7 @@ const kept = new Set([
   'maxSteps',
   'openrouterMaxTurns',
   'promptCache',
+  'screenshots',
 ]);
 export interface Settings {
   config: Partial<Config>;

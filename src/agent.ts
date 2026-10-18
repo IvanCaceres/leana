@@ -237,6 +237,8 @@ export async function newSession(root: string, objective: string): Promise<Sessi
 type BonsaiLike = Pick<Bonsai, 'count' | 'generate'> & {
   generateText?: Bonsai['generateText'];
   lastMeta?: Bonsai['lastMeta'] | null;
+  // Whether a prompt may show it an image; absent, it is never shown one.
+  seesImages?: () => Promise<boolean>;
 };
 export class Agent {
   readonly tools: ToolBox;
@@ -877,6 +879,25 @@ export class Agent {
     s.lastPromptTokens = counted.tokens;
     return { prompt, tokens: counted.tokens };
   }
+  // The step after an observation that took a picture sees it, when the model takes images: the facts say what the
+  // result reports (no exception, a canvas drawn), not what it looks like. (Runs brunner2 and brunner4: two 3D
+  // scenes accepted as drawn and animating, each opening with the camera against one tower that filled the frame;
+  // the worker said it had not looked.) Shown once, after the cache points, and never kept in the evidence.
+  private async withScreenshot(s: Session, prompt: Message[]): Promise<Message[]> {
+    const shot = s.screenshot;
+    if (!shot) return prompt;
+    delete s.screenshot;
+    if (!(await (this.bonsai.seesImages?.() ?? Promise.resolve(false)).catch(() => false))) return prompt;
+    await this.store.log('screenshot', { step: s.step, observed: shot.step, path: shot.path });
+    return [
+      ...prompt,
+      {
+        role: 'user',
+        content: `Attached: the screenshot the observation of step ${shot.step} took of ${shot.target}, as its user first sees it. The observation's facts say what the result reports; this shows what it looks like. Judge the result by both: if it does not look like what the objective asks for (framing, scale, colour, legibility, layout), fix that before finishing.`,
+        images: [shot.path],
+      },
+    ];
+  }
   static shape(s: Session): { ids: string[]; trail: string[] } {
     return { ids: s.entries.map(e => e.id), trail: [...(s.trail ?? [])] };
   }
@@ -907,7 +928,9 @@ export class Agent {
     schema: any,
     temperature?: number,
   ): Promise<Record<string, any>> {
-    const { prompt, tokens } = await this.fit(s, build);
+    const fitted = await this.fit(s, build);
+    const { tokens } = fitted;
+    const prompt = route === 'step' ? await this.withScreenshot(s, fitted.prompt) : fitted.prompt;
     this.observe({ kind: 'route', step: s.step, route, tokens, entries: s.entries.length });
     await this.logPrompt(s, route, prompt, tokens);
     this.observe({ kind: 'generating', step: s.step, route, attempt: 1 });
@@ -2397,6 +2420,9 @@ export class Agent {
       text: clip(r.text, 2600),
       ...(start.trim() ? { start } : {}),
     };
+    // What it looked like, when the observer took a picture: the next step sees it if its model takes images.
+    if (r.image) s.screenshot = { step: s.step, path: r.image, target };
+    else delete s.screenshot;
     await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
     this.observe({
       kind: 'result',

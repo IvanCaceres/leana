@@ -366,10 +366,12 @@ export interface Config {
   stepTemperatureEscalation: number[];
   // The model's own thinking before each step's reply (its template's <think> block at effort medium),
   // capped at stepThinkingBudget tokens, where the server closes it. false: the empty block is pre-filled.
-  stepThinking: boolean;
+  // 'auto' (the default) is decided for the model when the run's config is fitted to it (forModel): on for a
+  // model through OpenRouter that reasons, off otherwise; a fitted config holds true or false.
+  stepThinking: boolean | 'auto';
   stepThinkingBudget: number;
   // The model's own thinking before each file's code (create_file, rewrite_file), capped at codeThinkingBudget tokens.
-  codeThinking: boolean;
+  codeThinking: boolean | 'auto';
   codeThinkingBudget: number;
   // The template's reasoning effort for every thinking request (one value: its sentence is in the shared system message).
   thinkingEffort: string;

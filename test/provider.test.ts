@@ -1128,3 +1128,30 @@ test('Under the tools form a file written inside its call is shown as it is writ
   );
   assert.equal(fileBeingWritten(streaming('')), null);
 });
+
+test("Reasoning left to the model ('auto', the default) is on through OpenRouter for a model that reasons, off for one that does not and on a local server; on or off as set wins", async () => {
+  const [, gpt, , plain] = (await catalogue()).data.map(openrouterModelInfo);
+  const local = llamaModelInfo(
+    { chat_template: '{% if enable_thinking %}<think>{% endif %}', default_generation_settings: { n_ctx: 48000 } },
+    null,
+    'bonsai-27b',
+  );
+  assert.deepEqual([defaults.stepThinking, defaults.codeThinking], ['auto', 'auto']);
+  const fitted = (c: Partial<typeof defaults>, m: any) => {
+    const r = forModel({ ...defaults, provider: m.provider, ...c } as typeof defaults, m);
+    return [r.config.stepThinking, r.config.codeThinking, r.notes.some(n => /does not reason/.test(n))];
+  };
+  assert.deepEqual(fitted({}, gpt), [true, true, false], 'a reasoning model through OpenRouter thinks');
+  assert.deepEqual(fitted({}, plain), [false, false, false], 'one that does not reason: off, with nothing to say');
+  assert.deepEqual(fitted({}, local), [false, false, false], 'a local server (Bonsai): off, as measured');
+  assert.deepEqual(fitted({ stepThinking: false }, gpt), [false, true, false], 'off as set');
+  assert.deepEqual(fitted({ codeThinking: true }, local), [false, true, false], 'on as set');
+  const { loadConfig } = await import('../src/config.js');
+  assert.equal((await loadConfig(undefined, { stepThinking: 'auto' })).stepThinking, 'auto');
+  assert.equal((await loadConfig(undefined, { stepThinking: false })).stepThinking, false);
+  await assert.rejects(loadConfig(undefined, { stepThinking: 'sometimes' as any }), /Invalid config: stepThinking/);
+  const reasoning = modelOptions(gpt).find(o => o.name === 'reasoning')!;
+  assert.equal(reasoning.get(defaults), 'auto');
+  assert.deepEqual(reasoning.set(defaults, 'auto'), { stepThinking: 'auto' });
+  assert.deepEqual(reasoning.set(defaults, 'off'), { stepThinking: false });
+});

@@ -267,11 +267,9 @@ export class App {
     const candidate = { ...c, model: id };
     const m = await describeModel(candidate, await this.key(candidate));
     const { config, notes } = forModel(candidate, m);
-    await this.remember({
-      model: m.id,
-      thinkingEffort: config.thinkingEffort,
-      ...(m.reasoning.supported ? {} : { stepThinking: false, codeThinking: false }),
-    });
+    // Reasoning is not kept off for a model that cannot reason: forModel turns it off for that model, and a
+    // switch back to one that reasons finds the choice as it was.
+    await this.remember({ model: m.id, thinkingEffort: config.thinkingEffort });
     this.info = m;
     this.write(`model: ${m.id}`);
     for (const n of notes) this.write(`note: ${n}`);

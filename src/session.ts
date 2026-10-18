@@ -35,7 +35,14 @@ export function modelClient(config: Config, key: string, log: Log): ModelClient 
 }
 // The config a run uses with this model: limits fitted to it, an effort it takes (its default, or the
 // first it lists, when the configured one is not), reasoning off when it cannot reason; and what was changed.
-export function forModel(config: Config, m: ModelInfo): { config: Config; notes: string[] } {
+export function forModel(input: Config, m: ModelInfo): { config: Config; notes: string[] } {
+  // Thinking left to the model ('auto'): on through OpenRouter when the model reasons, off on a local server.
+  const reasons = m.provider === 'openrouter' && m.reasoning.supported;
+  const config = {
+    ...input,
+    stepThinking: input.stepThinking === 'auto' ? reasons : input.stepThinking,
+    codeThinking: input.codeThinking === 'auto' ? reasons : input.codeThinking,
+  };
   const notes = unsupportedSettings(config, m);
   let c = fitToModel(config, m);
   const efforts = effortsOf(m.reasoning);

@@ -62,12 +62,19 @@ export const defaults: Config = {
   // 2955 tokens at the median, and the work spread into 26 files it could not reconcile). PrismML's scores
   // were measured with thinking; on this harness and these tasks it cost time and bought no quality.
   // Each thinking token costs about 27 ms and is never reused from the cache.
-  stepThinking: false,
+  // That holds for Bonsai. Through OpenRouter it is the reverse ('auto': on for a model that reasons, off for
+  // Bonsai; see forModel): the same objective with Claude Haiku 5.5 ("a blade runner neon cyber cityscape scene in
+  // 3d"), effort medium, 1024-token budget, took 54 s, 6 steps, 4 requests and $0.006 with thinking (brunner4),
+  // against 62-65 s, 14 steps, 9-10 requests and $0.007-0.008 without (brunner2, brunner3); every run finished
+  // and was accepted at its first finish.
+  stepThinking: 'auto',
   stepThinkingBudget: 1024,
   thinkingEffort: 'medium',
-  codeThinking: false,
+  codeThinking: 'auto',
   codeThinkingBudget: 1024,
 };
+// Settings that are on, off, or decided for the model ('auto').
+const automatic = new Set(['stepThinking', 'codeThinking']);
 const zeroable = new Set(['stepMinP', 'codeMinP', 'codePresencePenalty', 'openrouterWorkingTokens']);
 export async function loadConfig(path?: string, overrides: Partial<Config> = {}): Promise<Config> {
   const input = path ? JSON.parse(await readFile(path, 'utf8')) : {};
@@ -75,7 +82,9 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   const c = { ...defaults, ...input, ...overrides } as Config;
   for (const [key, value] of Object.entries(c)) {
     const expected = defaults[key as keyof Config];
-    if (expected === undefined || typeof value !== typeof expected) throw new Error(`Invalid config: ${key}`);
+    if (automatic.has(key) ? value !== 'auto' && typeof value !== 'boolean' : typeof value !== typeof expected)
+      throw new Error(`Invalid config: ${key}`);
+    if (expected === undefined) throw new Error(`Invalid config: ${key}`);
     // min_p and the presence penalty may be 0 (off); every other number is positive.
     if (typeof value === 'number' && (!Number.isFinite(value) || value < 0 || (value === 0 && !zeroable.has(key))))
       throw new Error(`Invalid number: ${key}`);

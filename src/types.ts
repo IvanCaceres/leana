@@ -296,6 +296,8 @@ export interface Session {
   // The last observation of the result as its user meets it (a page, a service, a program run), as facts.
   // start: the command the observation started it with, if any.
   lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string; start?: string };
+  // The screenshot of the last page observation, until the next step's prompt has shown it to the model.
+  screenshot?: { step: number; path: string; target: string };
   // The start command a finish was told has no script (see Agent.finishBlocked): told once.
   startNoted?: string;
   // The actions this session may take, fixed at its start so the pinned block never changes.
@@ -322,6 +324,9 @@ export interface Config {
   // Prompt caching through OpenRouter (openrouter.ts): auto marks where the prompt stops changing for a model that
   // caches (its catalogue lists a cache-read price) and keeps a run on one provider; off sends neither.
   promptCache: 'auto' | 'off';
+  // The screenshot a page observation takes, shown to the model with the next step's prompt: auto for a model
+  // that takes images (its catalogue lists image input), or off.
+  screenshots: 'auto' | 'off';
   baseUrl: string;
   model: string;
   contextWindow: number;
@@ -401,6 +406,8 @@ export interface ToolCall {
 export interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  // PNG files on this machine shown with the text, to a model that takes images (a page observation's screenshot).
+  images?: string[];
   tool_calls?: ToolCall[];
   tool_call_id?: string;
 }

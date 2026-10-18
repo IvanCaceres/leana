@@ -6930,3 +6930,46 @@ test('Guidance given while the run goes on joins the objective at the next step,
     ['-export const a = 1;', '+export const a = 2;'],
   );
 });
+
+test('The step after a page observation sees its screenshot once, when the model takes images: as a last message after the cache points, never kept; a model that does not, or no screenshot, changes nothing', async t => {
+  const { root, store } = await repo(t);
+  const shot = join(root, 'shot.png');
+  await writeFile(shot, Buffer.from('89504e470d0a1a0a', 'hex'));
+  const prompt = [
+    { role: 'system' as const, content: 'You are the worker.' },
+    { role: 'user' as const, content: '{"request":"next"}' },
+  ];
+  const make = (sees: boolean) =>
+    new Agent(
+      config,
+      store,
+      jevOf({}),
+      {
+        count: async () => ({ tokens: 1, mode: 'estimate' }),
+        generate: async () => ({}),
+        seesImages: async () => sees,
+      } as any,
+      root,
+      () => {},
+      () => {},
+    );
+  const s = await newSession(root, 'build a scene');
+  s.screenshot = { step: 4, path: shot, target: 'http://127.0.0.1:5173/' };
+  const shown = await (make(true) as any).withScreenshot(s, prompt);
+  assert.equal(shown.length, 3);
+  assert.deepEqual(shown.slice(0, 2), prompt, 'the prompt before it as it was');
+  assert.deepEqual(shown[2].images, [shot]);
+  assert.match(
+    shown[2].content,
+    /^Attached: the screenshot the observation of step 4 took of http:\/\/127\.0\.0\.1:5173\//,
+  );
+  assert.equal(s.screenshot, undefined, 'shown once');
+  assert.deepEqual(await (make(true) as any).withScreenshot(s, prompt), prompt, 'and not again');
+  s.screenshot = { step: 5, path: shot, target: 'http://127.0.0.1:5173/' };
+  assert.deepEqual(await (make(false) as any).withScreenshot(s, prompt), prompt, 'a model that does not take images');
+  assert.equal(s.screenshot, undefined, 'dropped either way: the next observation takes a new one');
+  assert(
+    (await events(store)).some(e => e.type === 'screenshot' && e.data.observed === 4 && e.data.path === shot),
+    'logged',
+  );
+});

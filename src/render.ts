@@ -314,7 +314,7 @@ export async function renderFacts(
   screenshotPath: string | null,
   timeoutMs = 60000,
   inputs: PageInput[] = [],
-): Promise<{ ok: boolean; text: string; unmatched?: string[] }> {
+): Promise<{ ok: boolean; text: string; unmatched?: string[]; image?: string }> {
   const browser = await findBrowser();
   if (!browser)
     return {
@@ -451,10 +451,12 @@ export async function renderFacts(
           before = after;
         }
       }
+      let image: string | undefined;
       if (screenshotPath) {
         try {
           const shot = await cdp.send('Page.captureScreenshot', { format: 'png' }, sessionId);
           await writeFile(screenshotPath, Buffer.from(shot.data, 'base64'));
+          image = screenshotPath;
         } catch {
           /* the facts matter more */
         }
@@ -552,7 +554,7 @@ export async function renderFacts(
           ? `Played as its user would (each input, then what the page did until the next):\n${played.join('\n')}`
           : '',
       ].filter(Boolean);
-      return { ok, text: lines.join('\n'), ...(c.unmatched ? { unmatched: c.all } : {}) };
+      return { ok, text: lines.join('\n'), ...(c.unmatched ? { unmatched: c.all } : {}), ...(image ? { image } : {}) };
     } finally {
       try {
         child.kill('SIGKILL');

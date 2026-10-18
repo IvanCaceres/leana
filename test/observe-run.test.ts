@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canvasFacts, findBrowser, renderFacts } from '../src/render.js';
@@ -51,10 +51,13 @@ requestAnimationFrame(frame);
     join(root, 'serve.mjs'),
     `import { createServer } from "node:http"; import { readFileSync } from "node:fs"; createServer((q, r) => { r.setHeader("content-type", "text/html"); r.end(readFileSync("index.html")); }).listen(${port}, "127.0.0.1", () => console.log("Local: http://127.0.0.1:${port}/"));\n`,
   );
-  const r = await renderFacts(root, `http://127.0.0.1:${port}/`, 'node serve.mjs', null, 60000, [
+  const shot = join(root, 'shot.png');
+  const r = await renderFacts(root, `http://127.0.0.1:${port}/`, 'node serve.mjs', shot, 60000, [
     { do: 'wait', what: '', ms: 1000 },
   ]);
   assert.equal(r.ok, true, r.text);
+  assert.equal(r.image, shot, 'the screenshot it took, for a model that sees images');
+  assert.deepEqual([...(await readFile(shot)).subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], 'a PNG');
   assert.match(
     r.text,
     /\nCanvas: canvas \(480x240\): drawn, \d+ grey levels; [\d.]+% of it differs from its most common level/,

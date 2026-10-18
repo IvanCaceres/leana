@@ -35,6 +35,8 @@ export interface ModelInfo {
   pricing?: { prompt: number; completion: number; cacheRead?: number };
   // Facts about the model the provider reports (size, quantization, template), for display only.
   details?: Record<string, string>;
+  // It takes images in a prompt (OpenRouter's catalogue lists image input).
+  images?: boolean;
 }
 // Whether a model caches a repeated prompt prefix: its catalogue lists a cache-read price below its prompt price.
 // Some providers cache on their own, others where the request marks it; either way it is the same fact.
@@ -137,6 +139,9 @@ export function openrouterModelInfo(m: any): ModelInfo {
       completion: price(m.pricing?.completion),
       ...(m.pricing?.input_cache_read !== undefined ? { cacheRead: price(m.pricing.input_cache_read) } : {}),
     },
+    images: Array.isArray(arch.input_modalities)
+      ? arch.input_modalities.includes('image')
+      : /image/.test(String(arch.modality ?? '').split('->')[0] ?? ''),
     details: {
       ...(arch.modality ? { modality: String(arch.modality) } : {}),
       ...(arch.tokenizer ? { tokenizer: String(arch.tokenizer) } : {}),
@@ -416,6 +421,17 @@ export function modelOptions(m: ModelInfo): ModelOption[] {
       set: (_c, v) => {
         if (!/^(auto|off)$/.test(v)) throw new Error('prompt-cache takes auto or off');
         return { promptCache: v as 'auto' | 'off' };
+      },
+    });
+  if (m.images)
+    out.push({
+      name: 'screenshots',
+      describe: "show the model the screenshot of each page it observes, with its next step's prompt",
+      values: 'auto | off',
+      get: c => c.screenshots,
+      set: (_c, v) => {
+        if (!/^(auto|off)$/.test(v)) throw new Error('screenshots takes auto or off');
+        return { screenshots: v as 'auto' | 'off' };
       },
     });
   return out;

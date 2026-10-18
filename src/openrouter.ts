@@ -12,6 +12,7 @@
 // only when it caches (models.ts, cachesPrompts); a provider that refuses the markers is asked again without them,
 // and the run goes on unmarked.
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import type { Config, GenerationMeta, JsonSchema, Log, Message } from './types.js';
 import {
   isEventStream,
@@ -56,6 +57,20 @@ function stepActions(schema: JsonSchema): string[] | null {
   return names.length === alts.length ? names : null;
 }
 const chars = (m: Message): number => m.content.length + (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0);
+// What an image costs in prompt tokens, for the budget check: a 1280x900 screenshot is about 1,540 tokens on Claude
+// (width x height / 750) and fewer on most other models, which scale it down first.
+const imageTokens = 1600;
+// A message with images as OpenAI-style content parts: its text, then each PNG as a data URL.
+async function withImages(m: Message): Promise<unknown> {
+  const { images = [], ...rest } = m;
+  const parts = await Promise.all(
+    images.map(async p => ({
+      type: 'image_url',
+      image_url: { url: `data:image/png;base64,${(await readFile(p)).toString('base64')}` },
+    })),
+  );
+  return { ...rest, content: [{ type: 'text', text: m.content }, ...parts] };
+}
 
 export class OpenRouter {
   lastMeta: GenerationMeta | null = null;
@@ -80,6 +95,10 @@ export class OpenRouter {
   }
   model(): Promise<ModelInfo> {
     return describeModel(this.config, this.key);
+  }
+  // Whether a step's prompt may show the model an image: it takes images, and screenshots are not off.
+  async seesImages(): Promise<boolean> {
+    return this.config.screenshots === 'auto' && Boolean((await this.model()).images);
   }
   // An estimate: characters of the messages times the ratio last measured, plus a few tokens a message
   // for the chat template.
@@ -307,7 +326,13 @@ export class OpenRouter {
     thinking?: number,
   ): Promise<Record<string, any>> {
     const m = await this.model();
-    const count = await this.count(messages);
+    // A last message with images (a screenshot) goes after the cache points, unmarked, as text and image parts, so
+    // the points stay where every other request puts them; it is shown once, and never cached.
+    const shown = messages.at(-1)?.images?.length && m.images ? messages.at(-1)! : null;
+    messages = messages.filter(x => !x.images?.length);
+    const extra = shown ? [await withImages(shown)] : [];
+    const counted = await this.count(shown ? [...messages, { role: 'user', content: shown.content }] : messages);
+    const count = { ...counted, tokens: counted.tokens + (shown?.images?.length ?? 0) * imageTokens };
     this.budgetCheck(count, maxTokens, m);
     const requestId = randomUUID();
     const start = performance.now();
@@ -324,7 +349,7 @@ export class OpenRouter {
     const choose = (forced: unknown) =>
       m.params.includes('tool_choice') ? { tool_choice: reasons ? 'auto' : forced } : {};
     const prepared = this.messages(messages, via === 'prompt' ? schema : undefined);
-    const cached = this.cacheable(m, messages, prepared);
+    const cached = this.cacheable(m, messages, prepared, extra as Message[]);
     const body: Record<string, any> = {
       model: this.config.model,
       messages: cached.messages,
@@ -391,7 +416,7 @@ export class OpenRouter {
         cached.marked,
         unmarked =>
           this.chat(
-            unmarked ? { ...body, messages: prepared } : body,
+            unmarked ? { ...body, messages: [...prepared, ...extra] } : body,
             60000 + Number(body.max_tokens) * 120,
             quietly(progress),
             undefined,
@@ -403,7 +428,8 @@ export class OpenRouter {
         via === 'native'
           ? [r.content, ...r.calls.map(c => `${c.name}(${c.args})`)].filter(Boolean).join('\n')
           : r.calls[0]?.args || r.content;
-      this.learn(messages, r.usage);
+      // An image's tokens are not characters of the prompt: the ratio is learned from prompts without one.
+      if (!shown) this.learn(messages, r.usage);
       const ms = performance.now() - start;
       this.lastMeta = {
         ms,

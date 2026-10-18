@@ -848,6 +848,10 @@ export class Bonsai {
       ms: performance.now() - start,
     };
   }
+  // A local server's model is never shown images (Bonsai reads text).
+  async seesImages(): Promise<boolean> {
+    return false;
+  }
   async count(messages: Message[]): Promise<{ tokens: number; mode: string }> {
     try {
       const r = await this.render(messages);

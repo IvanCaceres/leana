@@ -25,6 +25,8 @@ export interface ObserveContext {
 export interface Observation {
   ok: boolean;
   text: string;
+  // A PNG of what was observed as its user sees it (a page's screenshot), when the observer took one.
+  image?: string;
 }
 export interface Observer {
   // kind, what it shows (for the action catalogue), and the gate's focused question about it: see observe-catalog.ts.
@@ -112,6 +114,7 @@ const page: Observer = {
     const stylesheets = ctx.files.filter(f => styles.test(f) && !/(^|\/)(?:node_modules|dist|build)\//.test(f));
     return {
       ok: r.ok,
+      ...(r.image ? { image: r.image } : {}),
       text: `${r.text}\nClass names no CSS selector matches, by the file that uses them:\n${
         Object.entries(where)
           .map(([f, cs]) => `  ${f}: ${cs.join(' ')}`)
@@ -129,7 +132,8 @@ const http: Observer = {
     const wait = Math.min(ctx.timeoutMs, 45000);
     const started = start.trim() ? await startServer(ctx.root, start, target, wait) : null;
     try {
-      if (started && started.ready !== true) return { ok: false, text: await notAnswering(start, target, started, wait) };
+      if (started && started.ready !== true)
+        return { ok: false, text: await notAnswering(start, target, started, wait) };
       const t0 = performance.now();
       let r: Response;
       try {

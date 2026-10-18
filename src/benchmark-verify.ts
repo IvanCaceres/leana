@@ -208,8 +208,7 @@ export function ${fn}(...args) {
     : await runCommand(process.execPath, ['--test', architecturePath], repo, 30000);
   await writeFile(join(runDir, 'architecture-verification.txt'), architecture.output + violations.join('\n') + '\n');
   const behaviorPassed = behavior.code === 0 && !behavior.timedOut;
-  const architecturePassed =
-    architecture.code === 0 && !architecture.timedOut && violations.length === 0;
+  const architecturePassed = architecture.code === 0 && !architecture.timedOut && violations.length === 0;
   const result = {
     passed: behaviorPassed && architecturePassed && protectedChanges.length === 0 && changed.length > 0,
     behaviorPassed,

@@ -191,9 +191,45 @@ const snapshot = `(() => {
       return { name, w: c.width, h: c.height, cells: s }; } catch { return { name, w: c.width, h: c.height, cells: null }; } });
   return { text: (document.body.innerText || '').replace(/[ \\t]+/g, ' ').slice(0, 4000), canvases, frames: window.__leanaFrames || 0, t: performance.now() };
 })()`;
+// A WebGL canvas clears its drawing buffer once a frame is shown, unless asked to keep it: read from outside the
+// page's own frame callback it is blank, so every 3D scene read as "unchanged" however it moved (run brunner,
+// 2026-10-17: 12 observations of a drawn, animated city, each "canvas: unchanged", and Jev read none of them as
+// showing the work). The observed page keeps it, so a canvas reads as what it last drew.
+const keepDrawing = `(() => { const get = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+    return /^(webgl2?|experimental-webgl)$/.test(type) ? get.call(this, type, Object.assign({}, attrs, { preserveDrawingBuffer: true })) : get.call(this, type, attrs);
+  }; })()`;
+// What each canvas shows, from a snapshot: blank (one grey level everywhere) or drawn, with how much of it differs
+// from its most common level (its background) and where.
+export function canvasFacts(snap: Snap): string[] {
+  return snap.canvases.map(c => {
+    if (!c.cells) return `${c.name} (${c.w}x${c.h}): not readable (drawn from another origin)`;
+    const counts = new Map<string, number>();
+    for (const g of c.cells) counts.set(g, (counts.get(g) ?? 0) + 1);
+    const [ground] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]!;
+    if (counts.size === 1)
+      return `${c.name} (${c.w}x${c.h}): blank, one grey level (${parseInt(ground, 16)} of 15) everywhere`;
+    let n = 0,
+      x0 = 96,
+      y0 = 72,
+      x1 = -1,
+      y1 = -1;
+    for (let k = 0; k < c.cells.length; k++)
+      if (c.cells[k] !== ground) {
+        n++;
+        x0 = Math.min(x0, k % 96);
+        x1 = Math.max(x1, k % 96);
+        y0 = Math.min(y0, Math.floor(k / 96));
+        y1 = Math.max(y1, Math.floor(k / 96));
+      }
+    const sx = c.w / 96,
+      sy = c.h / 72;
+    return `${c.name} (${c.w}x${c.h}): drawn, ${counts.size} grey levels; ${((100 * n) / c.cells.length).toFixed(1)}% of it differs from its most common level (${parseInt(ground, 16)} of 15), within x ${Math.round(x0 * sx)}..${Math.round((x1 + 1) * sx)}, y ${Math.round(y0 * sy)}..${Math.round((y1 + 1) * sy)}`;
+  });
+}
 // Starts counting animation frames, so how fast the page draws while it is played is a fact.
 const countFrames = `(() => { if (!window.__leanaFrames) { window.__leanaFrames = 0; const f = () => { window.__leanaFrames++; requestAnimationFrame(f); }; requestAnimationFrame(f); } return true; })()`;
-interface Snap {
+export interface Snap {
   text: string;
   canvases: { name: string; w: number; h: number; cells: string | null }[];
   frames: number;
@@ -290,7 +326,7 @@ export async function renderFacts(
     if (serve && serve.trim()) {
       const wait = Math.min(timeoutMs, 45000);
       server = await startServer(root, serve, url, wait);
-      if (server.ready !== true) return { ok: false, text: notAnswering(serve, url, server, wait) };
+      if (server.ready !== true) return { ok: false, text: await notAnswering(serve, url, server, wait) };
     }
     const child = spawn(
       browser,
@@ -313,6 +349,7 @@ export async function renderFacts(
       const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
       for (const m of ['Page.enable', 'Runtime.enable', 'Log.enable', 'Network.enable'])
         await cdp.send(m, {}, sessionId);
+      await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: keepDrawing }, sessionId);
       await cdp.send('Page.navigate', { url }, sessionId);
       const until = Date.now() + Math.min(timeoutMs, 30000);
       while (Date.now() < until && !cdp.events.some(e => e.method === 'Page.loadEventFired')) await sleep(200);
@@ -324,10 +361,11 @@ export async function renderFacts(
       const played: string[] = [];
       const playErrors: string[] = [];
       const loadThrown = cdp.events.filter(e => e.method === 'Runtime.exceptionThrown').length;
+      const look = async (): Promise<Snap> =>
+        (await cdp.send('Runtime.evaluate', { expression: snapshot, returnByValue: true }, sessionId))?.result
+          ?.value as Snap;
+      const drawn = facts ? await look().then(canvasFacts, () => [] as string[]) : [];
       if (facts && inputs.length) {
-        const look = async (): Promise<Snap> =>
-          (await cdp.send('Runtime.evaluate', { expression: snapshot, returnByValue: true }, sessionId))?.result
-            ?.value as Snap;
         const thrown = () => cdp.events.filter(e => e.method === 'Runtime.exceptionThrown').length;
         await cdp.send('Runtime.evaluate', { expression: countFrames }, sessionId);
         await sleep(300);
@@ -505,6 +543,7 @@ export async function renderFacts(
         facts.offscreen.length
           ? `Elements wholly outside the viewport (not on screen where they are)${facts.scrollWidth > Number(facts.viewport.split('x')[0]) + 2 ? '' : ', the page not scrolling to them'}: ${facts.offscreen.join(' | ')}`
           : '',
+        drawn.length ? `Canvas: ${drawn.join(' | ')}` : '',
         `Headings: ${facts.headings.length ? facts.headings.join(' | ') : 'none'}`,
         facts.empty.length ? `Visible regions with no text or media: ${facts.empty.join(' | ')}` : '',
         `Links: ${facts.links.length ? facts.links.slice(0, 12).join(' | ') : 'none'}`,

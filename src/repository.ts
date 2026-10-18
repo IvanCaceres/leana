@@ -1,7 +1,7 @@
 // The repository as a project: its status, packages and installs, the checks it offers, what a check's
 // output names, and the sources a completion is judged on.
 import { readFile, stat, readdir } from 'node:fs/promises';
-import { posix, resolve } from 'node:path';
+import { isAbsolute, posix, relative, resolve } from 'node:path';
 import { bashPathOf } from './shell.js';
 import type { CheckSummary, SourceEvidence } from './types.js';
 import { clip } from './context.js';
@@ -374,4 +374,43 @@ export async function solutionTsconfigReferences(root: string): Promise<string[]
   const includes =
     (Array.isArray(cfg?.include) && cfg.include.length) || (Array.isArray(cfg?.files) && cfg.files.length);
   return refs.length && !includes ? refs : null;
+}
+// The package a start command runs (in the directory of its leading `cd <dir> &&`, else the root) when its
+// package.json has no script that starts it as that command does, with the scripts it has; null when one does, or
+// when there is no package.json there. Its user starts a project from its scripts (npm run dev, npm start): a
+// command only the worker typed is not one they know. (Run brunner, 2026-10-17: a Vite scene observed twelve
+// times through `npx vite preview` was finished with package.json's scripts still npm init's "test" alone, and
+// its user, opening index.html from disk, saw nothing.)
+export async function unscriptedStart(
+  root: string,
+  start: string,
+): Promise<{ dir: string; command: string; scripts: string[] } | null> {
+  const m = start.trim().match(/^cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)\s*&&\s*([\s\S]*)$/);
+  const command = (m ? m[2]! : start).trim();
+  let dir = m ? m[1]!.replace(/^(["'])(.*)\1$/, '$2') : '.';
+  if (!command || dir.startsWith('~')) return null;
+  // The shell's own spelling of a Windows path (/c/Users/...), as Git Bash writes it.
+  if (process.platform === 'win32') dir = dir.replace(/^\/([A-Za-z])(?=\/|$)/, (_, d: string) => `${d.toUpperCase()}:`);
+  const rel = relative(root, resolve(root, dir)) || '.';
+  if (rel.startsWith('..') || isAbsolute(rel)) return null;
+  const where = rel.split(/[\\/]/).join('/');
+  let scripts: Record<string, unknown>;
+  try {
+    scripts = JSON.parse(await boundedRead(await safePath(root, posix.join(where, 'package.json')))).scripts ?? {};
+  } catch {
+    return null;
+  }
+  const named = command.match(
+    /^(?:npm\s+(?:run(?:-script)?\s+(\S+)|(start|test|stop|restart)\b)|(?:yarn|pnpm|bun)\s+(?:run\s+)?(\S+))/,
+  );
+  const script = named && (named[1] ?? named[2] ?? named[3]);
+  if (script && typeof scripts[script] === 'string') return null;
+  // The program it runs (npx vite preview: vite): a script running the same program starts it the same way.
+  const program = command
+    .replace(/^(?:npx|bunx|pnpm\s+(?:exec|dlx)|yarn\s+(?:exec|dlx))\s+(?:-\S+\s+)*/, '')
+    .split(/\s+/)[0];
+  const runs = (v: unknown) =>
+    typeof v === 'string' && v.split(/&&|\|\||;/).some(part => part.trim().split(/\s+/)[0] === program);
+  if (program && Object.values(scripts).some(runs)) return null;
+  return { dir: where, command, scripts: Object.keys(scripts) };
 }

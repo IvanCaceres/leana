@@ -13,7 +13,7 @@ import { Store } from './store.js';
 import { ToolBox } from './tools.js';
 import { boundedRead, hash, listRepoFiles, safePath, treeChanges, treeSnapshot, TreeHashes } from './files.js';
 import { droppedLines } from './edit-checks.js';
-import { repositoryStatus, sourceHashes, summarizeCheck } from './repository.js';
+import { repositoryStatus, sourceHashes, summarizeCheck, unscriptedStart } from './repository.js';
 import { runCommand } from './commands.js';
 import {
   breakIndex,
@@ -2389,7 +2389,14 @@ export class Agent {
       ok: r.ok,
       text: clip(r.text, 4000),
     });
-    s.lastObservation = { step: s.step, kind, ok: r.ok, target, text: clip(r.text, 2600) };
+    s.lastObservation = {
+      step: s.step,
+      kind,
+      ok: r.ok,
+      target,
+      text: clip(r.text, 2600),
+      ...(start.trim() ? { start } : {}),
+    };
     await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
     this.observe({
       kind: 'result',
@@ -2412,7 +2419,7 @@ export class Agent {
   // The worker's completion claim: refused before the gate when the check of record does not stand, else judged
   // by the gate of a change or, with nothing written, checked or observed, the gate of an answer.
   private async actFinish(s: Session, args: Record<string, any>): Promise<Outcome> {
-    const blocked = this.finishBlocked(s);
+    const blocked = this.finishBlocked(s) ?? (await this.startBlocked(s));
     if (blocked) return this.refuseAction(s, 'finish', args, blocked.why, blocked.again);
     // Nothing written, checked or observed: the finish is an answer, judged against what the worker
     // read (see answerGate). A check or an observation is evidence the gate of a change reads.
@@ -2455,6 +2462,20 @@ export class Agent {
     return {
       why: `finish was not judged: the check of record ${c ? `failed (step ${c.step}, ${quote(c.command ?? s.lastCheckCommand ?? '')}, exit ${c.summary.code ?? 'unknown'})` : 'has never run: no bash command has been run with check: true in this session'}. Finish is judged once the check of record exits 0 after the last write${s.lastWriteStep >= 0 ? ` (step ${s.lastWriteStep})` : ''}; the check of record is the last bash command run with check: true, so each one replaces the one before.${passed}${again ? ` This finish was refused at the same state before (nothing has been written or checked since).` : ''}`,
       again,
+    };
+  }
+  // A result observed through a start command its package has no script for: its user has no named way to start
+  // it. Said once per start command, before the gate; a finish after it is judged as it stands.
+  private async startBlocked(s: Session): Promise<{ why: string; again: boolean } | null> {
+    const start = s.lastObservation?.start;
+    if (!start || s.startNoted === start) return null;
+    const missing = await unscriptedStart(this.tools.root, start).catch(() => null);
+    if (!missing) return null;
+    s.startNoted = start;
+    const pkg = missing.dir === '.' ? 'package.json' : `${missing.dir}/package.json`;
+    return {
+      why: `finish was not judged: the result was observed by starting it with \`${clip(missing.command, 120)}\`${missing.dir === '.' ? '' : ` in ${missing.dir}`}, but ${pkg} has no script that starts it (its scripts: ${missing.scripts.length ? missing.scripts.join(', ') : 'none'}). Its user starts a project from its scripts (npm run dev, npm start), not from a command only this session typed: add a script to ${pkg} that starts it, and say in the summary the command that runs it. This is said once; a finish after it is judged as it stands.`,
+      again: false,
     };
   }
   private async judgeAnswer(s: Session, summary: string): Promise<GateVerdict> {

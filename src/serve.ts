@@ -3,7 +3,7 @@
 // answers, and stopped afterwards whatever happens. Shared by every observer
 // that needs something running.
 import { spawn, type ChildProcess } from 'node:child_process';
-import { connect } from 'node:net';
+import { connect, createServer } from 'node:net';
 import { bashPath, killTree, missingBash, runMark, shellEnv } from './shell.js';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -68,7 +68,8 @@ export function localAddresses(output: string): string[] {
   ];
 }
 export interface Started {
-  ready: true | string[] | false;
+  // occupied: something already listened at the URL before the command started (it was not started).
+  ready: true | string[] | false | 'occupied';
   log: () => string;
   stop: () => void;
   exited?: () => number | string | null;
@@ -85,6 +86,12 @@ export async function startServer(
   url: string | null,
   timeoutMs: number,
 ): Promise<Started> {
+  // What already answers at the URL is not this command's server, and once it answers nothing tells them apart:
+  // the command is not started. (Run brunner2, 2026-10-18: a Vite server of another project held localhost:5173;
+  // `npx vite --port 5173 --strictPort` exited at once, the other project answered, and the run was verified and
+  // accepted on what that project showed.)
+  if (url && (await connectionAt(url)) === 'connected')
+    return { ready: 'occupied', log: () => '', stop: () => {}, exited: () => 'not started' };
   const out: string[] = [];
   const mark = runMark();
   const child: ChildProcess = spawn(bashPath(), ['--noprofile', '--norc', '-c', command], {
@@ -126,7 +133,11 @@ async function waitForStart(
   return false;
 }
 // What a start that did not answer at the URL is reported as.
-export function notAnswering(command: string, url: string, started: Started, timeoutMs: number): string {
+export async function notAnswering(command: string, url: string, started: Started, timeoutMs: number): Promise<string> {
+  if (started.ready === 'occupied') {
+    const free = await freePort();
+    return `Something was already listening at ${listeningAt(url) ?? url} before "${command}" was started, so it was not started: what answers there is another server (another project's, or one left running), and observing it would show that server, not this result. Observe this result on a port nothing listens at${free ? ` (${free} is free now)` : ''}: change the port in both start and target.`;
+  }
   return Array.isArray(started.ready)
     ? `The server started with "${command}" says it is listening at ${started.ready.join(', ')}, and nothing answered at ${url}. Its output:\n${started.log().slice(-1500)}`
     : `The server started with "${command}" did not answer at ${url} within ${Math.round(timeoutMs / 1000)}s. Its output:\n${started.log().slice(-1500)}`;
@@ -159,6 +170,26 @@ export async function connectionRefused(url: string, timeoutMs = 2000): Promise<
   }
   if (!/^https?:$/.test(u.protocol) || !localHost(u.hostname)) return false;
   return (await connection(u, timeoutMs)) === 'refused';
+}
+// What a TCP connection to where a URL's connections go meets; 'other' for a URL that is not on this machine.
+async function connectionAt(url: string): Promise<'connected' | 'refused' | 'other'> {
+  try {
+    const u = new URL(url);
+    return /^https?:$/.test(u.protocol) && localHost(u.hostname) ? await connection(u, 1000) : 'other';
+  } catch {
+    return 'other';
+  }
+}
+// A TCP port nothing listens at on this machine now, or null.
+function freePort(): Promise<number | null> {
+  return new Promise(done => {
+    const s = createServer();
+    s.once('error', () => done(null));
+    s.listen(0, '127.0.0.1', () => {
+      const a = s.address();
+      s.close(() => done(a && typeof a === 'object' ? a.port : null));
+    });
+  });
 }
 // What a TCP connection to where a URL's connections go meets.
 async function connection(u: URL, timeoutMs: number): Promise<'connected' | 'refused' | 'other'> {

@@ -214,6 +214,14 @@ export function validateAnswers(questions: Questions, raw: unknown): Answers {
   }
   return answers;
 }
+// A value with each string's unpaired surrogates replaced by U+FFFD, as String.prototype.toWellFormed does.
+export function wellFormed<T>(v: T): T {
+  if (typeof v === 'string')
+    return v.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '�') as T;
+  if (Array.isArray(v)) return v.map(wellFormed) as T;
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, wellFormed(x)])) as T;
+  return v;
+}
 export class Jev {
   constructor(
     readonly config: Config,
@@ -222,7 +230,10 @@ export class Jev {
   ) {
     if (!key) throw new Error('Set TYPESAFE_API_KEY in the environment (or use --env-file PATH).');
   }
-  async decide(state: unknown, questions: Questions, context?: { step: number; phase: string }): Promise<Answers> {
+  async decide(stateIn: unknown, questions: Questions, context?: { step: number; phase: string }): Promise<Answers> {
+    // Every string well-formed: a text cut anywhere in the state (one of many slices) can end on half an emoji,
+    // and TypeSafe refuses the whole request ("Request contains invalid Unicode text", HTTP 400).
+    const state = wellFormed(stateIn);
     const body = { model: this.config.jevModel, state, questions };
     // Conservative UTF-8 byte caps, not characters/4; bound the hosted model request too.
     if (Buffer.byteLength(JSON.stringify(state)) > 22000 || Buffer.byteLength(JSON.stringify(body)) > 50000)
@@ -231,7 +242,13 @@ export class Jev {
     await this.log('jev-request', { requestId, ...context, model: body.model, state, questions });
     const start = performance.now();
     try {
-      const result = await postJson(this.config.jevUrl, body, this.key, 15000);
+      // A dropped connection or a timeout is tried once more (post retries only the transient statuses); a 4xx
+      // refuses this request as it is, so it is not.
+      const result = await postJson(this.config.jevUrl, body, this.key, 15000).catch(e =>
+        /^HTTP 4\d\d /.test((e as Error).message)
+          ? Promise.reject(e)
+          : sleep(500).then(() => postJson(this.config.jevUrl, body, this.key, 15000)),
+      );
       let answers: Answers;
       try {
         answers = validateAnswers(questions, result.answers);

@@ -3,7 +3,7 @@ import { open, rename, stat, unlink } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import type { Config, Route, ToolResult } from './types.js';
 import { clip } from './context.js';
-import { localAddresses } from './serve.js';
+import { foregroundServer, localAddresses } from './serve.js';
 import { relativeImports, syntaxErrors } from './code.js';
 import {
   type EditRecord,
@@ -501,14 +501,19 @@ export class ToolBox {
     const prefix = this.commandPrefix ? await this.commandPrefix().catch(() => '') : '';
     // A command that announces a local address and then goes quiet while still running is a
     // server: a shell step cannot keep it alive, so it is stopped and said to be one. Never a check.
+    // One that announces nothing is known by its command: a server started in the foreground and quiet for 8 s.
+    // (Run saas-landing-glm-5.3 trial 7: `npx -y http-server dist -p 4173 --silent` held its step to the 60 s timeout.)
+    const server = a.check === true ? null : foregroundServer(String(a.command));
     const settle =
       a.check === true
         ? undefined
         : (output: string, quietMs: number) => {
             const at = localAddresses(output);
-            return at.length && quietMs >= 5000
-              ? `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.`
-              : null;
+            if (at.length && quietMs >= 5000)
+              return `This command is a server: it announced ${at.slice(0, 3).join(', ')} and kept running, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to that address.`;
+            if (server && quietMs >= 8000)
+              return `This command starts a server (${server.what}) and was still running, quiet, after ${Math.round(quietMs / 1000)} s, so it was stopped (a shell step cannot keep a process alive). To look at what it serves, use observe with start set to this command and target set to ${server.port ? `http://localhost:${server.port}/` : 'the address it serves'}.`;
+            return null;
           };
     // Output past what is kept in memory is saved whole, as an artifact read_files and search_codebase can read.
     const saved = `${String(this.step).padStart(5, '0')}-command-${++this.commands}.log`;

@@ -1793,7 +1793,12 @@ export class Agent {
       s,
       `Proposed by the harness: Jev reads the objective as satisfied (${last!.objective.toFixed(2)}) and ${s.lastCheck!.command ?? s.lastCheckCommand} passed after the last edit. Notes: ${clip(s.notes ?? '', 600)}`,
     );
-    const verdict = await evidenceGate(this.jev, s, facts);
+    const verdict = await this.judged(s, () => evidenceGate(this.jev, s, facts));
+    if (!verdict) {
+      // Proposed again at this check on a later turn.
+      s.finishTriedAtCheck = -1;
+      return undefined;
+    }
     await this.store.log('completion', { step: s.step, proposedBy: 'harness', ...verdict });
     this.observe({
       kind: 'jev',
@@ -2549,7 +2554,14 @@ export class Agent {
     // read (see answerGate). A check or an observation is evidence the gate of a change reads.
     const answer = s.lastWriteStep < 0 && !s.lastCheck && !s.lastObservation;
     const summary = String(args.summary ?? '');
-    const verdict = answer ? await this.judgeAnswer(s, summary) : await this.judgeChange(s, summary);
+    const verdict = await this.judged(s, () => (answer ? this.judgeAnswer(s, summary) : this.judgeChange(s, summary)));
+    if (!verdict) {
+      await this.evidence(s, 'completion', {
+        ok: false,
+        text: 'The finish was not judged: the completion gate could not be reached (an error on its side, not a verdict on the work). Nothing is wrong with the work for that; finish again.',
+      });
+      return 'failed';
+    }
     await this.store.log('completion', { step: s.step, ...verdict });
     this.observe({
       kind: 'jev',
@@ -2601,6 +2613,21 @@ export class Agent {
       why: `finish was not judged: the result was observed by starting it with \`${clip(missing.command, 120)}\`${missing.dir === '.' ? '' : ` in ${missing.dir}`}, but ${pkg} has no script that starts it (its scripts: ${missing.scripts.length ? missing.scripts.join(', ') : 'none'}). Its user starts a project from its scripts (npm run dev, npm start), not from a command only this session typed: add a script to ${pkg} that starts it, and say in the summary the command that runs it. This is said once; a finish after it is judged as it stands.`,
       again: false,
     };
+  }
+  // A completion gate's verdict, or null when Jev could not give one: the finish goes unjudged rather than ending
+  // the session, which paused a finished run (saas-landing-glm-5.3 trial 6, its build and page passing) on one
+  // HTTP 400. Three such failures in a row still pause it: Jev is then out of reach, not briefly unavailable.
+  private async judged(s: Session, gate: () => Promise<GateVerdict>): Promise<GateVerdict | null> {
+    try {
+      const verdict = await gate();
+      s.gateErrors = 0;
+      return verdict;
+    } catch (e) {
+      s.gateErrors = (s.gateErrors ?? 0) + 1;
+      await this.store.log('gate-error', { step: s.step, error: (e as Error).message, inARow: s.gateErrors });
+      if (s.gateErrors >= 3) throw e;
+      return null;
+    }
   }
   private async judgeAnswer(s: Session, summary: string): Promise<GateVerdict> {
     const evidence = answerEvidence(s);

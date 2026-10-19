@@ -22,14 +22,23 @@ export function clipEnds(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const head = Math.floor(limit * 0.55);
   const tail = limit - head - 3;
-  return `${text.slice(0, head)}\n…\n${text.slice(text.length - tail)}`;
+  return `${text.slice(0, whole(text, head))}\n…\n${text.slice(whole(text, text.length - tail))}`;
 }
 const clipMarker = '\n[…truncated; use a narrower read or query…]\n';
 export function clip(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const room = Math.max(0, limit - clipMarker.length);
-  return text.slice(0, Math.ceil(room * 0.7)) + clipMarker + text.slice(-Math.floor(room * 0.3));
+  return (
+    text.slice(0, whole(text, Math.ceil(room * 0.7))) +
+    clipMarker +
+    text.slice(whole(text, text.length - Math.floor(room * 0.3)))
+  );
 }
+// A cut at i moved back off the middle of a character written as two UTF-16 units (an emoji): either half alone is
+// not Unicode text, and TypeSafe refuses a request holding one (HTTP 400). Run saas-landing-glm-5.3 trial 6 lost its
+// finished run when the excerpt of src/data.ts its completion gate sent ended half way through an icon's emoji.
+export const whole = (text: string, i: number): number =>
+  i > 0 && i < text.length && /[\ud800-\udbff]/.test(text[i - 1]!) && /[\udc00-\udfff]/.test(text[i]!) ? i - 1 : i;
 // The entry, newest first, that shows every part of text a clip kept (clipEnds and clip cut at
 // their markers), as written or as the content of a JSON string (a command's output sits in its
 // result's JSON). A tail field that restates it names the entry instead: the tail is processed

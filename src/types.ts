@@ -122,6 +122,9 @@ export interface Session {
   lastCompact: number;
   phase: Phase;
   knownFiles: string[];
+  // The repository's files when the session started: one not among them came to exist during the run (a scaffold's,
+  // or one the run wrote). Absent in a session saved before it was kept.
+  filesAtStart?: string[];
   inspectionCount: number;
   lastError: string | null;
   lastRoute: Route | null;

@@ -1610,3 +1610,103 @@ test("Reasoning left to the model ('auto', the default) is on through OpenRouter
   assert.deepEqual(reasoning.set(defaults, 'auto'), { stepThinking: 'auto' });
   assert.deepEqual(reasoning.set(defaults, 'off'), { stepThinking: false });
 });
+
+test('Under the tools form a batch keeps going past a refused call for its writes to other files, a create_file of a file the run brought into being writes over it, and an earlier write said in one line keeps the class names it uses (run saas-landing-glm-5.3 trial 4)', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'leana-or-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, 'pre.txt'), 'kept\n');
+  const store = new Store(join(root, '.leana', 'runs', 'r'));
+  await store.init();
+  const html = '<!doctype html><html><body><div id="root"></div></body></html>\n';
+  const hero = `export function Hero() {\n  return (\n    <section className="hero">\n      <h1 className="hero__title">Ship faster</h1>\n${Array.from({ length: 12 }, (_, i) => `      <p className="hero__text">Line ${i + 1} of the copy for the landing page hero.</p>\n`).join('')}    </section>\n  );\n}\n`;
+  const steps: { text: string; calls: [string, string][] }[] = [
+    {
+      text: 'Scaffold.',
+      calls: [
+        [
+          'bash',
+          JSON.stringify({
+            command: `node -e "require('fs').writeFileSync('index.html', '<p>scaffold</p>')"`,
+            purpose: 'scaffold',
+          }),
+        ],
+      ],
+    },
+    {
+      text: 'Write the app in one batch.',
+      calls: [
+        ['create_file', JSON.stringify({ path: 'pre.txt', content: 'replaced\n' })],
+        ['create_file', JSON.stringify({ path: 'index.html', content: html })],
+        ['create_file', JSON.stringify({ path: 'src/Hero.jsx', content: hero })],
+        ['bash', JSON.stringify({ command: 'node -e "process.exit(0)"', purpose: 'never', check: true })],
+        ['create_file', JSON.stringify({ path: 'src/b.mjs', content: 'export const b = 2;\n' })],
+      ],
+    },
+    { text: 'Note it.', calls: [['plan', JSON.stringify({ notes: 'written' })]] },
+    { text: 'Note it again.', calls: [['plan', JSON.stringify({ notes: 'written again' })]] },
+  ];
+  let step = 0;
+  const { url, bodies } = await mock(t, async (b, _n, res) => {
+    const s = steps[Math.min(step++, steps.length - 1)]!;
+    return sse(res, [
+      ...pieces(s.text, 6).map(p => ({ content: p })),
+      ...s.calls.flatMap(([name, args], index) =>
+        pieces(args, 40).map((p, i) => ({
+          tool_calls: [
+            {
+              index,
+              ...(i ? {} : { id: `call_${step}_${index}`, type: 'function' }),
+              function: { ...(i ? {} : { name }), arguments: p },
+            },
+          ],
+        })),
+      ),
+    ]);
+  });
+  const noul = (v: number) => ({ type: 'noul' as const, noul: v });
+  const jev = {
+    decide: async (_s: unknown, q: Questions): Promise<Answers> =>
+      Object.fromEntries(
+        Object.keys(q).map(k => [k, k === 'progress' || k === 'in_scope' ? noul(0.8) : noul(0.1)]),
+      ) as any,
+  };
+  const gpt = (await catalogue()).data.map(openrouterModelInfo)[1];
+  const { config: fitted } = forModel(cfg(url, gpt.id, { openrouterMaxTurns: 4 }), gpt);
+  const or = new OpenRouter(fitted, 'k', store.log.bind(store));
+  const s = await new Agent(
+    fitted,
+    store,
+    jev as any,
+    or,
+    root,
+    () => {},
+    () => {},
+  ).run(await newSession(root, 'Build it'));
+  assert.equal(s.form, 'tools');
+  assert.equal(
+    await readFile(join(root, 'pre.txt'), 'utf8'),
+    'kept\n',
+    'a file there at the start is not created over',
+  );
+  assert.equal(await readFile(join(root, 'index.html'), 'utf8'), html, "the scaffold's file, written over");
+  assert.equal(await readFile(join(root, 'src', 'Hero.jsx'), 'utf8'), hero, 'a write after the refusal ran');
+  assert.equal(
+    await readFile(join(root, 'src', 'b.mjs'), 'utf8'),
+    'export const b = 2;\n',
+    'and the write after the command',
+  );
+  assert.equal(s.lastCheckCommand ?? null, null, 'the command after the refusal did not run');
+  assert(
+    s.entries.some(
+      e =>
+        /later write\(s\) to other files were run/.test(e.text) &&
+        /other 1 action\(s\) were not run \(bash\)/.test(e.text),
+    ),
+    'the refusal says which actions ran and which did not',
+  );
+  const last = JSON.stringify(bodies.at(-1));
+  assert.match(
+    last,
+    /written at step \d+; not repeated here: read_files shows src\/Hero\.jsx as it is now; the class names it uses: hero hero__title hero__text/,
+  );
+});

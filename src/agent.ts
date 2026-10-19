@@ -155,6 +155,18 @@ async function answerCoverage(s: Session): Promise<AnswerCoverage> {
 }
 // A repository path as one spelling: forward slashes, no leading ./.
 const normalPath = (p: string): string => p.replace(/\\/g, '/').replace(/^(\.\/)+/, '');
+// Whether a file came to exist during the run: not among the files at its start, and not of a kind that listing
+// leaves out (.git, .leana, node_modules, .env files, keys), which may have been there all along.
+const cameDuringRun = (s: Session, path: string): boolean => {
+  const p = normalPath(path);
+  return (
+    Array.isArray(s.filesAtStart) &&
+    !s.filesAtStart.includes(p) &&
+    !/(^|\/)(\.git|\.leana|node_modules)\//.test(p) &&
+    !/(^|\/)\.env(\.|$)/.test(p) &&
+    !/\.(pem|key)$/i.test(p)
+  );
+};
 const readIfPresent = (root: string, path: string): Promise<string | null> =>
   safePath(root, path)
     .then(f => readFile(f, 'utf8'))
@@ -171,8 +183,10 @@ export async function newSession(root: string, objective: string): Promise<Sessi
   }
   if (Buffer.byteLength(instructions) > 12000)
     throw new Error('Root AGENTS.md exceeds 12 KB pinned instruction budget');
+  const files = await listRepoFiles(root);
   return {
     version: 1,
+    filesAtStart: [...files],
     root,
     objective,
     instructions,
@@ -187,7 +201,7 @@ export async function newSession(root: string, objective: string): Promise<Sessi
     lastWriteStep: -1,
     lastCheckStep: -1,
     phase: 'implement',
-    knownFiles: await listRepoFiles(root),
+    knownFiles: files,
     inspectionCount: 0,
     lastError: null,
     editEvidence: [],
@@ -1908,7 +1922,24 @@ export class Agent {
     const duplicates: boolean[] = [];
     const startFailures = run.failures;
     const notesBefore: string | undefined = s.notes;
+    // After an action fails, the rest of the batch waits for the worker to reason about it, except, under the tools
+    // form, its writes to other files: their content is already written (and paid for) in the calls, and none of them
+    // judges the failed one. Run saas-landing-glm-5.3 trial 4 lost eleven new components, 12,400 output tokens, to the
+    // refusal of its first call. held: the files the failed actions write.
+    let held: Set<string> | null = null;
+    let heldEntry: Entry | undefined;
+    let ranAfter = 0;
+    const notRun: Route[] = [];
+    const target = (b: Batch[number]) =>
+      editRoutes.includes(b.action) ? normalPath(String(b.args?.path ?? b.args?.destination ?? '')) : '';
     for (let i = 0; i < batch.length; i++) {
+      if (held) {
+        const t = target(batch[i]!);
+        if (!t || held.has(t)) {
+          notRun.push(batch[i]!.action);
+          continue;
+        }
+      }
       if (i > 0) {
         if (s.step >= run.endStep) break;
         s.step++;
@@ -1916,6 +1947,7 @@ export class Agent {
         this.observe({ kind: 'step', step: s.step, phase: s.phase, ...this.counted(run) });
       }
       const { action, problem } = batch[i]!;
+      const after = held !== null;
       const args = await this.callArguments(s, batch[i]!);
       this.duplicate = false;
       const outcome = await this.perform(
@@ -1936,22 +1968,36 @@ export class Agent {
       // and the turn is judged as a whole below.
       if ((outcome === 'ok' && !(action === 'plan' && s.notes === notesBefore)) || outcome === 'failed')
         run.failures = 0;
-      if (outcome === 'refused' && ++run.failures >= 4)
+      // A write run after the batch's first failure counts toward nothing: the turn already has its failure.
+      if (outcome === 'refused' && !after && ++run.failures >= 4)
         throw new Error('four actions in a row could not be executed; the session needs a different approach');
       if (outcome === 'stop') {
         halted = true;
         break;
       }
+      if (after) ranAfter++;
       if ((outcome === 'failed' || outcome === 'refused') && i < batch.length - 1) {
-        const e = s.entries.at(-1);
-        if (e)
-          e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch
-            .slice(i + 1)
-            .map(b => b.action)
-            .join(', ')}); reason about the result first.`;
-        break;
+        if (s.form !== 'tools') {
+          const e = s.entries.at(-1);
+          if (e)
+            e.text += `\nThe remaining ${batch.length - 1 - i} action(s) of this batch were not run (${batch
+              .slice(i + 1)
+              .map(b => b.action)
+              .join(', ')}); reason about the result first.`;
+          break;
+        }
+        held ??= new Set();
+        heldEntry ??= s.entries.at(-1);
+        const t = target(batch[i]!);
+        if (t) held.add(t);
       }
     }
+    if (heldEntry && (notRun.length || ranAfter))
+      heldEntry.text += `\n${
+        ranAfter
+          ? `The batch's ${ranAfter} later write(s) to other files were run, each with its own result${notRun.length ? '; ' : '.'}`
+          : ''
+      }${notRun.length ? `${ranAfter ? 'its' : "The batch's"} other ${notRun.length} action(s) were not run (${notRun.join(', ')}); reason about the result first.` : ''}`;
     s.currentTurn = null;
     await this.judgeTurn(s, { turn, repeated, batch, outcomes, duplicates, startFailures, notesBefore, halted }, run);
     return halted ? 'stop' : undefined;
@@ -2618,6 +2664,14 @@ export class Agent {
   private async actWriteFile(s: Session, route: Route, args: Record<string, any>, thought: string): Promise<Outcome> {
     // Under the tools form the content is the model's own, written in its call; it is written as generated content is, with the same facts.
     const given = s.form === 'tools' && typeof args.content === 'string' ? args.content : undefined;
+    // The whole content written for a file that has come to exist during this run (a scaffold's index.html, one the
+    // run wrote) replaces it, as rewrite_file would: refusing it threw away the batch it led. Run saas-landing-glm-5.3
+    // trial 4 regenerated 7,500 tokens of components after its create_file of the Vite scaffold's index.html.
+    const over =
+      route === 'create_file' &&
+      given !== undefined &&
+      cameDuringRun(s, String(args.path ?? '')) &&
+      (await readIfPresent(this.tools.root, String(args.path))) !== null;
     try {
       if (given === undefined && route === 'create_file' && typeof args.content === 'string' && args.content.trim())
         await this.execute(s, 'create_file', { path: args.path, content: args.content }, 'write-as-create');
@@ -2627,7 +2681,7 @@ export class Agent {
           String(args.path),
           String(args.purpose ?? ''),
           thought,
-          route === 'rewrite_file',
+          route === 'rewrite_file' || over,
           { start: args.start, end: args.end },
           Agent.actionKey(s, route, args, true),
           given,

@@ -985,6 +985,61 @@ test("A model's OpenRouter endpoints are asked for in order of what Leana's requ
   assert.equal(unlisted.bodies[0].provider?.order, undefined, 'no endpoint list: the request goes as before');
 });
 
+test('Under the tools form a result that no longer describes the repository and holds nothing current is said in one line, with why and where it is kept; one that still holds lines no later read shows stays whole (run react-demo-glm-8: six re-reads of its own files, each whole in every later prompt)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'leana-stale-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const s = await newSession(dir, 'x');
+  s.form = 'tools';
+  s.allowedActions = ['read_files', 'write', 'plan'];
+  const read = (path: string) =>
+    `${path} sha256=abc totalLines=40 shown=1..40\n${Array.from({ length: 40 }, (_, i) => `${i + 1}: const v${i} = ${i};`).join('\n')}`;
+  const turn = (id: string, step: number, actions: any[]) => ({
+    id,
+    step,
+    kind: 'turn' as const,
+    artifact: '',
+    relevance: 0.5,
+    outcomes: actions.map(a => `${a.action} ok`),
+    text: JSON.stringify({ thought: `Turn ${id}.`, actions }),
+  });
+  s.entries.push(
+    turn('t1', 1, [{ action: 'read_files', args: { files: [{ path: 'src/a.ts' }] } }]),
+    {
+      id: 'e1',
+      step: 1,
+      kind: 'read_files',
+      artifact: '@artifact/00001.txt',
+      relevance: 0.5,
+      turn: 't1',
+      text: read('src/a.ts'),
+      stale: 'edited at step 3: text and line numbers no longer match src/a.ts',
+    },
+    turn('t2', 2, [{ action: 'read_files', args: { files: [{ path: 'src/b.ts' }] } }]),
+    {
+      id: 'e2',
+      step: 2,
+      kind: 'read_files',
+      artifact: '@artifact/00002.txt',
+      relevance: 0.5,
+      turn: 't2',
+      text: read('src/b.ts'),
+      stale: 'superseded by the read at step 9',
+    },
+    turn('t3', 3, [{ action: 'write', args: { path: 'src/a.ts', oldText: 'v0', newText: 'w0' } }]),
+    { id: 'e3', step: 3, kind: 'write', artifact: 'a', relevance: 0.5, turn: 't3', text: 'written' },
+  );
+  s.writeSteps = { 'src/a.ts': 3 };
+  const results = stepMessages(s, s.allowedActions)
+    .filter(m => m.role === 'tool')
+    .map(m => JSON.parse(m.content).evidence);
+  assert.equal(
+    results[0].text,
+    '[left out: edited at step 3: text and line numbers no longer match src/a.ts. @artifact/00001.txt holds it in full.]',
+  );
+  assert.equal(results[1].text, read('src/b.ts'), 'its lines are shown by no later read and b.ts was not edited: kept');
+  assert.equal(results[2].text, 'written');
+});
+
 test("The tools form leaves Bonsai's prompt as it was: no session form, the same system message, the actions pinned, turns as JSON", async t => {
   const dir = await mkdtemp(join(tmpdir(), 'leana-form-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

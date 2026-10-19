@@ -296,6 +296,8 @@ export interface Session {
   // The last observation of the result as its user meets it (a page, a service, a program run), as facts.
   // start: the command the observation started it with, if any.
   lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string; start?: string };
+  // Calls of the last turn past its limit, not run: said in the next request, then cleared.
+  droppedCalls?: string[];
   // The screenshot of the last page observation, until the next step's prompt has shown it to the model.
   screenshot?: { step: number; path: string; target: string };
   // The start command a finish was told has no script (see Agent.finishBlocked): told once.

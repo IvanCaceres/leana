@@ -236,6 +236,11 @@ export async function newSession(root: string, objective: string): Promise<Sessi
 }
 
 // The model client: llama-server's (Bonsai) or OpenRouter's, which make the same calls.
+// The most calls a turn runs under the tools form (Bonsai's grammar holds a turn to eight): a model that batches
+// writes many files in one turn. Runs of 2026-10-18 and -19 sent 9 to 14 calls in eight turns and the calls past
+// eight were dropped unsaid (react-demo-3: five create_file calls and the check); the best GLM-5.3 run (react-demo-
+// glm-5) wrote eight files in its one turn of work, at the old limit.
+const toolsTurnCalls = 16;
 type BonsaiLike = Pick<Bonsai, 'count' | 'generate'> & {
   generateText?: Bonsai['generateText'];
   lastMeta?: Bonsai['lastMeta'] | null;
@@ -1676,6 +1681,26 @@ export class Agent {
         'Jev reads the last three steps as work the objective did not ask for. Finish what the objective asks, run your check, and finish; or ask the user whether the extra work is wanted.',
       );
     if ((await this.proposeCompletion(s, last, notes)) === 'stop') return 'stop';
+    if (s.droppedCalls?.length) {
+      notes.push(
+        `${s.droppedCalls.length} call${s.droppedCalls.length === 1 ? '' : 's'} of your last turn did not run (a turn runs at most ${toolsTurnCalls}): ${s.droppedCalls.join(', ')}. Make whichever of them are still needed now.`,
+      );
+      delete s.droppedCalls;
+    }
+    // Under the tools form every turn re-sends the whole conversation: a turn of one call that did not decide what
+    // follows is the costliest way to work. (Run react-demo-glm-8: 28 requests, most of one call, 338k prompt
+    // tokens; react-demo-glm-5 did the same work in 9, writing eight files in one turn.)
+    const lastTurn = s.form === 'tools' ? s.entries.filter(e => e.kind === 'turn').at(-1) : undefined;
+    if (
+      lastTurn &&
+      (lastTurn.outcomes?.length ?? 0) === 1 &&
+      /^(read_files|search_codebase|create_file|rewrite_file|write|replace_lines|move_lines) ok/.test(
+        lastTurn.outcomes![0]!,
+      )
+    )
+      notes.push(
+        `Your last turn made one call. Every turn re-sends the whole conversation, so batch as many calls as you can into this one: read every file you still need in one read_files, write every file you can write now (up to ${toolsTurnCalls} calls), then the check.`,
+      );
     if (s.lastCheckCommand && s.lastWriteStep > (s.lastCheck?.step ?? -1) && s.editsSinceCheck >= 3)
       notes.push(`${s.editsSinceCheck} edits have landed since your check last ran; run it when you want them judged.`);
     const readOnly = s.readOnlyTurns ?? 0;
@@ -1802,7 +1827,7 @@ export class Agent {
           type: 'object',
           properties: {
             thought: { type: 'string' },
-            actions: { type: 'array', minItems: 1, maxItems: 8, items: item },
+            actions: { type: 'array', minItems: 1, maxItems: s.form === 'tools' ? toolsTurnCalls : 8, items: item },
           },
           required: ['thought', 'actions'],
           additionalProperties: false,
@@ -1810,6 +1835,11 @@ export class Agent {
         temperature,
       );
       const thought = String(gen.thought ?? '').trim();
+      // Calls past the turn's limit were not run: the next request says which, so they are not taken as done.
+      if (Array.isArray(gen.dropped) && gen.dropped.length) {
+        await this.store.log('calls-not-run', { step: s.step, calls: gen.dropped });
+        s.droppedCalls = gen.dropped.map(String);
+      }
       // Calls written in a shape that reads one way only are made into the calls meant (repairCalls): under the
       // tools form, where a call's arguments are the model's to shape and are checked after (argsProblem). Bonsai's
       // grammar holds its calls to the schema as they are generated, so its batch is taken as written.

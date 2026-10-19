@@ -823,6 +823,19 @@ function elided(action: string, args: unknown, step: number): unknown {
   }
   return out;
 }
+// A result that no longer describes the repository (a read of a file since edited or read again, a check
+// superseded by a later one) and holds nothing current, said in one line with why and where it is kept, instead
+// of in full: the evidence marks such entries stale and evicts them first, but only once the prompt passes its
+// working budget, which a run through OpenRouter (90,000 tokens) seldom reaches. Run react-demo-glm-8 re-read files
+// it had written six times, and every read stayed whole in every later prompt. The entry changes once, when it
+// turns stale.
+function currentContent(s: Session, e: Entry): string {
+  if (!e.stale || e.text.length <= 400 || holdsCurrent(s, e)) return evidenceContent(e);
+  const where = e.artifact ? ` ${e.artifact} holds it in full.` : '';
+  return JSON.stringify({
+    evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: `[left out: ${e.stale}.${where}]` },
+  });
+}
 // The evidence as the model's own tool-calling transcript: a turn is an assistant message, its thought as the
 // text and one call per action; right after it, one tool message per call. Action i of a turn ran at the turn's
 // step + i, so a call's result is the turn's entries of that step. A call with none says what is known of it:
@@ -836,7 +849,7 @@ function toolTranscript(s: Session): Message[] {
   const out: Message[] = [];
   for (const e of s.entries) {
     if (e.kind !== 'turn') {
-      if (!e.turn || !shown.has(e.turn)) out.push(evidenceMessage(e));
+      if (!e.turn || !shown.has(e.turn)) out.push({ role: 'user', content: currentContent(s, e) });
       continue;
     }
     let turn: { thought?: unknown; actions?: { action: string; args?: unknown }[] } = {};
@@ -864,7 +877,7 @@ function toolTranscript(s: Session): Message[] {
     calls.forEach((c, i) => {
       const mine = results.filter(r => Math.min(Math.max(r.step - e.step, 0), calls.length - 1) === i);
       const content = mine.length
-        ? mine.map(evidenceContent).join('\n')
+        ? mine.map(r => currentContent(s, r)).join('\n')
         : i === running
           ? 'Running: the request below is for this call.'
           : running >= 0 && i > running
@@ -893,7 +906,7 @@ export function stepMessages(s: Session, allowed: string[], note?: string): Mess
   const request = {
     role:
       s.form === 'tools'
-        ? `Reason, then act. Write one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then call the tools for one to eight actions, in order. The harness runs the calls in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one call when its result decides what comes next.`
+        ? `Reason, then act. Write one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then call the tools, up to sixteen calls in order. Every turn re-sends the whole conversation, so the fewer turns the better: batch every call that follows from what you know now. Read every file you need in one turn; write every file you can write now in one turn, one call each; then the check, and an observation last. The harness runs the calls in order and stops at the first failure. Make a turn of one call only when its result decides everything after it.`
         : `Reason, then act. Write thought: one to three sentences on what the latest evidence shows and what to do next and why; your notes and your earlier turns already record what is done, so do not list it again. Then actions: an ordered list of one to eight actions (each an action name from ${narrowed ? 'allowedActions' : "the pinned block's actions"} with its args under that action's schema; descriptions, instructions and schemas are in the pinned block under actions). The harness runs them in order and stops at the first failure, so batch what follows from your reasoning (several files to create, an edit and its check, a check and an observation) and put a check or an observation last; keep to one action when its result decides what comes next.`,
     ...agentRequestBase(s, note),
     ...(narrowed && s.form !== 'tools' ? { allowedActions: allowed } : {}),

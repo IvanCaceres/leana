@@ -15,7 +15,7 @@ export const defaults: Config = {
   // The evidence budget of a model through OpenRouter: 0 fits it to the model (a quarter of its window, at most
   // 64000 tokens); workingTokens is Bonsai's, sized for its window and its local prefill.
   openrouterWorkingTokens: 0,
-  // The turns an invocation through OpenRouter may take (a turn runs one to eight actions); maxSteps is Bonsai's, in actions.
+  // The turns an invocation through OpenRouter may take (a turn runs one to sixteen actions); maxSteps is Bonsai's, in actions.
   openrouterMaxTurns: 120,
   // Prompt caching through OpenRouter: auto for a model whose catalogue lists a cache-read price, or off.
   promptCache: 'auto',

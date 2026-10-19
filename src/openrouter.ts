@@ -552,6 +552,8 @@ export class OpenRouter {
           });
         return {
           thought: r.content.trim(),
+          // Calls past the turn's limit are not run: said to the worker by the agent, with their names.
+          ...(r.calls.length > most ? { dropped: r.calls.slice(most).map(c => c.name) } : {}),
           actions: r.calls.slice(0, most).map(c => {
             let args: unknown;
             try {

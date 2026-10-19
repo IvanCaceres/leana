@@ -20,6 +20,7 @@ import {
   writeFileSync,
   createWriteStream,
   cpSync,
+  copyFileSync,
 } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
@@ -29,6 +30,31 @@ import { parseArgs } from 'node:util';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..');
+// A harness may stop every Node process on the machine: Cline stopped its preview server with
+// `Get-Process node | Stop-Process -Force`, which stopped the runner (and its proxy) too. On Windows the runner runs as a
+// copy of Node under another name, which a command naming node does not reach; the harnesses still run as themselves.
+// It is started detached: Node puts a child in a job that ends with its parent, and the parent here is a node. Its
+// output comes through the parent while that lives; if the parent is stopped, the runner carries on (its results are
+// files), its writes to the closed pipes ignored.
+if (process.platform === 'win32' && !/leana-bench\.exe$/i.test(process.execPath)) {
+  const copy = join(tmpdir(), 'leana-bench-node', 'leana-bench.exe');
+  if (!existsSync(copy) || statSync(copy).size !== statSync(process.execPath).size) {
+    mkdirSync(dirname(copy), { recursive: true });
+    copyFileSync(process.execPath, copy);
+  }
+  const c = spawn(copy, [...process.execArgv, fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+    windowsHide: true,
+    env: { ...process.env, LEANA_BENCH_NODE: process.execPath },
+  });
+  c.stdout.pipe(process.stdout);
+  c.stderr.pipe(process.stderr);
+  await new Promise(() => c.on('exit', code => process.exit(code ?? 1)));
+}
+if (process.env.LEANA_BENCH_NODE) for (const s of [process.stdout, process.stderr]) s.on('error', () => {});
+// The Node that runs Leana: the one the runner was started with, as a harness would be.
+const nodeExe = process.env.LEANA_BENCH_NODE || process.execPath;
 const { values: args } = parseArgs({
   options: {
     harness: { type: 'string', default: 'leana,hermes,cline,opencode' },
@@ -365,7 +391,7 @@ const harnesses = {
       return { proxy, config };
     },
     command: (s, repo, trial, ctx) => [
-      process.execPath,
+      nodeExe,
       [
         join(root, 'dist', 'src', 'cli.js'),
         'run',
@@ -967,9 +993,11 @@ if (args.rescore) {
       }).finally(() => clearInterval(watchdog));
       const wallSeconds = (Date.now() - t0) / 1000;
       // Working time: until the harness's last exchange with OpenRouter (its last reply, or for Leana the last before its
-      // completion check), apart from any wait after it for processes it left (the watchdog's case) or for its exit.
+      // completion check), less the quiet spells the watchdog ended by stopping what the harness waited on: the waits
+      // after its work, or within it (Hermes waited 7 minutes on the `npm run dev` it had started, then replied once).
       const lastTalk = ctx.proxy?.activity().last ?? 0;
-      const workingSeconds = lastTalk > t0 ? Math.min(wallSeconds, (lastTalk - t0) / 1000) : null;
+      const cut = stalls.filter(x => x.stopped && Date.parse(x.at) <= lastTalk).reduce((n, x) => n + x.quietSeconds, 0);
+      const workingSeconds = lastTalk > t0 ? Math.max(0, Math.min(wallSeconds, (lastTalk - t0) / 1000) - cut) : null;
       const after = await settledUsage(before);
       let usage = null;
       try {

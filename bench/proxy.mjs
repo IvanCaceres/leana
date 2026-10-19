@@ -130,14 +130,19 @@ export function startProxy(logFile, rewrite = null) {
       socket.pipe(up);
     });
     tunnels.add(socket);
+    // Activity is a chunk that can carry a request or a reply: an idle connection's few closing bytes are not (one
+    // Hermes left open closed 6 minutes after its last use, and moved a quiet spell's start to then).
+    const talk = d => {
+      if (d.length >= 64) last = Date.now();
+    };
     if (counted) {
       socket.on('data', d => {
         record.bytesUp += d.length;
-        last = Date.now();
+        talk(d);
       });
       up.on('data', d => {
         record.bytesDown += d.length;
-        last = Date.now();
+        talk(d);
       });
     }
     let done = false;

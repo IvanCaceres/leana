@@ -3,10 +3,7 @@
   "prompt": "build an advanced react demo landing page app for a saas startup using the latest and greatest best practices",
   "provider": "openrouter",
   "model": "z-ai/glm-5.3",
-  "effort": "medium",
-  "effortByHarness": {
-    "opencode": "low"
-  },
-  "effortNote": "GLM-5.3 offers reasoning efforts low, high and max. Leana rounds medium down to low; Hermes and Cline send medium as given; OpenCode refuses a variant the model does not list (\"Variant unavailable for openrouter/z-ai/glm-5.3: medium\"), so it is given low, the same rounding Leana applies.",
+  "effort": "low",
+  "effortNote": "GLM-5.3 offers reasoning efforts low, high and max, and every harness takes low as given. Each harness is asked for it with its own option, and every request each one sends is checked for it (see BENCHMARK.md, Same settings as Leana).",
   "timeoutMinutes": 20
 }

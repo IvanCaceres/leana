@@ -19,9 +19,10 @@ import {
   statSync,
   writeFileSync,
   createWriteStream,
+  cpSync,
 } from 'node:fs';
 import { createServer } from 'node:net';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -169,9 +170,92 @@ function* objects(v) {
   }
 }
 const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
-// The reasoning effort a harness is asked for: the scenario's, unless it names one for that harness (a level the
-// harness cannot send for this model; see scenario.json).
-const effortFor = (s, h) => s.effortByHarness?.[h] ?? s.effort;
+const { startProxy, settingsOf } = await import(new URL('./proxy.mjs', import.meta.url).href);
+
+// ---- the settings every harness sends: Leana's ---------------------------------------------------------------------
+// Each harness is asked for the scenario's reasoning effort with its own option. The rest of what decides a request's
+// result and cost is set to what Leana sent in the same round (its reference): sampling (temperature, top_p, top_k),
+// the output cap, and the OpenRouter endpoint order with fallbacks. Cline and OpenCode reach OpenRouter through the
+// recording proxy, which sets them on each request; Hermes through a plugin in a Hermes home of its own (see the
+// adapter). Every chat request a trial sent is recorded in its requests.jsonl, and compared with the reference.
+const effortOf = s => s?.reasoning?.effort ?? s?.reasoning_effort ?? null;
+const capOf = s => s?.max_tokens ?? s?.max_completion_tokens ?? null;
+const compared = {
+  model: s => s.model ?? null,
+  effort: effortOf,
+  temperature: s => s.temperature ?? null,
+  top_p: s => s.top_p ?? null,
+  top_k: s => s.top_k ?? null,
+  maxTokens: capOf,
+  provider: s => s.provider ?? null,
+};
+const records = file => (existsSync(file) ? jsonLines(readFileSync(file, 'utf8')).filter(r => r.sent) : []);
+const distinct = xs => [...new Set(xs.map(x => JSON.stringify(x ?? null)))].map(x => JSON.parse(x));
+// The settings most of a Leana trial's requests carried (its code requests and retries sample differently).
+function referenceOf(rs) {
+  if (!rs.length) return null;
+  const mode = f => {
+    const n = new Map();
+    for (const r of rs) {
+      const k = JSON.stringify(f(r.sent) ?? null);
+      n.set(k, (n.get(k) ?? 0) + 1);
+    }
+    return JSON.parse([...n].sort((a, b) => b[1] - a[1])[0][0]);
+  };
+  return Object.fromEntries(Object.entries(compared).map(([k, f]) => [k, mode(f)]));
+}
+// What a trial's requests carried, how many the proxy changed and what the harness had asked for there, the endpoints
+// that served them, and every way they differ from the reference.
+function settingsReport(rs, ref) {
+  const seen = Object.fromEntries(Object.entries(compared).map(([k, f]) => [k, distinct(rs.map(r => f(r.sent)))]));
+  const servedBy = {};
+  for (const r of rs)
+    if ('servedBy' in r) servedBy[r.servedBy ?? 'unknown'] = (servedBy[r.servedBy ?? 'unknown'] ?? 0) + 1;
+  const asked = {};
+  for (const r of rs) for (const [k, v] of Object.entries(r.harnessAsked ?? {})) (asked[k] ??= []).push(v);
+  return {
+    requests: rs.length,
+    ...seen,
+    sessions: distinct(rs.map(r => r.sent.session_id)).length,
+    servedBy: Object.keys(servedBy).length ? servedBy : null,
+    changedByRunner: rs.filter(r => r.harnessAsked).length,
+    harnessAsked: Object.fromEntries(Object.entries(asked).map(([k, v]) => [k, distinct(v)])),
+    differences:
+      ref && rs.length
+        ? Object.keys(compared)
+            .filter(k => seen[k].length !== 1 || JSON.stringify(seen[k][0]) !== JSON.stringify(ref[k]))
+            .map(k => `${k} ${seen[k].map(v => JSON.stringify(v)).join(' / ')} (Leana ${JSON.stringify(ref[k])})`)
+        : ['no requests recorded'],
+  };
+}
+// The proxy's rewrite to the reference, for a harness that reaches OpenRouter through it. The reasoning effort is
+// changed only when the harness did not send the reference's (it is asked for it with its own option); the output cap
+// keeps the name the harness gives it; a request with no session_id gets the trial's, as Leana's and Hermes's carry one.
+const asLeana = (ref, session) => body => {
+  const changed = [];
+  const set = (k, v) => {
+    if (JSON.stringify(body[k]) === JSON.stringify(v ?? undefined)) return;
+    if (v === null || v === undefined) delete body[k];
+    else body[k] = v;
+    changed.push(k);
+  };
+  if (effortOf(body) !== ref.effort) {
+    set('reasoning', ref.effort ? { effort: ref.effort } : null);
+    set('reasoning_effort', null);
+  }
+  for (const k of ['temperature', 'top_p', 'top_k']) set(k, ref[k]);
+  if (body.max_completion_tokens !== undefined && body.max_tokens === undefined)
+    set('max_completion_tokens', ref.maxTokens);
+  else {
+    set('max_tokens', ref.maxTokens);
+    set('max_completion_tokens', null);
+  }
+  set('provider', ref.provider);
+  if (body.session_id === undefined) set('session_id', session);
+  return changed;
+};
+// A recording proxy for a trial, its rewrite to the reference when one is given.
+const proxyFor = (trial, rewrite) => startProxy(join(trial, 'requests.jsonl'), rewrite);
 
 // ---- the harnesses ----------------------------------------------------------------------------------------------
 // Each: its version, how it is run on the scenario in an empty directory, and the usage it reports itself.
@@ -179,7 +263,14 @@ const harnesses = {
   leana: {
     version: () =>
       JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version + ` (${git('rev-parse --short HEAD')})`,
-    command: (s, repo) => [
+    // Through the proxy too, unchanged: what it sends is recorded the same way, and becomes the round's reference.
+    async prepare(s, repo, trial) {
+      const proxy = await proxyFor(trial, null);
+      const config = join(trial, 'leana-config.json');
+      writeFileSync(config, JSON.stringify({ openrouterUrl: proxy.url }, null, 2));
+      return { proxy, config };
+    },
+    command: (s, repo, trial, ctx) => [
       process.execPath,
       [
         join(root, 'dist', 'src', 'cli.js'),
@@ -192,8 +283,10 @@ const harnesses = {
         '--model',
         s.model,
         '--effort',
-        effortFor(s, 'leana'),
+        s.effort,
         '--plain',
+        '--config',
+        ctx.config,
       ],
     ],
     requires: ['TYPESAFE_API_KEY'],
@@ -224,9 +317,55 @@ const harnesses = {
       u.extra = { session, jevCalls: jev };
       return u;
     },
+    cleanup: async ctx => ctx.proxy.close(),
   },
   hermes: {
     version: () => firstLine('hermes', ['--version']),
+    // Hermes sends its reasoning setting only to openrouter.ai, so it is not put behind the proxy: it runs from a Hermes
+    // home of its own (the user's is left alone) whose plugin sets the reference on each request, and that dumps each
+    // request it sends (HERMES_DUMP_REQUESTS, the key masked). The user's model cache is copied in: Hermes sends a
+    // reasoning setting only for a model its cache lists as reasoning. Its side calls (titles, compression) are given
+    // the same effort and endpoint order through its auxiliary settings; they are not dumped.
+    prepare(s, repo, trial, ref) {
+      const home = join(tmpdir(), `leana-bench-hermes-${Date.now()}`);
+      const user =
+        process.env.HERMES_HOME ??
+        (process.platform === 'win32'
+          ? join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'hermes')
+          : join(homedir(), '.hermes'));
+      mkdirSync(join(home, 'plugins', 'leana-bench'), { recursive: true });
+      if (existsSync(join(user, 'cache'))) cpSync(join(user, 'cache'), join(home, 'cache'), { recursive: true });
+      const plugin = join(home, 'plugins', 'leana-bench');
+      writeFileSync(
+        join(plugin, 'plugin.yaml'),
+        'name: leana-bench\nversion: 1.0.0\ndescription: "Sends the settings Leana sent (harness benchmark)."\n',
+      );
+      writeFileSync(join(plugin, '__init__.py'), hermesPlugin(ref));
+      const side = JSON.stringify({
+        reasoning_effort: ref.effort ?? '',
+        extra_body: ref.provider ? { provider: ref.provider } : {},
+      });
+      writeFileSync(
+        join(home, 'config.yaml'),
+        [
+          'model:',
+          `  provider: ${s.provider}`,
+          `  default: ${s.model}`,
+          'terminal:',
+          '  backend: local',
+          `  cwd: ${JSON.stringify(repo)}`,
+          'plugins:',
+          '  enabled: [leana-bench]',
+          'auxiliary:',
+          `  title_generation: ${side}`,
+          `  compression: ${side}`,
+          '',
+        ].join('\n'),
+      );
+      writeFileSync(join(trial, 'hermes-config.yaml'), readFileSync(join(home, 'config.yaml')));
+      writeFileSync(join(trial, 'hermes-plugin.py'), readFileSync(join(plugin, '__init__.py')));
+      return { home, started: Date.now() };
+    },
     command: (s, repo, trial) => [
       'hermes',
       [
@@ -239,14 +378,14 @@ const harnesses = {
         '-m',
         s.model,
         '--reasoning',
-        effortFor(s, 'hermes'),
+        s.effort,
         '--yolo',
         '--in',
         repo,
       ],
     ],
     // Its terminal tool starts in TERMINAL_CWD; without it, a one-shot run worked in the user's home directory.
-    env: repo => ({ TERMINAL_CWD: repo }),
+    env: (repo, ctx) => ({ TERMINAL_CWD: repo, HERMES_HOME: ctx.home, HERMES_DUMP_REQUESTS: '1' }),
     usage(trial) {
       const f = join(trial, 'hermes-usage.json');
       if (!existsSync(f)) return null;
@@ -269,11 +408,39 @@ const harnesses = {
         extra: { report: r },
       };
     },
+    // Its request dumps, read into the trial's requests.jsonl (OpenRouter's fields in extra_body read as the request's
+    // own), then its home removed.
+    cleanup(ctx, trial) {
+      const dumps = [];
+      const walk = d => {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          const p = join(d, e.name);
+          if (e.isDirectory()) walk(p);
+          else if (/^request_dump_.*\.json$/.test(e.name)) dumps.push(p);
+        }
+      };
+      if (existsSync(join(ctx.home, 'sessions'))) walk(join(ctx.home, 'sessions'));
+      const lines = dumps
+        .map(f => {
+          const d = JSON.parse(readFileSync(f, 'utf8'));
+          const { extra_body: extra, ...body } = d.request?.body ?? {};
+          return {
+            at: d.timestamp ?? statSync(f).mtime.toISOString(),
+            source: 'hermes request dump',
+            sent: settingsOf({ ...body, ...extra }),
+          };
+        })
+        .sort((a, b) => String(a.at).localeCompare(String(b.at)));
+      writeFileSync(join(trial, 'requests.jsonl'), lines.map(l => JSON.stringify(l) + '\n').join(''));
+      rmSync(ctx.home, { recursive: true, force: true });
+    },
   },
   cline: {
     version: () => firstLine('cline', ['--version']),
-    // State (and the key, which cline saves) in a private directory per trial, removed after the trial.
-    prepare(s, repo, trial) {
+    // State (and the key, which cline saves) in a private directory per trial, removed after the trial. Its OpenRouter
+    // base URL, which its auth command does not take for OpenRouter, is set in the provider settings it wrote.
+    async prepare(s, repo, trial, ref) {
+      const proxy = await proxyFor(trial, asLeana(ref, `bench-${Date.now()}`));
       const data = join(tmpdir(), `leana-bench-cline-${Date.now()}`);
       mkdirSync(data, { recursive: true });
       const x = resolved('cline', ['auth', '-p', s.provider, '-k', key, '-m', s.model, '--data-dir', data]);
@@ -284,7 +451,11 @@ const harnesses = {
         windowsVerbatimArguments: x.verbatim,
       });
       writeFileSync(join(trial, 'cline-auth.txt'), `${a.stdout ?? ''}${a.stderr ?? ''}`.replaceAll(key, '<key>'));
-      return { data };
+      const f = join(data, 'settings', 'providers.json');
+      const settings = JSON.parse(readFileSync(f, 'utf8'));
+      settings.providers[s.provider].settings.baseUrl = proxy.url;
+      writeFileSync(f, JSON.stringify(settings, null, 2));
+      return { proxy, data };
     },
     command: (s, repo, trial, ctx) => [
       'cline',
@@ -298,7 +469,7 @@ const harnesses = {
         '-m',
         s.model,
         '--thinking',
-        effortFor(s, 'cline'),
+        s.effort,
         '--data-dir',
         ctx.data,
         s.prompt,
@@ -320,25 +491,37 @@ const harnesses = {
         extra: { finishReason: end.finishReason, durationMs: end.durationMs },
       };
     },
-    cleanup(ctx) {
+    async cleanup(ctx) {
+      await ctx.proxy.close();
       rmSync(ctx.data, { recursive: true, force: true });
     },
   },
   opencode: {
     version: () => firstLine('opencode', ['--version']),
+    // Its OpenRouter base URL set to the proxy in a config of the trial's own (OPENCODE_CONFIG, merged over the user's),
+    // and its small model (titles) the scenario's model, so every request it makes is on that model.
+    async prepare(s, repo, trial, ref) {
+      const proxy = await proxyFor(trial, asLeana(ref, `bench-${Date.now()}`));
+      const config = join(trial, 'opencode-config.json');
+      writeFileSync(
+        config,
+        JSON.stringify(
+          {
+            $schema: 'https://opencode.ai/config.json',
+            small_model: `${s.provider}/${s.model}`,
+            provider: { [s.provider]: { options: { baseURL: proxy.url } } },
+          },
+          null,
+          2,
+        ),
+      );
+      return { proxy, config };
+    },
     command: (s, repo) => [
       'opencode',
-      [
-        'run',
-        '--standalone',
-        '--auto',
-        '--format',
-        'json',
-        '-m',
-        `${s.provider}/${s.model}#${effortFor(s, 'opencode')}`,
-        s.prompt,
-      ],
+      ['run', '--standalone', '--auto', '--format', 'json', '-m', `${s.provider}/${s.model}#${s.effort}`, s.prompt],
     ],
+    env: (repo, ctx) => ({ OPENCODE_CONFIG: ctx.config }),
     usage(trial, stdout) {
       const u = {
         requests: 0,
@@ -363,8 +546,51 @@ const harnesses = {
         }
       return u.requests ? u : null;
     },
+    cleanup: async ctx => ctx.proxy.close(),
   },
 };
+// The Hermes plugin: request middleware that sets the reference's sampling, output cap and endpoint order on each
+// request (OpenRouter's own fields in extra_body), and its effort only when Hermes did not send the reference's.
+function hermesPlugin(ref) {
+  return [
+    '# Written by bench/harnesses.mjs for one trial: the settings Leana sent, set on each request Hermes sends.',
+    'import json',
+    '',
+    `REF = json.loads(${JSON.stringify(JSON.stringify(ref))})`,
+    '',
+    '',
+    'def register(ctx):',
+    '    def as_leana(request=None, **_):',
+    '        if not isinstance(request, dict):',
+    '            return None',
+    '        r = dict(request)',
+    '        extra = dict(r.get("extra_body") or {})',
+    '        for k in ("temperature", "top_p"):',
+    '            if REF.get(k) is None:',
+    '                r.pop(k, None)',
+    '            else:',
+    '                r[k] = REF[k]',
+    '        for k, v in (("top_k", REF.get("top_k")), ("provider", REF.get("provider"))):',
+    '            if v is None:',
+    '                extra.pop(k, None)',
+    '            else:',
+    '                extra[k] = v',
+    '        r.pop("max_completion_tokens", None)',
+    '        if REF.get("maxTokens") is None:',
+    '            r.pop("max_tokens", None)',
+    '        else:',
+    '            r["max_tokens"] = REF["maxTokens"]',
+    '        effort = (extra.get("reasoning") or {}).get("effort") or extra.get("reasoning_effort")',
+    '        if REF.get("effort") and effort != REF["effort"]:',
+    '            extra["reasoning"] = {"enabled": True, "effort": REF["effort"]}',
+    '            extra.pop("reasoning_effort", None)',
+    '        r["extra_body"] = extra',
+    '        return {"request": r, "source": "leana-bench", "reason": "the settings Leana sent"}',
+    '',
+    '    ctx.register_middleware("llm_request", as_leana)',
+    '',
+  ].join('\n');
+}
 function git(cmd) {
   return spawnSync('git', cmd.split(' '), { cwd: root, encoding: 'utf8' }).stdout.trim();
 }
@@ -447,7 +673,7 @@ function runShell(line, cwd, file, timeoutMs = 300_000) {
   );
 }
 
-// ---- rescoring a finished suite: usage and verification again from each trial's saved output (no agent runs) ---------
+// ---- rescoring a finished suite: usage, settings and verification again from each trial's saved output (no agent runs)
 async function rescore(suiteDir) {
   const meta = JSON.parse(readFileSync(join(suiteDir, 'suite.json'), 'utf8'));
   const results = [];
@@ -467,11 +693,13 @@ async function rescore(suiteDir) {
     } catch (e) {
       usage = { error: e.message };
     }
+    const sent = records(join(trial, 'requests.jsonl'));
     const repo = join(trial, 'repo');
     const result = {
       ...old,
       wroteHere: readdirSync(repo).some(n => n !== '.git'),
       usage,
+      settings: settingsReport(sent, old.harness === 'leana' ? referenceOf(sent) : old.reference),
       verification: await verify(repo, trial).catch(e => ({ error: e.message })),
     };
     writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
@@ -481,6 +709,26 @@ async function rescore(suiteDir) {
     );
   }
   return { meta, results };
+}
+
+// The reference when the round has no Leana trial that sent requests (Leana not among the harnesses run, or its trial
+// sent none): a short Leana run on the scenario's model and effort through the proxy, kept in reference-<n>/.
+async function referenceRun(dir) {
+  const repo = join(dir, 'repo');
+  mkdirSync(repo, { recursive: true });
+  spawnSync('git', ['init', '-q'], { cwd: repo, windowsHide: true });
+  const s = { ...scenario, prompt: 'Create a file named ok.txt that contains the word OK.' };
+  const h = harnesses.leana;
+  const ctx = await h.prepare(s, repo, dir);
+  const [command, argv] = h.command(s, repo, dir, ctx);
+  await run(command, argv, {
+    cwd: repo,
+    timeoutMs: 300_000,
+    stdout: join(dir, 'agent-stdout.txt'),
+    stderr: join(dir, 'agent-stderr.txt'),
+  });
+  await h.cleanup(ctx, dir);
+  return referenceOf(records(join(dir, 'requests.jsonl')));
 }
 
 // ---- the suite -----------------------------------------------------------------------------------------------------
@@ -500,7 +748,10 @@ if (args.rescore) {
     .filter(Boolean);
   for (const h of chosen)
     if (!harnesses[h]) throw new Error(`Unknown harness ${h}; known: ${Object.keys(harnesses).join(', ')}`);
-  for (const h of chosen)
+  // Leana first in each round: what it sends is the reference for the others.
+  chosen.sort((a, b) => (b === 'leana') - (a === 'leana'));
+  // Leana's requirements always: it sets the reference even when it is not among the harnesses run.
+  for (const h of new Set(['leana', ...chosen]))
     for (const v of harnesses[h].requires ?? []) if (!process.env[v]) throw new Error(`${h} needs ${v}`);
   suite = join(args.out, new Date().toISOString().replace(/[:.]/g, '-'));
   mkdirSync(suite, { recursive: true });
@@ -527,9 +778,17 @@ if (args.rescore) {
       .join('\n')}`,
   );
   results = [];
-  for (let i = 1; i <= runs; i++)
+  let ref = null;
+  for (let i = 1; i <= runs; i++) {
+    if (!chosen.includes('leana')) ref = null;
     for (const name of chosen) {
       const h = harnesses[name];
+      if (name !== 'leana' && !ref) {
+        console.log(`\n[reference ${i}] a short Leana run, for the settings Leana sends`);
+        ref = await referenceRun(join(suite, `reference-${i}`));
+        if (!ref)
+          throw new Error('The reference Leana run sent no requests: there are no settings to give the harnesses');
+      }
       const trial = join(suite, `${name}-${i}`);
       const repo = join(trial, 'repo');
       mkdirSync(repo, { recursive: true });
@@ -541,12 +800,17 @@ if (args.rescore) {
       // What the checkout holding the runner has at its top level: a harness that writes outside its directory
       // (OpenCode did, into this checkout) is caught by what appears here.
       const outsideBefore = new Set(readdirSync(root));
-      const ctx = h.prepare ? h.prepare(scenario, repo, trial) : {};
+      const ctx = h.prepare ? await h.prepare(scenario, repo, trial, ref) : {};
       const [command, argv] = h.command(scenario, repo, trial, ctx);
       writeFileSync(
         join(trial, 'command.json'),
         JSON.stringify(
-          { command, argv: argv.map(a => (a === key ? '<key>' : a)), effort: effortFor(scenario, name) },
+          {
+            command,
+            argv: argv.map(a => (a === key ? '<key>' : a)),
+            effort: scenario.effort,
+            reference: name === 'leana' ? 'this trial' : ref,
+          },
           null,
           2,
         ),
@@ -554,7 +818,7 @@ if (args.rescore) {
       const t0 = Date.now();
       const r = await run(command, argv, {
         cwd: repo,
-        env: h.env ? h.env(repo) : {},
+        env: h.env ? h.env(repo, ctx) : {},
         timeoutMs: scenario.timeoutMinutes * 60_000,
         stdout: join(trial, 'agent-stdout.txt'),
         stderr: join(trial, 'agent-stderr.txt'),
@@ -567,7 +831,10 @@ if (args.rescore) {
       } catch (e) {
         usage = { error: e.message };
       }
-      h.cleanup?.(ctx);
+      await h.cleanup?.(ctx, trial);
+      const sent = records(join(trial, 'requests.jsonl'));
+      if (name === 'leana') ref = referenceOf(sent);
+      const settings = settingsReport(sent, ref);
       // A harness that wrote its project somewhere else leaves its directory empty: said, never scored as a result.
       const wroteHere = readdirSync(repo).some(n => n !== '.git');
       const wroteOutside = readdirSync(root)
@@ -579,7 +846,9 @@ if (args.rescore) {
       const result = {
         harness: name,
         trial: i,
-        effort: effortFor(scenario, name),
+        effort: scenario.effort,
+        reference: ref,
+        settings,
         wroteHere,
         ...(wroteOutside.length ? { wroteOutside } : {}),
         exitCode: r.code,
@@ -594,7 +863,17 @@ if (args.rescore) {
       console.log(
         `  exit ${r.code}${r.timedOut ? ' (timed out)' : ''} | ${wallSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)} | ${usage?.requests ?? '?'} requests, ${usage?.promptTokens ?? '?'} prompt / ${usage?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
       );
+      console.log(
+        `  settings: ${name === 'leana' ? 'the reference' : settings.differences.length ? `differ from Leana's: ${settings.differences.join('; ')}` : "Leana's"} | effort ${settings.effort.join('/')} | served by ${
+          settings.servedBy
+            ? Object.entries(settings.servedBy)
+                .map(([k, v]) => `${k} ${v}`)
+                .join(', ')
+            : 'not recorded'
+        }`,
+      );
     }
+  }
 }
 
 // ---- summary ---------------------------------------------------------------------------------------------------
@@ -613,21 +892,69 @@ const passed = r =>
   !r.wroteOutside?.length &&
   r.verification?.build !== false &&
   r.verification?.page?.ok === true;
+const asReference = r => r.settings && !r.settings.differences.length;
 const rows = chosen.map(name => {
   const rs = results.filter(r => r.harness === name);
   const of = f => rs.map(f).map(Number);
   const billed = of(r => r.billedUsd).filter(Number.isFinite);
-  return `| ${name} | ${rs[0]?.effort ?? effortFor(sc, name)} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => r.usage?.requests)))} | ${fmt(median(of(r => r.usage?.promptTokens)))} | ${fmt(median(of(r => r.usage?.outputTokens)))} |`;
+  const efforts = distinct(rs.flatMap(r => r.settings?.effort ?? []));
+  return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => r.usage?.requests)))} | ${fmt(median(of(r => r.usage?.promptTokens)))} | ${fmt(median(of(r => r.usage?.outputTokens)))} |`;
+});
+const describe = ref =>
+  ref
+    ? `effort ${ref.effort ?? 'none'}, temperature ${ref.temperature ?? 'none'}, top_p ${ref.top_p ?? 'none'}, top_k ${ref.top_k ?? 'none'}, output cap ${ref.maxTokens ?? 'none'}, endpoints ${ref.provider?.order?.join(' > ') ?? "OpenRouter's choice"}${ref.provider?.allow_fallbacks ? ' (then any other)' : ''}`
+    : 'none recorded';
+const references = distinct(results.map(r => r.reference).filter(Boolean));
+const settingLines = chosen.map(name => {
+  const rs = results.filter(r => r.harness === name && r.settings);
+  const served = {};
+  for (const r of rs) for (const [k, v] of Object.entries(r.settings.servedBy ?? {})) served[k] = (served[k] ?? 0) + v;
+  const asked = {};
+  for (const r of rs)
+    for (const [k, v] of Object.entries(r.settings.harnessAsked ?? {}))
+      asked[k] = distinct([...(asked[k] ?? []), ...v]);
+  const changed = rs.reduce((n, r) => n + r.settings.changedByRunner, 0);
+  const total = rs.reduce((n, r) => n + r.settings.requests, 0);
+  const diffs = rs
+    .filter(r => r.settings.differences.length)
+    .map(r => `trial ${r.trial}: ${r.settings.differences.join('; ')}`);
+  return [
+    `- **${name}**: ${total} requests recorded; endpoints that served them: ${
+      Object.keys(served).length
+        ? Object.entries(served)
+            .map(([k, v]) => `${k} ${v}`)
+            .join(', ')
+        : 'not recorded (Hermes is not behind the proxy; its requests come from its own dumps)'
+    }.`,
+    ...(changed
+      ? [
+          `  Set by the runner on ${changed} of them; the harness had asked for ${Object.entries(asked)
+            .map(([k, v]) => `${k} ${v.map(x => (x === null ? 'none' : JSON.stringify(x))).join(' / ')}`)
+            .join(', ')}.`,
+        ]
+      : []),
+    ...(name === 'leana'
+      ? []
+      : diffs.length
+        ? diffs.map(d => `  Differs from Leana's, ${d}.`)
+        : ["  Every request carried Leana's settings."]),
+  ].join('\n');
 });
 const summary = [
   `# ${sc.id}`,
   '',
   `Prompt: "${sc.prompt}"  `,
-  `Model: ${sc.provider}/${sc.model}, reasoning effort requested: ${sc.effort}. ${runs} trial${runs === 1 ? '' : 's'} per harness, run one after another.`,
+  `Model: ${sc.provider}/${sc.model}, reasoning effort: ${sc.effort}. ${runs} trial${runs === 1 ? '' : 's'} per harness, run one after another.`,
   '',
-  '| Harness | Effort sent | Passed | Wall time (median) | Billed by OpenRouter (median, range) | Requests (median) | Prompt tokens (median) | Output tokens (median) |',
-  '| --- | --- | --- | --- | --- | --- | --- | --- |',
+  "| Harness | Effort sent | Leana's settings | Passed | Wall time (median) | Billed by OpenRouter (median, range) | Requests (median) | Prompt tokens (median) | Output tokens (median) |",
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
   ...rows,
+  '',
+  '## Settings sent',
+  '',
+  `Leana's (the reference): ${references.length ? references.map(describe).join('; then, in a later round, ') : 'none recorded'}.`,
+  '',
+  ...settingLines,
   '',
   'Versions: ' +
     Object.entries(versions)
@@ -635,7 +962,7 @@ const summary = [
       .join('; ') +
     '.',
   '',
-  "Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as each harness reports them (see BENCHMARK.md). Passed: exit 0 in time, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
+  "Effort sent: the reasoning effort on the requests each harness sent. Leana's settings: trials whose every request carried the effort, sampling, output cap and endpoint order Leana sent in that round. Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as each harness reports them (see BENCHMARK.md). Passed: exit 0 in time, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
 ].join('\n');
 writeFileSync(join(suite, 'summary.json'), JSON.stringify(results, null, 2));
 writeFileSync(join(suite, 'SUMMARY.md'), summary + '\n');

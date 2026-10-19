@@ -154,7 +154,7 @@ npm run bench:harnesses -- --resume work/bench/harnesses/<suite>
 - **Trials run one at a time,** each in a new empty directory, made its own git repository (`git init`). Cost is read from the key around each trial, and two dev servers at once would compete for ports. With `--runs 3` the order is leana, hermes, cline, opencode, then repeat. Leana always runs first in a round, because its requests are that round's reference.
 - **Without Leana among the harnesses,** each round starts with a short Leana run (`reference-<n>/`, one small file to write) to get the reference.
 - **`--rescore`** recomputes the usage figures, the settings check and the verification of a finished suite from what its trials saved, without running any agent. Use it after changing a parser or the verification.
-- **`--skip-verify`** skips building and loading the result.
+- **`--skip-verify`** skips building and loading the result. With `--rescore`, it keeps each trial's earlier verification and only recomputes the usage and settings figures and the summary.
 - **`--resume`** finishes a suite that stopped part-way, for example when the disk filled up during a 4-run suite. It keeps every trial that has a `trial.json`, runs the rest with the suite's own scenario and harnesses, and refuses if a harness's version has changed since the suite started. To redo a trial, remove its folder first.
 - **Disk:** after a trial is checked, its `node_modules` and Next.js build cache are removed. A trial's `node_modules` is a few hundred megabytes, and a 4-run suite filled the disk. `--keep-deps` keeps them, and `--rescore` reinstalls them.
 

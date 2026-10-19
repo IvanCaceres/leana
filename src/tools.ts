@@ -57,6 +57,10 @@ export class ToolBox {
   // same evidence, so an edit carrying a hash from before an earlier edit of its
   // batch is numbered as in that text, and the harness knows exactly how it changed.
   journal: EditRecord[] | null = null;
+  // The characters a read may show of a file past its share of the read budget: for a file this run wrote (set by the
+  // loop), so one read shows it whole, as one generation wrote it; 0 for any other. Run saas-landing-glm-5.3 read back
+  // the 424-line stylesheet it had written in 2,000-character shares (three files to a read), over eight requests.
+  wholeReads: (path: string) => number = () => 0;
   step = 0;
   // Commands run, numbering the files their whole outputs are saved to.
   private commands = 0;
@@ -119,6 +123,8 @@ export class ToolBox {
     // Cut at line boundaries inside the evidence budget. A mid-text clip would
     // hand Bonsai a truncated excerpt that it then pastes back as oldText.
     const share = Math.floor(this.config.toolChars / a.files.length);
+    // What the evidence keeps of the result: the read budget, more when a file is read whole (wholeReads).
+    let kept = 0;
     for (const f of a.files) {
       if (/[?*\[\]]/.test(f.path))
         throw new Error(`read_files requires exact regular file paths; glob rejected: ${f.path}`);
@@ -127,7 +133,8 @@ export class ToolBox {
       const artifact = f.path.startsWith('@artifact/');
       const path = artifact ? await safePath(this.artifacts, f.path.slice(10)) : await safePath(this.root, f.path);
       // Reserve room for the header line and the continuation marker.
-      const budget = Math.max(400, share - f.path.length - 240);
+      const budget = Math.max(400, share - f.path.length - 240, artifact ? 0 : this.wholeReads(f.path));
+      kept += budget + f.path.length + 240;
       // Streamed: a file of any size is read in ranges; only the range is held.
       const { lines, totalLines, sha } = await readLines(path, f.start, f.end, budget);
       if (!artifact) hashes[f.path] = sha;
@@ -151,7 +158,7 @@ export class ToolBox {
         `${f.path} sha256=${sha} totalLines=${totalLines} shown=${f.start}..${shown}\n${body.join('\n') || '(no lines in range)'}${cut}`,
       );
     }
-    return { ok: true, text: results.join('\n\n'), hashes };
+    return { ok: true, text: results.join('\n\n'), hashes, keepChars: Math.max(this.config.toolChars, kept) };
   }
   private async searchCodebase(a: Record<string, any>): Promise<ToolResult> {
     const searchRoot = a.path === '@artifacts' ? this.artifacts : this.root;

@@ -3586,7 +3586,19 @@ test('The render action shows the worker what the user sees: errors, a broken im
     r.text,
     /Elements wholly outside the viewport \(not on screen where they are\): [^\n]*div\.drawer spans \d+\.\.\d+px/,
   );
-  assert.doesNotMatch(r.text, /> p spans/, "a listed element's descendants are not listed again");
+  assert.doesNotMatch(
+    r.text
+      .split('\n')
+      .filter(l => /^Elements (cut|wholly)/.test(l))
+      .join('\n'),
+    /> p spans/,
+    "a listed element's descendants are not listed again",
+  );
+  assert.match(
+    r.text,
+    /What reaches past the right edge, innermost first: [^\n]*div\.wide spans 0\.\.2000px[^\n]*div\.drawer > p spans \d+\.\.\d+px with text "Cart"/,
+    'what makes the page scroll sideways, by its innermost elements and their text',
+  );
   assert.match(
     r.text,
     /failed: net::ERR_[A-Z_]+ http:\/\/127\.0\.0\.1:1\/gone\.png/,
@@ -3744,6 +3756,44 @@ test("The render reports styling as facts, never as a failure: class names no CS
   r = await renderFacts(root, url, undefined, null, 30000);
   assert.equal(r.ok, true, r.text);
   assert.match(r.text, /Styling: \d+ CSS rules; 9 of the 9 class names on visible elements match a CSS selector;/);
+  // A few class names without a rule (hooks, as run saas-landing-glm-5.3's sections had): information, not a problem.
+  css =
+    'body{margin:0} .nav{display:flex} .nav__link{color:red} .hero,.hero__title{margin:0} .hero__text{color:#333} .flex{display:flex} .p-4{padding:1rem}';
+  r = await renderFacts(root, url, undefined, null, 30000);
+  assert.equal(r.ok, true, r.text);
+  assert.match(
+    r.text,
+    /^Rendered http:\S+: no exception, every request and image loaded\.\n/,
+    'no styling count in the first line',
+  );
+  assert.match(
+    r.text,
+    /7 of the 9 class names on visible elements match a CSS selector \(without one, for information: grid, card; a class with no rule of its own is common, as a hook for scripts, tests or anchors, or an icon's or a library's, and is not a problem in itself\)/,
+  );
+  assert.equal(r.unmatched, undefined, 'not handed on to be found in the sources: nothing to complete');
+});
+
+test('A page that scrolls sideways is reported with what pushes it: the innermost elements past the right edge, their text, and what keeps them from shrinking', async t => {
+  if (!(await findBrowser())) {
+    t.skip('no browser on this machine');
+    return;
+  }
+  // The shape of run saas-landing-glm-5.3: a yearly price rendered as an unbreakable float, 79.20000000000001.
+  const html = `<!doctype html><html><head><title>P</title><style>body{margin:0} .plans{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;padding:0 16px} .plan{border:1px solid #ccc;padding:16px} .price{white-space:nowrap;font-size:64px}</style></head><body><section class="plans"><div class="plan"><span class="price">$0</span></div><div class="plan"><span class="price">$19</span></div><div class="plan"><span class="price">$79.20000000000001/mo</span></div></section></body></html>`;
+  const server = createServer((req, res) => {
+    res.writeHead(req.url === '/' ? 200 : 404, { 'content-type': 'text/html' });
+    res.end(req.url === '/' ? html : '');
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()));
+  t.after(() => server.close());
+  const { root } = await repo(t);
+  const r = await renderFacts(root, `http://127.0.0.1:${(server.address() as any).port}/`, undefined, null, 30000);
+  assert.match(r.text, /The page scrolls sideways: it is \d+px wide in a \d+px viewport\./, r.text);
+  assert.match(
+    r.text,
+    /What reaches past the right edge, innermost first: [^\n|]*span\.price spans \d+\.\.\d+px with text "\$79\.20000000000001\/mo" \(white-space: nowrap\)/,
+    r.text,
+  );
 });
 
 test('Every call shares one prompt prefix: a reasoning turn and a file generation differ only after the evidence, and creating a file changes nothing before it', async t => {

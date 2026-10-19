@@ -56,6 +56,11 @@ const probe = `(() => {
   const overflow = placed(r => (r.right > vw + 2 && r.left < vw - 1) || (r.left < -2 && r.right > 1));
   const offscreen = placed(r => r.left >= vw - 1 || r.right <= 1);
   const scrollWidth = document.documentElement.scrollWidth;
+  // When the page scrolls sideways, what pushes it: the innermost visible elements reaching past the right edge, with
+  // their text and what keeps them from shrinking (run saas-landing-glm-5.3 spent five steps finding a price rendered
+  // as 79.20000000000001, one unbreakable string).
+  const past = scrollWidth > vw + 2 ? [...document.querySelectorAll('body *')].filter(e => vis(e) && e.getBoundingClientRect().right > vw + 2) : [];
+  const widest = past.filter(e => !past.some(o => o !== e && e.contains(o))).sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right).slice(0, 4).map(e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e); const t = (e.textContent || '').trim().replace(/\\s+/g, ' '); const why = [s.whiteSpace !== 'normal' ? 'white-space: ' + s.whiteSpace : '', s.minWidth !== '0px' && s.minWidth !== 'auto' ? 'min-width: ' + s.minWidth : '', s.flexShrink === '0' ? 'flex-shrink: 0' : ''].filter(Boolean); return path(e) + ' spans ' + Math.round(r.left) + '..' + Math.round(r.right) + 'px' + (t ? ' with text "' + t.slice(0, 80) + (t.length > 80 ? '…' : '') + '"' : '') + (why.length ? ' (' + why.join(', ') + ')' : ''); });
   const empty = [...document.querySelectorAll('section, main, article, header, footer')].filter(vis).filter(e => (e.textContent || '').trim().length < 20 && !e.querySelector('img,svg,canvas,video')).slice(0, 6).map(path);
   const rules = [...document.styleSheets].reduce((n, s) => { try { return n + s.cssRules.length; } catch { return n; } }, 0);
   // Every class name a selector mentions, walking nested rules (@media, @supports, @layer).
@@ -68,7 +73,7 @@ const probe = `(() => {
   const body = getComputedStyle(document.body);
   const text = (document.body.innerText || '').replace(/\\s+/g, ' ').trim();
   const links = [...document.querySelectorAll('a[href]')].filter(vis).slice(0, 30).map(a => ((a.textContent || a.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 30) || '(no text)') + ' -> ' + (a.getAttribute('href') || '').slice(0, 60));
-  return { title: document.title, headings, images, overflow, offscreen, scrollWidth, empty, rules, classes, inline, shadow, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
+  return { title: document.title, headings, images, overflow, offscreen, scrollWidth, widest, empty, rules, classes, inline, shadow, font: body.fontFamily.slice(0, 60), background: body.backgroundColor, textLength: text.length, textHead: text.slice(0, 300), links, docHeight: document.documentElement.scrollHeight, viewport: vw + 'x' + window.innerHeight };
 })()`;
 
 interface Facts {
@@ -78,6 +83,7 @@ interface Facts {
   overflow: string[];
   offscreen: string[];
   scrollWidth: number;
+  widest: string[];
   empty: string[];
   rules: number;
   classes: { used: number; unmatched: number; elementsUnmatched: number; sample: string[]; all: string[] };
@@ -522,6 +528,11 @@ export async function renderFacts(
       const messages = [...consoleErrors, ...logErrors].slice(0, 12);
       const requests = [...new Set([...failed, ...notLoaded])].slice(0, 12);
       const c = facts.classes;
+      // Most class names with no CSS rule: the page is largely unstyled (a stylesheet missing or not loaded;
+      // react-demo-26 styled 5 of 45), said first and found in the sources (observe). A few without a rule are a fact for
+      // information only: hooks, icons' and libraries' classes (run saas-landing-glm-5.3 spent a stylesheet rewrite
+      // giving six section hooks rules).
+      const unstyled = c.unmatched * 2 > c.used;
       const verdict = [
         errors.length ? `exceptions thrown in the page: ${errors.slice(0, 12).join(' | ')}` : '',
         playErrors.length ? `exceptions thrown while it was played: ${playErrors.join(' | ')}` : '',
@@ -531,13 +542,13 @@ export async function renderFacts(
       const ok = !verdict.length;
       const lines = [
         ok
-          ? `Rendered ${url}: no exception, every request and image loaded${c.used ? `; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS rule` : ''}.`
+          ? `Rendered ${url}: no exception, every request and image loaded${unstyled ? `; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS rule` : ''}.`
           : `RENDER FAILED for ${url}, ${verdict.length} problem(s):\n- ${verdict.join('\n- ')}`,
         messages.length ? `Console messages: ${messages.join(' | ')}` : '',
         `Page: title "${facts.title}"; ${facts.viewport}, height ${facts.docHeight}px; body font ${facts.font}; background ${facts.background}; ${facts.textLength} characters of text.`,
-        `Styling: ${facts.rules} CSS rules; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS selector${c.unmatched ? ` (without one: ${c.sample.join(', ')}${c.unmatched > c.sample.length ? ', …' : ''})` : ''}; ${facts.inline} elements with a style attribute; ${facts.shadow} shadow roots.`,
+        `Styling: ${facts.rules} CSS rules; ${c.used - c.unmatched} of the ${c.used} class names on visible elements match a CSS selector${c.unmatched ? ` (without one${unstyled ? '' : ', for information'}: ${c.sample.join(', ')}${c.unmatched > c.sample.length ? ', …' : ''}${unstyled ? '' : "; a class with no rule of its own is common, as a hook for scripts, tests or anchors, or an icon's or a library's, and is not a problem in itself"})` : ''}; ${facts.inline} elements with a style attribute; ${facts.shadow} shadow roots.`,
         facts.scrollWidth > Number(facts.viewport.split('x')[0]) + 2
-          ? `The page scrolls sideways: it is ${facts.scrollWidth}px wide in a ${facts.viewport.split('x')[0]}px viewport.`
+          ? `The page scrolls sideways: it is ${facts.scrollWidth}px wide in a ${facts.viewport.split('x')[0]}px viewport.${facts.widest.length ? ` What reaches past the right edge, innermost first: ${facts.widest.join(' | ')}` : ''}`
           : '',
         facts.overflow.length
           ? `Elements cut by the viewport's edge (partly on screen) in a ${facts.viewport.split('x')[0]}px viewport: ${facts.overflow.join(' | ')}`
@@ -554,7 +565,12 @@ export async function renderFacts(
           ? `Played as its user would (each input, then what the page did until the next):\n${played.join('\n')}`
           : '',
       ].filter(Boolean);
-      return { ok, text: lines.join('\n'), ...(c.unmatched ? { unmatched: c.all } : {}), ...(image ? { image } : {}) };
+      return {
+        ok,
+        text: lines.join('\n'),
+        ...(unstyled ? { unmatched: c.all } : {}),
+        ...(image ? { image } : {}),
+      };
     } finally {
       try {
         child.kill('SIGKILL');

@@ -153,6 +153,8 @@ async function answerCoverage(s: Session): Promise<AnswerCoverage> {
   }
   return { read, unread: files.filter(f => !(f in read)), files: files.length };
 }
+// A repository path as one spelling: forward slashes, no leading ./.
+const normalPath = (p: string): string => p.replace(/\\/g, '/').replace(/^(\.\/)+/, '');
 const readIfPresent = (root: string, path: string): Promise<string | null> =>
   safePath(root, path)
     .then(f => readFile(f, 'utf8'))
@@ -375,7 +377,7 @@ export class Agent {
       kind === 'repeat'
         ? result.text.length
         : kind === 'read_files' || kind === 'observe'
-          ? this.config.toolChars
+          ? Math.max(this.config.toolChars, result.keepChars ?? 0)
           : kind === 'bash'
             ? Math.min(this.config.toolChars, 2500)
             : kind === 'search_codebase'
@@ -605,6 +607,11 @@ export class Agent {
       for (const p of Agent.targets(route, args))
         replaced.set(p, await readIfPresent(this.tools.root, p).catch(() => null));
     this.tools.step = s.step;
+    // A file this run wrote is read whole: one generation wrote it (at most createTokens), so it fits one read, kept
+    // under a quarter of the working budget (about 3.5 characters a token).
+    const whole = Math.floor(Math.min(this.config.createTokens, this.config.workingTokens / 4) * 3.5);
+    const written = new Set(s.writes.map(normalPath));
+    this.tools.wholeReads = p => (written.has(normalPath(p)) ? whole : 0);
     try {
       result = await this.tools.execute(route, args);
     } catch (e) {

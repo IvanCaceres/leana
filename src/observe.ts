@@ -76,7 +76,8 @@ const page: Observer = {
       ctx.inputs ?? [],
     );
     if (!r.unmatched?.length) return r;
-    // Where each class name without a CSS rule is used, so the stylesheet can be completed without re-reading every component.
+    // A page most of whose class names have no CSS rule (renderFacts names them only then): where each is used, so a
+    // missing stylesheet can be written without re-reading every component.
     const styles = /\.(?:css|scss|sass|less|styl)$/;
     const where: Record<string, string[]> = {};
     const hits = await runCommand(
@@ -115,7 +116,7 @@ const page: Observer = {
     return {
       ok: r.ok,
       ...(r.image ? { image: r.image } : {}),
-      text: `${r.text}\nClass names no CSS selector matches, by the file that uses them:\n${
+      text: `${r.text}\nMost class names on the page match no CSS selector (a stylesheet missing or not loaded?); by the file that uses them:\n${
         Object.entries(where)
           .map(([f, cs]) => `  ${f}: ${cs.join(' ')}`)
           .join('\n') || '  (not found in the sources)'

@@ -914,9 +914,17 @@ if (args.rescore) {
   mkdirSync(suite, { recursive: true });
   runs = resumed ? resumed.runs : Number(args.runs);
   versions = Object.fromEntries(chosen.map(h => [h, harnesses[h].version()]));
+  // Leana's version names the checkout's commit: a commit that changed only the runner leaves Leana as it was, so its
+  // source tree is compared.
+  const sameLeana = (now, then) => {
+    const [a, b] = [now, then].map(v => v.match(/\(([0-9a-f]+)\)$/)?.[1]);
+    return (
+      Boolean(a && b) && git(`rev-parse ${a}:src`) === git(`rev-parse ${b}:src`) && git(`rev-parse ${a}:src`) !== ''
+    );
+  };
   if (resumed)
     for (const h of chosen)
-      if (versions[h] !== resumed.versions[h])
+      if (versions[h] !== resumed.versions[h] && !(h === 'leana' && sameLeana(versions[h], resumed.versions[h])))
         throw new Error(`${h} is ${versions[h]} now, ${resumed.versions[h]} when the suite started: start a new suite`);
   if (!resumed)
     writeFileSync(

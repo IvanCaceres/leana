@@ -13,7 +13,7 @@ import type {
 import { editRoutes } from './types.js';
 import { focusedEditSchema, schemas, toolSchema } from './schema.js';
 import { referenceContext } from './references.js';
-import { sourceFile } from './profiles.js';
+import { classNamesIn, sourceFile } from './profiles.js';
 import { observerCatalog } from './observe-catalog.js';
 import { contentLines, echoOf, substantive, type Around, type Echo } from './clients.js';
 // A tool's output kept from both ends: a runner's verdict is its last lines,
@@ -818,8 +818,12 @@ function elided(action: string, args: unknown, step: number): unknown {
   for (const f of fields) {
     const text = out[f];
     if (typeof text !== 'string' || text.length <= 600) continue;
+    // The class names markup uses stay said: a stylesheet written in a later turn is written against them. Run
+    // saas-landing-glm-5.3 trial 4 wrote its components with BEM names (nav__brand) and, a turn later and without
+    // them, a stylesheet with hyphenated ones (nav-links): 13 of 125 matched, and the stylesheet was written again.
+    const classes = /\.(css|scss|sass|less|styl)$/i.test(String(out.path ?? '')) ? [] : classNamesIn(text);
     out[f] =
-      `[${text.split('\n').length} lines (${text.length} characters) written at step ${step}; not repeated here: read_files shows ${String(out.path ?? 'the file')} as it is now]`;
+      `[${text.split('\n').length} lines (${text.length} characters) written at step ${step}; not repeated here: read_files shows ${String(out.path ?? 'the file')} as it is now${classes.length ? `; the class names it uses: ${classes.slice(0, 80).join(' ')}${classes.length > 80 ? ' …' : ''}` : ''}]`;
   }
   return out;
 }

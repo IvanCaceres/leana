@@ -132,14 +132,25 @@ class Cdp {
     const id = ++this.id;
     const msg = JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + '\0';
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      (this.child.stdio[3] as NodeJS.WritableStream).write(msg);
-      setTimeout(() => {
+      // Cleared once answered: a timer left running kept the process alive for up to 20 s after the session ended
+      // (15 to 19 s of every benchmark run of Leana, after its last observation).
+      const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
           reject(new Error(`${method} timed out`));
         }
       }, 20000);
+      this.pending.set(id, {
+        resolve: v => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: e => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+      (this.child.stdio[3] as NodeJS.WritableStream).write(msg);
     });
   }
 }

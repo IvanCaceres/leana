@@ -1148,6 +1148,60 @@ const rows = chosen.map(name => {
   const efforts = distinct(rs.flatMap(r => r.settings?.effort ?? []));
   return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${fmt(median(of(r => r.workingSeconds ?? NaN)))} s${rs.some(r => r.stalls?.length) ? ` (${rs.filter(r => r.stalls?.length).length} waited on leftovers)` : ''} | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => (r.metered ?? r.usage)?.requests)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.promptTokens)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.outputTokens)))} |`;
 });
+// The headline: what a run costs on average (what many runs cost), the worst run (a stuck repair loop is the failure
+// that matters), the total, and the same for wall time. The median hides both: a harness with a cheap median and a
+// few dear runs costs more than it says.
+const mean = xs => {
+  const s = xs.filter(x => Number.isFinite(x));
+  return s.length ? s.reduce((a, b) => a + b, 0) / s.length : NaN;
+};
+const headline = chosen.map(name => {
+  const rs = results.filter(r => r.harness === name);
+  const billed = rs.map(r => Number(r.billedUsd)).filter(Number.isFinite);
+  const wall = rs.map(r => Number(r.wallSeconds)).filter(Number.isFinite);
+  return `| ${name} | ${rs.filter(passed).length}/${rs.length} | ${usd(mean(billed))} | ${billed.length ? usd(Math.max(...billed)) : '?'} | ${usd(billed.reduce((a, b) => a + b, 0))} | ${fmt(mean(wall))} s | ${wall.length ? fmt(Math.max(...wall)) : '?'} s |`;
+});
+// Each harness against Leana round by round: every round gives both the same task and settings, so the difference
+// within a round leaves out what the round shares. The range is the 2.5th to 97.5th percentile of the mean
+// difference over 20,000 resamplings of the rounds (a seeded bootstrap): one that crosses 0 says the gap may be chance.
+const paired = (name, f) => {
+  const pairs = [];
+  for (let i = 1; i <= runs; i++) {
+    const a = results.find(r => r.harness === 'leana' && r.trial === i);
+    const b = results.find(r => r.harness === name && r.trial === i);
+    const d = Number(f(b)) - Number(f(a));
+    if (a && b && Number.isFinite(d)) pairs.push(d);
+  }
+  if (!pairs.length) return null;
+  let seed = 1;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const means = [];
+  for (let k = 0; k < 20000; k++) {
+    let s = 0;
+    for (let j = 0; j < pairs.length; j++) s += pairs[Math.floor(rnd() * pairs.length)];
+    means.push(s / pairs.length);
+  }
+  means.sort((x, y) => x - y);
+  return {
+    rounds: pairs.length,
+    leanaAhead: pairs.filter(d => d > 0).length,
+    mean: mean(pairs),
+    lo: means[500],
+    hi: means[19500],
+  };
+};
+const signed = (x, u) => (x < 0 ? '−' : '') + (u === '$' ? usd(Math.abs(x)) : `${fmt(Math.abs(x))} s`);
+const againstLeana = chosen.includes('leana')
+  ? chosen
+      .filter(n => n !== 'leana')
+      .map(name => {
+        const c = paired(name, r => r.billedUsd);
+        const w = paired(name, r => r.wallSeconds);
+        const cell = (p, u) =>
+          p ? `${p.leanaAhead}/${p.rounds} | ${signed(p.mean, u)} (${signed(p.lo, u)} to ${signed(p.hi, u)})` : '? | ?';
+        return `| ${name} | ${cell(c, '$')} | ${cell(w, 's')} |`;
+      })
+  : [];
 const describe = ref =>
   ref
     ? `effort ${ref.effort ?? 'none'}, temperature ${ref.temperature ?? 'none'}, top_p ${ref.top_p ?? 'none'}, top_k ${ref.top_k ?? 'none'}, output cap ${ref.maxTokens ?? 'none'}, endpoints ${ref.provider?.order?.join(' > ') ?? "OpenRouter's choice"}${ref.provider?.allow_fallbacks ? ' (then any other)' : ''}`
@@ -1193,6 +1247,24 @@ const summary = [
   '',
   `Prompt: "${sc.prompt}"  `,
   `Model: ${sc.provider}/${sc.model}, reasoning effort: ${sc.effort}. ${runs} trial${runs === 1 ? '' : 's'} per harness, run one after another.`,
+  '',
+  '| Harness | Passed | Cost per run (mean) | Dearest run | Total billed | Wall time (mean) | Slowest run |',
+  '| --- | --- | --- | --- | --- | --- | --- |',
+  ...headline,
+  '',
+  ...(againstLeana.length
+    ? [
+        '## Against Leana, round by round',
+        '',
+        '| Harness | Leana cheaper in | Costs more than Leana per run (mean, 95% range) | Leana faster in | Slower than Leana per run (mean, 95% range) |',
+        '| --- | --- | --- | --- | --- |',
+        ...againstLeana,
+        '',
+        'A range that crosses 0 means the gap may be chance at this many rounds.',
+        '',
+      ]
+    : []),
+  '## Medians',
   '',
   "| Harness | Effort sent | Leana's settings | Passed | Wall time (median) | Working time (median) | Billed by OpenRouter (median, range) | Requests (median) | Prompt tokens (median) | Output tokens (median) |",
   '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',

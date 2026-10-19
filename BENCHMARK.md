@@ -51,18 +51,18 @@ A Leana run passes only when the independent verifier passes **and** the agent r
 
 The terminal prints each action, the full before/after diff, and report paths. Each trial directory contains:
 
-| File | Contents |
-| --- | --- |
-| `PROMPT.md` | Exact task to give either agent |
-| `manifest.json` | Fixture version, source hash, task hash, label |
-| `baseline.txt` | Passing original behavioral tests |
-| `before.json`, `after.json`, `changes.diff` | File snapshots and unified diff |
-| `agent-console.txt` | Leana's live terminal output |
-| `result.json`, `REPORT.md` | Machine-readable and readable measurements |
-| `behavior-verification.txt` | Independent behavioral test output |
-| `architecture-verification.txt` | Shared-layer tests and adapter violations |
-| `verification.json` | Verification outcomes and changed files |
-| `repo/.leana/runs/…/jev-decisions.md` | Exact Jev questions, state and answers |
+| File                                        | Contents                                       |
+| ------------------------------------------- | ---------------------------------------------- |
+| `PROMPT.md`                                 | Exact task to give either agent                |
+| `manifest.json`                             | Fixture version, source hash, task hash, label |
+| `baseline.txt`                              | Passing original behavioral tests              |
+| `before.json`, `after.json`, `changes.diff` | File snapshots and unified diff                |
+| `agent-console.txt`                         | Leana's live terminal output                   |
+| `result.json`, `REPORT.md`                  | Machine-readable and readable measurements     |
+| `behavior-verification.txt`                 | Independent behavioral test output             |
+| `architecture-verification.txt`             | Shared-layer tests and adapter violations      |
+| `verification.json`                         | Verification outcomes and changed files        |
+| `repo/.leana/runs/…/jev-decisions.md`       | Exact Jev questions, state and answers         |
 
 Each suite also writes `summary.json` with all trial results and the verified completion rate. Exit code 0 means all requested trials passed; code 1 means a trial or benchmark setup failed.
 
@@ -120,23 +120,24 @@ Do not infer an advantage from one trial. Start with three or more fresh runs pe
 
 `bench/harnesses.mjs` runs the same task through Leana, [Hermes](https://github.com/NousResearch/hermes-agent), [Cline](https://cline.bot) and [OpenCode](https://opencode.ai), all on the same model through OpenRouter. Every harness sends the same request settings as Leana, every request is recorded to show it, and every harness is measured the same way. The task and model are in [`bench/scenario.json`](bench/scenario.json):
 
-| Field | Value |
-| --- | --- |
-| Prompt | `build an advanced react demo landing page app for a saas startup using the latest and greatest best practices` |
-| Model | `z-ai/glm-5.3` through OpenRouter |
-| Reasoning effort | `low`, for every harness (see *Same settings as Leana*) |
-| Time limit | 20 minutes per trial |
-| Quiet limit | 4 minutes with no OpenRouter traffic before the watchdog acts (`idleMinutes`; see *Leftover processes*) |
+| Field            | Value                                                                                                           |
+| ---------------- | --------------------------------------------------------------------------------------------------------------- |
+| Prompt           | `build an advanced react demo landing page app for a saas startup using the latest and greatest best practices` |
+| Model            | `z-ai/glm-5.3` through OpenRouter                                                                               |
+| Reasoning effort | `low`, for every harness (see _Same settings as Leana_)                                                         |
+| Time limit       | 20 minutes per trial                                                                                            |
+| Quiet limit      | 4 minutes with no OpenRouter traffic before the watchdog acts (`idleMinutes`; see _Leftover processes_)         |
 
 ## Prerequisites
 
 - **Node 22 or later.** Leana built from this checkout (`npm ci && npm run build`); the runner reuses its process control and page observer.
 - **The CLIs on `PATH`**, as tested: Hermes Agent v0.21.3, Cline CLI 3.0.73, OpenCode v2.0.32. The runner records each version it finds.
-- **`OPENROUTER_API_KEY`** in the environment: one key for every harness. Use a key nothing else spends from while the suite runs, because cost is read from that key (see *What is measured*).
+- **`OPENROUTER_API_KEY`** in the environment: one key for every harness. Use a key nothing else spends from while the suite runs, because cost is read from that key (see _What is measured_).
 - **`TYPESAFE_API_KEY`** for Leana's Jev. It's needed even when Leana isn't among the harnesses run, because Leana's requests set the settings the others are given.
 - **Chrome or Chromium,** used by the verification's page check.
 
 None of the harnesses needs prior setup, and the runner leaves their own configuration alone:
+
 - **Cline:** each trial authenticates it with OpenRouter in a private state directory under the system temp folder. That directory holds the key, so it's deleted after the trial.
 - **Hermes:** each trial gives it a Hermes home of its own under the system temp folder, deleted after the trial. The only thing copied in is your Hermes model cache (`<hermes home>/cache`): Hermes sends a reasoning setting only for a model its cache lists as a reasoning model.
 - **OpenCode:** each trial gives it a config file of its own through `OPENCODE_CONFIG`, merged over yours.
@@ -160,29 +161,30 @@ npm run bench:harnesses -- --resume work/bench/harnesses/<suite>
 
 Everything goes under `work/bench/harnesses/<timestamp>/` (git-ignored):
 
-| File | Contents |
-| --- | --- |
-| `suite.json` | Scenario, harness versions, platform, Node version, start time |
-| `<harness>-<n>/repo/` | The directory the harness worked in, and what it built there |
-| `<harness>-<n>/command.json` | The exact command and arguments run (the key masked), the effort asked for, and the reference settings the trial was given |
-| `<harness>-<n>/requests.jsonl` | One line per chat request the harness sent. Each line has the request's settings (never its messages or the key) and, behind the proxy, the endpoint that served it, its usage, and what the runner changed (`harnessAsked`: the harness's own values) |
-| `hermes-<n>/connections.jsonl` | Hermes' HTTPS connections to OpenRouter through the tunnel: when each opened and closed, and the bytes each way (nothing of their content) |
-| `<harness>-<n>/leana-config.json`, `opencode-config.json`, `hermes-config.yaml`, `hermes-plugin.py` | What the trial was configured with (no key) |
-| `<harness>-<n>/agent-stdout.txt`, `agent-stderr.txt` | The harness's output |
-| `<harness>-<n>/trial.json` | Every measurement of the trial, the reference, and the settings check (`settings`) |
-| `<harness>-<n>/verify-*.txt`, `page.png` | Install, build and page-check output, and a screenshot of the page |
-| `summary.json`, `SUMMARY.md` | All trials, the comparison table, and the settings each harness sent |
+| File                                                                                                | Contents                                                                                                                                                                                                                                               |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `suite.json`                                                                                        | Scenario, harness versions, platform, Node version, start time                                                                                                                                                                                         |
+| `<harness>-<n>/repo/`                                                                               | The directory the harness worked in, and what it built there                                                                                                                                                                                           |
+| `<harness>-<n>/command.json`                                                                        | The exact command and arguments run (the key masked), the effort asked for, and the reference settings the trial was given                                                                                                                             |
+| `<harness>-<n>/requests.jsonl`                                                                      | One line per chat request the harness sent. Each line has the request's settings (never its messages or the key) and, behind the proxy, the endpoint that served it, its usage, and what the runner changed (`harnessAsked`: the harness's own values) |
+| `hermes-<n>/connections.jsonl`                                                                      | Hermes' HTTPS connections to OpenRouter through the tunnel: when each opened and closed, and the bytes each way (nothing of their content)                                                                                                             |
+| `<harness>-<n>/leana-config.json`, `opencode-config.json`, `hermes-config.yaml`, `hermes-plugin.py` | What the trial was configured with (no key)                                                                                                                                                                                                            |
+| `<harness>-<n>/agent-stdout.txt`, `agent-stderr.txt`                                                | The harness's output                                                                                                                                                                                                                                   |
+| `<harness>-<n>/trial.json`                                                                          | Every measurement of the trial, the reference, and the settings check (`settings`)                                                                                                                                                                     |
+| `<harness>-<n>/verify-*.txt`, `page.png`                                                            | Install, build and page-check output, and a screenshot of the page                                                                                                                                                                                     |
+| `summary.json`, `SUMMARY.md`                                                                        | All trials, the comparison table, and the settings each harness sent                                                                                                                                                                                   |
 
 ## How each harness is run
 
-| Harness | Command (in the trial's empty directory) | Its own usage report |
-| --- | --- | --- |
-| Leana | `node dist/src/cli.js run <prompt> --repo <dir> --provider openrouter --model z-ai/glm-5.3 --effort low --plain --config <trial>/leana-config.json` (the config sets only `openrouterUrl`, to the proxy) | `events.jsonl` of the session it prints: one `bonsai` event per model request |
-| Hermes | `hermes -z <prompt> --usage-file <trial>/hermes-usage.json --provider openrouter -m z-ai/glm-5.3 --reasoning low --yolo --in <dir>`, with `TERMINAL_CWD=<dir>`, `HERMES_HOME=<its own home>`, `HERMES_DUMP_REQUESTS=1`, and `HTTPS_PROXY` set to the runner's tunnel | The usage file: `api_calls`, input, cache-read, output and reasoning tokens, estimated cost |
-| Cline | `cline auth -p openrouter -k <key> -m z-ai/glm-5.3 --data-dir <tmp>`, its OpenRouter `baseUrl` set to the proxy in `<tmp>/settings/providers.json`, then `cline -y --json -c <dir> -P openrouter -m z-ai/glm-5.3 --thinking low --data-dir <tmp> <prompt>` | The `run_result` line of its JSON output: iterations, input tokens (cache reads included), cache reads, output tokens, cost |
-| OpenCode | `opencode run --standalone --auto --format json -m openrouter/z-ai/glm-5.3#low <prompt>`, with `OPENCODE_CONFIG=<trial>/opencode-config.json` (OpenRouter `baseURL` set to the proxy; `small_model` set to the scenario's model) | Its JSON events: tokens and cost per step |
+| Harness  | Command (in the trial's empty directory)                                                                                                                                                                                                                             | Its own usage report                                                                                                        |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Leana    | `node dist/src/cli.js run <prompt> --repo <dir> --provider openrouter --model z-ai/glm-5.3 --effort low --plain --config <trial>/leana-config.json` (the config sets only `openrouterUrl`, to the proxy)                                                             | `events.jsonl` of the session it prints: one `bonsai` event per model request                                               |
+| Hermes   | `hermes -z <prompt> --usage-file <trial>/hermes-usage.json --provider openrouter -m z-ai/glm-5.3 --reasoning low --yolo --in <dir>`, with `TERMINAL_CWD=<dir>`, `HERMES_HOME=<its own home>`, `HERMES_DUMP_REQUESTS=1`, and `HTTPS_PROXY` set to the runner's tunnel | The usage file: `api_calls`, input, cache-read, output and reasoning tokens, estimated cost                                 |
+| Cline    | `cline auth -p openrouter -k <key> -m z-ai/glm-5.3 --data-dir <tmp>`, its OpenRouter `baseUrl` set to the proxy in `<tmp>/settings/providers.json`, then `cline -y --json -c <dir> -P openrouter -m z-ai/glm-5.3 --thinking low --data-dir <tmp> <prompt>`           | The `run_result` line of its JSON output: iterations, input tokens (cache reads included), cache reads, output tokens, cost |
+| OpenCode | `opencode run --standalone --auto --format json -m openrouter/z-ai/glm-5.3#low <prompt>`, with `OPENCODE_CONFIG=<trial>/opencode-config.json` (OpenRouter `baseURL` set to the proxy; `small_model` set to the scenario's model)                                     | Its JSON events: tokens and cost per step                                                                                   |
 
 Notes:
+
 - **Unattended mode:** every harness runs with its own approvals off (`--yolo`, `-y`, `--auto`; Leana's shell and writes are on by default). They run unsandboxed with your user's permissions, as in normal use.
 - **Hermes and `TERMINAL_CWD`:** without it, Hermes' one-shot mode ran its terminal tool in the user's home directory and created the project there (`~/saas-landing`). The runner sets it, and the terminal `cwd` in Hermes' config, to the trial directory. A trial whose directory stays empty is reported as such and doesn't pass.
 - **`PWD` is set to the trial directory.** OpenCode takes its project from `PWD`, which a shell sets and Node doesn't. Without it, OpenCode worked in the directory the runner was started from. After each trial the runner also lists anything new at the top of the Leana checkout, and a trial that wrote there doesn't pass (`wroteOutside` in `trial.json`).
@@ -201,37 +203,39 @@ Notes:
 
 Each harness is asked for the scenario's effort, `low`, with its own option: `--effort`, `--reasoning`, `--thinking`, or the `#low` variant. GLM-5.3 offers `low`, `high` and `max`, and every harness takes `low` as given.
 
-Several other settings also decide what a request does, where it runs and what it costs. Each round, these are set to what Leana sent in that round, its *reference*. The reference is the value most of Leana's requests carried (its file-writing requests and retries sample differently):
+Several other settings also decide what a request does, where it runs and what it costs. Each round, these are set to what Leana sent in that round, its _reference_. The reference is the value most of Leana's requests carried (its file-writing requests and retries sample differently):
 
-| Setting | Leana's, on GLM-5.3 | The harnesses' own |
-| --- | --- | --- |
-| Reasoning effort | `low` | `low` (each asked with its own option) |
-| Sampling | temperature 1, top_p 0.95, top_k 20 | None sent: the endpoint's default |
-| Output cap (`max_tokens`) | 21,216 | Cline 283,115; OpenCode 256,000 (`max_completion_tokens`); Hermes none |
-| Endpoints | Up to five, cheapest for Leana's requests first, then OpenRouter's fallbacks (`provider.order`, `allow_fallbacks`) | OpenRouter's default routing |
-| Session | One `session_id` per run, so requests stay with the endpoint holding their prompt cache | Hermes sends its own; the proxy gives Cline and OpenCode one per trial when they send none |
+| Setting                   | Leana's, on GLM-5.3                                                                                                | The harnesses' own                                                                         |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| Reasoning effort          | `low`                                                                                                              | `low` (each asked with its own option)                                                     |
+| Sampling                  | temperature 1, top_p 0.95, top_k 20                                                                                | None sent: the endpoint's default                                                          |
+| Output cap (`max_tokens`) | 21,216                                                                                                             | Cline 283,115; OpenCode 256,000 (`max_completion_tokens`); Hermes none                     |
+| Endpoints                 | Up to five, cheapest for Leana's requests first, then OpenRouter's fallbacks (`provider.order`, `allow_fallbacks`) | OpenRouter's default routing                                                               |
+| Session                   | One `session_id` per run, so requests stay with the endpoint holding their prompt cache                            | Hermes sends its own; the proxy gives Cline and OpenCode one per trial when they send none |
 
 The endpoint order changes as prices and availability change. One run put `relace` first, another `wafer/us`. That's why the reference is taken again in every round.
 
 How each harness is given these settings:
+
 - **Leana** goes through the recording proxy (`bench/proxy.mjs`) unchanged, so its requests are recorded the same way as the others'.
 - **Cline and OpenCode** go through the same proxy, which sets the reference on each chat request. The effort is changed only when a request lacks the reference's, and the output cap keeps the name the harness uses. The record keeps what the harness had asked for.
 - **Hermes** can't go behind the proxy, because it sends its reasoning setting only to `openrouter.ai`. Instead, a small plugin in its own Hermes home (`hermes-plugin.py`, request middleware) sets the same values on each request. Hermes dumps each request as sent, with the key masked, and those dumps are its record. Its side calls (session titles, context compression) get the same effort and endpoint order through its `auxiliary` settings. They aren't dumped, but they are billed.
 
-**The check:** after each trial, its recorded requests are compared with the reference: model, effort, temperature, top_p, top_k, output cap, and endpoint order. The summary has a column for trials whose every request matched, and a *Settings sent* section. That section lists the endpoints that served each harness (Hermes' aren't recorded), what the runner changed, and any request that differed.
+**The check:** after each trial, its recorded requests are compared with the reference: model, effort, temperature, top_p, top_k, output cap, and endpoint order. The summary has a column for trials whose every request matched, and a _Settings sent_ section. That section lists the endpoints that served each harness (Hermes' aren't recorded), what the runner changed, and any request that differed.
 
 ## What is measured
 
-| Measure | How | Same for every harness? |
-| --- | --- | --- |
-| **Billed (USD)** | `GET https://openrouter.ai/api/v1/key` before and after the trial. The key's total usage, waited on until it has held still for 20 s, because OpenRouter books costs shortly after a request ends. This is what was charged, whichever endpoint served it. | Yes: it doesn't depend on the harness reporting anything. Any other spend on the key during a trial is counted too. |
-| **Wall time** | From starting the harness to its exit (or the time limit) | Yes |
-| **Working time** | From starting the harness to its last exchange with OpenRouter. It leaves out the quiet spells the watchdog ended by stopping what the harness was waiting on, whether after its work or in the middle of it (Hermes once waited 7 minutes on an `npm run dev` it had started, then replied once more). It also leaves out the wait for the harness's exit. The proxy sees Leana's, Cline's and OpenCode's requests. Hermes reaches OpenRouter through the runner's tunnel (`HTTPS_PROXY`), which passes its encrypted requests through unread and sees only when bytes flow. | Yes. For Leana it also leaves out the completion check after its last model request, a few seconds. |
-| **Requests, prompt tokens (cached tokens included), output tokens** | As OpenRouter reported them, request by request, through the proxy, for Leana, Cline and OpenCode (`metered` in `trial.json`). Hermes isn't behind the proxy, so its figures are its own report (`usage`, as are the other harnesses' own reports). | Yes, for the three behind the proxy. A harness's own count can be far off: Cline reported a fifth to a third of the output tokens OpenRouter billed it for. Leana's figures exclude its Jev calls, which TypeSafe bills separately. |
-| **Settings sent** | Every chat request recorded (the proxy, or Hermes' dumps) and compared with Leana's | Yes |
-| **Passed** | The harness exited 0 within the time limit and left its project in its directory. The project's own `npm run build` passed (when it has a build script). Its page loaded in a headless browser with no exception and no failed request. | Yes |
+| Measure                                                             | How                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Same for every harness?                                                                                                                                                                                                             |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Billed (USD)**                                                    | `GET https://openrouter.ai/api/v1/key` before and after the trial. The key's total usage, waited on until it has held still for 20 s, because OpenRouter books costs shortly after a request ends. This is what was charged, whichever endpoint served it.                                                                                                                                                                                                                                                                                                                    | Yes: it doesn't depend on the harness reporting anything. Any other spend on the key during a trial is counted too.                                                                                                                 |
+| **Wall time**                                                       | From starting the harness to its exit (or the time limit)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Yes                                                                                                                                                                                                                                 |
+| **Working time**                                                    | From starting the harness to its last exchange with OpenRouter. It leaves out the quiet spells the watchdog ended by stopping what the harness was waiting on, whether after its work or in the middle of it (Hermes once waited 7 minutes on an `npm run dev` it had started, then replied once more). It also leaves out the wait for the harness's exit. The proxy sees Leana's, Cline's and OpenCode's requests. Hermes reaches OpenRouter through the runner's tunnel (`HTTPS_PROXY`), which passes its encrypted requests through unread and sees only when bytes flow. | Yes. For Leana it also leaves out the completion check after its last model request, a few seconds.                                                                                                                                 |
+| **Requests, prompt tokens (cached tokens included), output tokens** | As OpenRouter reported them, request by request, through the proxy, for Leana, Cline and OpenCode (`metered` in `trial.json`). Hermes isn't behind the proxy, so its figures are its own report (`usage`, as are the other harnesses' own reports).                                                                                                                                                                                                                                                                                                                           | Yes, for the three behind the proxy. A harness's own count can be far off: Cline reported a fifth to a third of the output tokens OpenRouter billed it for. Leana's figures exclude its Jev calls, which TypeSafe bills separately. |
+| **Settings sent**                                                   | Every chat request recorded (the proxy, or Hermes' dumps) and compared with Leana's                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Yes                                                                                                                                                                                                                                 |
+| **Passed**                                                          | The harness exited 0 within the time limit and left its project in its directory. The project's own `npm run build` passed (when it has a build script). Its page loaded in a headless browser with no exception and no failed request.                                                                                                                                                                                                                                                                                                                                       | Yes                                                                                                                                                                                                                                 |
 
 Verification runs after the harness exits:
+
 1. Find the project: the trial directory, or the one subdirectory up to two levels down that has a `package.json` (Cline scaffolds into `app/`, Hermes into `saas-landing/`).
 2. `npm install` if `node_modules` is missing, then `npm run build` if there's a build script.
 3. Serve it on a free port with its own scripts: `preview` after a passing build, else `dev`, else `start`. A Next.js project is served with `start` after a passing build, else `dev`, using Next's own flags (`-p`, `-H`).
@@ -241,7 +245,10 @@ Verification runs after the harness exits:
 
 ## Reading the results
 
-- **Several trials per harness.** Runs of the same harness on the same task vary a lot: Leana's own runs of this task ranged from 7 to 28 requests. The summary gives medians, and ranges for cost.
+- **Several trials per harness.** Runs of the same harness on the same task vary a lot: Leana's own runs of this task ranged from 7 to 28 requests. The summary leads with three views:
+  - **Mean cost per run, dearest run and total billed, and mean and slowest wall time.** The mean is what many runs cost, and the worst run shows the stuck repair loops the median hides.
+  - **Each harness against Leana, round by round.** A round gives every harness the same task and settings, so comparing within it removes what the round shares. It gives how many rounds Leana was cheaper and faster, and the average difference with a 95% range from resampling the rounds. A range that crosses 0 means the gap may be chance at that many rounds; 4 rounds is often too few.
+  - **Medians,** with the request and token counts.
 - **Note what else used the key.** Background jobs or another session spending from the same key inflate the billed figure. Use a dedicated key.
-- **Same settings, different work.** With the settings equal, the differences left are each harness's own: its prompts, its tools, and how many requests and tokens it spends on the task. OpenRouter can still fall back to an endpoint lower in the order (or outside it) when one is busy; the *Settings sent* section shows which endpoints actually served Leana, Cline and OpenCode.
+- **Same settings, different work.** With the settings equal, the differences left are each harness's own: its prompts, its tools, and how many requests and tokens it spends on the task. OpenRouter can still fall back to an endpoint lower in the order (or outside it) when one is busy; the _Settings sent_ section shows which endpoints actually served Leana, Cline and OpenCode.
 - **Results describe this machine, these versions, and this model on these days.** Publish `suite.json` with any results.

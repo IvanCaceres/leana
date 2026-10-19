@@ -126,6 +126,7 @@ Do not infer an advantage from one trial. Start with three or more fresh runs pe
 | Model | `z-ai/glm-5.3` through OpenRouter |
 | Reasoning effort | `low`, for every harness (see *Same settings as Leana*) |
 | Time limit | 20 minutes per trial |
+| Quiet limit | 4 minutes with no OpenRouter traffic before the watchdog acts (`idleMinutes`; see *Leftover processes*) |
 
 ## Prerequisites
 
@@ -162,6 +163,7 @@ Everything goes under `work/bench/harnesses/<timestamp>/` (git-ignored):
 | `<harness>-<n>/repo/` | The directory the harness worked in, and what it built there |
 | `<harness>-<n>/command.json` | The exact command and arguments run (the key masked), the effort asked for, and the reference settings the trial was given |
 | `<harness>-<n>/requests.jsonl` | One line per chat request the harness sent. Each line has the request's settings (never its messages or the key) and, behind the proxy, the endpoint that served it, its usage, and what the runner changed (`harnessAsked`: the harness's own values) |
+| `hermes-<n>/connections.jsonl` | Hermes' HTTPS connections to OpenRouter through the tunnel: when each opened and closed, and the bytes each way (nothing of their content) |
 | `<harness>-<n>/leana-config.json`, `opencode-config.json`, `hermes-config.yaml`, `hermes-plugin.py` | What the trial was configured with (no key) |
 | `<harness>-<n>/agent-stdout.txt`, `agent-stderr.txt` | The harness's output |
 | `<harness>-<n>/trial.json` | Every measurement of the trial, the reference, and the settings check (`settings`) |
@@ -173,7 +175,7 @@ Everything goes under `work/bench/harnesses/<timestamp>/` (git-ignored):
 | Harness | Command (in the trial's empty directory) | Its own usage report |
 | --- | --- | --- |
 | Leana | `node dist/src/cli.js run <prompt> --repo <dir> --provider openrouter --model z-ai/glm-5.3 --effort low --plain --config <trial>/leana-config.json` (the config sets only `openrouterUrl`, to the proxy) | `events.jsonl` of the session it prints: one `bonsai` event per model request |
-| Hermes | `hermes -z <prompt> --usage-file <trial>/hermes-usage.json --provider openrouter -m z-ai/glm-5.3 --reasoning low --yolo --in <dir>`, with `TERMINAL_CWD=<dir>`, `HERMES_HOME=<its own home>`, `HERMES_DUMP_REQUESTS=1` | The usage file: `api_calls`, input, cache-read, output and reasoning tokens, estimated cost |
+| Hermes | `hermes -z <prompt> --usage-file <trial>/hermes-usage.json --provider openrouter -m z-ai/glm-5.3 --reasoning low --yolo --in <dir>`, with `TERMINAL_CWD=<dir>`, `HERMES_HOME=<its own home>`, `HERMES_DUMP_REQUESTS=1`, and `HTTPS_PROXY` set to the runner's tunnel | The usage file: `api_calls`, input, cache-read, output and reasoning tokens, estimated cost |
 | Cline | `cline auth -p openrouter -k <key> -m z-ai/glm-5.3 --data-dir <tmp>`, its OpenRouter `baseUrl` set to the proxy in `<tmp>/settings/providers.json`, then `cline -y --json -c <dir> -P openrouter -m z-ai/glm-5.3 --thinking low --data-dir <tmp> <prompt>` | The `run_result` line of its JSON output: iterations, input tokens (cache reads included), cache reads, output tokens, cost |
 | OpenCode | `opencode run --standalone --auto --format json -m openrouter/z-ai/glm-5.3#low <prompt>`, with `OPENCODE_CONFIG=<trial>/opencode-config.json` (OpenRouter `baseURL` set to the proxy; `small_model` set to the scenario's model) | Its JSON events: tokens and cost per step |
 
@@ -182,7 +184,11 @@ Notes:
 - **Hermes and `TERMINAL_CWD`:** without it, Hermes' one-shot mode ran its terminal tool in the user's home directory and created the project there (`~/saas-landing`). The runner sets it, and the terminal `cwd` in Hermes' config, to the trial directory. A trial whose directory stays empty is reported as such and doesn't pass.
 - **`PWD` is set to the trial directory.** OpenCode takes its project from `PWD`, which a shell sets and Node doesn't. Without it, OpenCode worked in the directory the runner was started from. After each trial the runner also lists anything new at the top of the Leana checkout, and a trial that wrote there doesn't pass (`wroteOutside` in `trial.json`).
 - **Each trial is its own git repository.** A harness takes the enclosing repository as its project: OpenCode, run in a plain folder under `work/`, wrote its project into the Leana checkout, and Cline's linter read that checkout's `.gitignore`.
-- **Leftover processes:** a harness can leave a dev server running (OpenCode left a `vite preview`). A trial ends when the harness exits, after a 3-second drain, not when its output pipes close, and everything it started is stopped. On Windows that uses an inherited `LEANA_RUN` mark, so it reaches detached processes too; elsewhere the harness's process group is stopped.
+- **Leftover processes:** a harness can leave a server running. OpenCode and Cline each left a `vite preview` that held the runner's output open after they exited. Hermes, finished in about 2 minutes, then waited 11 more on the one it had left, until it was stopped by hand. The runner handles both:
+  - A trial ends when the harness exits, after a 3-second drain, not when its output pipes close.
+  - The runner follows the harness's process family while it runs: every process started since the trial began by a member, even one whose parent has since exited. It also covers whatever carries the inherited `LEANA_RUN` mark (Windows) or the harness's process group (elsewhere), and whatever runs from inside the trial directory. After the harness exits, all of it is stopped.
+  - **The watchdog:** when a harness has had no OpenRouter traffic for the quiet limit and has no request open, the runner stops everything in its family except the harness itself. A harness waiting on a server it left then exits on its own; the trial records it under `stalls`. If the harness stays quiet for another quiet limit with nothing left to stop, the harness itself is stopped, and the trial records `stalled` and doesn't pass.
+  - Builds and installs between model requests take a few minutes at most, under the quiet limit.
 - **On Windows,** Cline and OpenCode installed through npm or Volta are `.cmd` shims, which the runner starts through `cmd.exe`.
 
 ## Same settings as Leana
@@ -214,6 +220,7 @@ How each harness is given these settings:
 | --- | --- | --- |
 | **Billed (USD)** | `GET https://openrouter.ai/api/v1/key` before and after the trial. The key's total usage, waited on until it has held still for 20 s, because OpenRouter books costs shortly after a request ends. This is what was charged, whichever endpoint served it. | Yes: it doesn't depend on the harness reporting anything. Any other spend on the key during a trial is counted too. |
 | **Wall time** | From starting the harness to its exit (or the time limit) | Yes |
+| **Working time** | From starting the harness to its last exchange with OpenRouter. It leaves out any wait afterwards, such as Hermes waiting on a server it left running, or the harness's exit. The proxy sees Leana's, Cline's and OpenCode's requests. Hermes reaches OpenRouter through the runner's tunnel (`HTTPS_PROXY`), which passes its encrypted requests through unread and sees only when bytes flow. | Yes. For Leana it also leaves out the completion check after its last model request, a few seconds. |
 | **Requests, prompt tokens (cached tokens included), output tokens** | Each harness's own report (see the table above) | No: each counts in its own way. Treat them as indicative and the billed figure as authoritative. Leana's figures exclude its Jev calls, which TypeSafe bills separately. |
 | **Settings sent** | Every chat request recorded (the proxy, or Hermes' dumps) and compared with Leana's | Yes |
 | **Passed** | The harness exited 0 within the time limit and left its project in its directory. The project's own `npm run build` passed (when it has a build script). Its page loaded in a headless browser with no exception and no failed request. | Yes |

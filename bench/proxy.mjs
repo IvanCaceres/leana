@@ -6,6 +6,7 @@
 // from its own request dumps).
 import { createServer } from 'node:http';
 import { appendFileSync } from 'node:fs';
+import { connect } from 'node:net';
 
 const upstream = 'https://openrouter.ai';
 // The settings of a chat request that decide what the model does, where it runs and what it costs.
@@ -35,8 +36,18 @@ export function settingsOf(body) {
 }
 
 // rewrite(body) changes a chat request's body in place and returns the keys it changed.
+//
+// The proxy also tunnels HTTPS (CONNECT), for a harness given it as HTTPS_PROXY (Hermes): the tunnel carries the
+// harness's own encrypted requests to OpenRouter unchanged and unread, so it records only when bytes went to or came
+// from openrouter.ai. activity() tells, for both ways in, when OpenRouter last sent or received anything and how many
+// requests through the recorder are still open: the runner's watchdog and its working time read it.
 export function startProxy(logFile, rewrite = null) {
+  let last = 0;
+  let open = 0;
+  const tunnels = new Set();
   const server = createServer(async (req, res) => {
+    open++;
+    last = Date.now();
     const chunks = [];
     for await (const c of req) chunks.push(c);
     let raw = Buffer.concat(chunks);
@@ -68,6 +79,7 @@ export function startProxy(logFile, rewrite = null) {
       let text = '';
       if (r.body)
         for await (const c of r.body) {
+          last = Date.now();
           res.write(c);
           if (chat) text += Buffer.from(c).toString('utf8');
         }
@@ -100,19 +112,62 @@ export function startProxy(logFile, rewrite = null) {
       record.error = String(e?.message ?? e);
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: record.error } }));
+    } finally {
+      open--;
+      last = Date.now();
     }
+    record.ended = new Date(last).toISOString();
     appendFileSync(logFile, JSON.stringify(record) + '\n');
   });
+  server.on('connect', (req, socket, head) => {
+    const [host, port] = String(req.url ?? '').split(':');
+    const counted = /(^|\.)openrouter\.ai$/i.test(host ?? '');
+    const record = { at: new Date().toISOString(), tunnel: host, bytesUp: 0, bytesDown: 0 };
+    const up = connect(Number(port) || 443, host, () => {
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head?.length) up.write(head);
+      up.pipe(socket);
+      socket.pipe(up);
+    });
+    tunnels.add(socket);
+    if (counted) {
+      socket.on('data', d => {
+        record.bytesUp += d.length;
+        last = Date.now();
+      });
+      up.on('data', d => {
+        record.bytesDown += d.length;
+        last = Date.now();
+      });
+    }
+    let done = false;
+    const end = () => {
+      if (done) return;
+      done = true;
+      tunnels.delete(socket);
+      socket.destroy();
+      up.destroy();
+      if (counted) appendFileSync(logFile, JSON.stringify({ ...record, ended: new Date().toISOString() }) + '\n');
+    };
+    up.on('error', end);
+    up.on('close', end);
+    socket.on('error', end);
+    socket.on('close', end);
+  });
   return new Promise(done =>
-    server.listen(0, '127.0.0.1', () =>
+    server.listen(0, '127.0.0.1', () => {
+      const origin = `http://127.0.0.1:${server.address().port}`;
       done({
-        url: `http://127.0.0.1:${server.address().port}/api/v1`,
+        url: `${origin}/api/v1`,
+        origin,
+        activity: () => ({ last, open }),
         close: () =>
           new Promise(r => {
+            for (const s of tunnels) s.destroy();
             server.closeAllConnections?.();
             server.close(() => r());
           }),
-      }),
-    ),
+      });
+    }),
   );
 }

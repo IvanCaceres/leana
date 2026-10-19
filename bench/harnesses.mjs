@@ -43,11 +43,11 @@ const scenario = JSON.parse(readFileSync(args.scenario, 'utf8'));
 const key = process.env.OPENROUTER_API_KEY;
 if (!key) throw new Error('Set OPENROUTER_API_KEY: every harness is pointed at OpenRouter with this key.');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const { killTree, runMark, stopMarked } = await import(new URL('../dist/src/shell.js', import.meta.url).href).catch(
-  () => {
-    throw new Error('Build Leana first (npm run build): the runner uses its process and page-observation code.');
-  },
-);
+const { killTree, runMark, stopMarked, windowsLeft } = await import(
+  new URL('../dist/src/shell.js', import.meta.url).href
+).catch(() => {
+  throw new Error('Build Leana first (npm run build): the runner uses its process and page-observation code.');
+});
 const { renderFacts } = await import(new URL('../dist/src/render.js', import.meta.url).href);
 
 // ---- the OpenRouter key's spend: read before and after each trial ------------------------------------------------
@@ -90,7 +90,11 @@ function resolved(command, argv) {
 // did): the run ends when the harness exits, after a short drain, not when its pipes close. On Windows every process it
 // starts carries a mark (LEANA_RUN, inherited through the environment), and whatever still carries it afterwards is
 // stopped, detached or not; elsewhere the harness runs in its own process group, which is stopped whole.
-function run(command, argv, { cwd, env = {}, timeoutMs, stdout, stderr }) {
+//
+// signal: aborting it stops the harness (the watchdog's last resort for one that does nothing for long); the result
+// says stalled.
+// onSpawn({pid, mark, at}): what the watchdog needs to find what the harness has started.
+function run(command, argv, { cwd, env = {}, timeoutMs, stdout, stderr, signal, onSpawn }) {
   const r = resolved(command, argv);
   const mark = runMark();
   return new Promise(done => {
@@ -104,6 +108,7 @@ function run(command, argv, { cwd, env = {}, timeoutMs, stdout, stderr }) {
       windowsHide: true,
       detached: process.platform !== 'win32',
     });
+    onSpawn?.({ pid: child.pid, mark, at: Date.now() });
     const out = stdout ? createWriteStream(stdout) : null;
     const err = stderr ? createWriteStream(stderr) : null;
     let text = '';
@@ -113,6 +118,7 @@ function run(command, argv, { cwd, env = {}, timeoutMs, stdout, stderr }) {
     });
     child.stderr.on('data', d => err?.write(d));
     let timedOut = false;
+    let stalled = false;
     let finished = false;
     let drain = null;
     const stop = () => {
@@ -127,19 +133,107 @@ function run(command, argv, { cwd, env = {}, timeoutMs, stdout, stderr }) {
       stop();
       out?.end();
       err?.end();
-      done({ code, timedOut, stdout: text, ...(error ? { error } : {}) });
+      done({ code, timedOut, stalled, stdout: text, ...(error ? { error } : {}) });
     };
     const timer = setTimeout(() => {
       timedOut = true;
       stop();
       setTimeout(() => finish(null), 5000);
     }, timeoutMs);
+    signal?.addEventListener('abort', () => {
+      if (finished) return;
+      stalled = true;
+      stop();
+      setTimeout(() => finish(null), 5000);
+    });
     child.on('error', e => finish(-1, e.message));
     child.on('exit', code => {
       drain = setTimeout(() => finish(code), 3000);
     });
     child.on('close', code => finish(code));
   });
+}
+// ---- what a harness leaves running ---------------------------------------------------------------------------------
+// A harness can start a server and leave it running: Cline and OpenCode left a vite preview, which held the runner's
+// output open after they exited; Hermes waited on its own until it was stopped (11 minutes); a test left
+// `npx http-server -p 4599 .`. On Windows a parent chain breaks when a parent exits, and LEANA_RUN reaches only what
+// Git Bash starts (windowsLeft), so the harness's family is followed while it runs: on each look at the process table,
+// every process started since the trial began by a member, living or not, joins it. Elsewhere the harness runs in its
+// own process group. What runs from inside the trial's directory, by its command line, is taken too.
+function processTable() {
+  if (process.platform === 'win32') {
+    const ps =
+      'Get-CimInstance Win32_Process | ForEach-Object { [string]$_.ProcessId + [char]9 + $_.ParentProcessId + [char]9 + ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() + [char]9 + $_.CommandLine }';
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+      encoding: 'utf8',
+      windowsHide: true,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return (r.stdout ?? '')
+      .split(/\r?\n/)
+      .map(l => l.split('\t'))
+      .filter(f => f.length >= 3)
+      .map(([pid, ppid, created, ...line]) => ({
+        pid: Number(pid),
+        ppid: Number(ppid),
+        group: 0,
+        created: Number(created),
+        line: line.join('\t').toLowerCase(),
+      }));
+  }
+  const r = spawnSync('ps', ['-eo', 'pid=,ppid=,pgid=,args='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  return (r.stdout ?? '')
+    .split('\n')
+    .map(l => l.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/))
+    .filter(Boolean)
+    .map(m => ({ pid: Number(m[1]), ppid: Number(m[2]), group: Number(m[3]), created: 0, line: m[4].toLowerCase() }));
+}
+// The family of the harness of one trial. keep: what the harness's own command lines hold (the prompt); a process
+// holding it is the harness, never stopped while it runs.
+function family(trial, keep) {
+  const dir = resolve(trial).toLowerCase();
+  const kept = keep.map(k => k.toLowerCase()).filter(Boolean);
+  const members = new Set();
+  let root = null;
+  const look = () => {
+    const rows = processTable();
+    if (root && process.platform === 'win32')
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const r of rows)
+          if (members.has(r.ppid) && !members.has(r.pid) && r.created >= root.at - 1000) {
+            members.add(r.pid);
+            grew = true;
+          }
+      }
+    return rows;
+  };
+  return {
+    started(s) {
+      root = s;
+      members.add(s.pid);
+    },
+    look,
+    // Stops what the family and the trial's directory still run (the harness itself only once it has exited).
+    async stop({ harnessToo = false } = {}) {
+      const rows = look();
+      const ours = r =>
+        members.has(r.pid) || (root && r.group === root.pid && process.platform !== 'win32') || r.line.includes(dir);
+      const pids = new Set(
+        rows
+          .filter(r => ours(r) && r.pid !== process.pid)
+          .filter(r => harnessToo || (r.pid !== root?.pid && !kept.some(k => r.line.includes(k))))
+          .map(r => r.pid),
+      );
+      if (root?.mark)
+        for (const p of await windowsLeft(root.mark, root.at))
+          if (harnessToo || !kept.some(k => p.args.toLowerCase().includes(k))) pids.add(p.pid);
+      pids.delete(process.pid);
+      if (!harnessToo) pids.delete(root?.pid);
+      for (const p of pids) killTree(p, 'SIGKILL');
+      return pids.size;
+    },
+  };
 }
 const freePort = () =>
   new Promise(done => {
@@ -325,8 +419,11 @@ const harnesses = {
     // home of its own (the user's is left alone) whose plugin sets the reference on each request, and that dumps each
     // request it sends (HERMES_DUMP_REQUESTS, the key masked). The user's model cache is copied in: Hermes sends a
     // reasoning setting only for a model its cache lists as reasoning. Its side calls (titles, compression) are given
-    // the same effort and endpoint order through its auxiliary settings; they are not dumped.
-    prepare(s, repo, trial, ref) {
+    // the same effort and endpoint order through its auxiliary settings; they are not dumped. The proxy is its
+    // HTTPS_PROXY, a tunnel that passes its requests unread: it tells only when Hermes last talked to OpenRouter (the
+    // watchdog's and the working time's measure), logged to connections.jsonl.
+    async prepare(s, repo, trial, ref) {
+      const proxy = await startProxy(join(trial, 'connections.jsonl'));
       const home = join(tmpdir(), `leana-bench-hermes-${Date.now()}`);
       const user =
         process.env.HERMES_HOME ??
@@ -364,7 +461,7 @@ const harnesses = {
       );
       writeFileSync(join(trial, 'hermes-config.yaml'), readFileSync(join(home, 'config.yaml')));
       writeFileSync(join(trial, 'hermes-plugin.py'), readFileSync(join(plugin, '__init__.py')));
-      return { home, started: Date.now() };
+      return { home, proxy };
     },
     command: (s, repo, trial) => [
       'hermes',
@@ -385,7 +482,15 @@ const harnesses = {
       ],
     ],
     // Its terminal tool starts in TERMINAL_CWD; without it, a one-shot run worked in the user's home directory.
-    env: (repo, ctx) => ({ TERMINAL_CWD: repo, HERMES_HOME: ctx.home, HERMES_DUMP_REQUESTS: '1' }),
+    env: (repo, ctx) => ({
+      TERMINAL_CWD: repo,
+      HERMES_HOME: ctx.home,
+      HERMES_DUMP_REQUESTS: '1',
+      HTTPS_PROXY: ctx.proxy.origin,
+      https_proxy: ctx.proxy.origin,
+      NO_PROXY: '127.0.0.1,localhost',
+      no_proxy: '127.0.0.1,localhost',
+    }),
     usage(trial) {
       const f = join(trial, 'hermes-usage.json');
       if (!existsSync(f)) return null;
@@ -410,7 +515,8 @@ const harnesses = {
     },
     // Its request dumps, read into the trial's requests.jsonl (OpenRouter's fields in extra_body read as the request's
     // own), then its home removed.
-    cleanup(ctx, trial) {
+    async cleanup(ctx, trial) {
+      await ctx.proxy.close();
       const dumps = [];
       const walk = d => {
         for (const e of readdirSync(d, { withFileTypes: true })) {
@@ -816,14 +922,54 @@ if (args.rescore) {
         ),
       );
       const t0 = Date.now();
+      // The watchdog: a harness that has not talked to OpenRouter for idleMinutes, with no request open, is waiting on
+      // something else. Hermes, done in 2 minutes, waited 11 more on the vite preview it had left running, until it was
+      // stopped by hand. Whatever the harness's family runs is stopped (family), never the harness; a harness idle that
+      // long again with nothing left to stop is stopped itself (stalled). Long builds and installs in between
+      // model requests last a few minutes at most.
+      const idleMs = (scenario.idleMinutes ?? 4) * 60_000;
+      const stalls = [];
+      const abort = new AbortController();
+      let lastStop = t0;
+      const fam = family(trial, [scenario.prompt.slice(0, 60)]);
+      let looking = false;
+      const watchdog = setInterval(async () => {
+        if (looking) return;
+        looking = true;
+        try {
+          await tick();
+        } finally {
+          looking = false;
+        }
+      }, 10_000);
+      const tick = async () => {
+        fam.look();
+        const a = ctx.proxy?.activity();
+        if (!a || a.open) return;
+        const quiet = Date.now() - Math.max(a.last, t0);
+        if (quiet < idleMs || Date.now() - lastStop < idleMs) return;
+        lastStop = Date.now();
+        const stopped = await fam.stop();
+        stalls.push({ at: new Date().toISOString(), quietSeconds: Math.round(quiet / 1000), stopped });
+        console.log(
+          `  no OpenRouter traffic for ${Math.round(quiet / 1000)} s: ${stopped ? `stopped ${stopped} process${stopped === 1 ? '' : 'es'} it left running` : 'nothing of its own to stop'}`,
+        );
+        if (!stopped && stalls.filter(x => !x.stopped).length >= 2) abort.abort();
+      };
       const r = await run(command, argv, {
         cwd: repo,
         env: h.env ? h.env(repo, ctx) : {},
         timeoutMs: scenario.timeoutMinutes * 60_000,
         stdout: join(trial, 'agent-stdout.txt'),
         stderr: join(trial, 'agent-stderr.txt'),
-      });
+        signal: abort.signal,
+        onSpawn: s => fam.started(s),
+      }).finally(() => clearInterval(watchdog));
       const wallSeconds = (Date.now() - t0) / 1000;
+      // Working time: until the harness's last exchange with OpenRouter (its last reply, or for Leana the last before its
+      // completion check), apart from any wait after it for processes it left (the watchdog's case) or for its exit.
+      const lastTalk = ctx.proxy?.activity().last ?? 0;
+      const workingSeconds = lastTalk > t0 ? Math.min(wallSeconds, (lastTalk - t0) / 1000) : null;
       const after = await settledUsage(before);
       let usage = null;
       try {
@@ -832,6 +978,8 @@ if (args.rescore) {
         usage = { error: e.message };
       }
       await h.cleanup?.(ctx, trial);
+      const leftover = await fam.stop({ harnessToo: true });
+      if (leftover) console.log(`  stopped ${leftover} process${leftover === 1 ? '' : 'es'} it left running`);
       const sent = records(join(trial, 'requests.jsonl'));
       if (name === 'leana') ref = referenceOf(sent);
       const settings = settingsReport(sent, ref);
@@ -843,6 +991,7 @@ if (args.rescore) {
       if (wroteOutside.length) console.log(`  it wrote outside its directory: ${wroteOutside.join(', ')}`);
       if (!wroteHere) console.log('  its directory is empty: it wrote its project elsewhere, or nothing');
       const verification = args['skip-verify'] ? null : await verify(repo, trial).catch(e => ({ error: e.message }));
+      await fam.stop({ harnessToo: true });
       const result = {
         harness: name,
         trial: i,
@@ -853,7 +1002,10 @@ if (args.rescore) {
         ...(wroteOutside.length ? { wroteOutside } : {}),
         exitCode: r.code,
         timedOut: r.timedOut,
+        stalled: r.stalled,
+        ...(stalls.length ? { stalls } : {}),
         wallSeconds,
+        workingSeconds,
         billedUsd: +(after - before).toFixed(6),
         usage,
         verification,
@@ -861,7 +1013,7 @@ if (args.rescore) {
       writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
       results.push(result);
       console.log(
-        `  exit ${r.code}${r.timedOut ? ' (timed out)' : ''} | ${wallSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)} | ${usage?.requests ?? '?'} requests, ${usage?.promptTokens ?? '?'} prompt / ${usage?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
+        `  exit ${r.code}${r.timedOut ? ' (timed out)' : r.stalled ? ' (stalled: stopped)' : ''} | ${wallSeconds.toFixed(0)} s, working ${workingSeconds === null ? '?' : workingSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)} | ${usage?.requests ?? '?'} requests, ${usage?.promptTokens ?? '?'} prompt / ${usage?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
       );
       console.log(
         `  settings: ${name === 'leana' ? 'the reference' : settings.differences.length ? `differ from Leana's: ${settings.differences.join('; ')}` : "Leana's"} | effort ${settings.effort.join('/')} | served by ${
@@ -888,6 +1040,7 @@ const usd = x => (Number.isFinite(x) ? `$${x.toFixed(4)}` : '?');
 const passed = r =>
   r.exitCode === 0 &&
   !r.timedOut &&
+  !r.stalled &&
   r.wroteHere !== false &&
   !r.wroteOutside?.length &&
   r.verification?.build !== false &&
@@ -898,7 +1051,7 @@ const rows = chosen.map(name => {
   const of = f => rs.map(f).map(Number);
   const billed = of(r => r.billedUsd).filter(Number.isFinite);
   const efforts = distinct(rs.flatMap(r => r.settings?.effort ?? []));
-  return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => r.usage?.requests)))} | ${fmt(median(of(r => r.usage?.promptTokens)))} | ${fmt(median(of(r => r.usage?.outputTokens)))} |`;
+  return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${fmt(median(of(r => r.workingSeconds ?? NaN)))} s${rs.some(r => r.stalls?.length) ? ` (${rs.filter(r => r.stalls?.length).length} waited on leftovers)` : ''} | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => r.usage?.requests)))} | ${fmt(median(of(r => r.usage?.promptTokens)))} | ${fmt(median(of(r => r.usage?.outputTokens)))} |`;
 });
 const describe = ref =>
   ref
@@ -946,8 +1099,8 @@ const summary = [
   `Prompt: "${sc.prompt}"  `,
   `Model: ${sc.provider}/${sc.model}, reasoning effort: ${sc.effort}. ${runs} trial${runs === 1 ? '' : 's'} per harness, run one after another.`,
   '',
-  "| Harness | Effort sent | Leana's settings | Passed | Wall time (median) | Billed by OpenRouter (median, range) | Requests (median) | Prompt tokens (median) | Output tokens (median) |",
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  "| Harness | Effort sent | Leana's settings | Passed | Wall time (median) | Working time (median) | Billed by OpenRouter (median, range) | Requests (median) | Prompt tokens (median) | Output tokens (median) |",
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
   ...rows,
   '',
   '## Settings sent',
@@ -962,8 +1115,10 @@ const summary = [
       .join('; ') +
     '.',
   '',
-  "Effort sent: the reasoning effort on the requests each harness sent. Leana's settings: trials whose every request carried the effort, sampling, output cap and endpoint order Leana sent in that round. Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as each harness reports them (see BENCHMARK.md). Passed: exit 0 in time, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
+  "Effort sent: the reasoning effort on the requests each harness sent. Leana's settings: trials whose every request carried the effort, sampling, output cap and endpoint order Leana sent in that round. Wall time: from starting the harness to its exit. Working time: to its last exchange with OpenRouter, leaving out any wait after it, such as for a server it left running (the watchdog stops those after a quiet spell and notes it). Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as each harness reports them (see BENCHMARK.md). Passed: exit 0 in time without being stopped, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
 ].join('\n');
 writeFileSync(join(suite, 'summary.json'), JSON.stringify(results, null, 2));
 writeFileSync(join(suite, 'SUMMARY.md'), summary + '\n');
 console.log(`\n${summary}\n\n${join(suite, 'SUMMARY.md')}`);
+// Every trial's processes are stopped: nothing left open (a pipe a stray process held) keeps the runner alive.
+process.exit(0);

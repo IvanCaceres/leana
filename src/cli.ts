@@ -250,17 +250,33 @@ async function main(): Promise<void> {
   });
   // Wall-clock for this invocation and, when the session was resumed, since its first event.
   let since = '';
+  // Jev's calls in this invocation, priced as each was logged (Jev bills input tokens only): a cost of its own, apart
+  // from the worker's.
+  let jevLine = '';
   try {
-    const first = (await readFile(join(outcome.store.path, 'events.jsonl'), 'utf8')).split('\n')[0];
-    const at = first ? Date.parse(JSON.parse(first).at) : NaN;
-    if (Number.isFinite(at) && at < Date.now() - outcome.elapsedMs - 5000)
-      since = `; ${elapsed(Date.now() - at)} since the session began`;
+    const lines = (await readFile(join(outcome.store.path, 'events.jsonl'), 'utf8')).split('\n').filter(Boolean);
+    const at = lines[0] ? Date.parse(JSON.parse(lines[0]).at) : NaN;
+    const began = Date.now() - outcome.elapsedMs;
+    if (Number.isFinite(at) && at < began - 5000) since = `; ${elapsed(Date.now() - at)} since the session began`;
+    let calls = 0;
+    let input = 0;
+    let cost = 0;
+    for (const l of lines) {
+      if (!l.includes('"type":"jev"')) continue;
+      const e = JSON.parse(l);
+      if (e.type !== 'jev' || Date.parse(e.at) < began - 1000) continue;
+      calls++;
+      input += e.data?.usage?.input_tokens ?? 0;
+      cost += e.data?.costUsd ?? 0;
+    }
+    if (calls)
+      jevLine = `\nJev: ${calls} call${calls === 1 ? '' : 's'} | ${(input / 1000).toFixed(1)}k in | $${cost.toFixed(4)}`;
   } catch {
     /* no event log */
   }
   const r = outcome.session;
   console.log(
-    `\n${r.status.toUpperCase()}: ${r.outcome ?? r.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps (${r.step} in total)${since}${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}\nSession: ${outcome.store.path}`,
+    `\n${r.status.toUpperCase()}: ${r.outcome ?? r.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps (${r.step} in total)${since}${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}${jevLine}\nSession: ${outcome.store.path}`,
   );
   if (r.status !== 'complete') process.exitCode = 2;
 }

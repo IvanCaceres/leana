@@ -345,6 +345,7 @@ export interface Config {
   safetyTokens: number;
   jevUrl: string;
   jevModel: string;
+  jevUsdPerMillionInput: number;
   routeProbability: number;
   routeMargin: number;
   compactProbability: number;

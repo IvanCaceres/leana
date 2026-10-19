@@ -201,6 +201,27 @@ test('Jev HTTP request uses documented state/questions wire shape', async t => {
   assert.deepEqual(seen.body.state, { evidence: 'passed' });
   assert.equal(seen.body.model, 'jev-latest');
 });
+test("Jev's reply is priced from the input tokens it reports at TypeSafe's price, output free, and logged with it; a reply without usage is not priced", async t => {
+  let usage: unknown = { input_tokens: 2_000_000, output_tokens: 500 };
+  const server = createServer(async (req, res) => {
+    for await (const _ of req);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ model: 'jev-test', answers: { ok: { type: 'noul', noul: 0.9 } }, usage }));
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>(resolve => server.once('listening', resolve));
+  t.after(() => server.close());
+  const c = { ...defaults, jevUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1/systemone` };
+  const logged: { type: string; data: any }[] = [];
+  const jev = new Jev(c, 'k', async (type: string, data: any) => void logged.push({ type, data }));
+  const ask = () => jev.decide({ x: 1 }, { ok: { type: 'noul', instructions: 'Ok?' } }, { step: 1, phase: 'watchdog' });
+  await ask();
+  assert.equal(defaults.jevUsdPerMillionInput, 0.042);
+  assert.equal(logged.find(e => e.type === 'jev')!.data.costUsd, 0.084, '2M input tokens at $0.042 per million');
+  usage = undefined;
+  logged.length = 0;
+  await ask();
+  assert.equal('costUsd' in logged.find(e => e.type === 'jev')!.data, false);
+});
 test('HTTP retries transient responses but never retries authentication errors', async t => {
   let requests = 0;
   let status = 529;

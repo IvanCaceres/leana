@@ -25,7 +25,7 @@ import {
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -331,6 +331,10 @@ function referenceOf(rs) {
 }
 // What a trial's requests carried, how many the proxy changed and what the harness had asked for there, the endpoints
 // that served them, and every way they differ from the reference.
+// What TypeSafe charges per million Jev input tokens, as Leana's defaults say (output tokens are free).
+const jevUsdPerMillionInput = await import(pathToFileURL(join(root, 'dist', 'src', 'config.js')).href)
+  .then(m => m.defaults.jevUsdPerMillionInput)
+  .catch(() => 0.042);
 // A trial's requests and tokens as OpenRouter reported them, request by request, through the proxy: the same
 // count for every harness behind it. Harnesses count their own way: Cline reported a fifth to a third of the output
 // tokens OpenRouter billed it for. Null when the proxy recorded no usage (Hermes, whose requests come from its dumps).
@@ -443,9 +447,18 @@ const harnesses = {
         reportedCost: 0,
         extra: {},
       };
-      let jev = 0;
+      // Jev's calls, billed by TypeSafe apart from OpenRouter: priced as Leana logged each one, or, in a session from
+      // before it priced them, at the price it uses (input tokens only).
+      const jev = { calls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 };
       for (const e of jsonLines(readFileSync(join(session, 'events.jsonl'), 'utf8'))) {
-        if (e.type === 'jev') jev++;
+        if (e.type === 'jev') {
+          jev.calls++;
+          jev.inputTokens += num(e.data?.usage?.input_tokens);
+          jev.outputTokens += num(e.data?.usage?.output_tokens);
+          jev.costUsd += Number.isFinite(e.data?.costUsd)
+            ? e.data.costUsd
+            : (num(e.data?.usage?.input_tokens) * jevUsdPerMillionInput) / 1e6;
+        }
         if (e.type !== 'bonsai' || !e.data?.usage) continue;
         const x = e.data.usage;
         u.requests++;
@@ -455,7 +468,9 @@ const harnesses = {
         u.reasoningTokens += num(x.completion_tokens_details?.reasoning_tokens);
         u.reportedCost += num(x.cost);
       }
-      u.extra = { session, jevCalls: jev };
+      jev.costUsd = +jev.costUsd.toFixed(6);
+      u.extra = { session, jevCalls: jev.calls };
+      u.jev = jev;
       return u;
     },
     cleanup: async ctx => ctx.proxy.close(),
@@ -1108,7 +1123,7 @@ if (args.rescore) {
       writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
       results.push(result);
       console.log(
-        `  exit ${r.code}${r.timedOut ? ' (timed out)' : r.stalled ? ' (stalled: stopped)' : ''} | ${wallSeconds.toFixed(0)} s, working ${workingSeconds === null ? '?' : workingSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)} | ${(result.metered ?? usage)?.requests ?? '?'} requests, ${(result.metered ?? usage)?.promptTokens ?? '?'} prompt / ${(result.metered ?? usage)?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
+        `  exit ${r.code}${r.timedOut ? ' (timed out)' : r.stalled ? ' (stalled: stopped)' : ''} | ${wallSeconds.toFixed(0)} s, working ${workingSeconds === null ? '?' : workingSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)}${usage?.jev ? `, Jev $${usage.jev.costUsd.toFixed(4)} (${usage.jev.calls} calls)` : ''} | ${(result.metered ?? usage)?.requests ?? '?'} requests, ${(result.metered ?? usage)?.promptTokens ?? '?'} prompt / ${(result.metered ?? usage)?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
       );
       console.log(
         `  settings: ${name === 'leana' ? 'the reference' : settings.differences.length ? `differ from Leana's: ${settings.differences.join('; ')}` : "Leana's"} | effort ${settings.effort.join('/')} | served by ${
@@ -1141,12 +1156,16 @@ const passed = r =>
   r.verification?.build !== false &&
   r.verification?.page?.ok === true;
 const asReference = r => r.settings && !r.settings.differences.length;
+// Jev's cost, which TypeSafe bills apart from OpenRouter: Leana's alone (the other harnesses make no Jev calls), and
+// what a run costs in all.
+const jevUsd = r => (r.harness === 'leana' ? Number(r.usage?.jev?.costUsd ?? NaN) : 0);
+const totalUsd = r => Number(r.billedUsd) + jevUsd(r);
 const rows = chosen.map(name => {
   const rs = results.filter(r => r.harness === name);
   const of = f => rs.map(f).map(Number);
   const billed = of(r => r.billedUsd).filter(Number.isFinite);
   const efforts = distinct(rs.flatMap(r => r.settings?.effort ?? []));
-  return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${fmt(median(of(r => r.workingSeconds ?? NaN)))} s${rs.some(r => r.stalls?.length) ? ` (${rs.filter(r => r.stalls?.length).length} waited on leftovers)` : ''} | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => (r.metered ?? r.usage)?.requests)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.promptTokens)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.outputTokens)))} |`;
+  return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${fmt(median(of(r => r.workingSeconds ?? NaN)))} s${rs.some(r => r.stalls?.length) ? ` (${rs.filter(r => r.stalls?.length).length} waited on leftovers)` : ''} | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${name === 'leana' ? usd(median(rs.map(jevUsd))) : '—'} | ${fmt(median(of(r => (r.metered ?? r.usage)?.requests)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.promptTokens)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.outputTokens)))} |`;
 });
 // The headline: what a run costs on average (what many runs cost), the worst run (a stuck repair loop is the failure
 // that matters), the total, and the same for wall time. The median hides both: a harness with a cheap median and a
@@ -1157,9 +1176,12 @@ const mean = xs => {
 };
 const headline = chosen.map(name => {
   const rs = results.filter(r => r.harness === name);
-  const billed = rs.map(r => Number(r.billedUsd)).filter(Number.isFinite);
-  const wall = rs.map(r => Number(r.wallSeconds)).filter(Number.isFinite);
-  return `| ${name} | ${rs.filter(passed).length}/${rs.length} | ${usd(mean(billed))} | ${billed.length ? usd(Math.max(...billed)) : '?'} | ${usd(billed.reduce((a, b) => a + b, 0))} | ${fmt(mean(wall))} s | ${wall.length ? fmt(Math.max(...wall)) : '?'} s |`;
+  const of = f => rs.map(f).filter(Number.isFinite);
+  const billed = of(r => Number(r.billedUsd));
+  const jev = of(jevUsd);
+  const total = of(totalUsd);
+  const wall = of(r => Number(r.wallSeconds));
+  return `| ${name} | ${rs.filter(passed).length}/${rs.length} | ${usd(mean(billed))} | ${name === 'leana' ? usd(mean(jev)) : '—'} | ${usd(mean(total))} | ${total.length ? usd(Math.max(...total)) : '?'} | ${usd(total.reduce((a, b) => a + b, 0))} | ${fmt(mean(wall))} s | ${wall.length ? fmt(Math.max(...wall)) : '?'} s |`;
 });
 // Each harness against Leana round by round: every round gives both the same task and settings, so the difference
 // within a round leaves out what the round shares. The range is the 2.5th to 97.5th percentile of the mean
@@ -1195,7 +1217,7 @@ const againstLeana = chosen.includes('leana')
   ? chosen
       .filter(n => n !== 'leana')
       .map(name => {
-        const c = paired(name, r => r.billedUsd);
+        const c = paired(name, totalUsd);
         const w = paired(name, r => r.wallSeconds);
         const cell = (p, u) =>
           p ? `${p.leanaAhead}/${p.rounds} | ${signed(p.mean, u)} (${signed(p.lo, u)} to ${signed(p.hi, u)})` : '? | ?';
@@ -1248,15 +1270,15 @@ const summary = [
   `Prompt: "${sc.prompt}"  `,
   `Model: ${sc.provider}/${sc.model}, reasoning effort: ${sc.effort}. ${runs} trial${runs === 1 ? '' : 's'} per harness, run one after another.`,
   '',
-  '| Harness | Passed | Cost per run (mean) | Dearest run | Total billed | Wall time (mean) | Slowest run |',
-  '| --- | --- | --- | --- | --- | --- | --- |',
+  '| Harness | Passed | OpenRouter per run (mean) | Jev per run (mean) | Cost per run (mean) | Dearest run | Total cost | Wall time (mean) | Slowest run |',
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
   ...headline,
   '',
   ...(againstLeana.length
     ? [
         '## Against Leana, round by round',
         '',
-        '| Harness | Leana cheaper in | Costs more than Leana per run (mean, 95% range) | Leana faster in | Slower than Leana per run (mean, 95% range) |',
+        '| Harness | Leana cheaper in (OpenRouter and Jev) | Costs more than Leana per run (mean, 95% range) | Leana faster in | Slower than Leana per run (mean, 95% range) |',
         '| --- | --- | --- | --- | --- |',
         ...againstLeana,
         '',
@@ -1266,8 +1288,8 @@ const summary = [
     : []),
   '## Medians',
   '',
-  "| Harness | Effort sent | Leana's settings | Passed | Wall time (median) | Working time (median) | Billed by OpenRouter (median, range) | Requests (median) | Prompt tokens (median) | Output tokens (median) |",
-  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+  "| Harness | Effort sent | Leana's settings | Passed | Wall time (median) | Working time (median) | Billed by OpenRouter (median, range) | Jev (median) | Requests (median) | Prompt tokens (median) | Output tokens (median) |",
+  '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
   ...rows,
   '',
   '## Settings sent',
@@ -1282,7 +1304,9 @@ const summary = [
       .join('; ') +
     '.',
   '',
-  "Effort sent: the reasoning effort on the requests each harness sent. Leana's settings: trials whose every request carried the effort, sampling, output cap and endpoint order Leana sent in that round. Wall time: from starting the harness to its exit. Working time: to its last exchange with OpenRouter, leaving out any wait after it, such as for a server it left running (the watchdog stops those after a quiet spell and notes it). Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as OpenRouter reported them through the proxy (Leana, Cline, OpenCode); Hermes's own report, as it is not behind the proxy (see BENCHMARK.md). Passed: exit 0 in time without being stopped, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
+  "Effort sent: the reasoning effort on the requests each harness sent. Leana's settings: trials whose every request carried the effort, sampling, output cap and endpoint order Leana sent in that round. Wall time: from starting the harness to its exit. Working time: to its last exchange with OpenRouter, leaving out any wait after it, such as for a server it left running (the watchdog stops those after a quiet spell and notes it). Billed by OpenRouter: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Jev: Leana's calls to Jev, which TypeSafe bills apart from OpenRouter, priced from the input tokens each reply reports at $" +
+    jevUsdPerMillionInput +
+    " per million (output tokens are free); the other harnesses make none. Cost: the two together, which the dearest run and the round-by-round comparison use. Requests and tokens: as OpenRouter reported them through the proxy (Leana, Cline, OpenCode); Hermes's own report, as it is not behind the proxy (see BENCHMARK.md). Passed: exit 0 in time without being stopped, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
 ].join('\n');
 writeFileSync(join(suite, 'summary.json'), JSON.stringify(results, null, 2));
 writeFileSync(join(suite, 'SUMMARY.md'), summary + '\n');

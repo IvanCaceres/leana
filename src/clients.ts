@@ -263,6 +263,10 @@ export class Jev {
         model: result.model,
         answers,
         usage: result.usage,
+        // Priced from the tokens the reply reports: Jev bills input only.
+        ...(typeof result.usage?.input_tokens === 'number'
+          ? { costUsd: (result.usage.input_tokens * (this.config.jevUsdPerMillionInput ?? 0)) / 1e6 }
+          : {}),
       });
       return answers;
     } catch (e) {

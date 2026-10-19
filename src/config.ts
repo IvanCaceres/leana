@@ -27,6 +27,9 @@ export const defaults: Config = {
   promptForm: 'json',
   jevUrl: 'https://api.typesafe.ai/v1/systemone',
   jevModel: 'jev-latest',
+  // What TypeSafe charges per million input tokens to Jev (docs.typesafe.ai/models: $42 per billion; output tokens are
+  // free). Jev's reply reports its tokens, not a cost; each is priced at this.
+  jevUsdPerMillionInput: 0.042,
   routeProbability: 0.55,
   routeMargin: 0.12,
   compactProbability: 0.75,

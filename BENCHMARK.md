@@ -148,12 +148,15 @@ None of the harnesses needs prior setup, and the runner leaves their own configu
 npm run bench:harnesses -- --runs 3
 npm run bench:harnesses -- --harness leana,opencode --runs 1
 npm run bench:harnesses -- --rescore work/bench/harnesses/<suite>
+npm run bench:harnesses -- --resume work/bench/harnesses/<suite>
 ```
 
 - **Trials run one at a time,** each in a new empty directory, made its own git repository (`git init`). Cost is read from the key around each trial, and two dev servers at once would compete for ports. With `--runs 3` the order is leana, hermes, cline, opencode, then repeat. Leana always runs first in a round, because its requests are that round's reference.
 - **Without Leana among the harnesses,** each round starts with a short Leana run (`reference-<n>/`, one small file to write) to get the reference.
 - **`--rescore`** recomputes the usage figures, the settings check and the verification of a finished suite from what its trials saved, without running any agent. Use it after changing a parser or the verification.
 - **`--skip-verify`** skips building and loading the result.
+- **`--resume`** finishes a suite that stopped part-way, for example when the disk filled up during a 4-run suite. It keeps every trial that has a `trial.json`, runs the rest with the suite's own scenario and harnesses, and refuses if a harness's version has changed since the suite started. To redo a trial, remove its folder first.
+- **Disk:** after a trial is checked, its `node_modules` and Next.js build cache are removed. A trial's `node_modules` is a few hundred megabytes, and a 4-run suite filled the disk. `--keep-deps` keeps them, and `--rescore` reinstalls them.
 
 Everything goes under `work/bench/harnesses/<timestamp>/` (git-ignored):
 
@@ -231,7 +234,7 @@ How each harness is given these settings:
 Verification runs after the harness exits:
 1. Find the project: the trial directory, or the one subdirectory up to two levels down that has a `package.json` (Cline scaffolds into `app/`, Hermes into `saas-landing/`).
 2. `npm install` if `node_modules` is missing, then `npm run build` if there's a build script.
-3. Serve it on a free port with its own scripts: `preview` after a passing build, else `dev`, else `start`.
+3. Serve it on a free port with its own scripts: `preview` after a passing build, else `dev`, else `start`. A Next.js project is served with `start` after a passing build, else `dev`, using Next's own flags (`-p`, `-H`).
 4. Load the page with Leana's page observer: exceptions, failed requests, text length, and a screenshot.
 
 **"Passed" isn't a quality score.** A page can load and still look wrong. For example, a hero held invisible by a scroll animation still counts as loaded text, because the check reads text, not visibility. Look at each trial's `page.png`.

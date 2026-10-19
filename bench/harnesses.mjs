@@ -63,9 +63,14 @@ const { values: args } = parseArgs({
     out: { type: 'string', default: join(root, 'work', 'bench', 'harnesses') },
     'skip-verify': { type: 'boolean', default: false },
     rescore: { type: 'string' },
+    resume: { type: 'string' },
+    'keep-deps': { type: 'boolean', default: false },
   },
 });
-const scenario = JSON.parse(readFileSync(args.scenario, 'utf8'));
+// A resumed suite keeps the scenario it was started with.
+const scenario = args.resume
+  ? JSON.parse(readFileSync(join(resolve(args.resume), 'suite.json'), 'utf8')).scenario
+  : JSON.parse(readFileSync(args.scenario, 'utf8'));
 const key = process.env.OPENROUTER_API_KEY;
 if (!key) throw new Error('Set OPENROUTER_API_KEY: every harness is pointed at OpenRouter with this key.');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -771,8 +776,17 @@ async function verify(trialRepo, trial) {
   out.installed = existsSync(join(repo, 'node_modules')) || (await npm('install', 'verify-install.txt')).code === 0;
   if (scripts.build) out.build = (await npm('run build', 'verify-build.txt')).code === 0;
   const port = await freePort();
-  const serve =
-    scripts.preview && out.build
+  // Served by its own scripts, with the flags its tool takes: Next.js (next start after a passing build, else next dev)
+  // takes -p and -H and refuses Vite's --strictPort (OpenCode built a Next.js app, failed as not served); Vite and the
+  // rest, --port, --strictPort and --host.
+  const next = /next/.test(`${scripts.dev ?? ''} ${scripts.start ?? ''}`);
+  const serve = next
+    ? scripts.start && out.build
+      ? `npm run start -- -p ${port} -H 127.0.0.1`
+      : scripts.dev
+        ? `npm run dev -- -p ${port} -H 127.0.0.1`
+        : null
+    : scripts.preview && out.build
       ? `npm run preview -- --port ${port} --strictPort --host 127.0.0.1`
       : scripts.dev
         ? `npm run dev -- --port ${port} --strictPort --host 127.0.0.1`
@@ -780,7 +794,7 @@ async function verify(trialRepo, trial) {
           ? `npm run start -- -p ${port}`
           : null;
   out.served = serve;
-  if (!serve) return out;
+  if (!serve) return dropDeps(repo, out);
   const r = await renderFacts(repo, `http://127.0.0.1:${port}/`, serve, join(trial, 'page.png'), 90_000, [
     { do: 'wait', what: '', ms: 3000 },
   ]);
@@ -790,6 +804,13 @@ async function verify(trialRepo, trial) {
     textChars: Number(r.text.match(/(\d+) characters of text/)?.[1] ?? 0),
     title: r.text.match(/title "([^"]*)"/)?.[1] ?? null,
   };
+  return dropDeps(repo, out);
+}
+// A checked project's installed packages and build caches are removed (--keep-deps keeps them): a trial's
+// node_modules is a few hundred megabytes, and a 4-run suite filled the disk. npm install puts them back for a rescore.
+function dropDeps(repo, out) {
+  if (args['keep-deps']) return out;
+  for (const d of ['node_modules', join('.next', 'cache')]) rmSync(join(repo, d), { recursive: true, force: true });
   return out;
 }
 function runShell(line, cwd, file, timeoutMs = 300_000) {
@@ -885,25 +906,42 @@ if (args.rescore) {
   // Leana's requirements always: it sets the reference even when it is not among the harnesses run.
   for (const h of new Set(['leana', ...chosen]))
     for (const v of harnesses[h].requires ?? []) if (!process.env[v]) throw new Error(`${h} needs ${v}`);
-  suite = join(args.out, new Date().toISOString().replace(/[:.]/g, '-'));
+  // --resume: the suite's own harnesses and runs; a trial with a trial.json is kept, any other run (a trial to redo is
+  // removed first). The versions found now must be those the suite was started with.
+  const resumed = args.resume ? JSON.parse(readFileSync(join(resolve(args.resume), 'suite.json'), 'utf8')) : null;
+  if (resumed) chosen = Object.keys(resumed.versions);
+  suite = resumed ? resolve(args.resume) : join(args.out, new Date().toISOString().replace(/[:.]/g, '-'));
   mkdirSync(suite, { recursive: true });
-  runs = Number(args.runs);
+  runs = resumed ? resumed.runs : Number(args.runs);
   versions = Object.fromEntries(chosen.map(h => [h, harnesses[h].version()]));
-  writeFileSync(
-    join(suite, 'suite.json'),
-    JSON.stringify(
-      {
-        scenario,
-        runs,
-        versions,
-        platform: `${process.platform} ${process.arch}`,
-        node: process.version,
-        started: new Date().toISOString(),
-      },
-      null,
-      2,
-    ),
-  );
+  // Leana's version names the checkout's commit: a commit that changed only the runner leaves Leana as it was, so its
+  // source tree is compared.
+  const sameLeana = (now, then) => {
+    const [a, b] = [now, then].map(v => v.match(/\(([0-9a-f]+)\)$/)?.[1]);
+    return (
+      Boolean(a && b) && git(`rev-parse ${a}:src`) === git(`rev-parse ${b}:src`) && git(`rev-parse ${a}:src`) !== ''
+    );
+  };
+  if (resumed)
+    for (const h of chosen)
+      if (versions[h] !== resumed.versions[h] && !(h === 'leana' && sameLeana(versions[h], resumed.versions[h])))
+        throw new Error(`${h} is ${versions[h]} now, ${resumed.versions[h]} when the suite started: start a new suite`);
+  if (!resumed)
+    writeFileSync(
+      join(suite, 'suite.json'),
+      JSON.stringify(
+        {
+          scenario,
+          runs,
+          versions,
+          platform: `${process.platform} ${process.arch}`,
+          node: process.version,
+          started: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+    );
   console.log(
     `Suite ${suite}\n${Object.entries(versions)
       .map(([h, v]) => `  ${h}: ${v}`)
@@ -922,6 +960,14 @@ if (args.rescore) {
           throw new Error('The reference Leana run sent no requests: there are no settings to give the harnesses');
       }
       const trial = join(suite, `${name}-${i}`);
+      if (resumed && existsSync(join(trial, 'trial.json'))) {
+        const kept = JSON.parse(readFileSync(join(trial, 'trial.json'), 'utf8'));
+        if (name === 'leana') ref = referenceOf(records(join(trial, 'requests.jsonl'))) ?? ref;
+        results.push(kept);
+        console.log(`
+[${name} ${i}/${runs}] kept from before: exit ${kept.exitCode}, billed ${kept.billedUsd}`);
+        continue;
+      }
       const repo = join(trial, 'repo');
       mkdirSync(repo, { recursive: true });
       // Its own empty git repository: a harness takes the enclosing repository as its project (OpenCode wrote its

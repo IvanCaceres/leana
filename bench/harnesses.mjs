@@ -331,6 +331,22 @@ function referenceOf(rs) {
 }
 // What a trial's requests carried, how many the proxy changed and what the harness had asked for there, the endpoints
 // that served them, and every way they differ from the reference.
+// A trial's requests and tokens as OpenRouter reported them, request by request, through the proxy: the same
+// count for every harness behind it. Harnesses count their own way: Cline reported a fifth to a third of the output
+// tokens OpenRouter billed it for. Null when the proxy recorded no usage (Hermes, whose requests come from its dumps).
+function meteredOf(rs) {
+  const u = rs.map(r => r.usage).filter(Boolean);
+  if (!u.length) return null;
+  const sum = f => u.reduce((n, x) => n + num(f(x)), 0);
+  return {
+    requests: rs.length,
+    promptTokens: sum(x => x.prompt_tokens),
+    cachedTokens: sum(x => x.prompt_tokens_details?.cached_tokens),
+    outputTokens: sum(x => x.completion_tokens),
+    reasoningTokens: sum(x => x.completion_tokens_details?.reasoning_tokens),
+    cost: +sum(x => x.cost).toFixed(6),
+  };
+}
 function settingsReport(rs, ref) {
   const seen = Object.fromEntries(Object.entries(compared).map(([k, f]) => [k, distinct(rs.map(r => f(r.sent)))]));
   const servedBy = {};
@@ -853,6 +869,7 @@ async function rescore(suiteDir) {
       wroteHere: readdirSync(repo).some(n => n !== '.git'),
       usage,
       settings: settingsReport(sent, old.harness === 'leana' ? referenceOf(sent) : old.reference),
+      metered: meteredOf(sent),
       // --skip-verify keeps each trial's verification: the summary and the usage and settings figures, recomputed alone.
       verification: args['skip-verify']
         ? old.verification
@@ -861,7 +878,7 @@ async function rescore(suiteDir) {
     writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
     results.push(result);
     console.log(
-      `${d}: ${result.usage?.requests ?? '?'} requests | build ${result.verification?.build ?? '-'} | page ${result.verification?.page?.ok ?? '-'}`,
+      `${d}: ${(result.metered ?? result.usage)?.requests ?? '?'} requests | build ${result.verification?.build ?? '-'} | page ${result.verification?.page?.ok ?? '-'}`,
     );
   }
   return { meta, results };
@@ -1075,6 +1092,7 @@ if (args.rescore) {
         effort: scenario.effort,
         reference: ref,
         settings,
+        metered: meteredOf(sent),
         wroteHere,
         ...(wroteOutside.length ? { wroteOutside } : {}),
         exitCode: r.code,
@@ -1090,7 +1108,7 @@ if (args.rescore) {
       writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
       results.push(result);
       console.log(
-        `  exit ${r.code}${r.timedOut ? ' (timed out)' : r.stalled ? ' (stalled: stopped)' : ''} | ${wallSeconds.toFixed(0)} s, working ${workingSeconds === null ? '?' : workingSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)} | ${usage?.requests ?? '?'} requests, ${usage?.promptTokens ?? '?'} prompt / ${usage?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
+        `  exit ${r.code}${r.timedOut ? ' (timed out)' : r.stalled ? ' (stalled: stopped)' : ''} | ${wallSeconds.toFixed(0)} s, working ${workingSeconds === null ? '?' : workingSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)} | ${(result.metered ?? usage)?.requests ?? '?'} requests, ${(result.metered ?? usage)?.promptTokens ?? '?'} prompt / ${(result.metered ?? usage)?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
       );
       console.log(
         `  settings: ${name === 'leana' ? 'the reference' : settings.differences.length ? `differ from Leana's: ${settings.differences.join('; ')}` : "Leana's"} | effort ${settings.effort.join('/')} | served by ${
@@ -1128,7 +1146,7 @@ const rows = chosen.map(name => {
   const of = f => rs.map(f).map(Number);
   const billed = of(r => r.billedUsd).filter(Number.isFinite);
   const efforts = distinct(rs.flatMap(r => r.settings?.effort ?? []));
-  return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${fmt(median(of(r => r.workingSeconds ?? NaN)))} s${rs.some(r => r.stalls?.length) ? ` (${rs.filter(r => r.stalls?.length).length} waited on leftovers)` : ''} | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => r.usage?.requests)))} | ${fmt(median(of(r => r.usage?.promptTokens)))} | ${fmt(median(of(r => r.usage?.outputTokens)))} |`;
+  return `| ${name} | ${efforts.length ? efforts.join(' / ') : '?'} | ${name === 'leana' ? 'reference' : `${rs.filter(asReference).length}/${rs.length}`} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${fmt(median(of(r => r.workingSeconds ?? NaN)))} s${rs.some(r => r.stalls?.length) ? ` (${rs.filter(r => r.stalls?.length).length} waited on leftovers)` : ''} | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => (r.metered ?? r.usage)?.requests)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.promptTokens)))} | ${fmt(median(of(r => (r.metered ?? r.usage)?.outputTokens)))} |`;
 });
 const describe = ref =>
   ref
@@ -1192,7 +1210,7 @@ const summary = [
       .join('; ') +
     '.',
   '',
-  "Effort sent: the reasoning effort on the requests each harness sent. Leana's settings: trials whose every request carried the effort, sampling, output cap and endpoint order Leana sent in that round. Wall time: from starting the harness to its exit. Working time: to its last exchange with OpenRouter, leaving out any wait after it, such as for a server it left running (the watchdog stops those after a quiet spell and notes it). Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as each harness reports them (see BENCHMARK.md). Passed: exit 0 in time without being stopped, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
+  "Effort sent: the reasoning effort on the requests each harness sent. Leana's settings: trials whose every request carried the effort, sampling, output cap and endpoint order Leana sent in that round. Wall time: from starting the harness to its exit. Working time: to its last exchange with OpenRouter, leaving out any wait after it, such as for a server it left running (the watchdog stops those after a quiet spell and notes it). Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as OpenRouter reported them through the proxy (Leana, Cline, OpenCode); Hermes's own report, as it is not behind the proxy (see BENCHMARK.md). Passed: exit 0 in time without being stopped, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
 ].join('\n');
 writeFileSync(join(suite, 'summary.json'), JSON.stringify(results, null, 2));
 writeFileSync(join(suite, 'SUMMARY.md'), summary + '\n');

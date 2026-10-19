@@ -450,6 +450,8 @@ export interface ToolResult {
   verification?: boolean;
   stale?: boolean;
   hashes?: Record<string, string>;
+  // How much of the text the evidence keeps, when more than its kind's budget (a file read whole).
+  keepChars?: number;
   snapshots?: Record<string, string>;
   // A created file reports what the parser found and what it imports, so the
   // harness can queue a repair and derive the deliverables its imports imply.

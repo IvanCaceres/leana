@@ -104,6 +104,42 @@ test('read_files reads a range of a file of any size, holding only that range, w
   );
 });
 
+test('A file the run wrote is read whole, past its share of the read budget; another in the same read keeps its share', async t => {
+  const d = await scratch(t);
+  // The shape of run saas-landing-glm-5.3: a 424-line stylesheet it wrote, read with two other files.
+  const css =
+    Array.from({ length: 424 }, (_, i) => `.rule-${i} { color: #${String(i).padStart(6, '0')}; }`).join('\n') + '\n';
+  await writeFile(join(d, 'styles.css'), css);
+  await writeFile(
+    join(d, 'other.ts'),
+    Array.from({ length: 400 }, (_, i) => `export const v${i} = ${i};`).join('\n') + '\n',
+  );
+  await writeFile(join(d, 'App.tsx'), 'export default function App() { return null; }\n');
+  const tools = new ToolBox(d, join(d, '.art'), { ...defaults }, async () => '');
+  const files = [
+    { path: 'styles.css', start: 1, end: 1000000 },
+    { path: 'other.ts', start: 1, end: 1000000 },
+    { path: 'App.tsx', start: 1, end: 1000000 },
+  ];
+  const shared = await tools.execute('read_files', { files });
+  assert.match(shared.text, /^styles\.css sha256=\w+ totalLines=425 shown=1\.\.\d+\n/);
+  assert.match(
+    shared.text,
+    /truncated at the read budget after line \d+; request lines \d+\.\.425/,
+    'a third of the budget',
+  );
+  tools.wholeReads = p => (p === 'styles.css' ? 50000 : 0);
+  const whole = await tools.execute('read_files', { files });
+  assert.match(whole.text, /^styles\.css sha256=\w+ totalLines=425 shown=1\.\.425\n/, 'the whole file');
+  assert.match(whole.text, /\n424: \.rule-423 \{ color: #000423; \}\n425: \n\nother\.ts/);
+  assert.match(
+    whole.text,
+    /other\.ts sha256=\w+ totalLines=401 shown=1\.\.\d+\n[^]*truncated at the read budget/,
+    'its share',
+  );
+  assert(whole.keepChars! >= whole.text.length, 'the evidence keeps all of it');
+});
+
 test('search_codebase finds text in a file past a megabyte', async t => {
   const d = await scratch(t);
   await writeFile(join(d, 'big.txt'), `${'filler line\n'.repeat(200000)}NEEDLE_HERE\n`);

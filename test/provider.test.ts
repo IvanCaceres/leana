@@ -138,6 +138,107 @@ test("A model's facts come from its provider: OpenRouter's catalogue entry (cont
   );
 });
 
+test('An effort a model does not take becomes the nearest it takes, rounding down (less reasoning), never off; the note says which (run react-demo-glm-1: medium went to GLM-5.3 default, max)', async () => {
+  const { nearestEffort } = await import('../src/models.js');
+  assert.equal(nearestEffort('medium', ['max', 'high', 'low']), 'low', 'GLM-5.3: down to low, not its default max');
+  assert.equal(nearestEffort('xhigh', ['high', 'low']), 'high');
+  assert.equal(nearestEffort('low', ['max', 'high']), 'high', 'nothing below: the nearest above');
+  assert.equal(nearestEffort('medium', ['max', 'high', 'none']), 'high', 'rounding down never turns reasoning off');
+  assert.equal(nearestEffort('none', ['low', 'none']), 'none');
+  assert.equal(nearestEffort('high', ['max', 'high', 'low']), 'high', 'one it takes: as it is');
+  assert.equal(nearestEffort('turbo', ['high']), null, 'not an effort of the order: left to the caller');
+  const [claude] = (await catalogue()).data.map(openrouterModelInfo);
+  const glm = {
+    ...claude,
+    id: 'z-ai/glm-5.3',
+    reasoning: {
+      ...claude.reasoning,
+      mandatory: true,
+      efforts: ['max', 'high', 'low'],
+      defaultEffort: 'max',
+      budget: true,
+    },
+  };
+  const { config, notes } = forModel({ ...defaults, provider: 'openrouter', thinkingEffort: 'medium' }, glm);
+  assert.equal(config.thinkingEffort, 'low');
+  assert(
+    notes.includes('z-ai/glm-5.3 does not take effort medium (it takes max, high, low): low is used instead'),
+    notes.join(' | '),
+  );
+});
+
+test('A reply that reached its limit with nothing but reasoning is asked again at once with less reasoning (its token budget), and said for what it was when that is all reasoning too (run react-demo-glm-1: three replies of 21,216 reasoning tokens failed as unfinished arguments)', async t => {
+  const schema = {
+    type: 'object' as const,
+    properties: { content: { type: 'string' as const } },
+    required: ['content'],
+    additionalProperties: false as const,
+  };
+  const prompt = [
+    { role: 'system' as const, content: 'You are the worker.' },
+    { role: 'user' as const, content: '{"request":"next"}' },
+  ];
+  const thinking = async (res: ServerResponse) =>
+    sse(res, [{ reasoning: 'Let me think about this at length. '.repeat(20) }], 'length', {
+      prompt_tokens: 5000,
+      completion_tokens: 21216,
+      cost: 0,
+    } as any);
+  const once = await mock(t, async (_b, n, res) =>
+    n === 1 ? thinking(res) : sse(res, [{ content: '{"content":"ok"}' }]),
+  );
+  const events: any[] = [];
+  const or = new OpenRouter(
+    cfg(once.url, 'anthropic/claude-sonnet-5.5', { thinkingEffort: 'medium' }),
+    'k',
+    async (type, data) => {
+      events.push({ type, data });
+    },
+  );
+  assert.deepEqual(await or.generate(prompt, schema), { content: 'ok' });
+  assert.deepEqual(
+    once.bodies.map(b => b.reasoning),
+    [{ effort: 'medium' }, { max_tokens: defaults.stepThinkingBudget }],
+    'asked again with the step budget',
+  );
+  const said = events.find(e => e.type === 'reasoning-exhausted')!.data;
+  assert.deepEqual(
+    [said.tokens, said.reasoning, said.retry],
+    [21216, { effort: 'medium' }, { max_tokens: defaults.stepThinkingBudget }],
+  );
+  const twice = await mock(t, async (_b, _n, res) => thinking(res));
+  await assert.rejects(
+    new OpenRouter(cfg(twice.url, 'anthropic/claude-sonnet-5.5'), 'k', async () => {}).generate(prompt, schema),
+    /^Error: The model spent its whole reply \(21216 tokens\) reasoning and never began to answer, also when asked again with less reasoning$/,
+  );
+  assert.equal(twice.bodies.length, 2, 'asked again once, not more');
+});
+
+test("The completion gate's packet is held under Jev's byte cap: the oldest written file's source goes first and is named as left out, then the longest texts shorten (run react-demo-glm-1: the finish was never judged)", async () => {
+  const { fitGateState } = await import('../src/control.js');
+  const code = (n: number) =>
+    `export const f${n} = () => {\n  return "a \\"quoted\\" line";\n};\n`.repeat(40).slice(0, 1200);
+  const sources = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`src/f${i}.tsx`, code(i)]));
+  const state: Record<string, any> = {
+    objective: 'build a landing page',
+    summary: 'S'.repeat(1500),
+    notes: 'N'.repeat(1500),
+    diffStat: 'D'.repeat(700),
+    observation: { kind: 'page', target: 'http://127.0.0.1:5173/', ok: true, facts: 'F'.repeat(2900) },
+    sources,
+  };
+  const all = Object.keys(sources);
+  assert(Buffer.byteLength(JSON.stringify(state)) > 22000, 'over the cap as built');
+  fitGateState(state);
+  assert(Buffer.byteLength(JSON.stringify(state)) <= 21000);
+  const kept = Object.keys(state.sources);
+  assert(kept.length > 0 && kept.at(-1) === 'src/f11.tsx', 'the newest sources kept');
+  assert.deepEqual([...state.sourcesLeftOut, ...kept], all, 'the oldest left out, and named');
+  const small: Record<string, any> = { summary: 's', sources: { 'a.ts': 'x' } };
+  fitGateState(small);
+  assert.deepEqual(small, { summary: 's', sources: { 'a.ts': 'x' } }, 'a packet that fits: untouched');
+});
+
 test('Only the options the model takes are offered, and a value it does not take is refused with what it takes', async () => {
   const [claude, gpt, ling, plain] = (await catalogue()).data.map(openrouterModelInfo);
   const names = (m: any) => modelOptions(m).map(o => o.name);
@@ -171,8 +272,8 @@ test('Only the options the model takes are offered, and a value it does not take
         .map(openrouterModelInfo)
         .map((m: any) => ({ ...m, reasoning: { ...m.reasoning, efforts: ['high', 'low'], defaultEffort: 'low' } }))[1],
     ).config.thinkingEffort,
-    'low',
-    'an effort it does not take becomes its default',
+    'high',
+    'an effort it does not take becomes the nearest it takes, rounding down, not its default',
   );
   assert.equal(forModel({ ...defaults, stepThinking: true }, plain).config.stepThinking, false);
   const small = fitToModel(

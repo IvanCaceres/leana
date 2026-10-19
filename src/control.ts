@@ -280,6 +280,29 @@ export const objectiveClauses = (objective: string): string[] => {
   const items = [...objective.matchAll(/^[ \t]*(?:[-*+\u2022]|\d+[.)])[ \t]+(\S.*)$/gm)].map(m => m[1]!.trim());
   return items.length >= 2 ? items.slice(0, 12) : [];
 };
+// The gate's packet held under Jev's byte cap as JSON (escaped code is longer than its text), as the answer gate
+// holds its own: the oldest written file's source goes first, and the files left out are named; then the longest
+// texts are shortened. (Run react-demo-glm-1: twelve sources of 1,200 characters, a page observation and the
+// summary went over the cap, the finish was never judged, and the run stopped.)
+export function fitGateState(state: Record<string, any>, limit = 21000): void {
+  const size = () => Buffer.byteLength(JSON.stringify(state));
+  const sources = state.sources as Record<string, string> | undefined;
+  const left: string[] = [];
+  for (const k of Object.keys(sources ?? {})) {
+    if (size() <= limit) break;
+    delete sources![k];
+    left.push(k);
+    state.sourcesLeftOut = left;
+  }
+  for (const n of [800, 400, 200]) {
+    if (size() <= limit) break;
+    state.summary = clip(String(state.summary ?? ''), n);
+    state.notes = clip(String(state.notes ?? ''), n);
+    state.diffStat = clip(String(state.diffStat ?? ''), n);
+    if (state.observation && typeof state.observation === 'object')
+      state.observation = { ...state.observation, facts: clip(String(state.observation.facts ?? ''), n) };
+  }
+}
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
   const observation =
@@ -292,8 +315,9 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     notes: clip(s.notes ?? '', 1500),
     ...facts,
     observation,
-    sources: facts.sources,
-  };
+    sources: { ...(facts.sources as Record<string, string>) } as Record<string, string>,
+  } as Record<string, any>;
+  fitGateState(state);
   const questions: Questions = {
     ...gateQuestions,
     ...Object.fromEntries(

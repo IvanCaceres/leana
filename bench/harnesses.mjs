@@ -1,0 +1,642 @@
+#!/usr/bin/env node
+// Runs one coding task through several agent harnesses (Leana, Hermes, Cline, OpenCode) on the same model through
+// OpenRouter, and measures each the same way: wall time, the dollars OpenRouter billed (the API key's usage before and
+// after), the requests and tokens the harness itself reports, and whether its result builds and renders. See
+// BENCHMARK.md, "Compare harnesses".
+//
+//   npm run build && node bench/harnesses.mjs --runs 3
+//   node bench/harnesses.mjs --harness leana,opencode --runs 1
+//
+// Trials run one after another (never in parallel: the key's usage is read around each, and two dev servers would
+// contend for ports). Every trial starts in a new empty directory under work/bench/harnesses/<stamp>/.
+import { spawn, spawnSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  createWriteStream,
+} from 'node:fs';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = resolve(here, '..');
+const { values: args } = parseArgs({
+  options: {
+    harness: { type: 'string', default: 'leana,hermes,cline,opencode' },
+    runs: { type: 'string', default: '1' },
+    scenario: { type: 'string', default: join(here, 'scenario.json') },
+    out: { type: 'string', default: join(root, 'work', 'bench', 'harnesses') },
+    'skip-verify': { type: 'boolean', default: false },
+    rescore: { type: 'string' },
+  },
+});
+const scenario = JSON.parse(readFileSync(args.scenario, 'utf8'));
+const key = process.env.OPENROUTER_API_KEY;
+if (!key) throw new Error('Set OPENROUTER_API_KEY: every harness is pointed at OpenRouter with this key.');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const { killTree, runMark, stopMarked } = await import(new URL('../dist/src/shell.js', import.meta.url).href).catch(
+  () => {
+    throw new Error('Build Leana first (npm run build): the runner uses its process and page-observation code.');
+  },
+);
+const { renderFacts } = await import(new URL('../dist/src/render.js', import.meta.url).href);
+
+// ---- the OpenRouter key's spend: read before and after each trial ------------------------------------------------
+async function keyUsage() {
+  const r = await fetch('https://openrouter.ai/api/v1/key', { headers: { Authorization: `Bearer ${key}` } });
+  if (!r.ok) throw new Error(`OpenRouter /key answered ${r.status}`);
+  return Number((await r.json()).data.usage);
+}
+// OpenRouter books a generation's cost shortly after it ends: wait until the usage has held still for 20 s (at most 3 min).
+async function settledUsage(before) {
+  let last = await keyUsage();
+  let still = Date.now();
+  const until = Date.now() + 180_000;
+  while (Date.now() < until) {
+    await sleep(5000);
+    const now = await keyUsage();
+    if (now !== last) {
+      last = now;
+      still = Date.now();
+    } else if (Date.now() - still >= 20_000 && (last > before || Date.now() - still >= 60_000)) break;
+  }
+  return last;
+}
+
+// ---- running a command, bounded in time, with its whole tree stopped afterwards ----------------------------------
+// On Windows a CLI installed by npm or Volta is a .cmd shim, which Node starts only through cmd.exe: each argument is
+// quoted for it. An .exe (Hermes) and everything elsewhere start directly.
+function resolved(command, argv) {
+  if (process.platform !== 'win32' || /[\\/]/.test(command)) return { command, argv, verbatim: false };
+  const found =
+    spawnSync('where', [command], { encoding: 'utf8', windowsHide: true }).stdout?.split(/\r?\n/).filter(Boolean) ?? [];
+  const exe = found.find(f => /\.exe$/i.test(f));
+  if (exe) return { command: exe, argv, verbatim: false };
+  const cmd = found.find(f => /\.cmd$/i.test(f));
+  if (!cmd) return { command, argv, verbatim: false };
+  const quote = a => `"${String(a).replaceAll('"', '""')}"`;
+  return { command: 'cmd.exe', argv: ['/d', '/s', '/c', `"${[cmd, ...argv].map(quote).join(' ')}"`], verbatim: true };
+}
+// A harness can leave processes running that hold its output open after it exits (a dev server it started; OpenCode
+// did): the run ends when the harness exits, after a short drain, not when its pipes close. On Windows every process it
+// starts carries a mark (LEANA_RUN, inherited through the environment), and whatever still carries it afterwards is
+// stopped, detached or not; elsewhere the harness runs in its own process group, which is stopped whole.
+function run(command, argv, { cwd, env = {}, timeoutMs, stdout, stderr }) {
+  const r = resolved(command, argv);
+  const mark = runMark();
+  return new Promise(done => {
+    const child = spawn(r.command, r.argv, {
+      windowsVerbatimArguments: r.verbatim,
+      cwd,
+      // PWD as well as the process's directory: OpenCode takes its project from PWD, which a shell sets and Node does
+      // not (it worked in the directory the runner was started from).
+      env: { ...process.env, PWD: cwd, ...env, ...(mark ? { LEANA_RUN: mark } : {}) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      detached: process.platform !== 'win32',
+    });
+    const out = stdout ? createWriteStream(stdout) : null;
+    const err = stderr ? createWriteStream(stderr) : null;
+    let text = '';
+    child.stdout.on('data', d => {
+      text += d;
+      out?.write(d);
+    });
+    child.stderr.on('data', d => err?.write(d));
+    let timedOut = false;
+    let finished = false;
+    let drain = null;
+    const stop = () => {
+      killTree(child.pid, 'SIGKILL');
+      if (mark) stopMarked(mark);
+    };
+    const finish = (code, error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(drain);
+      stop();
+      out?.end();
+      err?.end();
+      done({ code, timedOut, stdout: text, ...(error ? { error } : {}) });
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop();
+      setTimeout(() => finish(null), 5000);
+    }, timeoutMs);
+    child.on('error', e => finish(-1, e.message));
+    child.on('exit', code => {
+      drain = setTimeout(() => finish(code), 3000);
+    });
+    child.on('close', code => finish(code));
+  });
+}
+const freePort = () =>
+  new Promise(done => {
+    const s = createServer();
+    s.listen(0, '127.0.0.1', () => {
+      const { port } = s.address();
+      s.close(() => done(port));
+    });
+  });
+const jsonLines = text =>
+  text
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.startsWith('{'))
+    .map(l => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+// Every object anywhere inside a value (usage blocks sit at different depths in each harness's output).
+function* objects(v) {
+  if (v && typeof v === 'object') {
+    yield v;
+    for (const x of Object.values(v)) yield* objects(x);
+  }
+}
+const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+// The reasoning effort a harness is asked for: the scenario's, unless it names one for that harness (a level the
+// harness cannot send for this model; see scenario.json).
+const effortFor = (s, h) => s.effortByHarness?.[h] ?? s.effort;
+
+// ---- the harnesses ----------------------------------------------------------------------------------------------
+// Each: its version, how it is run on the scenario in an empty directory, and the usage it reports itself.
+const harnesses = {
+  leana: {
+    version: () =>
+      JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version + ` (${git('rev-parse --short HEAD')})`,
+    command: (s, repo) => [
+      process.execPath,
+      [
+        join(root, 'dist', 'src', 'cli.js'),
+        'run',
+        s.prompt,
+        '--repo',
+        repo,
+        '--provider',
+        s.provider,
+        '--model',
+        s.model,
+        '--effort',
+        effortFor(s, 'leana'),
+        '--plain',
+      ],
+    ],
+    requires: ['TYPESAFE_API_KEY'],
+    usage(trial, stdout) {
+      const session = stdout.match(/^Session: (.+)$/m)?.[1]?.trim();
+      if (!session || !existsSync(join(session, 'events.jsonl'))) return null;
+      const u = {
+        requests: 0,
+        promptTokens: 0,
+        cachedTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        reportedCost: 0,
+        extra: {},
+      };
+      let jev = 0;
+      for (const e of jsonLines(readFileSync(join(session, 'events.jsonl'), 'utf8'))) {
+        if (e.type === 'jev') jev++;
+        if (e.type !== 'bonsai' || !e.data?.usage) continue;
+        const x = e.data.usage;
+        u.requests++;
+        u.promptTokens += num(x.prompt_tokens);
+        u.cachedTokens += num(x.prompt_tokens_details?.cached_tokens);
+        u.outputTokens += num(x.completion_tokens);
+        u.reasoningTokens += num(x.completion_tokens_details?.reasoning_tokens);
+        u.reportedCost += num(x.cost);
+      }
+      u.extra = { session, jevCalls: jev };
+      return u;
+    },
+  },
+  hermes: {
+    version: () => firstLine('hermes', ['--version']),
+    command: (s, repo, trial) => [
+      'hermes',
+      [
+        '-z',
+        s.prompt,
+        '--usage-file',
+        join(trial, 'hermes-usage.json'),
+        '--provider',
+        s.provider,
+        '-m',
+        s.model,
+        '--reasoning',
+        effortFor(s, 'hermes'),
+        '--yolo',
+        '--in',
+        repo,
+      ],
+    ],
+    // Its terminal tool starts in TERMINAL_CWD; without it, a one-shot run worked in the user's home directory.
+    env: repo => ({ TERMINAL_CWD: repo }),
+    usage(trial) {
+      const f = join(trial, 'hermes-usage.json');
+      if (!existsSync(f)) return null;
+      const r = JSON.parse(readFileSync(f, 'utf8'));
+      const pick = (...names) => {
+        for (const o of objects(r))
+          for (const n of names) if (o[n] !== undefined && typeof o[n] !== 'object') return num(o[n]);
+        return 0;
+      };
+      const input = pick('input_tokens', 'prompt_tokens');
+      const cached = pick('cache_read_tokens', 'cached_tokens');
+      return {
+        requests: pick('api_calls', 'api_call_count'),
+        // Hermes counts cache reads apart from input tokens: the prompt is both.
+        promptTokens: input + cached,
+        cachedTokens: cached,
+        outputTokens: pick('output_tokens', 'completion_tokens'),
+        reasoningTokens: pick('reasoning_tokens'),
+        reportedCost: pick('actual_cost_usd', 'estimated_cost_usd', 'cost_usd', 'cost'),
+        extra: { report: r },
+      };
+    },
+  },
+  cline: {
+    version: () => firstLine('cline', ['--version']),
+    // State (and the key, which cline saves) in a private directory per trial, removed after the trial.
+    prepare(s, repo, trial) {
+      const data = join(tmpdir(), `leana-bench-cline-${Date.now()}`);
+      mkdirSync(data, { recursive: true });
+      const x = resolved('cline', ['auth', '-p', s.provider, '-k', key, '-m', s.model, '--data-dir', data]);
+      const a = spawnSync(x.command, x.argv, {
+        cwd: repo,
+        encoding: 'utf8',
+        windowsHide: true,
+        windowsVerbatimArguments: x.verbatim,
+      });
+      writeFileSync(join(trial, 'cline-auth.txt'), `${a.stdout ?? ''}${a.stderr ?? ''}`.replaceAll(key, '<key>'));
+      return { data };
+    },
+    command: (s, repo, trial, ctx) => [
+      'cline',
+      [
+        '-y',
+        '--json',
+        '-c',
+        repo,
+        '-P',
+        s.provider,
+        '-m',
+        s.model,
+        '--thinking',
+        effortFor(s, 'cline'),
+        '--data-dir',
+        ctx.data,
+        s.prompt,
+      ],
+    ],
+    // The run ends with one run_result line: its iterations (one request each) and the run's usage, cache reads
+    // inside inputTokens.
+    usage(trial, stdout) {
+      const end = jsonLines(stdout).findLast(l => l.type === 'run_result');
+      if (!end?.usage) return null;
+      const x = end.usage;
+      return {
+        requests: num(end.iterations),
+        promptTokens: num(x.inputTokens),
+        cachedTokens: num(x.cacheReadTokens),
+        outputTokens: num(x.outputTokens),
+        reasoningTokens: 0,
+        reportedCost: num(x.totalCost),
+        extra: { finishReason: end.finishReason, durationMs: end.durationMs },
+      };
+    },
+    cleanup(ctx) {
+      rmSync(ctx.data, { recursive: true, force: true });
+    },
+  },
+  opencode: {
+    version: () => firstLine('opencode', ['--version']),
+    command: (s, repo) => [
+      'opencode',
+      [
+        'run',
+        '--standalone',
+        '--auto',
+        '--format',
+        'json',
+        '-m',
+        `${s.provider}/${s.model}#${effortFor(s, 'opencode')}`,
+        s.prompt,
+      ],
+    ],
+    usage(trial, stdout) {
+      const u = {
+        requests: 0,
+        promptTokens: 0,
+        cachedTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        reportedCost: 0,
+        extra: {},
+      };
+      for (const e of jsonLines(stdout))
+        for (const o of objects(e)) {
+          // A step's finish carries its tokens ({input, output, reasoning, cache: {read, write}}) and cost.
+          if (o.tokens && typeof o.tokens === 'object' && o.tokens.input !== undefined) {
+            u.requests++;
+            u.promptTokens += num(o.tokens.input) + num(o.tokens.cache?.read);
+            u.cachedTokens += num(o.tokens.cache?.read);
+            u.outputTokens += num(o.tokens.output) + num(o.tokens.reasoning);
+            u.reasoningTokens += num(o.tokens.reasoning);
+            u.reportedCost += num(o.cost);
+          }
+        }
+      return u.requests ? u : null;
+    },
+  },
+};
+function git(cmd) {
+  return spawnSync('git', cmd.split(' '), { cwd: root, encoding: 'utf8' }).stdout.trim();
+}
+function firstLine(command, argv) {
+  const x = resolved(command, argv);
+  const r = spawnSync(x.command, x.argv, {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 60_000,
+    windowsVerbatimArguments: x.verbatim,
+  });
+  return `${r.stdout ?? ''}${r.stderr ?? ''}`.trim().split('\n')[0] ?? 'unknown';
+}
+
+// ---- checking the result the same way for every harness -------------------------------------------------------
+// The project's own build, then its page served by its own scripts and loaded in a headless browser (Leana's page
+// observer): exceptions, failed requests, how much text it shows, and a screenshot to look at.
+// The project a harness built: its directory, or the one subdirectory (two levels down at most) that holds a
+// package.json, as Cline (app/) and Hermes (saas-landing/) scaffold into a new folder.
+function projectDir(repo) {
+  if (existsSync(join(repo, 'package.json'))) return repo;
+  const found = [];
+  const walk = (dir, depth) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (!e.isDirectory() || e.name === 'node_modules' || e.name.startsWith('.')) continue;
+      const p = join(dir, e.name);
+      if (existsSync(join(p, 'package.json'))) found.push(p);
+      else if (depth < 2) walk(p, depth + 1);
+    }
+  };
+  walk(repo, 1);
+  return found.length === 1 ? found[0] : null;
+}
+async function verify(trialRepo, trial) {
+  const out = { project: null, packageJson: false, installed: false, build: null, served: null, page: null };
+  const repo = projectDir(trialRepo);
+  if (!repo) return out;
+  out.project = repo === trialRepo ? '.' : repo.slice(trialRepo.length + 1).replaceAll('\\', '/');
+  const pkgPath = join(repo, 'package.json');
+  out.packageJson = true;
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  const scripts = pkg.scripts ?? {};
+  out.scripts = Object.keys(scripts);
+  // npm through a shell: on Windows it is a .cmd script.
+  const npm = (line, file) => runShell(`npm ${line}`, repo, join(trial, file));
+  out.installed = existsSync(join(repo, 'node_modules')) || (await npm('install', 'verify-install.txt')).code === 0;
+  if (scripts.build) out.build = (await npm('run build', 'verify-build.txt')).code === 0;
+  const port = await freePort();
+  const serve =
+    scripts.preview && out.build
+      ? `npm run preview -- --port ${port} --strictPort --host 127.0.0.1`
+      : scripts.dev
+        ? `npm run dev -- --port ${port} --strictPort --host 127.0.0.1`
+        : scripts.start
+          ? `npm run start -- -p ${port}`
+          : null;
+  out.served = serve;
+  if (!serve) return out;
+  const r = await renderFacts(repo, `http://127.0.0.1:${port}/`, serve, join(trial, 'page.png'), 90_000, [
+    { do: 'wait', what: '', ms: 3000 },
+  ]);
+  writeFileSync(join(trial, 'verify-page.txt'), r.text);
+  out.page = {
+    ok: r.ok,
+    textChars: Number(r.text.match(/(\d+) characters of text/)?.[1] ?? 0),
+    title: r.text.match(/title "([^"]*)"/)?.[1] ?? null,
+  };
+  return out;
+}
+function runShell(line, cwd, file, timeoutMs = 300_000) {
+  return run(
+    process.platform === 'win32' ? 'cmd.exe' : 'sh',
+    process.platform === 'win32' ? ['/d', '/s', '/c', line] : ['-c', line],
+    {
+      cwd,
+      timeoutMs,
+      stdout: file,
+      stderr: file.replace('.txt', '.err.txt'),
+    },
+  );
+}
+
+// ---- rescoring a finished suite: usage and verification again from each trial's saved output (no agent runs) ---------
+async function rescore(suiteDir) {
+  const meta = JSON.parse(readFileSync(join(suiteDir, 'suite.json'), 'utf8'));
+  const results = [];
+  for (const d of readdirSync(suiteDir, { withFileTypes: true })
+    .filter(e => e.isDirectory())
+    .map(e => e.name)
+    .sort()) {
+    const trial = join(suiteDir, d);
+    if (!existsSync(join(trial, 'trial.json'))) continue;
+    const old = JSON.parse(readFileSync(join(trial, 'trial.json'), 'utf8'));
+    const stdout = existsSync(join(trial, 'agent-stdout.txt'))
+      ? readFileSync(join(trial, 'agent-stdout.txt'), 'utf8')
+      : '';
+    let usage = null;
+    try {
+      usage = harnesses[old.harness].usage(trial, stdout);
+    } catch (e) {
+      usage = { error: e.message };
+    }
+    const repo = join(trial, 'repo');
+    const result = {
+      ...old,
+      wroteHere: readdirSync(repo).some(n => n !== '.git'),
+      usage,
+      verification: await verify(repo, trial).catch(e => ({ error: e.message })),
+    };
+    writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
+    results.push(result);
+    console.log(
+      `${d}: ${result.usage?.requests ?? '?'} requests | build ${result.verification?.build ?? '-'} | page ${result.verification?.page?.ok ?? '-'}`,
+    );
+  }
+  return { meta, results };
+}
+
+// ---- the suite -----------------------------------------------------------------------------------------------------
+let suite, results, versions, chosen, runs, sc;
+if (args.rescore) {
+  suite = resolve(args.rescore);
+  const r = await rescore(suite);
+  ({ versions, runs } = r.meta);
+  sc = r.meta.scenario;
+  chosen = Object.keys(versions);
+  results = r.results;
+} else {
+  sc = scenario;
+  chosen = args.harness
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  for (const h of chosen)
+    if (!harnesses[h]) throw new Error(`Unknown harness ${h}; known: ${Object.keys(harnesses).join(', ')}`);
+  for (const h of chosen)
+    for (const v of harnesses[h].requires ?? []) if (!process.env[v]) throw new Error(`${h} needs ${v}`);
+  suite = join(args.out, new Date().toISOString().replace(/[:.]/g, '-'));
+  mkdirSync(suite, { recursive: true });
+  runs = Number(args.runs);
+  versions = Object.fromEntries(chosen.map(h => [h, harnesses[h].version()]));
+  writeFileSync(
+    join(suite, 'suite.json'),
+    JSON.stringify(
+      {
+        scenario,
+        runs,
+        versions,
+        platform: `${process.platform} ${process.arch}`,
+        node: process.version,
+        started: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
+  console.log(
+    `Suite ${suite}\n${Object.entries(versions)
+      .map(([h, v]) => `  ${h}: ${v}`)
+      .join('\n')}`,
+  );
+  results = [];
+  for (let i = 1; i <= runs; i++)
+    for (const name of chosen) {
+      const h = harnesses[name];
+      const trial = join(suite, `${name}-${i}`);
+      const repo = join(trial, 'repo');
+      mkdirSync(repo, { recursive: true });
+      // Its own empty git repository: a harness takes the enclosing repository as its project (OpenCode wrote its
+      // project into the checkout that holds work/, and Cline's linter read that checkout's .gitignore).
+      spawnSync('git', ['init', '-q'], { cwd: repo, windowsHide: true });
+      console.log(`\n[${name} ${i}/${runs}] ${repo}`);
+      const before = await keyUsage();
+      // What the checkout holding the runner has at its top level: a harness that writes outside its directory
+      // (OpenCode did, into this checkout) is caught by what appears here.
+      const outsideBefore = new Set(readdirSync(root));
+      const ctx = h.prepare ? h.prepare(scenario, repo, trial) : {};
+      const [command, argv] = h.command(scenario, repo, trial, ctx);
+      writeFileSync(
+        join(trial, 'command.json'),
+        JSON.stringify(
+          { command, argv: argv.map(a => (a === key ? '<key>' : a)), effort: effortFor(scenario, name) },
+          null,
+          2,
+        ),
+      );
+      const t0 = Date.now();
+      const r = await run(command, argv, {
+        cwd: repo,
+        env: h.env ? h.env(repo) : {},
+        timeoutMs: scenario.timeoutMinutes * 60_000,
+        stdout: join(trial, 'agent-stdout.txt'),
+        stderr: join(trial, 'agent-stderr.txt'),
+      });
+      const wallSeconds = (Date.now() - t0) / 1000;
+      const after = await settledUsage(before);
+      let usage = null;
+      try {
+        usage = h.usage(trial, r.stdout);
+      } catch (e) {
+        usage = { error: e.message };
+      }
+      h.cleanup?.(ctx);
+      // A harness that wrote its project somewhere else leaves its directory empty: said, never scored as a result.
+      const wroteHere = readdirSync(repo).some(n => n !== '.git');
+      const wroteOutside = readdirSync(root)
+        .filter(n => !outsideBefore.has(n))
+        .map(n => join(root, n));
+      if (wroteOutside.length) console.log(`  it wrote outside its directory: ${wroteOutside.join(', ')}`);
+      if (!wroteHere) console.log('  its directory is empty: it wrote its project elsewhere, or nothing');
+      const verification = args['skip-verify'] ? null : await verify(repo, trial).catch(e => ({ error: e.message }));
+      const result = {
+        harness: name,
+        trial: i,
+        effort: effortFor(scenario, name),
+        wroteHere,
+        ...(wroteOutside.length ? { wroteOutside } : {}),
+        exitCode: r.code,
+        timedOut: r.timedOut,
+        wallSeconds,
+        billedUsd: +(after - before).toFixed(6),
+        usage,
+        verification,
+      };
+      writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
+      results.push(result);
+      console.log(
+        `  exit ${r.code}${r.timedOut ? ' (timed out)' : ''} | ${wallSeconds.toFixed(0)} s | billed $${result.billedUsd.toFixed(4)} | ${usage?.requests ?? '?'} requests, ${usage?.promptTokens ?? '?'} prompt / ${usage?.outputTokens ?? '?'} output tokens | build ${verification?.build ?? '-'} | page ${verification?.page?.ok ?? '-'}`,
+      );
+    }
+}
+
+// ---- summary ---------------------------------------------------------------------------------------------------
+const median = xs => {
+  const s = xs.filter(x => Number.isFinite(x)).sort((a, b) => a - b);
+  return s.length ? (s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : NaN;
+};
+const fmt = (x, d = 0) => (Number.isFinite(x) ? x.toFixed(d) : '?');
+const usd = x => (Number.isFinite(x) ? `$${x.toFixed(4)}` : '?');
+// A trial passes when the harness exited 0 within its time, wrote its project where it was asked, the project's build
+// passed (when it has one) and its page loaded with no exception or failed request.
+const passed = r =>
+  r.exitCode === 0 &&
+  !r.timedOut &&
+  r.wroteHere !== false &&
+  !r.wroteOutside?.length &&
+  r.verification?.build !== false &&
+  r.verification?.page?.ok === true;
+const rows = chosen.map(name => {
+  const rs = results.filter(r => r.harness === name);
+  const of = f => rs.map(f).map(Number);
+  const billed = of(r => r.billedUsd).filter(Number.isFinite);
+  return `| ${name} | ${rs[0]?.effort ?? effortFor(sc, name)} | ${rs.filter(passed).length}/${rs.length} | ${fmt(median(of(r => r.wallSeconds)))} s | ${usd(median(billed))} (${billed.length ? `${usd(Math.min(...billed))}–${usd(Math.max(...billed))}` : '?'}) | ${fmt(median(of(r => r.usage?.requests)))} | ${fmt(median(of(r => r.usage?.promptTokens)))} | ${fmt(median(of(r => r.usage?.outputTokens)))} |`;
+});
+const summary = [
+  `# ${sc.id}`,
+  '',
+  `Prompt: "${sc.prompt}"  `,
+  `Model: ${sc.provider}/${sc.model}, reasoning effort requested: ${sc.effort}. ${runs} trial${runs === 1 ? '' : 's'} per harness, run one after another.`,
+  '',
+  '| Harness | Effort sent | Passed | Wall time (median) | Billed by OpenRouter (median, range) | Requests (median) | Prompt tokens (median) | Output tokens (median) |',
+  '| --- | --- | --- | --- | --- | --- | --- | --- |',
+  ...rows,
+  '',
+  'Versions: ' +
+    Object.entries(versions)
+      .map(([h, v]) => `${h} ${v}`)
+      .join('; ') +
+    '.',
+  '',
+  "Billed: the OpenRouter key's usage before and after each trial, which is what was charged, whichever endpoint served it. Requests and tokens: as each harness reports them (see BENCHMARK.md). Passed: exit 0 in time, the project written where asked, its build passed (when it has one) and its page loaded with no exception or failed request. Look at each trial's page.png too: a page can load and still look wrong.",
+].join('\n');
+writeFileSync(join(suite, 'summary.json'), JSON.stringify(results, null, 2));
+writeFileSync(join(suite, 'SUMMARY.md'), summary + '\n');
+console.log(`\n${summary}\n\n${join(suite, 'SUMMARY.md')}`);

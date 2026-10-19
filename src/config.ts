@@ -15,12 +15,14 @@ export const defaults: Config = {
   // The evidence budget of a model through OpenRouter: 0 fits it to the model (a quarter of its window, at most
   // 64000 tokens); workingTokens is Bonsai's, sized for its window and its local prefill.
   openrouterWorkingTokens: 0,
-  // The turns an invocation through OpenRouter may take (a turn runs one to eight actions); maxSteps is Bonsai's, in actions.
+  // The turns an invocation through OpenRouter may take (a turn runs one to sixteen actions); maxSteps is Bonsai's, in actions.
   openrouterMaxTurns: 120,
   // Prompt caching through OpenRouter: auto for a model whose catalogue lists a cache-read price, or off.
   promptCache: 'auto',
   // A page observation's screenshot, shown to a model that takes images with the next step: auto, or off.
   screenshots: 'auto',
+  // OpenRouter endpoints by what Leana's requests cost on them (endpointOrder), or OpenRouter's own choice.
+  openrouterRouting: 'cost',
   // How the prompt is written (Session.form): json for Bonsai; fitted to an OpenRouter model, tools when it takes them, else text.
   promptForm: 'json',
   jevUrl: 'https://api.typesafe.ai/v1/systemone',
@@ -133,6 +135,7 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   if (!['json', 'text', 'tools'].includes(c.promptForm)) throw new Error('promptForm must be json, text or tools');
   if (!['auto', 'off'].includes(c.promptCache)) throw new Error('promptCache must be auto or off');
   if (!['auto', 'off'].includes(c.screenshots)) throw new Error('screenshots must be auto or off');
+  if (!['cost', 'default'].includes(c.openrouterRouting)) throw new Error('openrouterRouting must be cost or default');
   if (
     !Number.isSafeInteger(c.openrouterWorkingTokens) ||
     (c.openrouterWorkingTokens && c.openrouterWorkingTokens < 2000)
@@ -184,6 +187,7 @@ const kept = new Set([
   'openrouterMaxTurns',
   'promptCache',
   'screenshots',
+  'openrouterRouting',
 ]);
 export interface Settings {
   config: Partial<Config>;

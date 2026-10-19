@@ -27,7 +27,16 @@ import {
   type GenerationCut,
 } from './clients.js';
 import { actions, samplingSchema, validate } from './schema.js';
-import { cachesPrompts, describeModel, effortsOf, gatewayEfforts, type ModelInfo } from './models.js';
+import {
+  cachesPrompts,
+  describeModel,
+  effortsOf,
+  endpointOrder,
+  gatewayEfforts,
+  modelEndpoints,
+  requestCost,
+  type ModelInfo,
+} from './models.js';
 import { AGENT_SYSTEM, actionTool, agentSystem, cachePoints } from './context.js';
 
 // One tool call of a reply, its arguments as the text the model wrote.
@@ -280,8 +289,44 @@ export class OpenRouter {
     );
     return { messages: [...out, ...extra], marked: points.size > 0 };
   }
-  private routing(): Record<string, unknown> {
-    return this.config.promptCache === 'auto' ? { session_id: this.session } : {};
+  // How a request is routed: one session for the run (its provider keeps the prompt cache), and, unless routing is
+  // left to OpenRouter, the model's endpoints where Leana's requests cost least, asked for first with OpenRouter's
+  // fallbacks kept; requireParameters for a reply whose schema the provider must enforce.
+  private async routing(m: ModelInfo, requireParameters = false): Promise<Record<string, unknown>> {
+    const order = await this.providerOrder(m);
+    const provider = {
+      ...(order.length ? { order, allow_fallbacks: true } : {}),
+      ...(requireParameters ? { require_parameters: true } : {}),
+    };
+    return {
+      ...(this.config.promptCache === 'auto' ? { session_id: this.session } : {}),
+      ...(Object.keys(provider).length ? { provider } : {}),
+    };
+  }
+  // The endpoint order of the run, worked out once from the model's endpoints (endpointOrder); none when routing is
+  // left to OpenRouter or the endpoints cannot be listed, so a request is never held up by it.
+  private order: Promise<string[]> | null = null;
+  private providerOrder(m: ModelInfo): Promise<string[]> {
+    if (this.config.openrouterRouting !== 'cost') return Promise.resolve([]);
+    this.order ??= modelEndpoints(this.config, this.key)
+      .then(async endpoints => {
+        const need = {
+          context: this.config.workingTokens + this.config.maxTokens + this.config.createTokens,
+          output: this.config.maxTokens + this.config.createTokens,
+          params: m.params.includes('tools') ? ['tools'] : [],
+        };
+        const order = endpointOrder(endpoints, need);
+        await this.log('provider-order', {
+          model: this.config.model,
+          order,
+          costs: Object.fromEntries(
+            endpoints.filter(e => order.includes(e.tag)).map(e => [e.tag, +(requestCost(e) * 1e6).toFixed(4)]),
+          ),
+        });
+        return order;
+      })
+      .catch(() => [] as string[]);
+    return this.order;
   }
   // A request whose markers a provider refused (HTTP 400) is sent again without them, and marking stops for the run.
   private async unmarkedOnRefusal<T>(
@@ -371,7 +416,7 @@ export class OpenRouter {
     const body: Record<string, any> = {
       model: this.config.model,
       messages: cached.messages,
-      ...this.routing(),
+      ...(await this.routing(m, via === 'schema')),
       // Reasoning counts against max_tokens: a model that reasons gets its budget on top of the reply's. A native step
       // writes files in its calls, so it has a file's budget (createTokens) on top as well.
       max_tokens: Math.min(
@@ -390,7 +435,6 @@ export class OpenRouter {
                 type: 'json_schema',
                 json_schema: { name: 'arguments', strict: true, schema: samplingSchema(schema) },
               },
-              provider: { require_parameters: true },
             }
           : via === 'tool'
             ? {
@@ -508,6 +552,8 @@ export class OpenRouter {
           });
         return {
           thought: r.content.trim(),
+          // Calls past the turn's limit are not run: said to the worker by the agent, with their names.
+          ...(r.calls.length > most ? { dropped: r.calls.slice(most).map(c => c.name) } : {}),
           actions: r.calls.slice(0, most).map(c => {
             let args: unknown;
             try {
@@ -614,7 +660,7 @@ export class OpenRouter {
         const body: Record<string, any> = {
           model: this.config.model,
           messages: cached.messages,
-          ...this.routing(),
+          ...(await this.routing(m)),
           max_tokens: Math.min(n + (think ?? 0), m.maxOutput || Infinity),
           ...this.sampling(m, 'code', temperature),
           ...this.reasoning(m, think),

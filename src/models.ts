@@ -439,6 +439,18 @@ export function modelOptions(m: ModelInfo): ModelOption[] {
         return { promptCache: v as 'auto' | 'off' };
       },
     });
+  if (m.provider === 'openrouter')
+    out.push({
+      name: 'routing',
+      describe:
+        "ask first for the model's OpenRouter endpoints where Leana's requests cost least (cost), or leave it to OpenRouter (default)",
+      values: 'cost | default',
+      get: c => c.openrouterRouting,
+      set: (_c, v) => {
+        if (!/^(cost|default)$/.test(v)) throw new Error('routing takes cost or default');
+        return { openrouterRouting: v as 'cost' | 'default' };
+      },
+    });
   if (m.images)
     out.push({
       name: 'screenshots',
@@ -472,4 +484,72 @@ export function unsupportedSettings(c: Config, m: ModelInfo): string[] {
       })()}`,
     );
   return out;
+}
+
+// One of a model's endpoints on OpenRouter: the slug a request's provider.order names (provider/variant/region), its
+// prices per token, and what it takes.
+export interface Endpoint {
+  tag: string;
+  prompt: number;
+  completion: number;
+  cacheRead?: number;
+  context: number;
+  maxOutput?: number;
+  params: string[];
+  up: boolean;
+}
+const endpointLists = new Map<string, Promise<Endpoint[]>>();
+const perToken = (v: unknown) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+export async function modelEndpoints(config: Config, key: string): Promise<Endpoint[]> {
+  const id = `${config.openrouterUrl} ${config.model}`;
+  let p = endpointLists.get(id);
+  if (!p) {
+    p = getJson(`${config.openrouterUrl.replace(/\/$/, '')}/models/${config.model}/endpoints`, key, 15000).then(r =>
+      (Array.isArray(r?.data?.endpoints) ? r.data.endpoints : [])
+        .filter((e: any) => typeof e?.tag === 'string' && e.pricing)
+        .map((e: any): Endpoint => ({
+          tag: e.tag,
+          prompt: perToken(e.pricing.prompt),
+          completion: perToken(e.pricing.completion),
+          ...(e.pricing.input_cache_read !== undefined ? { cacheRead: perToken(e.pricing.input_cache_read) } : {}),
+          context: Number(e.context_length ?? 0),
+          ...(e.max_completion_tokens ? { maxOutput: Number(e.max_completion_tokens) } : {}),
+          params: Array.isArray(e.supported_parameters) ? e.supported_parameters.map(String) : [],
+          up: (e.status ?? 0) === 0 && !(Number(e.uptime_last_30m) < 90),
+        })),
+    );
+    p.catch(() => endpointLists.delete(id));
+    endpointLists.set(id, p);
+  }
+  return p;
+}
+// What a prompt token of Leana's costs on an endpoint, with the output it brings: by the share of prompt tokens read
+// from the provider's cache and the output per prompt token of run react-demo-glm-3 (178,520 of 204,381 prompt
+// tokens cached, 14,295 output). An endpoint that lists no cache price is taken to charge cached tokens in full.
+const share = { uncached: 0.13, cached: 0.87, output: 0.07 };
+export const requestCost = (e: Endpoint): number =>
+  e.prompt * share.uncached + (e.cacheRead ?? e.prompt) * share.cached + e.completion * share.output;
+// The endpoints to ask first, cheapest for Leana's requests first (OpenRouter's own order among equals): those up,
+// with the window and output a request needs, taking the parameters it sends. (Run react-demo-glm-3 was billed
+// $0.056 at GLM-5.3's wafer/fp4 endpoint, $0.179 per million prompt tokens, while wafer/us lists $0.079.)
+export function endpointOrder(
+  endpoints: Endpoint[],
+  need: { context: number; output: number; params: string[] },
+  most = 5,
+): string[] {
+  return endpoints
+    .filter(
+      e =>
+        e.up &&
+        e.context >= need.context &&
+        !(e.maxOutput !== undefined && e.maxOutput < need.output) &&
+        need.params.every(p => !e.params.length || e.params.includes(p)),
+    )
+    .map((e, i) => ({ e, i, cost: requestCost(e) }))
+    .sort((a, b) => a.cost - b.cost || a.i - b.i)
+    .slice(0, most)
+    .map(x => x.e.tag);
 }

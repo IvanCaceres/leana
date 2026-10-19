@@ -20,8 +20,8 @@ import { App } from '../src/app.js';
 import { Agent, argsProblem, fileBeingWritten, newSession } from '../src/agent.js';
 import { Store } from '../src/store.js';
 import { schemas, stepSchema, toolSchema, withDefaults } from '../src/schema.js';
-import { AGENT_SYSTEM, agentSystem, stepMessages } from '../src/context.js';
-import type { Answers, Config, Questions } from '../src/types.js';
+import { AGENT_SYSTEM, actionTool, agentSystem, stepMessages } from '../src/context.js';
+import type { Answers, Config, Message, Questions } from '../src/types.js';
 
 const fixtures = fileURLToPath(new URL('../../test/fixtures/openrouter/', import.meta.url));
 const catalogue = async () => JSON.parse(await readFile(join(fixtures, 'models.json'), 'utf8'));
@@ -54,10 +54,12 @@ async function sse(
   res.end('data: [DONE]\n\n');
 }
 // A mock OpenRouter: the catalogue at /models, chat answered by `reply` (body and call number).
+// A model's endpoints at /models/ID/endpoints when given (else 404: routing is left to OpenRouter).
 async function mock(
   t: any,
   reply: (b: any, n: number, res: ServerResponse) => Promise<void> | void,
   extra: any[] = [],
+  endpoints?: any[],
 ) {
   const bodies: any[] = [];
   const list = await catalogue();
@@ -66,6 +68,11 @@ async function mock(
     if (req.url?.endsWith('/models')) {
       res.setHeader('Content-Type', 'application/json');
       return res.end(JSON.stringify(list));
+    }
+    if (req.url?.endsWith('/endpoints')) {
+      res.statusCode = endpoints ? 200 : 404;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify(endpoints ? { data: { endpoints } } : { error: { message: 'not found' } }));
     }
     const b = await body(req);
     bodies.push(b);
@@ -710,7 +717,7 @@ test("Under the tools form a step is the model's own tool calling: each action a
       ['path', 'oldText', 'newText'],
     ],
   );
-  assert.match(tool('create_file').description, /^Create a file that does not exist yet, with its complete content\./);
+  assert.match(tool('create_file').description, /^Create a file that does not exist yet with its whole content: /);
   assert.doesNotMatch(tool('create_file').description + tool('rewrite_file').description, /generated|purpose/);
   assert.deepEqual(tool('read_files').parameters, toolSchema('read_files'));
   assert.equal(bodies[0].messages[0].content, agentSystem());
@@ -818,6 +825,220 @@ const gptActions = [
   'finish',
   'ask_user',
 ];
+
+test('Under the tools form a file written in an earlier turn is said in one line, not re-sent; the latest turn keeps what it wrote; a turn changes once, when it stops being the latest (run react-demo-glm-3: 28,000 characters of written files in each of twelve prompts)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'leana-elide-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const s = await newSession(dir, 'x');
+  s.form = 'tools';
+  s.allowedActions = ['create_file', 'write', 'plan'];
+  const big = (name: string) =>
+    Array.from({ length: 50 }, (_, i) => `export const ${name}${i} = ${i}; // line ${i}`).join('\n');
+  const turn = (id: string, step: number, actions: any[]) => ({
+    id,
+    step,
+    kind: 'turn' as const,
+    artifact: '',
+    relevance: 0.5,
+    outcomes: actions.map(a => `${a.action} ok`),
+    text: JSON.stringify({ thought: `Turn ${id}.`, actions }),
+  });
+  const result = (id: string, step: number, of: string, kind = 'create_file') => ({
+    id,
+    step,
+    kind,
+    artifact: 'a',
+    relevance: 0.5,
+    turn: of,
+    text: 'written',
+  });
+  s.entries.push(
+    turn('t1', 1, [
+      { action: 'create_file', args: { path: 'src/App.tsx', content: big('a') } },
+      { action: 'write', args: { path: 'src/main.tsx', oldText: 'x', newText: 'y' } },
+    ]),
+    result('e1', 1, 't1'),
+    result('e2', 2, 't1', 'write'),
+    turn('t3', 3, [{ action: 'create_file', args: { path: 'src/index.css', content: big('c') } }]),
+    result('e3', 3, 't3'),
+  );
+  const args = (m: Message[]) =>
+    m.filter(x => x.role === 'assistant').map(x => x.tool_calls!.map(c => JSON.parse(c.function.arguments)));
+  const first = stepMessages(s, s.allowedActions);
+  const [t1, t3] = args(first);
+  assert.match(
+    t1![0].content,
+    /^\[50 lines \(\d+ characters\) written at step 1; not repeated here: read_files shows src\/App\.tsx as it is now\]$/,
+  );
+  assert.deepEqual(t1![1], { path: 'src/main.tsx', oldText: 'x', newText: 'y' }, 'a short edit is shown as made');
+  assert.equal(t3![0].content, big('c'), 'the latest turn shows what it wrote');
+  s.entries.push(turn('t4', 4, [{ action: 'plan', args: { notes: 'n' } }]), result('e4', 4, 't4', 'plan'));
+  const second = stepMessages(s, s.allowedActions);
+  assert.match(args(second)[1]![0].content, /^\[50 lines .* src\/index\.css as it is now\]$/, 'no longer the latest');
+  const at = first.findIndex(m => m.role === 'assistant' && m.content === 'Turn t3.');
+  assert(at > 0);
+  assert.deepEqual(
+    second.slice(0, at),
+    first.slice(0, at),
+    'everything before that turn is as it was: the cache prefix holds',
+  );
+});
+
+test('The tools are described briefly, each rule the harness enforces kept', () => {
+  const descriptions = gptActions.map(a => actionTool(a).function.description);
+  const total = descriptions.reduce((n, d) => n + d.length, 0);
+  assert(total < 6000, `${total} characters of descriptions`);
+  assert(
+    descriptions.every(d => d.length <= 700),
+    'none runs long',
+  );
+  const of = (a: string) => actionTool(a).function.description;
+  assert.match(of('bash'), /check of record/);
+  assert.match(of('bash'), /do not cd elsewhere/);
+  assert.match(of('finish'), /verificationAfterLastWrite/);
+  assert.match(of('write'), /copied exactly/);
+  assert.match(of('replace_lines'), /expectedHash/);
+  assert.match(of('read_files'), /up to three/);
+  assert.match(of('create_file'), /call of its own/);
+});
+
+test("A model's OpenRouter endpoints are asked for in order of what Leana's requests cost there (mostly cached prompt, some output), those down, too small or without tools left out (run react-demo-glm-3: billed at wafer/fp4, $0.179 per million prompt tokens, where wafer/us lists $0.079)", async t => {
+  const { endpointOrder, requestCost } = await import('../src/models.js');
+  const e = (tag: string, prompt: number, cacheRead: number | undefined, completion: number, more: any = {}) => ({
+    tag,
+    prompt: prompt / 1e6,
+    completion: completion / 1e6,
+    ...(cacheRead === undefined ? {} : { cacheRead: cacheRead / 1e6 }),
+    context: 1048576,
+    params: ['tools', 'reasoning'],
+    up: true,
+    ...more,
+  });
+  // GLM-5.3's endpoints on 2026-10-19 (dollars per million tokens), and three that cannot serve a step.
+  const glm = [
+    e('morph/fp8', 0.04, 0.025, 6.0),
+    e('wafer/us', 0.079, 0.078, 1.4),
+    e('inference-net/fp4', 0.08, 0.076, 4.381),
+    e('wafer/fp4', 0.179, 0.178, 1.4),
+    e('sail-research/us', 0.5, 0.119, 1.505),
+    e('relace', 0.75, 0.075, 2.4),
+    e('nebius/fp4', 1.4, undefined, 4.4),
+    e('friendli', 0.01, 0.01, 0.01, { up: false }),
+    e('tiny', 0.01, 0.01, 0.01, { context: 32000 }),
+    e('notools', 0.01, 0.01, 0.01, { params: ['reasoning'] }),
+  ];
+  const need = { context: 112000, output: 20000, params: ['tools'] };
+  assert.deepEqual(endpointOrder(glm, need), [
+    'wafer/us',
+    'sail-research/us',
+    'wafer/fp4',
+    'relace',
+    'inference-net/fp4',
+  ]);
+  assert(requestCost(glm[6]!) > requestCost(glm[3]!) * 5, 'no cache price: cached tokens at the full prompt price');
+  // Requests name the order, with OpenRouter's fallbacks kept.
+  const endpoints = [
+    {
+      tag: 'dear',
+      pricing: { prompt: '0.000003', completion: '0.000015', input_cache_read: '0.0000003' },
+      context_length: 200000,
+      supported_parameters: ['tools'],
+      status: 0,
+    },
+    {
+      tag: 'cheap/us',
+      pricing: { prompt: '0.000001', completion: '0.000005', input_cache_read: '0.0000001' },
+      context_length: 200000,
+      supported_parameters: ['tools'],
+      status: 0,
+    },
+  ];
+  const schema = {
+    type: 'object' as const,
+    properties: { content: { type: 'string' as const } },
+    required: ['content'],
+    additionalProperties: false as const,
+  };
+  const prompt = [{ role: 'user' as const, content: '{"request":"next"}' }];
+  const reply = async (_b: any, _n: number, res: ServerResponse) => sse(res, [{ content: '{"content":"ok"}' }]);
+  const routed = await mock(t, reply, [], endpoints);
+  const events: any[] = [];
+  const or = new OpenRouter(cfg(routed.url, 'anthropic/claude-sonnet-5.5'), 'k', async (type, data) => {
+    events.push({ type, data });
+  });
+  await or.generate(prompt, schema);
+  await or.generate(prompt, schema);
+  for (const b of routed.bodies) {
+    assert.deepEqual(b.provider.order, ['cheap/us', 'dear']);
+    assert.equal(b.provider.allow_fallbacks, true);
+  }
+  assert.equal(events.filter(x => x.type === 'provider-order').length, 1, 'worked out once a run');
+  const asIs = await mock(t, reply, [], endpoints);
+  await new OpenRouter(
+    cfg(asIs.url, 'anthropic/claude-sonnet-5.5', { openrouterRouting: 'default' }),
+    'k',
+    async () => {},
+  ).generate(prompt, schema);
+  assert.equal(asIs.bodies[0].provider?.order, undefined, 'routing left to OpenRouter');
+  const unlisted = await mock(t, reply);
+  await new OpenRouter(cfg(unlisted.url, 'anthropic/claude-sonnet-5.5'), 'k', async () => {}).generate(prompt, schema);
+  assert.equal(unlisted.bodies[0].provider?.order, undefined, 'no endpoint list: the request goes as before');
+});
+
+test('Under the tools form a result that no longer describes the repository and holds nothing current is said in one line, with why and where it is kept; one that still holds lines no later read shows stays whole (run react-demo-glm-8: six re-reads of its own files, each whole in every later prompt)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'leana-stale-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const s = await newSession(dir, 'x');
+  s.form = 'tools';
+  s.allowedActions = ['read_files', 'write', 'plan'];
+  const read = (path: string) =>
+    `${path} sha256=abc totalLines=40 shown=1..40\n${Array.from({ length: 40 }, (_, i) => `${i + 1}: const v${i} = ${i};`).join('\n')}`;
+  const turn = (id: string, step: number, actions: any[]) => ({
+    id,
+    step,
+    kind: 'turn' as const,
+    artifact: '',
+    relevance: 0.5,
+    outcomes: actions.map(a => `${a.action} ok`),
+    text: JSON.stringify({ thought: `Turn ${id}.`, actions }),
+  });
+  s.entries.push(
+    turn('t1', 1, [{ action: 'read_files', args: { files: [{ path: 'src/a.ts' }] } }]),
+    {
+      id: 'e1',
+      step: 1,
+      kind: 'read_files',
+      artifact: '@artifact/00001.txt',
+      relevance: 0.5,
+      turn: 't1',
+      text: read('src/a.ts'),
+      stale: 'edited at step 3: text and line numbers no longer match src/a.ts',
+    },
+    turn('t2', 2, [{ action: 'read_files', args: { files: [{ path: 'src/b.ts' }] } }]),
+    {
+      id: 'e2',
+      step: 2,
+      kind: 'read_files',
+      artifact: '@artifact/00002.txt',
+      relevance: 0.5,
+      turn: 't2',
+      text: read('src/b.ts'),
+      stale: 'superseded by the read at step 9',
+    },
+    turn('t3', 3, [{ action: 'write', args: { path: 'src/a.ts', oldText: 'v0', newText: 'w0' } }]),
+    { id: 'e3', step: 3, kind: 'write', artifact: 'a', relevance: 0.5, turn: 't3', text: 'written' },
+  );
+  s.writeSteps = { 'src/a.ts': 3 };
+  const results = stepMessages(s, s.allowedActions)
+    .filter(m => m.role === 'tool')
+    .map(m => JSON.parse(m.content).evidence);
+  assert.equal(
+    results[0].text,
+    '[left out: edited at step 3: text and line numbers no longer match src/a.ts. @artifact/00001.txt holds it in full.]',
+  );
+  assert.equal(results[1].text, read('src/b.ts'), 'its lines are shown by no later read and b.ts was not edited: kept');
+  assert.equal(results[2].text, 'written');
+});
 
 test("The tools form leaves Bonsai's prompt as it was: no session form, the same system message, the actions pinned, turns as JSON", async t => {
   const dir = await mkdtemp(join(tmpdir(), 'leana-form-'));

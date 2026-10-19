@@ -2685,6 +2685,75 @@ test('Calls written in a shape that reads one way only are run as meant, not ref
   );
 });
 
+test('Under the tools form a turn takes up to sixteen calls, a turn of one call that decided nothing is answered with a push to batch, and calls past the limit are said to have not run (runs react-demo-glm-8: 28 requests mostly of one call; react-demo-3: five create_file calls dropped unsaid)', async t => {
+  const { root, store } = await repo(t);
+  for (const n of ['a', 'b']) await writeFile(join(root, `${n}.ts`), `export const ${n} = 1;\n`);
+  const read = (path: string) => ({ action: 'read_files', args: { files: [{ path, start: 1, end: 5 }] } });
+  const bonsai = bonsaiOf({
+    steps: [
+      { thought: 'One read.', action: 'read_files', batch: [read('a.ts')] },
+      { thought: 'Two reads.', action: 'read_files', batch: [read('a.ts'), read('b.ts')] },
+      { thought: 'Two more, two dropped.', action: 'read_files', batch: [read('b.ts')] },
+      { thought: 'Ask.', action: 'ask_user', args: { question: 'done' } },
+    ],
+  });
+  const prompts: Message[][] = [];
+  const schemas: any[] = [];
+  let n = 0;
+  const agent = new Agent(
+    { ...config, promptForm: 'tools' },
+    store,
+    jevOf({}),
+    {
+      ...bonsai,
+      generate: async (m: Message[], schema: any) => {
+        prompts.push(m);
+        schemas.push(schema);
+        const out = await bonsai.generate(m, schema);
+        return ++n === 3 ? { ...out, dropped: ['create_file', 'bash'] } : out;
+      },
+    } as any,
+    root,
+    () => {},
+    () => {},
+  );
+  const result = await agent.run(await newSession(root, 'read'));
+  assert.equal(result.stopReason, 'done');
+  assert.deepEqual(
+    schemas.map(x => x.properties.actions.maxItems),
+    [16, 16, 16, 16],
+    'up to sixteen calls a turn',
+  );
+  const request = (i: number) => JSON.parse(prompts[i]!.at(-1)!.content);
+  assert.match(request(0).role, /up to sixteen calls in order\. Every turn re-sends the whole conversation/);
+  assert.match(
+    String(request(1).harnessNote),
+    /^Your last turn made one call\. Every turn re-sends the whole conversation/,
+  );
+  assert.doesNotMatch(String(request(2).harnessNote ?? ''), /Your last turn made one call/, 'a turn of two calls');
+  assert.match(
+    String(request(3).harnessNote),
+    /2 calls of your last turn did not run \(a turn runs at most 16\): create_file, bash\. Make whichever of them are still needed now\./,
+  );
+  const json = new Agent(
+    config,
+    store,
+    jevOf({}),
+    {
+      ...bonsaiOf({ steps: [{ thought: 'Ask.', action: 'ask_user', args: { question: 'q' } }] }),
+      generate: async (m: Message[], schema: any) => {
+        schemas.push(schema);
+        return { thought: 'Ask.', actions: [{ action: 'ask_user', args: { question: 'q' } }] };
+      },
+    } as any,
+    root,
+    () => {},
+    () => {},
+  );
+  await json.run(await newSession(root, 'json'));
+  assert.equal(schemas.at(-1).properties.actions.maxItems, 8, "Bonsai's grammar keeps eight");
+});
+
 test('A read shows as much of the range as the character budget allows, not a fixed number of lines', async t => {
   const { root } = await repo(t);
   await writeFile(

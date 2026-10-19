@@ -327,6 +327,9 @@ export interface Config {
   // The screenshot a page observation takes, shown to the model with the next step's prompt: auto for a model
   // that takes images (its catalogue lists image input), or off.
   screenshots: 'auto' | 'off';
+  // Which of a model's OpenRouter endpoints a run asks for first: cost ranks them by what Leana's requests cost there
+  // (mostly cached prompt, some output; see endpointOrder), default leaves the choice to OpenRouter.
+  openrouterRouting: 'cost' | 'default';
   baseUrl: string;
   model: string;
   contextWindow: number;

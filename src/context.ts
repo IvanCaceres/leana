@@ -758,23 +758,33 @@ export function cachePoints(messages: Message[]): number[] {
 const evidenceContent = (e: Entry): string =>
   JSON.stringify({ evidence: { id: e.id, kind: e.kind, artifact: e.artifact, text: e.text } });
 const evidenceMessage = (e: Entry): Message => ({ role: 'user', content: evidenceContent(e) });
-// The file actions as the model's own tools: the content is written in the call (toolForms).
-const toolDescriptions: Partial<Record<Route, string>> = {
-  create_file: 'Create a file that does not exist yet, with its complete content.',
-  rewrite_file:
-    'Replace the whole content of an existing file, or one block of it (start and end). For any change larger than a few lines.',
-  write:
-    "Replace one exact piece of an existing file's text with new text: the way to change a few lines without retyping the file.",
-  replace_lines:
-    'Replace, delete or prefix up to 40 line ranges of an already-read file in one call, addressed by line numbers instead of exact text; the way to remove many unused-import lines at once, or to export many declarations at once (prepend).',
-};
-const toolDetails: Partial<Record<Route, string>> = {
+// Each action as one of the model's tools (the tools form), described once, briefly: the tool definitions are sent
+// with every request, and the catalogue Bonsai reads (routeDescriptions, details) ran to 9,800 characters, about a
+// quarter of a small run's prompt (run react-demo-glm-3). Every rule the harness enforces is kept; the reasons and
+// examples are not. The file actions write their content in the call (toolForms).
+const toolBriefs: Record<Route, string> = {
+  read_files:
+    'Read files or line ranges, or a stored output as @artifact/NAME. files: up to three {path, start, end} (1-based, inclusive; no range reads the whole file); more go in further read_files calls of the same turn. Exact repository-relative paths, no globs or directories. A read shows as much of each range as fits its budget and names the last line shown: continue from the next line. To find a declaration in a large file, search_codebase first and read around it. Read a file before editing it.',
+  search_codebase:
+    'Find text (mode text: path:line:text) or files by name (mode files) under path: "." for the repository, "@artifacts" for stored outputs. Use a narrow literal query; never repeat a query already in searched.',
+  bash: 'Run a shell command in the repository root (do not cd elsewhere; no background processes or servers: observe starts and watches those). check is true only when the command verifies the work (a build, a type check, tests): it becomes the check of record, and finish is refused while an edit is newer than the last check. A command that succeeded is not run again until something is written or installed.',
   create_file:
-    'path is the repository-relative path of a file that does not exist yet (an existing file is changed with rewrite_file or write). content is the whole file: working code with no placeholders, TODOs or omitted sections, importing repository modules by the names they export and packages the manifest declares. A large file goes in a call of its own: a reply is limited in length, and a call cut off by the limit is not run.',
+    'Create a file that does not exist yet with its whole content: working code with no placeholders, TODOs or omitted parts, importing repository modules by the names they export and packages the manifest declares. A large file goes in a call of its own: a reply cut off by its length limit is not run. An existing file is changed with rewrite_file or write.',
   rewrite_file:
-    'path is an existing file. Without start and end, content is its whole new content. With start and end (1-based, inclusive, numbered as in the latest read or edit result of the file), content is the new text of lines start..end only, and the rest of the file stays as it is (end = start - 1 inserts before line start; start = totalLines + 1 appends): give them whenever most of the file stays. Lines numbered from a version of the file you have not seen are refused.',
+    "Replace an existing file's whole content, or with start and end (1-based, inclusive, numbered as in your latest read or edit of it) only those lines; end = start - 1 inserts before start, start = totalLines + 1 appends. Give start and end when most of the file stays. Lines numbered from a version you have not seen are refused.",
   write:
-    "oldText is copied exactly from the file as you last read or wrote it and occurs in it once; newText replaces it and differs from it. expectedHash (optional) is the file's sha256 from fileHashes; without it the file as it is now is edited, and oldText must match it exactly. A new file is made with create_file.",
+    "Replace one exact piece of an existing file: oldText copied exactly from the file as you last read or wrote it, occurring once; newText differs from it. expectedHash (optional) is the file's sha256 from fileHashes; without it oldText must match the file as it is now.",
+  replace_lines:
+    'Edit up to 40 non-overlapping line ranges of a file you have read, by number, all numbered as in the read whose sha256 is expectedHash (from fileHashes); never from a check that ran before the file\'s latest edit. Each edit {start, end, newText} replaces the lines (newText "" deletes; end = start - 1 inserts before start). With prepend (e.g. "export ") and newText "", every line of the range gets that prefix. Edits apply bottom-up; a later edit of the same file in the batch, with the same hash, is numbered as in that same text. Edits that leave the file unparseable are refused. A missing import is added at the top, never by overwriting the line that uses the name.',
+  move_lines:
+    'Move lines start..end (at most 2000) of source, unchanged, to the end of destination (created if new). expectedHash is the source sha256 and destinationHash the destination sha256 from fileHashes, or "new" for a new destination. What the moved lines need in their new place (imports, references) is yours to add.',
+  plan: 'Replace your notes, under forty lines: the plan, what is done, what you learned (versions, commands that work, decisions), what is next.',
+  observe:
+    'See the result as its user meets it. kind page: a page in a headless browser (exceptions, failed requests, console, styling, layout, text, canvases); http: one GET to a running service (status, content type, body); program: a command run as its user would (exit code, output). start: the command that starts what is observed and keeps running (a server on a fixed port, no browser opening), stopped afterwards; "" when nothing needs starting. target: the URL, or the command with its arguments. inputs (page only, in order): press or hold a key, type text, click a CSS selector, or wait; each is followed by ms of watching, and what it did is stated.',
+  finish:
+    'Report completion: summary gives the final structure, the verification and limitations. Refused while an edit is newer than the last check (verificationAfterLastWrite false). With nothing written, the summary is your answer, judged against what you read. Report only what the evidence shows: missing history proves neither that a step was followed nor that it was skipped.',
+  ask_user:
+    'Pause because essential information or a permission only the user has is missing. Ask one concise question.',
 };
 // An action as one of the model's tools (the tools form): its name, its description and instructions, its arguments' schema.
 export function actionTool(action: string): {
@@ -786,10 +796,32 @@ export function actionTool(action: string): {
     type: 'function',
     function: {
       name: action,
-      description: `${toolDescriptions[a] ?? routeDescriptions[a]} ${toolDetails[a] ?? details[a]}`,
+      description: toolBriefs[a] ?? `${routeDescriptions[a]} ${details[a]}`,
       parameters: toolSchema(a) as unknown as Record<string, unknown>,
     },
   };
+}
+// A file's text in a call of an earlier turn, said in one line instead of repeated: the file as it is now is a
+// read away, and the call's result states what was written (its sha256 and line count). Every request re-sent
+// every file the run had written, whole: run react-demo-glm-3 (GLM-5.3, 16 requests) sent App.tsx and index.css,
+// 28,000 characters, in each of its last twelve prompts, about 45% of its prompt tokens. The latest turn keeps its
+// text, so the step after a write sees what it wrote; the turn before it changes once, when it stops being latest.
+const elidedFields: Record<string, string[]> = {
+  create_file: ['content'],
+  rewrite_file: ['content'],
+  write: ['oldText', 'newText'],
+};
+function elided(action: string, args: unknown, step: number): unknown {
+  const fields = elidedFields[action];
+  if (!fields || !args || typeof args !== 'object') return args ?? {};
+  const out: Record<string, unknown> = { ...(args as Record<string, unknown>) };
+  for (const f of fields) {
+    const text = out[f];
+    if (typeof text !== 'string' || text.length <= 600) continue;
+    out[f] =
+      `[${text.split('\n').length} lines (${text.length} characters) written at step ${step}; not repeated here: read_files shows ${String(out.path ?? 'the file')} as it is now]`;
+  }
+  return out;
 }
 // The evidence as the model's own tool-calling transcript: a turn is an assistant message, its thought as the
 // text and one call per action; right after it, one tool message per call. Action i of a turn ran at the turn's
@@ -799,6 +831,8 @@ export function actionTool(action: string): {
 // results of a turn that left, stay user messages where they are.
 function toolTranscript(s: Session): Message[] {
   const shown = new Set(s.entries.filter(e => e.kind === 'turn').map(e => e.id));
+  // The latest turn is shown as written; an earlier one without the files it wrote (see elided).
+  const latest = s.entries.filter(e => e.kind === 'turn').at(-1)?.id;
   const out: Message[] = [];
   for (const e of s.entries) {
     if (e.kind !== 'turn') {
@@ -814,7 +848,10 @@ function toolTranscript(s: Session): Message[] {
     const calls = (Array.isArray(turn.actions) ? turn.actions : []).map((a, i) => ({
       id: `${e.id}_${i}`,
       type: 'function' as const,
-      function: { name: String(a.action), arguments: JSON.stringify(a.args ?? {}) },
+      function: {
+        name: String(a.action),
+        arguments: JSON.stringify(e.id === latest ? (a.args ?? {}) : elided(String(a.action), a.args, e.step + i)),
+      },
     }));
     out.push({
       role: 'assistant',

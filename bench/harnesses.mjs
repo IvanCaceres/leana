@@ -779,7 +779,7 @@ async function verify(trialRepo, trial) {
   // Served by its own scripts, with the flags its tool takes: Next.js (next start after a passing build, else next dev)
   // takes -p and -H and refuses Vite's --strictPort (OpenCode built a Next.js app, failed as not served); Vite and the
   // rest, --port, --strictPort and --host.
-  const next = /next/.test(`${scripts.dev ?? ''} ${scripts.start ?? ''}`);
+  const next = /\bnext\b/.test(`${scripts.dev ?? ''} ${scripts.start ?? ''}`);
   const serve = next
     ? scripts.start && out.build
       ? `npm run start -- -p ${port} -H 127.0.0.1`
@@ -853,7 +853,10 @@ async function rescore(suiteDir) {
       wroteHere: readdirSync(repo).some(n => n !== '.git'),
       usage,
       settings: settingsReport(sent, old.harness === 'leana' ? referenceOf(sent) : old.reference),
-      verification: await verify(repo, trial).catch(e => ({ error: e.message })),
+      // --skip-verify keeps each trial's verification: the summary and the usage and settings figures, recomputed alone.
+      verification: args['skip-verify']
+        ? old.verification
+        : await verify(repo, trial).catch(e => ({ error: e.message })),
     };
     writeFileSync(join(trial, 'trial.json'), JSON.stringify(result, null, 2));
     results.push(result);

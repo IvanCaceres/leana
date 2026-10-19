@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import type { Config, Log, Session } from './types.js';
 import { Bonsai, Jev } from './clients.js';
 import { OpenRouter } from './openrouter.js';
-import { describeModel, effortsOf, fitToModel, unsupportedSettings, type ModelInfo } from './models.js';
+import { describeModel, effortsOf, fitToModel, nearestEffort, unsupportedSettings, type ModelInfo } from './models.js';
 import { Agent, newSession } from './agent.js';
 import { Store, runsDir, stateDir } from './store.js';
 import { runCommand } from './commands.js';
@@ -33,8 +33,8 @@ export type ModelClient = Bonsai | OpenRouter;
 export function modelClient(config: Config, key: string, log: Log): ModelClient {
   return config.provider === 'openrouter' ? new OpenRouter(config, key, log) : new Bonsai(config, key, log);
 }
-// The config a run uses with this model: limits fitted to it, an effort it takes (its default, or the
-// first it lists, when the configured one is not), reasoning off when it cannot reason; and what was changed.
+// The config a run uses with this model: limits fitted to it, an effort it takes (the nearest to the configured
+// one, rounding down: nearestEffort), reasoning off when it cannot reason; and what was changed.
 export function forModel(input: Config, m: ModelInfo): { config: Config; notes: string[] } {
   // Thinking left to the model ('auto'): on through OpenRouter when the model reasons, off on a local server.
   const reasons = m.provider === 'openrouter' && m.reasoning.supported;
@@ -51,11 +51,12 @@ export function forModel(input: Config, m: ModelInfo): { config: Config; notes: 
     c = {
       ...c,
       thinkingEffort:
-        m.reasoning.defaultEffort && efforts.includes(m.reasoning.defaultEffort)
+        nearestEffort(c.thinkingEffort, efforts) ??
+        (m.reasoning.defaultEffort && efforts.includes(m.reasoning.defaultEffort)
           ? m.reasoning.defaultEffort
           : efforts.includes('medium')
             ? 'medium'
-            : efforts[0]!,
+            : efforts[0]!),
     };
   if (
     c.contextWindow !== config.contextWindow ||

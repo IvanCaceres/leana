@@ -72,6 +72,9 @@ async function withImages(m: Message): Promise<unknown> {
   return { ...rest, content: [{ type: 'text', text: m.content }, ...parts] };
 }
 
+// A reply that reached its limit without a word of answer: no text and no call, only reasoning.
+const exhausted = (r: { finish?: string; content: string; calls: unknown[] }): boolean =>
+  r.finish === 'length' && !r.content.trim() && !r.calls.length;
 export class OpenRouter {
   lastMeta: GenerationMeta | null = null;
   // Tokens per character of a rendered prompt, from the last reply's usage (OpenRouter has no tokenizer
@@ -128,6 +131,21 @@ export class OpenRouter {
     if (efforts.includes(this.config.thinkingEffort)) return { reasoning: { effort: this.config.thinkingEffort } };
     if (r.budget) return { reasoning: { max_tokens: budget } };
     return { reasoning: { enabled: true } };
+  }
+  // Less reasoning than a request asked for, for asking again after a reply that was all reasoning: a token budget
+  // where the model takes one (the configured step budget), else reasoning off where it can be turned off, else
+  // the least effort it takes; null when nothing less can be asked.
+  private lessReasoning(m: ModelInfo, asked: any): Record<string, unknown> | null {
+    const r = m.reasoning;
+    if (!r.supported || !asked || asked.enabled === false || asked.effort === 'none') return null;
+    if (r.budget && !(asked.max_tokens <= this.config.stepThinkingBudget))
+      return { max_tokens: this.config.stepThinkingBudget };
+    if (!r.mandatory)
+      return effortsOf(r).includes('none') && r.efforts !== null ? { effort: 'none' } : { enabled: false };
+    const least = [...effortsOf(r)]
+      .filter(e => e !== 'none')
+      .sort((a, b) => gatewayEfforts.indexOf(b) - gatewayEfforts.indexOf(a))[0];
+    return least && least !== asked.effort ? { effort: least } : null;
   }
   // The messages as this model gets them: the agent's system message without Bonsai's name, and, when
   // the reply's schema is enforced neither by the provider nor through a tool, the schema stated there.
@@ -412,18 +430,43 @@ export class OpenRouter {
         ? ''
         : `{"thought":${JSON.stringify(content.trim())},"actions":[${calls.map(c => `{"action":${JSON.stringify(c.name)},"args":${c.args || '{'}`).join('},')}`;
     try {
-      const r = await this.unmarkedOnRefusal(
-        cached.marked,
-        unmarked =>
-          this.chat(
-            unmarked ? { ...body, messages: [...prepared, ...extra] } : body,
-            60000 + Number(body.max_tokens) * 120,
-            quietly(progress),
-            undefined,
-            via === 'native' ? asStep : undefined,
-          ),
-        context,
-      );
+      const send = () =>
+        this.unmarkedOnRefusal(
+          cached.marked,
+          unmarked =>
+            this.chat(
+              unmarked ? { ...body, messages: [...prepared, ...extra] } : body,
+              60000 + Number(body.max_tokens) * 120,
+              quietly(progress),
+              undefined,
+              via === 'native' ? asStep : undefined,
+            ),
+          context,
+        );
+      let r = await send();
+      // A reply that reached its limit with nothing but reasoning: the model never began to answer. Asked again
+      // at once with less reasoning (exhausted), instead of the step failing as a cut-off reply. (Run
+      // react-demo-glm-1: three of GLM-5.3's replies at effort max were all 21,216 tokens of reasoning, about
+      // 100 s each, and each failed its step as an unfinished argument.)
+      if (exhausted(r)) {
+        const less = this.lessReasoning(m, body.reasoning);
+        await this.log('reasoning-exhausted', {
+          requestId,
+          ...context,
+          model: this.config.model,
+          tokens: r.usage?.completion_tokens,
+          reasoning: body.reasoning,
+          ...(less ? { retry: less } : {}),
+        });
+        if (less) {
+          body.reasoning = less;
+          r = await send();
+        }
+        if (exhausted(r))
+          throw new Error(
+            `The model spent its whole reply (${r.usage?.completion_tokens ?? body.max_tokens} tokens) reasoning and never began to answer${less ? ', also when asked again with less reasoning' : ''}`,
+          );
+      }
       reply =
         via === 'native'
           ? [r.content, ...r.calls.map(c => `${c.name}(${c.args})`)].filter(Boolean).join('\n')

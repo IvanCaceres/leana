@@ -45,6 +45,22 @@ export const cachesPrompts = (m: ModelInfo): boolean =>
 // The efforts OpenRouter's gateway accepts when a model lists none of its own.
 export const gatewayEfforts = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
 export const effortsOf = (r: ReasoningInfo): string[] => r.efforts ?? gatewayEfforts;
+// The effort a model takes nearest to the one wanted, by the gateway's order (max down to none), rounding down:
+// the nearest that reasons less, else the nearest that reasons more. Reasoning is never turned off this way (none
+// only when none is wanted). Null when the wanted effort is not one of the order (the caller falls back).
+// (Run react-demo-glm-1: GLM-5.3 takes max, high and low; medium went to its default, max, and 78% of the run's
+// output was reasoning, three replies ending inside it.)
+export function nearestEffort(wanted: string, offered: string[]): string | null {
+  const at = gatewayEfforts.indexOf(wanted);
+  if (at < 0) return null;
+  if (offered.includes(wanted)) return wanted;
+  const ranked = offered
+    .filter(e => gatewayEfforts.includes(e) && (e !== 'none' || wanted === 'none'))
+    .map(e => ({ e, i: gatewayEfforts.indexOf(e) }));
+  const below = ranked.filter(x => x.i > at).sort((a, b) => a.i - b.i)[0];
+  const above = ranked.filter(x => x.i < at).sort((a, b) => b.i - a.i)[0];
+  return (below ?? above)?.e ?? null;
+}
 const root = (url: string) => url.replace(/\/v1\/?$/, '').replace(/\/$/, '');
 
 async function getJson(url: string, key: string, timeoutMs = 15000): Promise<any> {
@@ -450,7 +466,10 @@ export function unsupportedSettings(c: Config, m: ModelInfo): string[] {
     !(m.provider === 'llama' && !effortsOf(r).length)
   )
     out.push(
-      `${m.id} does not take effort ${c.thinkingEffort} (it takes ${effortsOf(r).join(', ') || 'none'})${r.budget ? ': its token budget is used instead' : ''}`,
+      `${m.id} does not take effort ${c.thinkingEffort} (it takes ${effortsOf(r).join(', ') || 'none'})${(() => {
+        const near = nearestEffort(c.thinkingEffort, effortsOf(r));
+        return near ? `: ${near} is used instead` : r.budget ? ': its token budget is used instead' : '';
+      })()}`,
     );
   return out;
 }

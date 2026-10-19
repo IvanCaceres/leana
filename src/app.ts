@@ -266,10 +266,10 @@ export class App {
     const c = await this.config();
     const candidate = { ...c, model: id };
     const m = await describeModel(candidate, await this.key(candidate));
-    const { config, notes } = forModel(candidate, m);
-    // Reasoning is not kept off for a model that cannot reason: forModel turns it off for that model, and a
-    // switch back to one that reasons finds the choice as it was.
-    await this.remember({ model: m.id, thinkingEffort: config.thinkingEffort });
+    const { notes } = forModel(candidate, m);
+    // Neither reasoning nor its effort is kept as fitted to this model: forModel fits them for each run (reasoning
+    // off where it cannot reason, the nearest effort it takes), and a switch back finds the choices as they were.
+    await this.remember({ model: m.id });
     this.info = m;
     this.write(`model: ${m.id}`);
     for (const n of notes) this.write(`note: ${n}`);

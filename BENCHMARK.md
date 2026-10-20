@@ -252,17 +252,19 @@ Leana's completion gate asks Jev whether a finish is done, and what Jev is shown
 npm run bench:gate-replay
 ```
 
-It takes every logged gate request from the Leana trials under `work/bench/harnesses` (or the suite directories you name) whose check passed and whose result was observed working, presents each with the gate as it is built now, and reports how many it accepts. It also makes 24 flawed copies (the objective names a feature none of them has, the summary claims one that is not there, or the source is a stub) and reports how many of those it accepts, which should stay at none. It needs `TYPESAFE_API_KEY` and costs a few cents.
+It takes every logged gate request from the Leana trials under `work/bench/harnesses` (or the suite directories you name) whose check passed and whose result was observed working, presents each with the gate as it is built now, and reports how many it accepts. It also makes 32 flawed copies (the objective names a feature none of them has, the summary claims one that is not there, the source is a stub, or the objective asks for something else entirely) and reports how many of those it accepts, which should stay at none. It needs `TYPESAFE_API_KEY` and costs a few cents.
 
-What it found, on 102 good finishes and 24 flawed ones from nine suites:
+What it found on the logged Claude Haiku 5.5 and GLM-5.3 suites:
 
-| Presentation                                                                             | Good accepted | Claude Haiku 5.5 | GLM-5.3  | Flawed accepted |
-| ---------------------------------------------------------------------------------------- | ------------- | ---------------- | -------- | --------------- |
-| Flat: facts and the worker's account side by side                                        | 56            | 37 of 80         | 19 of 22 | 0               |
-| Grouped into `result` (facts) and `workerReport` (claims), stale observations made again | 77            | 58 of 80         | 19 of 22 | 0               |
+| Presentation                                                                                               | Good accepted | Claude Haiku 5.5 | GLM-5.3  | Flawed accepted |
+| ---------------------------------------------------------------------------------------------------------- | ------------- | ---------------- | -------- | --------------- |
+| Flat: facts and the worker's account side by side (nine suites)                                            | 56 of 102     | 37 of 80         | 19 of 22 | 0 of 24         |
+| Grouped into `result` (facts) and `workerReport` (claims), stale observations made again                   | 77 of 102     | 58 of 80         | 19 of 22 | 0 of 24         |
+| Grouped, judged on the named thing delivered, how advanced it is a score that decides nothing (ten suites) | 89 of 113     | 68 of 91         | 21 of 22 | 0 of 32         |
 
 - **The worker's account was read as facts.** A list of what was not done, written by the worker in its summary ("no backend wired up" for a demo page), read as a partial change. Its working notes, kept while it worked and often out of date ("Not done: lint run" after the lint had run), read as the worker contradicting itself. Grouped apart from the facts, they are judged as claims.
 - **Wording moves the answer as much as the state.** "What the objective and its requirements ask for", with no requirements in the state, accepted 12 fewer good finishes than "what the objective asks for"; "its observation … or the absence of one" 17 fewer than "its observation".
+- **Taste held finishes back.** One question asked whether the result implemented the objective, including whether it was "advanced" and used "best practices". Working results read near 0.7 against a bar of 0.75, and the worker went back with nothing concrete to fix, added checks, and read near 0.7 again. Asked apart, whether the named thing was delivered reads 0.72 on good finishes and 0.01 to 0.11 on a missing feature, a stub or the wrong thing built; how advanced it is goes to a score that is reported and decides nothing.
 - **More of the source did not help.** Sending each page file whole, about 23,000 characters instead of 10,000 in excerpts, changed nothing.
 
 ## Reading the results

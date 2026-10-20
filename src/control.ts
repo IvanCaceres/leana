@@ -305,23 +305,55 @@ export function fitGateState(state: Record<string, any>, limit = 21000): void {
       state.observation = { ...state.observation, facts: clip(String(state.observation.facts ?? ''), n) };
   }
 }
+// A summary's own section of what the worker did not do or test (Limitations, Known issues, Caveats), apart from the
+// rest: the gate shows it to Jev as workerNotes, weighed only where the objective asks for the thing. In the summary,
+// a list of what was not done read as a partial change: Claude Haiku 5.5 ended 20 of its 38 gated summaries with one
+// ("no backend wired up", "not tested on mobile" for a demo landing page), GLM-5.3 none of its 22; Jev's reading of
+// implementation_matches_request on those 20 was 0.73 (9 cleared 0.75) and 0.78 (18 cleared) with the section
+// apart, while an objective asking for something the notes said was not built still read 0.14.
+const notesHeading =
+  /^\s*(?:#{1,6}\s*)?(?:\*\*|__)?\s*(?:known\s+)?(?:limitations?|caveats?|known issues|not (?:done|tested|covered)(?: yet)?)\s*(?:\*\*|__)?\s*:?\s*(?:\*\*|__)?\s*(.*)$/i;
+const sectionHeading = /^\s*(?:#{1,6}\s+\S|(?:\*\*|__)[^*_]{1,40}(?:\*\*|__):?\s*$|[A-Z][\w /-]{1,30}:\s*$)/;
+export function workerNotes(summary: string): { summary: string; notes: string } {
+  const lines = summary.split('\n');
+  const start = lines.findIndex(l => notesHeading.test(l));
+  if (start < 0) return { summary, notes: '' };
+  let end = start + 1;
+  while (end < lines.length && !(sectionHeading.test(lines[end]!) && !notesHeading.test(lines[end]!))) end++;
+  const inline = lines[start]!.match(notesHeading)![1]!.trim();
+  const notes = [inline, ...lines.slice(start + 1, end)].join('\n').trim();
+  return { summary: [...lines.slice(0, start), ...lines.slice(end)].join('\n').trim(), notes };
+}
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
   const observation =
     facts.observation && typeof facts.observation === 'object'
       ? { ...(facts.observation as Record<string, unknown>), question: undefined }
       : facts.observation;
+  const told = workerNotes(facts.summary);
   const state = {
     objective: s.objective,
     clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])),
     notes: clip(s.notes ?? '', 1500),
     ...facts,
+    summary: told.summary,
+    ...(told.notes ? { workerNotes: told.notes } : {}),
     observation,
     sources: { ...(facts.sources as Record<string, string>) } as Record<string, string>,
   } as Record<string, any>;
   fitGateState(state);
+  const weighNotes = (q: Questions[string], sentence: string) =>
+    told.notes ? { ...q, instructions: `${(q as { instructions: string }).instructions} ${sentence}` } : q;
   const questions: Questions = {
     ...gateQuestions,
+    implementation_matches_request: weighNotes(
+      gateQuestions.implementation_matches_request!,
+      'workerNotes lists what the worker chose to mention as not done or not tested; weigh an item there only when the objective asks for that thing.',
+    ),
+    requirement_unaddressed: weighNotes(
+      gateQuestions.requirement_unaddressed!,
+      'An item in workerNotes is a requirement only when the objective asks for it.',
+    ),
     ...Object.fromEntries(
       clauses.map((_, i) => [
         `clause_${i}`,

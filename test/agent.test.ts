@@ -7296,3 +7296,59 @@ test('Unattended, a finish Jev would route to the user goes back to the worker w
   assert.equal(back.length, 2, 'sent back twice');
   assert.match(back[0]!.text, /starting with the parts Jev is least sure of: "Build a landing page" \(0\.50\)/);
 });
+
+test("The completion gate shows Jev the worker's own list of what it did not do or test as workerNotes, apart from the summary, and asks that an item there count only where the objective asks for it; a summary without one is sent as before (Claude Haiku 5.5: 13 of 38 gated finishes passed the match bar with the list in the summary, 25 with it apart)", async () => {
+  const { evidenceGate, workerNotes, gateQuestions } = await import('../src/control.js');
+  // The forms the worker wrote: a heading on its own line, a bold heading, an inline one, and a section that is
+  // followed by another.
+  assert.deepEqual(workerNotes('Built it.\n\nLimitations:\n- no backend\n- not tested on mobile'), {
+    summary: 'Built it.',
+    notes: '- no backend\n- not tested on mobile',
+  });
+  assert.deepEqual(workerNotes('Built it.\n**Known limitations**\n- hash links only'), {
+    summary: 'Built it.',
+    notes: '- hash links only',
+  });
+  assert.deepEqual(workerNotes('Built it.\nLimitations: demo content is fictional; no backend.'), {
+    summary: 'Built it.',
+    notes: 'demo content is fictional; no backend.',
+  });
+  assert.deepEqual(workerNotes('Built it.\n\nLimitations:\n- no backend\n\nVerification:\n- npm run build passes'), {
+    summary: 'Built it.\n\nVerification:\n- npm run build passes',
+    notes: '- no backend',
+  });
+  assert.deepEqual(workerNotes('Built it; the build passes.'), { summary: 'Built it; the build passes.', notes: '' });
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Build a demo landing page');
+  const facts = (summary: string) => ({
+    summary,
+    changedFiles: ['src/App.tsx'],
+    diffStat: '',
+    verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' },
+    requirements: [],
+    sources: {},
+  });
+  const jev = jevOf({});
+  const seen: { state: any; questions: any }[] = [];
+  const spy = {
+    decide: async (state: any, questions: any, ctx: any) => {
+      if (ctx?.phase === 'evidence-gate') seen.push({ state, questions });
+      return jev.decide(state, questions, ctx);
+    },
+  };
+  await evidenceGate(spy as any, s, facts('Built the page.\n\nLimitations:\n- no backend is wired up'));
+  await evidenceGate(spy as any, s, facts('Built the page.'));
+  const [withNotes, without] = seen;
+  assert.equal(withNotes!.state.summary, 'Built the page.');
+  assert.equal(withNotes!.state.workerNotes, '- no backend is wired up');
+  assert.match(
+    withNotes!.questions.implementation_matches_request.instructions,
+    /weigh an item there only when the objective asks for that thing\.$/,
+  );
+  assert.match(withNotes!.questions.requirement_unaddressed.instructions, /only when the objective asks for it\.$/);
+  assert.equal(without!.state.workerNotes, undefined);
+  assert.equal(
+    without!.questions.implementation_matches_request.instructions,
+    (gateQuestions.implementation_matches_request as any).instructions,
+    'a summary without notes is asked about as before',
+  );
+});

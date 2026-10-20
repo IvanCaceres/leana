@@ -430,6 +430,9 @@ const harnesses = {
         '--effort',
         s.effort,
         '--plain',
+        // No one reviews a finish here, as no one does for the other harnesses: one Jev would route to the user goes
+        // back to the worker (saas-landing-haiku-5.5 trials 4 and 6 paused for a review that never came).
+        '--unattended',
         '--config',
         ctx.config,
       ],

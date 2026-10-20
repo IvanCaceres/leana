@@ -2674,6 +2674,34 @@ export class Agent {
       );
       return 'stop';
     }
+    // Unattended, no one reviews it: the finish goes back to the worker with the parts of the objective Jev is
+    // least sure of, and after unattendedReviews of them the run completes, saying Jev would have asked for review.
+    // (saas-landing-haiku-5.5 trials 4 and 6 paused here with their build and page passing, unaddressed 0.79 and
+    // 0.68, their pages about half the text of the other harnesses'.)
+    if (verdict.route === 'human' && this.config.unattended) {
+      s.reviewsSentBack = (s.reviewsSentBack ?? 0) + 1;
+      if (s.reviewsSentBack > unattendedReviews) {
+        s.status = 'complete';
+        ending(
+          s,
+          `Complete, unreviewed: Jev would have routed this to the user for review ${s.reviewsSentBack} times (last: requirement unaddressed ${verdict.unaddressed.toFixed(2)}): `,
+          summary,
+          400,
+        );
+        return 'stop';
+      }
+      const least = (verdict.clauses ?? [])
+        .slice(0, 3)
+        .map(c => `"${c.clause}" (${c.p.toFixed(2)})`)
+        .join('; ');
+      s.completionFeedback = {
+        step: s.step,
+        text: `The completion proposed at step ${s.step} was not accepted yet: Jev reads part of the request as possibly unaddressed (${verdict.unaddressed.toFixed(2)}) and would ask the user to review it, and no one will. Compare the result with the objective${least ? `, starting with the parts Jev is least sure of: ${least}` : ''}. Build out what is missing or thin, verify, observe it, and finish again.`,
+        awaitingEvidence: true,
+      };
+      await this.evidence(s, 'completion', { ok: false, text: s.completionFeedback.text });
+      return 'failed';
+    }
     if (verdict.route === 'human') {
       s.status = 'paused';
       ending(s, 'Completion proposed; Jev routes it to the user for review: ', summary, 400);
@@ -2939,6 +2967,8 @@ const evictAt = 0.6;
 const evictTo = 0.3;
 // The answers Jev may reject in an invocation before the last goes to the user.
 const answerReviews = 3;
+// Unattended, the finishes Jev would route to the user that go back to the worker before one completes the run.
+const unattendedReviews = 2;
 const failureKindText = (k: string): string =>
   (
     ({

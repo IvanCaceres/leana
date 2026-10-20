@@ -183,6 +183,8 @@ export interface GateVerdict {
   supported: number;
   route: string;
   reason: string;
+  // Jev's reading of each clause of the objective, least addressed first (the gate of a change).
+  clauses?: { clause: string; p: number }[];
 }
 // A finish with nothing written, checked or observed is an answer, not a change: there is no result
 // to verify or to observe, and the files it rests on are the ones the worker read, not ones it wrote. It is
@@ -303,6 +305,10 @@ export function fitGateState(state: Record<string, any>, limit = 21000): void {
       state.observation = { ...state.observation, facts: clip(String(state.observation.facts ?? ''), n) };
   }
 }
+// The reading of requirement_unaddressed at which a finish is sent back to be built out, and how many times a session
+// is sent back for it.
+const thinAt = 0.6;
+const scopeReviews = 2;
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
   const observation =
@@ -331,7 +337,8 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     ),
   };
   const a = await jev.decide(state, questions, { step: s.step, phase: 'evidence-gate' });
-  const weak = clauses.map((c, i) => ({ c, p: noul(a[`clause_${i}`]) })).filter(x => x.p < 0.4);
+  const readings = clauses.map((c, i) => ({ clause: c, p: noul(a[`clause_${i}`]) })).sort((x, y) => x.p - y.p);
+  const weak = readings.filter(x => x.p < 0.4).map(x => ({ c: x.clause, p: x.p }));
   const matches = noul(a.implementation_matches_request);
   const unaddressed = noul(a.requirement_unaddressed);
   const supported = noul(a.claim_supported);
@@ -351,31 +358,45 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     weakest === 'observation' &&
     weakestP >= 0.5 &&
     (facts.observationState === 'never' || facts.observationState === 'stale');
+  // A requirement Jev reads as probably unaddressed sends the finish back to be built out, at most scopeReviews times
+  // in a session, after which the readings above decide. Accepted finishes on Claude Haiku 5.5 read 0.64 to 0.72 here,
+  // their pages about half the text of the other harnesses'; on GLM-5.3, with full pages, 0.29 to 0.55.
+  const thin = unaddressed >= thinAt && (s.scopeRejections ?? 0) < scopeReviews;
   const accepted =
     facts_ok &&
     !observationBroken &&
     !observationMissing &&
+    !thin &&
     route !== 'human' &&
     !weak.length &&
     (route === 'deterministic_only' ? matches >= 0.6 : matches >= 0.75 && supported >= 0.6);
   // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
   const humanReview =
-    route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && matches >= 0.6;
+    route === 'human' &&
+    facts_ok &&
+    !observationBroken &&
+    !observationMissing &&
+    !thin &&
+    !weak.length &&
+    matches >= 0.6;
+  if (thin && facts_ok && !observationBroken && !observationMissing) s.scopeRejections = (s.scopeRejections ?? 0) + 1;
   const reason = !facts_ok
     ? 'the verification did not pass after the last edit'
     : observationMissing
       ? `Jev reads the observation as the weakest evidence (${weakestP.toFixed(2)}) and the result ${facts.observationState === 'never' ? 'has never been observed' : 'has not been observed since the last write'}: observe it as its user meets it and act on what that shows before finishing`
       : observationBroken
         ? `the last observation (${obs!.kind} ${obs!.target ?? ''}) failed: ${clip(String(obs!.facts ?? ''), 300)}`
-        : humanReview
-          ? 'Jev routes this completion to the user'
-          : accepted
-            ? "the facts and Jev's reading agree"
-            : weak.length
-              ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}`
-              : `Jev reads the change as ${matches < 0.75 ? 'not implementing the request' : ''}${supported < 0.6 ? ' not supported by the facts' : ''}`
-                  .replace(/\s+/g, ' ')
-                  .trim();
+        : thin
+          ? `Jev reads part of what the objective asks as probably not done yet (${unaddressed.toFixed(2)})${weak.length ? `, these parts most: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}` : ''}. That is missing work, not missing verification: more checks will not answer it. Reread the objective word by word, and for each thing it asks for or implies (every feature, section, quality or practice it names, and what "advanced", "complete" or "best practices" would mean to its user), find where the result delivers it. Build what is absent or thin, then verify and observe it, and finish again`
+          : humanReview
+            ? 'Jev routes this completion to the user'
+            : accepted
+              ? "the facts and Jev's reading agree"
+              : weak.length
+                ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}`
+                : `Jev reads the change as ${matches < 0.75 ? 'not implementing the request' : ''}${supported < 0.6 ? ' not supported by the facts' : ''}`
+                    .replace(/\s+/g, ' ')
+                    .trim();
   // A rejection says where Jev reads the gap, with the fact itself, so the worker acts on it rather than guessing.
   const pointer =
     accepted || humanReview || !facts_ok || observationBroken || observationMissing || !weakest
@@ -411,6 +432,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
         supported,
         route: 'rejected',
         reason: `Jev's focused reading of the ${weakest} alone is that it does not show the work done (${focus.toFixed(2)}): ${weakestFact(weakest, facts)}`,
+        clauses: readings,
       };
   }
   return {
@@ -420,6 +442,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     supported,
     route: humanReview ? 'human' : accepted ? route : 'rejected',
     reason: reason + pointer,
+    clauses: readings,
   };
 }
 // The focused question per kind of evidence: judged by that evidence alone.

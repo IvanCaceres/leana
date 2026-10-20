@@ -172,6 +172,10 @@ export interface Session {
   finishTriedAtCheck: number;
   // Completion gates in a row that Jev could not answer; the third pauses the session.
   gateErrors?: number;
+  // Unattended: the finishes Jev would have routed to the user that went back to the worker.
+  reviewsSentBack?: number;
+  // Finishes sent back to be built out because Jev read a requirement as probably unaddressed (see evidenceGate).
+  scopeRejections?: number;
   // Coverage per content hash, so a rollback to known content restores read state.
   coverageByHash: Record<string, Coverage>;
   repetitionSteps: Record<string, number>;
@@ -346,6 +350,7 @@ export interface Config {
   jevUrl: string;
   jevModel: string;
   jevUsdPerMillionInput: number;
+  unattended: boolean;
   routeProbability: number;
   routeMargin: number;
   compactProbability: number;

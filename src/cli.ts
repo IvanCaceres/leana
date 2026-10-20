@@ -26,7 +26,8 @@ const usage = `Leana — a coding agent: the model reasons and acts, Jev guards 
 Model:   --provider llama|openrouter, --model ID, --reasoning on|off, --file-reasoning on|off,
          --effort LEVEL, --reasoning-budget N  (only what the model takes is accepted; see leana model)
 Other:   --plain (the prompt and status panel instead of the full-screen app), --key-file PATH (Jev), --env-file PATH, --config PATH, --max-steps N (turns through OpenRouter), --allow-dirty, --verbose,
-         --check "command" (the verification; run as a baseline first and after every edit)
+         --check "command" (the verification; run as a baseline first and after every edit),
+         --unattended (no one is there to review: a finish Jev would send to you goes back to the worker instead)
 Keys:    OpenRouter's from OPENROUTER_API_KEY or providerKeyFile in the config; Jev's from --key-file or TYPESAFE_API_KEY.
 Default: the model writes files and runs shell commands, unsandboxed with your user privileges (including
 file changes outside the repository). --no-bash turns the shell off; --read-only turns off writes and the shell. The app keeps its choices in ~/.config/leana/settings.json.`;
@@ -56,6 +57,7 @@ async function main(): Promise<void> {
       message: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
       'allow-dirty': { type: 'boolean' },
+      unattended: { type: 'boolean' },
       verbose: { type: 'boolean', short: 'v' },
       follow: { type: 'boolean' },
       plain: { type: 'boolean' },
@@ -117,6 +119,7 @@ async function main(): Promise<void> {
     ...(v['max-steps'] ? { maxSteps: Number(v['max-steps']), openrouterMaxTurns: Number(v['max-steps']) } : {}),
     ...(v.verbose ? { verbose: true } : {}),
     ...(v.check ? { checkCommand: v.check } : {}),
+    ...(v.unattended ? { unattended: true } : {}),
   };
   // A provider switched by flag starts from its own default model, unless one is named.
   const kept =

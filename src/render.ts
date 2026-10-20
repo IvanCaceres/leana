@@ -155,6 +155,8 @@ class Cdp {
   }
 }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+// The longest page a full-page screenshot takes, in CSS pixels: the landing pages built so far ran 2,500 to 7,000.
+const fullPageMax = 12000;
 // One input of a played page, as observe takes it: press a key (down, then up), hold one for ms, type text
 // into what has focus, click the element a selector names, or wait; each followed by ms of watching.
 export interface PageInput {
@@ -331,6 +333,9 @@ export async function renderFacts(
   screenshotPath: string | null,
   timeoutMs = 60000,
   inputs: PageInput[] = [],
+  // The whole page as well, top to bottom (at most fullPageMax CSS pixels), for a person to look at: the benchmark's
+  // record of what each harness built. The screenshot above stays the viewport, as the worker is shown it.
+  fullPagePath: string | null = null,
 ): Promise<{ ok: boolean; text: string; unmatched?: string[]; image?: string }> {
   const browser = await findBrowser();
   if (!browser)
@@ -474,6 +479,46 @@ export async function renderFacts(
           const shot = await cdp.send('Page.captureScreenshot', { format: 'png' }, sessionId);
           await writeFile(screenshotPath, Buffer.from(shot.data, 'base64'));
           image = screenshotPath;
+        } catch {
+          /* the facts matter more */
+        }
+      }
+      if (fullPagePath) {
+        try {
+          // Scrolled through first, half a viewport at a time, to the bottom and back to the top: sections that appear
+          // as they are scrolled into view (a landing page's reveal animations) are drawn, not left blank. Smooth
+          // scrolling, transitions and animations are turned off first, so each scroll lands at once and what it
+          // reveals is drawn whole: with scroll-behavior smooth, the scroll back to the top was still under way when
+          // the page was captured (its fixed header drawn 700 px down) and the last section was never reached.
+          await cdp.send(
+            'Runtime.evaluate',
+            {
+              expression: `(async () => {
+                const style = document.createElement('style');
+                style.textContent = 'html, body { scroll-behavior: auto !important; } *, *::before, *::after { transition: none !important; animation-duration: 0s !important; animation-delay: 0s !important; }';
+                document.head.appendChild(style);
+                const wait = ms => new Promise(r => setTimeout(r, ms));
+                const go = y => scrollTo({ top: y, left: 0, behavior: 'instant' });
+                const h = Math.min(document.documentElement.scrollHeight, ${fullPageMax});
+                for (let y = 0; y < h; y += innerHeight / 2) { go(y); await wait(150); }
+                go(h);
+                await wait(300);
+                go(0);
+                await wait(600);
+              })()`,
+              awaitPromise: true,
+            },
+            sessionId,
+          );
+          const m = await cdp.send('Page.getLayoutMetrics', {}, sessionId);
+          const width = Math.ceil(m.cssLayoutViewport?.clientWidth ?? 1262);
+          const height = Math.min(Math.ceil(m.cssContentSize?.height ?? 804), fullPageMax);
+          const shot = await cdp.send(
+            'Page.captureScreenshot',
+            { format: 'png', captureBeyondViewport: true, clip: { x: 0, y: 0, width, height, scale: 1 } },
+            sessionId,
+          );
+          await writeFile(fullPagePath, Buffer.from(shot.data, 'base64'));
         } catch {
           /* the facts matter more */
         }

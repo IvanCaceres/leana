@@ -826,7 +826,7 @@ const gptActions = [
   'ask_user',
 ];
 
-test('Under the tools form a file written in an earlier turn is said in one line, not re-sent; the latest turn keeps what it wrote; a turn changes once, when it stops being the latest (run react-demo-glm-3: 28,000 characters of written files in each of twelve prompts)', async t => {
+test('Under the tools form a file written in a turn is said in one line, not re-sent, the latest turn too; what the latest wrote is shown whole after the transcript, so the transcript only grows and the next request reads it from the cache (run react-demo-glm-3: 28,000 characters of written files in each of twelve prompts; Claude Haiku 5.5: a latest turn shown whole, then in one line, was never read from the cache)', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'leana-elide-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const s = await newSession(dir, 'x');
@@ -871,17 +871,20 @@ test('Under the tools form a file written in an earlier turn is said in one line
     /^\[50 lines \(\d+ characters\) written at step 1; not repeated here: read_files shows src\/App\.tsx as it is now\]$/,
   );
   assert.deepEqual(t1![1], { path: 'src/main.tsx', oldText: 'x', newText: 'y' }, 'a short edit is shown as made');
-  assert.equal(t3![0].content, big('c'), 'the latest turn shows what it wrote');
+  assert.match(t3![0].content, /^\[50 lines .* src\/index\.css as it is now\]$/, 'the latest turn too');
+  const shownAfter = (m: Message[]) => JSON.parse(m.at(-2)!.content).writtenInLatestTurn;
+  assert.deepEqual(
+    shownAfter(first).calls,
+    [{ call: 1, action: 'create_file', path: 'src/index.css', content: big('c') }],
+    'what the latest turn wrote, whole, after the transcript',
+  );
   s.entries.push(turn('t4', 4, [{ action: 'plan', args: { notes: 'n' } }]), result('e4', 4, 't4', 'plan'));
   const second = stepMessages(s, s.allowedActions);
-  assert.match(args(second)[1]![0].content, /^\[50 lines .* src\/index\.css as it is now\]$/, 'no longer the latest');
-  const at = first.findIndex(m => m.role === 'assistant' && m.content === 'Turn t3.');
-  assert(at > 0);
-  assert.deepEqual(
-    second.slice(0, at),
-    first.slice(0, at),
-    'everything before that turn is as it was: the cache prefix holds',
-  );
+  assert.equal(shownAfter(second), undefined, 'a latest turn that wrote nothing long shows nothing after it');
+  const transcript = first.length - 2;
+  assert.deepEqual(second.slice(0, transcript), first.slice(0, transcript), 'the transcript only grew');
+  const { cachePoints } = await import('../src/context.js');
+  assert.equal(Math.max(...cachePoints(first)), transcript - 1, "the first request's cache point ends its transcript");
 });
 
 test('The tools are described briefly, each rule the harness enforces kept', () => {
@@ -1463,30 +1466,21 @@ test('Prompt caching through OpenRouter: the cache points are marked where the m
     msg('user', '{"notes":""}'),
     msg('user', '{"role":"act"}'),
   ];
-  assert.deepEqual(cachePoints(prompt), [1, 2], 'after the orientation and before the latest turn');
+  assert.deepEqual(cachePoints(prompt), [1, 3], 'after the orientation and at the end of the evidence');
   assert.deepEqual(
     cachePoints([...prompt.slice(0, 3), { role: 'assistant', content: '', tool_calls: [] } as any, ...prompt.slice(4)]),
     [1, 2],
     'a turn that only calls tools has no text: the point moves to the message before it',
   );
-  // Two requests in a row: the turn that was latest is said in one line once it is not (a file it wrote, left out).
-  // What the first request marked is unchanged in the second, so the second reads it from the cache.
-  const turn = (n: number, whole: boolean) => [
-    msg('assistant', `turn ${n}: ${whole ? 'the whole file '.repeat(50) : '[the file, left out]'}`),
-    msg('tool', `result ${n}`),
-  ];
-  const first = [prompt[0]!, prompt[1]!, ...turn(1, true), msg('user', '{"notes":""}'), msg('user', '{"role":"act"}')];
-  const second = [
-    prompt[0]!,
-    prompt[1]!,
-    ...turn(1, false),
-    ...turn(2, true),
-    msg('user', '{"notes":""}'),
-    msg('user', '{"role":"act"}'),
-  ];
+  // Two requests in a row: the evidence only grows (what the latest turn wrote is shown after it, in the volatile
+  // block), so what the first request marked is unchanged in the second, which reads it from the cache.
+  const turn = (n: number) => [msg('assistant', `turn ${n}: [the file, left out]`), msg('tool', `result ${n}`)];
+  const tail = (n: number) => [msg('user', `{"writtenInLatestTurn":"file ${n}"}`), msg('user', '{"role":"act"}')];
+  const first = [prompt[0]!, prompt[1]!, ...turn(1), ...tail(1)];
+  const second = [prompt[0]!, prompt[1]!, ...turn(1), ...turn(2), ...tail(2)];
   const point = Math.max(...cachePoints(first));
   assert.deepEqual(second.slice(0, point + 1), first.slice(0, point + 1), "the first request's cached prefix holds");
-  assert.deepEqual(cachePoints(second), [1, 3], 'and the second marks up to the turn before its latest');
+  assert.deepEqual(cachePoints(second), [1, 5], 'and the second marks the end of its evidence');
   assert.deepEqual(cachePoints([msg('user', 'x'), msg('user', 'y')]), [], 'not a prompt of the agent: nothing marked');
   const schema = {
     type: 'object' as const,
@@ -1521,7 +1515,7 @@ test('Prompt caching through OpenRouter: the cache points are marked where the m
   await claude.generate(prompt, schema);
   await claude.generate(prompt, schema);
   await claude.generateText([...prompt.slice(0, 5), msg('user', '{"role":"write the code"}')], { budgetTokens: 200 });
-  for (const b of caching.bodies) assert.deepEqual(marked(b), [1, 2], 'the points, and nothing else');
+  for (const b of caching.bodies) assert.deepEqual(marked(b), [1, 3], 'the points, and nothing else');
   assert.deepEqual(caching.bodies[0].messages[1].content, [
     { type: 'text', text: '{"objective":"x"}', cache_control: { type: 'ephemeral' } },
   ]);
@@ -1561,7 +1555,7 @@ test('Prompt caching through OpenRouter: the cache points are marked where the m
   });
   assert.deepEqual(await client.generate(prompt, schema), { content: 'ok' });
   assert.deepEqual(await client.generate(prompt, schema), { content: 'ok' });
-  assert.deepEqual(refusing.bodies.map(marked), [[1, 2], [], []], 'refused once, then sent unmarked');
+  assert.deepEqual(refusing.bodies.map(marked), [[1, 3], [], []], 'refused once, then sent unmarked');
   assert.equal(logged.filter(x => x === 'cache-markers-off').length, 1);
 });
 

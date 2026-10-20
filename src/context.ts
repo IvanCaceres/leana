@@ -754,13 +754,19 @@ function agentPrefix(s: Session): Message[] {
   ];
 }
 // Where a prompt stops changing, for a provider that caches a prefix where the request marks it: after the
-// orientation (the same for the whole session, whatever is evicted) and after the evidence (append-only between
-// evictions, so the next turn's prompt extends it). Every prompt here is agentPrefix, then the volatile block and
-// the request; a continuation appends after those and is not marked.
+// orientation (the same for the whole session, whatever is evicted) and before the latest turn. The evidence is
+// append-only between evictions except for the latest turn, which is said in one line on the next request once it
+// is no longer latest (elided: a file it wrote, left out). A point after it is never read again: Anthropic reads a
+// prefix only when it is unchanged to the byte, and Leana on Claude Haiku 5.5 wrote 500 to 1,000 tokens to the
+// cache on each request and read back only the orientation. Every prompt here is agentPrefix, then the volatile
+// block and the request; a continuation appends after those and is not marked.
 export function cachePoints(messages: Message[]): number[] {
   if (messages[0]?.role !== 'system' || messages.length < 4) return [];
+  // Before the latest turn: the message before the last assistant message, else (no turn yet) the message
+  // before the volatile block and the request.
+  const latest = messages.findLastIndex((m, i) => i > 1 && m.role === 'assistant');
+  let end = latest > 1 ? latest - 1 : messages.length - 3;
   // A marker goes on text: an assistant turn that only calls tools has none, so its point is the message before it.
-  let end = messages.length - 3;
   while (end > 1 && !messages[end]!.content) end--;
   return [...new Set([1, end])];
 }

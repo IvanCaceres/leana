@@ -1463,12 +1463,30 @@ test('Prompt caching through OpenRouter: the cache points are marked where the m
     msg('user', '{"notes":""}'),
     msg('user', '{"role":"act"}'),
   ];
-  assert.deepEqual(cachePoints(prompt), [1, 3], 'after the orientation and after the evidence');
+  assert.deepEqual(cachePoints(prompt), [1, 2], 'after the orientation and before the latest turn');
   assert.deepEqual(
     cachePoints([...prompt.slice(0, 3), { role: 'assistant', content: '', tool_calls: [] } as any, ...prompt.slice(4)]),
     [1, 2],
     'a turn that only calls tools has no text: the point moves to the message before it',
   );
+  // Two requests in a row: the turn that was latest is said in one line once it is not (a file it wrote, left out).
+  // What the first request marked is unchanged in the second, so the second reads it from the cache.
+  const turn = (n: number, whole: boolean) => [
+    msg('assistant', `turn ${n}: ${whole ? 'the whole file '.repeat(50) : '[the file, left out]'}`),
+    msg('tool', `result ${n}`),
+  ];
+  const first = [prompt[0]!, prompt[1]!, ...turn(1, true), msg('user', '{"notes":""}'), msg('user', '{"role":"act"}')];
+  const second = [
+    prompt[0]!,
+    prompt[1]!,
+    ...turn(1, false),
+    ...turn(2, true),
+    msg('user', '{"notes":""}'),
+    msg('user', '{"role":"act"}'),
+  ];
+  const point = Math.max(...cachePoints(first));
+  assert.deepEqual(second.slice(0, point + 1), first.slice(0, point + 1), "the first request's cached prefix holds");
+  assert.deepEqual(cachePoints(second), [1, 3], 'and the second marks up to the turn before its latest');
   assert.deepEqual(cachePoints([msg('user', 'x'), msg('user', 'y')]), [], 'not a prompt of the agent: nothing marked');
   const schema = {
     type: 'object' as const,
@@ -1503,7 +1521,7 @@ test('Prompt caching through OpenRouter: the cache points are marked where the m
   await claude.generate(prompt, schema);
   await claude.generate(prompt, schema);
   await claude.generateText([...prompt.slice(0, 5), msg('user', '{"role":"write the code"}')], { budgetTokens: 200 });
-  for (const b of caching.bodies) assert.deepEqual(marked(b), [1, 3], 'the points, and nothing else');
+  for (const b of caching.bodies) assert.deepEqual(marked(b), [1, 2], 'the points, and nothing else');
   assert.deepEqual(caching.bodies[0].messages[1].content, [
     { type: 'text', text: '{"objective":"x"}', cache_control: { type: 'ephemeral' } },
   ]);
@@ -1543,7 +1561,7 @@ test('Prompt caching through OpenRouter: the cache points are marked where the m
   });
   assert.deepEqual(await client.generate(prompt, schema), { content: 'ok' });
   assert.deepEqual(await client.generate(prompt, schema), { content: 'ok' });
-  assert.deepEqual(refusing.bodies.map(marked), [[1, 3], [], []], 'refused once, then sent unmarked');
+  assert.deepEqual(refusing.bodies.map(marked), [[1, 2], [], []], 'refused once, then sent unmarked');
   assert.equal(logged.filter(x => x === 'cache-markers-off').length, 1);
 });
 

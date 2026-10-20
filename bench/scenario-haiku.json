@@ -1,0 +1,10 @@
+{
+  "id": "saas-landing-haiku-5.5",
+  "prompt": "build an advanced react demo landing page app for a saas startup using the latest and greatest best practices",
+  "provider": "openrouter",
+  "model": "anthropic/claude-haiku-5.5",
+  "effort": "low",
+  "effortNote": "The same task as saas-landing-glm-5.3, on Claude Haiku 5.5 at reasoning effort low. Haiku takes no top_k, so none is sent. Its cached input costs a tenth of its input, so how each harness marks its prompt for caching shows in its cost (see BENCHMARK.md, Same settings as Leana).",
+  "timeoutMinutes": 20,
+  "idleMinutes": 4
+}

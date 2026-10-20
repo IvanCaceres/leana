@@ -139,30 +139,46 @@ export interface GateFacts {
   requirements: string[];
   sources: unknown;
 }
+// The wording is measured, not chosen (bench/gate-replay.mjs): "and its requirements" with none in the state, or "its
+// observation ..., or the absence of one", each cost 12 to 17 of 90 good finishes; requirements the repository states
+// are named only when there are some (evidenceGate). implementation_matches_request asks what can be settled, whether
+// the named thing was delivered; how advanced or polished it is goes to quality, a score that decides nothing.
 export const gateQuestions: Questions = {
   implementation_matches_request: {
     type: 'noul',
     instructions:
-      'Does the change (changedFiles, diffStat, sources, and the observation of the result as its user meets it, or its absence) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken or invented?',
+      '`result` (its files, its check and its observation) delivers what `objective` names: the kind of thing to build, what it is for, and every feature or technology the objective names. Judge only what is named; leave words of quality such as advanced, modern or best practices aside. Items in `workerReport.notDoneOrUntested` count only when the objective names that thing.',
+  },
+  quality: {
+    type: 'score',
+    instructions:
+      'How fully does `result` show the qualities `objective` asks for in words such as advanced, modern, polished or best practices? Judge only those qualities, not whether named things exist.',
+    criteria: [
+      'A starter or template-level result: the minimum that works, defaults throughout, nothing beyond what is required.',
+      'A complete, coherent result: everything expected of its kind is there and consistent, built with current tools on a sound structure.',
+      'A showcase result: well beyond the minimum in craft and care (thoughtful details, robustness, accessibility or performance where they apply), with well organised code and current libraries used well.',
+    ],
   },
   requirement_unaddressed: {
     type: 'noul',
-    instructions: 'Does any requirement of the objective appear unaddressed by the change and the verification?',
+    instructions:
+      'Does any requirement of `objective` appear unaddressed by `result`? An item in `workerReport.notDoneOrUntested` is a requirement only when the objective asks for it.',
   },
   claim_supported: {
     type: 'noul',
     instructions:
-      "Is the worker's completion summary supported by the facts shown (files that exist, a verification that passed after the last edit), rather than asserted?",
+      'Is `workerReport.summary` supported by `result` (files that exist, a check that passed after the last edit, the observation), rather than asserted?',
   },
   weakest_evidence: {
     type: 'choice',
     instructions: 'Which part of the evidence most undermines the completion claim?',
     criteria: {
-      observation: 'What observing the result as its user meets it showed, or that it was never observed.',
-      verification: 'What the verification command ran and reported.',
-      sources: 'The source files and what they implement.',
-      requirements: 'Parts of the objective the change does not yet build.',
-      summary: 'The summary claims more than the facts show.',
+      observation:
+        '`result.observation`: what observing the result as its user meets it showed, or that it was never observed.',
+      verification: '`result.check`: what the check ran and reported.',
+      sources: '`result.files`: the source files and what they implement.',
+      requirements: 'Parts of `objective` that `result` does not yet build.',
+      summary: '`workerReport.summary` claims more than `result` shows.',
     },
   },
   verification_needed: {
@@ -185,6 +201,9 @@ export interface GateVerdict {
   reason: string;
   // Jev's reading of each clause of the objective, least addressed first (the gate of a change).
   clauses?: { clause: string; p: number }[];
+  // How fully the result shows the qualities the objective asks for (advanced, best practices), 0 to 2: reported,
+  // never a reason to reject (the gate of a change).
+  quality?: number;
 }
 // A finish with nothing written, checked or observed is an answer, not a change: there is no result
 // to verify or to observe, and the files it rests on are the ones the worker read, not ones it wrote. It is
@@ -286,23 +305,29 @@ export const objectiveClauses = (objective: string): string[] => {
 // holds its own: the oldest written file's source goes first, and the files left out are named; then the longest
 // texts are shortened. (Run react-demo-glm-1: twelve sources of 1,200 characters, a page observation and the
 // summary went over the cap, the finish was never judged, and the run stopped.)
+// It takes the gate's grouped state (result, workerReport) and a flat one alike.
 export function fitGateState(state: Record<string, any>, limit = 21000): void {
   const size = () => Buffer.byteLength(JSON.stringify(state));
-  const sources = state.sources as Record<string, string> | undefined;
+  const files = state.result?.files ?? state;
+  const report = state.workerReport ?? state;
+  const seen = state.result ?? state;
+  const sources = files.sources as Record<string, string> | undefined;
   const left: string[] = [];
   for (const k of Object.keys(sources ?? {})) {
     if (size() <= limit) break;
     delete sources![k];
     left.push(k);
-    state.sourcesLeftOut = left;
+    files.sourcesLeftOut = left;
   }
   for (const n of [800, 400, 200]) {
     if (size() <= limit) break;
-    state.summary = clip(String(state.summary ?? ''), n);
-    state.notes = clip(String(state.notes ?? ''), n);
-    state.diffStat = clip(String(state.diffStat ?? ''), n);
-    if (state.observation && typeof state.observation === 'object')
-      state.observation = { ...state.observation, facts: clip(String(state.observation.facts ?? ''), n) };
+    report.summary = clip(String(report.summary ?? ''), n);
+    if ('notes' in state) state.notes = clip(String(state.notes ?? ''), n);
+    if (report.workingNotes)
+      report.workingNotes = { ...report.workingNotes, text: clip(String(report.workingNotes.text), n) };
+    if ('diffStat' in files) files.diffStat = clip(String(files.diffStat ?? ''), n);
+    if (seen.observation && typeof seen.observation === 'object' && 'facts' in seen.observation)
+      seen.observation = { ...seen.observation, facts: clip(String(seen.observation.facts ?? ''), n) };
   }
 }
 // A summary's own section of what the worker did not do or test (Limitations, Known issues, Caveats), apart from the
@@ -324,42 +349,83 @@ export function workerNotes(summary: string): { summary: string; notes: string }
   const notes = [inline, ...lines.slice(start + 1, end)].join('\n').trim();
   return { summary: [...lines.slice(0, start), ...lines.slice(end)].join('\n').trim(), notes };
 }
+// What the gate shows Jev, in three parts: what was asked (objective, its clauses, the requirements the repository
+// states), the result as the harness found it (result: the files, the check, the page), and the worker's own account
+// of it (workerReport: its summary, what it says it did not do or test, the notes it kept while working). Facts and
+// claims were side by side before, the worker's notes among them; grouped, the questions judge the claims against
+// the facts. Replaying 90 logged finishes whose build and page passed, 58 were accepted laid out flat and 76 grouped
+// (Claude Haiku 5.5: 39 and 57 of 69), while none of 24 flawed copies (a named feature missing, a claim the result
+// does not hold, a stub page) was accepted either way. Laid out flat, a list of what was not done read as a partial
+// change and notes kept while working ("Not done: lint run", after it had run) as the worker contradicting itself.
+export function gateState(
+  s: Session,
+  facts: GateFacts,
+  observation: unknown,
+  clauses: string[] = objectiveClauses(s.objective),
+): Record<string, any> {
+  const told = workerNotes(facts.summary);
+  return {
+    objective: s.objective,
+    ...(clauses.length ? { clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])) } : {}),
+    ...(facts.requirements.length ? { requirements: facts.requirements } : {}),
+    result: {
+      about: 'What the harness found in the repository and the running result: facts, not claims.',
+      files: {
+        changed: facts.changedFiles,
+        diffStat: facts.diffStat,
+        sources: { ...(facts.sources as Record<string, string>) },
+      },
+      check: {
+        command: facts.verification.command,
+        passed: facts.verification.ok,
+        ranAfterLastEdit: facts.verification.afterLastWrite,
+        exitCode: facts.verification.exitCode,
+        output: facts.verification.text,
+      },
+      observation:
+        observation && typeof observation === 'object'
+          ? { state: facts.observationState ?? 'never', ...(observation as Record<string, unknown>) }
+          : { state: facts.observationState ?? 'never', note: observation },
+    },
+    workerReport: {
+      about: "The worker's own account of its work: claims to be judged against result.",
+      summary: told.summary,
+      ...(told.notes ? { notDoneOrUntested: told.notes } : {}),
+      ...(s.notes?.trim()
+        ? { workingNotes: { about: 'Notes kept while it worked; they may be out of date.', text: clip(s.notes, 1500) } }
+        : {}),
+    },
+  };
+}
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
   const observation =
     facts.observation && typeof facts.observation === 'object'
       ? { ...(facts.observation as Record<string, unknown>), question: undefined }
       : facts.observation;
-  const told = workerNotes(facts.summary);
-  const state = {
-    objective: s.objective,
-    clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])),
-    notes: clip(s.notes ?? '', 1500),
-    ...facts,
-    summary: told.summary,
-    ...(told.notes ? { workerNotes: told.notes } : {}),
-    observation,
-    sources: { ...(facts.sources as Record<string, string>) } as Record<string, string>,
-  } as Record<string, any>;
+  const state = gateState(s, facts, observation, clauses);
   fitGateState(state);
-  const weighNotes = (q: Questions[string], sentence: string) =>
-    told.notes ? { ...q, instructions: `${(q as { instructions: string }).instructions} ${sentence}` } : q;
   const questions: Questions = {
     ...gateQuestions,
-    implementation_matches_request: weighNotes(
-      gateQuestions.implementation_matches_request!,
-      'workerNotes lists what the worker chose to mention as not done or not tested; weigh an item there only when the objective asks for that thing.',
-    ),
-    requirement_unaddressed: weighNotes(
-      gateQuestions.requirement_unaddressed!,
-      'An item in workerNotes is a requirement only when the objective asks for it.',
-    ),
+    ...(facts.requirements.length
+      ? {
+          implementation_matches_request: {
+            ...gateQuestions.implementation_matches_request!,
+            instructions: (
+              gateQuestions.implementation_matches_request as { instructions: string }
+            ).instructions.replace(
+              'delivers what `objective` names',
+              'delivers what `objective` and `requirements` name',
+            ),
+          },
+        }
+      : {}),
     ...Object.fromEntries(
       clauses.map((_, i) => [
         `clause_${i}`,
         {
           type: 'noul',
-          instructions: `Is clause_${i} of the objective addressed by the change and the verification shown?`,
+          instructions: `Is clause_${i} of the objective addressed by \`result\` (its files, its check and its observation)?`,
         },
       ]),
     ),
@@ -386,19 +452,24 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     weakest === 'observation' &&
     weakestP >= 0.5 &&
     (facts.observationState === 'never' || facts.observationState === 'stale');
-  const accepted =
-    facts_ok &&
-    !observationBroken &&
-    !observationMissing &&
-    route !== 'human' &&
-    !weak.length &&
-    (route === 'deterministic_only' ? matches >= 0.6 : matches >= 0.75 && supported >= 0.6);
-  // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
+  // A finish passes on what can be settled: the result delivers what the objective names (matches, now asked of
+  // that alone), and the worker's summary is supported by it. How advanced or polished it is (quality, a score) is a
+  // matter of taste, read and reported but never a reason to send the worker back: asked as one question with the
+  // rest, it held working results near 0.7 against a bar of 0.75, and the worker went back, added checks, and was
+  // read near 0.7 again (Claude Haiku 5.5: two of six runs 2 to 3 minutes longer for it). Replayed, the named-delivery
+  // reading is 0.72 on good finishes (none under 0.57) and 0.01 to 0.11 on a missing feature, a stub or the wrong
+  // thing built; at 0.5, 78 of 90 good finishes passed against 75, none of 32 flawed ones. The user's review stays
+  // for a reading that would otherwise pass: without it one unsupported claim passed.
   // requirement_unaddressed decides nothing here: sending a finish back at 0.6 or more (at most twice) made Claude
   // Haiku 5.5 runs 3 to 5 times dearer and slower, every run sent back twice, for pages 10 to 30% longer, and the reading
   // stayed above 0.6 after the rebuilds.
+  const delivered = matches >= 0.5 && supported >= 0.6;
+  const accepted =
+    facts_ok && !observationBroken && !observationMissing && route !== 'human' && !weak.length && delivered;
+  // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
   const humanReview =
-    route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && matches >= 0.6;
+    route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && delivered;
+  const quality = a.quality?.type === 'score' ? a.quality.score : undefined;
   const reason = !facts_ok
     ? 'the verification did not pass after the last edit'
     : observationMissing
@@ -411,9 +482,16 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
             ? "the facts and Jev's reading agree"
             : weak.length
               ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}`
-              : `Jev reads the change as ${matches < 0.75 ? 'not implementing the request' : ''}${supported < 0.6 ? ' not supported by the facts' : ''}`
-                  .replace(/\s+/g, ' ')
-                  .trim();
+              : [
+                  matches < 0.5
+                    ? `Jev reads the result as not delivering what the objective names (${matches.toFixed(2)})`
+                    : '',
+                  supported < 0.6
+                    ? `Jev reads the summary as claiming more than the result shows (${supported.toFixed(2)})`
+                    : '',
+                ]
+                  .filter(Boolean)
+                  .join('; ');
   // A rejection says where Jev reads the gap, with the fact itself, so the worker acts on it rather than guessing.
   const pointer =
     accepted || humanReview || !facts_ok || observationBroken || observationMissing || !weakest
@@ -450,6 +528,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
         route: 'rejected',
         reason: `Jev's focused reading of the ${weakest} alone is that it does not show the work done (${focus.toFixed(2)}): ${weakestFact(weakest, facts)}`,
         clauses: readings,
+        ...(quality !== undefined ? { quality } : {}),
       };
   }
   return {
@@ -460,6 +539,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     route: humanReview ? 'human' : accepted ? route : 'rejected',
     reason: reason + pointer,
     clauses: readings,
+    ...(quality !== undefined ? { quality } : {}),
   };
 }
 // The focused question per kind of evidence: judged by that evidence alone.

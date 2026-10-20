@@ -1508,6 +1508,7 @@ export class Agent {
 
   // ---- completion --------------------------------------------------------------
   private async completionFacts(s: Session, summary: string): Promise<Parameters<typeof evidenceGate>[2]> {
+    await this.refreshObservation(s);
     const diff = await runCommand('git', ['diff', '--stat', 'HEAD', '--'], s.root, 10000).catch(() => null);
     const untracked = await runCommand('git', ['ls-files', '--others', '--exclude-standard'], s.root, 10000).catch(
       () => null,
@@ -2488,44 +2489,18 @@ export class Agent {
   private async actObserve(s: Session, route: Route, args: Record<string, any>): Promise<Outcome> {
     if (!this.config.allowBash)
       return this.refuseAction(s, route, args, 'observe needs --allow-bash (it starts and runs what it observes).');
-    const kind = String(args.kind ?? '');
-    const start = String(args.start ?? '');
-    const target = String(args.target ?? '');
-    const artifactPath = join(this.store.artifacts, `${String(s.step).padStart(5, '0')}-observe.png`);
-    const prefix = await shellPrefixFor(this.tools.root).catch(() => '');
     const inputs = Array.isArray(args.inputs)
       ? (args.inputs as any[])
           .filter(i => i && typeof i === 'object')
-          .map(i => ({ do: String(i.do) as any, what: String(i.what ?? ''), ms: Number(i.ms) || 0 }))
+          .map(i => ({ do: String(i.do), what: String(i.what ?? ''), ms: Number(i.ms) || 0 }))
       : [];
-    const r = await observeResult(kind, start, target, {
-      root: this.tools.root,
-      artifactPath,
-      timeoutMs: this.config.commandTimeoutMs,
-      prefix,
-      files: s.knownFiles,
+    const r = await this.runObservation(
+      s,
+      String(args.kind ?? ''),
+      String(args.start ?? ''),
+      String(args.target ?? ''),
       inputs,
-    });
-    await this.store.log('observe', {
-      step: s.step,
-      kind,
-      start,
-      target,
-      ...(inputs.length ? { inputs } : {}),
-      ok: r.ok,
-      text: clip(r.text, 4000),
-    });
-    s.lastObservation = {
-      step: s.step,
-      kind,
-      ok: r.ok,
-      target,
-      text: clip(r.text, 2600),
-      ...(start.trim() ? { start } : {}),
-    };
-    // What it looked like, when the observer took a picture: the next step sees it if its model takes images.
-    if (r.image) s.screenshot = { step: s.step, path: r.image, target };
-    else delete s.screenshot;
+    );
     await this.evidence(s, 'observe', { ok: r.ok, text: r.text }, args);
     this.observe({
       kind: 'result',
@@ -2537,6 +2512,65 @@ export class Agent {
       text: clip(r.text, 200),
     });
     return r.ok ? 'ok' : 'failed';
+  }
+  // An observation made and recorded as the last one: the worker's (observe), or the harness's own (by).
+  private async runObservation(
+    s: Session,
+    kind: string,
+    start: string,
+    target: string,
+    inputs: { do: string; what: string; ms: number }[],
+    by?: string,
+  ): Promise<{ ok: boolean; text: string }> {
+    const artifactPath = join(
+      this.store.artifacts,
+      `${String(s.step).padStart(5, '0')}-observe${by ? '-again' : ''}.png`,
+    );
+    const prefix = await shellPrefixFor(this.tools.root).catch(() => '');
+    const r = await observeResult(kind, start, target, {
+      root: this.tools.root,
+      artifactPath,
+      timeoutMs: this.config.commandTimeoutMs,
+      prefix,
+      files: s.knownFiles,
+      inputs: inputs as any,
+    });
+    await this.store.log('observe', {
+      step: s.step,
+      kind,
+      start,
+      target,
+      ...(inputs.length ? { inputs } : {}),
+      ...(by ? { by } : {}),
+      ok: r.ok,
+      text: clip(r.text, 4000),
+    });
+    s.lastObservation = {
+      step: s.step,
+      kind,
+      ok: r.ok,
+      target,
+      text: clip(r.text, 2600),
+      ...(start.trim() ? { start } : {}),
+      ...(inputs.length ? { inputs } : {}),
+    };
+    // What it looked like, when the observer took a picture: the next step sees it if its model takes images.
+    if (r.image) s.screenshot = { step: s.step, path: r.image, target };
+    else delete s.screenshot;
+    return r;
+  }
+  // The last observation made again, as it was made, when files were written after it: a finish is judged on the
+  // result as it is, not as it was. The gate turned a stale observation into a rejection, and the worker spent a turn
+  // observing again what the harness can (Claude Haiku 5.5: 11 of 39 gated finishes went with a stale observation).
+  private async refreshObservation(s: Session): Promise<void> {
+    const o = s.lastObservation;
+    if (!o || o.step > s.lastWriteStep || !this.config.allowBash) return;
+    if (!(s.allowedActions ?? []).includes('observe')) return;
+    const r = await this.runObservation(s, o.kind, o.start ?? '', o.target, o.inputs ?? [], 'harness');
+    await this.evidence(s, 'observe', {
+      ok: r.ok,
+      text: `The harness observed the result again, as step ${o.step} did, since files were written after it:\n${r.text}`,
+    });
   }
   private async actAskUser(s: Session, args: Record<string, any>): Promise<Outcome> {
     s.status = 'paused';

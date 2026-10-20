@@ -22,14 +22,23 @@ export function clipEnds(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const head = Math.floor(limit * 0.55);
   const tail = limit - head - 3;
-  return `${text.slice(0, head)}\n…\n${text.slice(text.length - tail)}`;
+  return `${text.slice(0, whole(text, head))}\n…\n${text.slice(whole(text, text.length - tail))}`;
 }
 const clipMarker = '\n[…truncated; use a narrower read or query…]\n';
 export function clip(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const room = Math.max(0, limit - clipMarker.length);
-  return text.slice(0, Math.ceil(room * 0.7)) + clipMarker + text.slice(-Math.floor(room * 0.3));
+  return (
+    text.slice(0, whole(text, Math.ceil(room * 0.7))) +
+    clipMarker +
+    text.slice(whole(text, text.length - Math.floor(room * 0.3)))
+  );
 }
+// A cut at i moved back off the middle of a character written as two UTF-16 units (an emoji): either half alone is
+// not Unicode text, and TypeSafe refuses a request holding one (HTTP 400). Run saas-landing-glm-5.3 trial 6 lost its
+// finished run when the excerpt of src/data.ts its completion gate sent ended half way through an icon's emoji.
+export const whole = (text: string, i: number): number =>
+  i > 0 && i < text.length && /[\ud800-\udbff]/.test(text[i - 1]!) && /[\udc00-\udfff]/.test(text[i]!) ? i - 1 : i;
 // The entry, newest first, that shows every part of text a clip kept (clipEnds and clip cut at
 // their markers), as written or as the content of a JSON string (a command's output sits in its
 // result's JSON). A tail field that restates it names the entry instead: the tail is processed
@@ -745,13 +754,19 @@ function agentPrefix(s: Session): Message[] {
   ];
 }
 // Where a prompt stops changing, for a provider that caches a prefix where the request marks it: after the
-// orientation (the same for the whole session, whatever is evicted) and after the evidence (append-only between
-// evictions, so the next turn's prompt extends it). Every prompt here is agentPrefix, then the volatile block and
-// the request; a continuation appends after those and is not marked.
+// orientation (the same for the whole session, whatever is evicted) and before the latest turn. The evidence is
+// append-only between evictions except for the latest turn, which is said in one line on the next request once it
+// is no longer latest (elided: a file it wrote, left out). A point after it is never read again: Anthropic reads a
+// prefix only when it is unchanged to the byte, and Leana on Claude Haiku 5.5 wrote 500 to 1,000 tokens to the
+// cache on each request and read back only the orientation. Every prompt here is agentPrefix, then the volatile
+// block and the request; a continuation appends after those and is not marked.
 export function cachePoints(messages: Message[]): number[] {
   if (messages[0]?.role !== 'system' || messages.length < 4) return [];
+  // Before the latest turn: the message before the last assistant message, else (no turn yet) the message
+  // before the volatile block and the request.
+  const latest = messages.findLastIndex((m, i) => i > 1 && m.role === 'assistant');
+  let end = latest > 1 ? latest - 1 : messages.length - 3;
   // A marker goes on text: an assistant turn that only calls tools has none, so its point is the message before it.
-  let end = messages.length - 3;
   while (end > 1 && !messages[end]!.content) end--;
   return [...new Set([1, end])];
 }

@@ -170,6 +170,8 @@ export interface Session {
   } | null;
   // The passing check for which the harness already proposed a finish; one attempt per check.
   finishTriedAtCheck: number;
+  // Completion gates in a row that Jev could not answer; the third pauses the session.
+  gateErrors?: number;
   // Coverage per content hash, so a rollback to known content restores read state.
   coverageByHash: Record<string, Coverage>;
   repetitionSteps: Record<string, number>;
@@ -343,6 +345,7 @@ export interface Config {
   safetyTokens: number;
   jevUrl: string;
   jevModel: string;
+  jevUsdPerMillionInput: number;
   routeProbability: number;
   routeMargin: number;
   compactProbability: number;

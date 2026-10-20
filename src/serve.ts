@@ -67,6 +67,43 @@ export function localAddresses(output: string): string[] {
     ),
   ];
 }
+// The server a shell command starts in the foreground, known by its words, and the port it names; null for one
+// it puts in the background (&) or a build, test or install. A server can be told only by its command when it
+// prints nothing (http-server --silent).
+const serverCommands: [RegExp, string][] = [
+  // Run as the command itself, or through npx and its kind: a grep for "serve" names it without running it.
+  [
+    /(?:^|\b(?:npx|bunx|pnpm\s+dlx|yarn\s+dlx)\s+(?:-y\s+)?)(?:http-server|live-server|lite-server|serve)\b/,
+    'a static file server',
+  ],
+  [/\bpython3?\s+-m\s+http\.server\b/, "Python's http.server"],
+  [/\bphp\s+-S\b/, "PHP's built-in server"],
+  [/\bvite\b(?![.@/-])(?!\s+(?:build|optimize)\b)/, 'Vite'],
+  [/\bnext\s+(?:dev|start)\b/, 'Next.js'],
+  [/\bastro\s+(?:dev|preview)\b/, 'Astro'],
+  [/\bwebpack(?:-dev-server|\s+serve)\b/, 'webpack-dev-server'],
+  [/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|preview|serve)\b|\bnpm\s+start\b/, 'a dev or preview script'],
+];
+export function foregroundServer(command: string): { what: string; port?: string } | null {
+  const c = command.trim();
+  // The last command of the line is the one left running; one sent to the background is not held by the step.
+  if (/&\s*$/.test(c) && !/&&\s*$/.test(c)) return null;
+  const last = c
+    .split(/&&|\|\||;/)
+    .at(-1)!
+    .trim();
+  if (/&\s*$/.test(last)) return null;
+  // Installing or scaffolding one names it without running it (npm install vite, npm create vite@latest).
+  if (
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add|create|init|exec\s+--\s+create)\b|\bnpx\s+(?:-y\s+)?create-/.test(last)
+  )
+    return null;
+  const hit = serverCommands.find(([re]) => re.test(last));
+  if (!hit) return null;
+  const port =
+    last.match(/(?:^|\s)(?:-p|--port)[ =]?(\d{2,5})\b/)?.[1] ?? last.match(/http\.server\s+(\d{2,5})\b/)?.[1];
+  return { what: hit[1], ...(port ? { port } : {}) };
+}
 export interface Started {
   // occupied: something already listened at the URL before the command started (it was not started).
   ready: true | string[] | false | 'occupied';

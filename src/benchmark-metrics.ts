@@ -54,6 +54,7 @@ export function summarizeEvents(events: Event[]) {
     jevLatency: providerTime(jev, data('jev-error')),
     jevInputTokens: tokens(jev, 'input_tokens'),
     jevOutputTokens: tokens(jev, 'output_tokens'),
+    jevCostUsd: sum(jev.map(d => (typeof d.costUsd === 'number' ? d.costUsd : 0))),
     bonsaiRequests: data('bonsai-request').length,
     bonsaiResponses: bonsai.length,
     bonsaiErrors: data('bonsai-error').length,

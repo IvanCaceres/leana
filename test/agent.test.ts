@@ -7153,3 +7153,104 @@ test('The step after a page observation sees its screenshot once, when the model
     'logged',
   );
 });
+
+test('A completion gate Jev cannot answer leaves the finish unjudged instead of ending the session: the worker finishes again and is judged; three in a row still pause it (saas-landing-glm-5.3 trial 6)', async t => {
+  const steps = [
+    { thought: 'write', action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } },
+    { thought: 'check', action: 'bash', args: { command: 'node -e "process.exit(0)"', purpose: 'check', check: true } },
+    { thought: 'done', action: 'finish', args: { summary: 'src/a.ts exports a; the check passes.' } },
+    { thought: 'done again', action: 'finish', args: { summary: 'src/a.ts exports a; the check passes.' } },
+    { thought: 'and again', action: 'finish', args: { summary: 'src/a.ts exports a; the check passes.' } },
+    { thought: 'and again', action: 'finish', args: { summary: 'src/a.ts exports a; the check passes.' } },
+  ];
+  const run = async (failures: number) => {
+    const { root, store } = await repo(t);
+    const jev = jevOf({});
+    let failed = 0;
+    const flaky = {
+      ...jev,
+      decide: async (state: unknown, q: Questions, ctx?: { step: number; phase: string }) => {
+        if (ctx?.phase === 'evidence-gate' && failed < failures) {
+          failed++;
+          throw new Error('HTTP 400 from https://api.typesafe.ai');
+        }
+        return jev.decide(state, q, ctx);
+      },
+    };
+    const result = await new Agent(
+      { ...config, maxSteps: 12 },
+      store,
+      flaky as any,
+      bonsaiOf({ steps, files: { 'src/a.ts': 'export const a = 1;\n' } }),
+      root,
+      () => {},
+      () => {},
+    ).run(await newSession(root, 'x'));
+    return { result, ev: await events(store) };
+  };
+  const once = await run(1);
+  assert.equal(once.result.status, 'complete', once.result.stopReason);
+  assert(
+    once.result.entries.some(e => /The finish was not judged: the completion gate could not be reached/.test(e.text)),
+  );
+  assert.equal(once.ev.filter(e => e.type === 'gate-error').length, 1);
+  const always = await run(3);
+  assert.equal(always.result.status, 'paused');
+  assert.match(always.result.stopReason, /Stopped: HTTP 400/);
+});
+
+test('A server started in the foreground that prints nothing is known by its command and stopped once quiet, pointed at observe and its port; a build, an install, a grep or a backgrounded command is not one (saas-landing-glm-5.3 trial 7)', async t => {
+  const { foregroundServer } = await import('../src/serve.js');
+  assert.deepEqual(foregroundServer('npx -y http-server dist -p 4173 --silent'), {
+    what: 'a static file server',
+    port: '4173',
+  });
+  assert.deepEqual(foregroundServer('cd app && npm run preview -- --port 4173'), {
+    what: 'a dev or preview script',
+    port: '4173',
+  });
+  assert.deepEqual(foregroundServer('python -m http.server 8000'), { what: "Python's http.server", port: '8000' });
+  assert.deepEqual(foregroundServer('npx next dev -p 3001'), { what: 'Next.js', port: '3001' });
+  assert.equal(foregroundServer('npx vite')?.what, 'Vite');
+  for (const c of [
+    'npm run build',
+    'npx vite build',
+    'npm install vite',
+    'npm create vite@latest app -- --template react',
+    'npm run dev &',
+    'grep -r serve src',
+    'cat vite.config.ts',
+    'npm test',
+  ])
+    assert.equal(foregroundServer(c), null, c);
+  const { root } = await repo(t);
+  const { ToolBox } = await import('../src/tools.js');
+  const tools = new ToolBox(root, join(root, '.art'), { ...config, commandTimeoutMs: 30000 }, async () => '');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ scripts: { dev: 'node silent.mjs' } }));
+  await writeFile(join(root, 'silent.mjs'), "import http from 'node:http';\nhttp.createServer(() => {}).listen(0);\n");
+  const t0 = Date.now();
+  const r = await tools.execute('bash', { command: 'npm run dev -- --port 4321', purpose: 'serve', check: false });
+  assert(Date.now() - t0 < 20000, `stopped once quiet (${Date.now() - t0} ms), not at the 30 s timeout`);
+  assert.equal(r.ok, false);
+  assert.match(
+    r.text,
+    /This command starts a server \(a dev or preview script\) and was still running, quiet, .* target set to http:\/\/localhost:4321\//,
+  );
+});
+
+test('A text is clipped on whole characters, and Jev is sent only well-formed text: half an emoji is Unicode no server accepts (saas-landing-glm-5.3 trial 6: HTTP 400 "Request contains invalid Unicode text")', async () => {
+  const { clip, clipEnds } = await import('../src/context.js');
+  const { wellFormed } = await import('../src/clients.js');
+  const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+  const text = '🚀'.repeat(400);
+  for (let n = 60; n < 140; n++) {
+    assert(!lone.test(clip(text, n)), `clip at ${n}`);
+    assert(!lone.test(clipEnds(text, n)), `clipEnds at ${n}`);
+  }
+  const s = '🚀'.slice(0, 1);
+  assert.deepEqual(wellFormed({ a: [`icon: "${s}`, 1], b: '🚀 ok', c: null }), {
+    a: ['icon: "�', 1],
+    b: '🚀 ok',
+    c: null,
+  });
+});

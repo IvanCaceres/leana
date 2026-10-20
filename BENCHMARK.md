@@ -244,6 +244,27 @@ Verification runs after the harness exits:
 
 **"Passed" isn't a quality score.** A page can load and still look wrong. For example, a hero held invisible by a scroll animation still counts as loaded text, because the check reads text, not visibility. Look at each trial's screenshots: the summary's **Trials** grid shows them.
 
+## Replaying the completion gate
+
+Leana's completion gate asks Jev whether a finish is done, and what Jev is shown decides the answer. Jev answers the same state the same way each time (within about 0.01), so a change to how a finish is presented can be measured on the gate requests already logged, before any benchmark run:
+
+```bash
+npm run bench:gate-replay
+```
+
+It takes every logged gate request from the Leana trials under `work/bench/harnesses` (or the suite directories you name) whose check passed and whose result was observed working, presents each with the gate as it is built now, and reports how many it accepts. It also makes 24 flawed copies (the objective names a feature none of them has, the summary claims one that is not there, or the source is a stub) and reports how many of those it accepts, which should stay at none. It needs `TYPESAFE_API_KEY` and costs a few cents.
+
+What it found, on 102 good finishes and 24 flawed ones from nine suites:
+
+| Presentation                                                                             | Good accepted | Claude Haiku 5.5 | GLM-5.3  | Flawed accepted |
+| ---------------------------------------------------------------------------------------- | ------------- | ---------------- | -------- | --------------- |
+| Flat: facts and the worker's account side by side                                        | 56            | 37 of 80         | 19 of 22 | 0               |
+| Grouped into `result` (facts) and `workerReport` (claims), stale observations made again | 77            | 58 of 80         | 19 of 22 | 0               |
+
+- **The worker's account was read as facts.** A list of what was not done, written by the worker in its summary ("no backend wired up" for a demo page), read as a partial change. Its working notes, kept while it worked and often out of date ("Not done: lint run" after the lint had run), read as the worker contradicting itself. Grouped apart from the facts, they are judged as claims.
+- **Wording moves the answer as much as the state.** "What the objective and its requirements ask for", with no requirements in the state, accepted 12 fewer good finishes than "what the objective asks for"; "its observation … or the absence of one" 17 fewer than "its observation".
+- **More of the source did not help.** Sending each page file whole, about 23,000 characters instead of 10,000 in excerpts, changed nothing.
+
 ## Reading the results
 
 - **Several trials per harness.** Runs of the same harness on the same task vary a lot: Leana's own runs of this task ranged from 7 to 28 requests. The summary has four views:

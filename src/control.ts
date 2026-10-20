@@ -139,30 +139,36 @@ export interface GateFacts {
   requirements: string[];
   sources: unknown;
 }
+// The wording is measured, not chosen: on 90 replayed finishes "what `objective` and its requirements ask for" (with no
+// requirements in the state) accepted 63, "what `objective` asks for" 75; "its observation as its user meets it, or
+// the absence of one" 58 against "its observation" 75. Neither let any of 24 flawed copies through. Requirements the
+// repository states are named only when there are some (evidenceGate).
 export const gateQuestions: Questions = {
   implementation_matches_request: {
     type: 'noul',
     instructions:
-      'Does the change (changedFiles, diffStat, sources, and the observation of the result as its user meets it, or its absence) implement what the objective and its requirements ask for, as opposed to something adjacent, partial, broken or invented?',
+      'Does `result` (its files, its check and its observation) implement what `objective` asks for, as opposed to something adjacent, partial, broken or invented? Items in `workerReport.notDoneOrUntested` count only when the objective asks for that thing.',
   },
   requirement_unaddressed: {
     type: 'noul',
-    instructions: 'Does any requirement of the objective appear unaddressed by the change and the verification?',
+    instructions:
+      'Does any requirement of `objective` appear unaddressed by `result`? An item in `workerReport.notDoneOrUntested` is a requirement only when the objective asks for it.',
   },
   claim_supported: {
     type: 'noul',
     instructions:
-      "Is the worker's completion summary supported by the facts shown (files that exist, a verification that passed after the last edit), rather than asserted?",
+      'Is `workerReport.summary` supported by `result` (files that exist, a check that passed after the last edit, the observation), rather than asserted?',
   },
   weakest_evidence: {
     type: 'choice',
     instructions: 'Which part of the evidence most undermines the completion claim?',
     criteria: {
-      observation: 'What observing the result as its user meets it showed, or that it was never observed.',
-      verification: 'What the verification command ran and reported.',
-      sources: 'The source files and what they implement.',
-      requirements: 'Parts of the objective the change does not yet build.',
-      summary: 'The summary claims more than the facts show.',
+      observation:
+        '`result.observation`: what observing the result as its user meets it showed, or that it was never observed.',
+      verification: '`result.check`: what the check ran and reported.',
+      sources: '`result.files`: the source files and what they implement.',
+      requirements: 'Parts of `objective` that `result` does not yet build.',
+      summary: '`workerReport.summary` claims more than `result` shows.',
     },
   },
   verification_needed: {
@@ -286,25 +292,29 @@ export const objectiveClauses = (objective: string): string[] => {
 // holds its own: the oldest written file's source goes first, and the files left out are named; then the longest
 // texts are shortened. (Run react-demo-glm-1: twelve sources of 1,200 characters, a page observation and the
 // summary went over the cap, the finish was never judged, and the run stopped.)
+// It takes the gate's grouped state (result, workerReport) and a flat one alike.
 export function fitGateState(state: Record<string, any>, limit = 21000): void {
   const size = () => Buffer.byteLength(JSON.stringify(state));
-  const sources = state.sources as Record<string, string> | undefined;
+  const files = state.result?.files ?? state;
+  const report = state.workerReport ?? state;
+  const seen = state.result ?? state;
+  const sources = files.sources as Record<string, string> | undefined;
   const left: string[] = [];
   for (const k of Object.keys(sources ?? {})) {
     if (size() <= limit) break;
     delete sources![k];
     left.push(k);
-    state.sourcesLeftOut = left;
+    files.sourcesLeftOut = left;
   }
   for (const n of [800, 400, 200]) {
     if (size() <= limit) break;
-    state.summary = clip(String(state.summary ?? ''), n);
+    report.summary = clip(String(report.summary ?? ''), n);
     if ('notes' in state) state.notes = clip(String(state.notes ?? ''), n);
-    if (state.workingNotes)
-      state.workingNotes = { ...state.workingNotes, text: clip(String(state.workingNotes.text), n) };
-    state.diffStat = clip(String(state.diffStat ?? ''), n);
-    if (state.observation && typeof state.observation === 'object')
-      state.observation = { ...state.observation, facts: clip(String(state.observation.facts ?? ''), n) };
+    if (report.workingNotes)
+      report.workingNotes = { ...report.workingNotes, text: clip(String(report.workingNotes.text), n) };
+    if ('diffStat' in files) files.diffStat = clip(String(files.diffStat ?? ''), n);
+    if (seen.observation && typeof seen.observation === 'object' && 'facts' in seen.observation)
+      seen.observation = { ...seen.observation, facts: clip(String(seen.observation.facts ?? ''), n) };
   }
 }
 // A summary's own section of what the worker did not do or test (Limitations, Known issues, Caveats), apart from the
@@ -326,53 +336,80 @@ export function workerNotes(summary: string): { summary: string; notes: string }
   const notes = [inline, ...lines.slice(start + 1, end)].join('\n').trim();
   return { summary: [...lines.slice(0, start), ...lines.slice(end)].join('\n').trim(), notes };
 }
+// What the gate shows Jev, in three parts: what was asked (objective, its clauses, the requirements the repository
+// states), the result as the harness found it (result: the files, the check, the page), and the worker's own account
+// of it (workerReport: its summary, what it says it did not do or test, the notes it kept while working). Facts and
+// claims were side by side before, the worker's notes among them; grouped, the questions judge the claims against
+// the facts. Replaying 90 logged finishes whose build and page passed, 58 were accepted laid out flat and 76 grouped
+// (Claude Haiku 5.5: 39 and 57 of 69), while none of 24 flawed copies (a named feature missing, a claim the result
+// does not hold, a stub page) was accepted either way. Laid out flat, a list of what was not done read as a partial
+// change and notes kept while working ("Not done: lint run", after it had run) as the worker contradicting itself.
+export function gateState(
+  s: Session,
+  facts: GateFacts,
+  observation: unknown,
+  clauses: string[] = objectiveClauses(s.objective),
+): Record<string, any> {
+  const told = workerNotes(facts.summary);
+  return {
+    objective: s.objective,
+    ...(clauses.length ? { clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])) } : {}),
+    ...(facts.requirements.length ? { requirements: facts.requirements } : {}),
+    result: {
+      about: 'What the harness found in the repository and the running result: facts, not claims.',
+      files: {
+        changed: facts.changedFiles,
+        diffStat: facts.diffStat,
+        sources: { ...(facts.sources as Record<string, string>) },
+      },
+      check: {
+        command: facts.verification.command,
+        passed: facts.verification.ok,
+        ranAfterLastEdit: facts.verification.afterLastWrite,
+        exitCode: facts.verification.exitCode,
+        output: facts.verification.text,
+      },
+      observation:
+        observation && typeof observation === 'object'
+          ? { state: facts.observationState ?? 'never', ...(observation as Record<string, unknown>) }
+          : { state: facts.observationState ?? 'never', note: observation },
+    },
+    workerReport: {
+      about: "The worker's own account of its work: claims to be judged against result.",
+      summary: told.summary,
+      ...(told.notes ? { notDoneOrUntested: told.notes } : {}),
+      ...(s.notes?.trim()
+        ? { workingNotes: { about: 'Notes kept while it worked; they may be out of date.', text: clip(s.notes, 1500) } }
+        : {}),
+    },
+  };
+}
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
   const observation =
     facts.observation && typeof facts.observation === 'object'
       ? { ...(facts.observation as Record<string, unknown>), question: undefined }
       : facts.observation;
-  const told = workerNotes(facts.summary);
-  const state = {
-    objective: s.objective,
-    clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])),
-    // The worker's notes as it kept them while it worked, said to be that: they may be out of date ("Not done: lint
-    // run" after the lint had run), and read as the worker's account of its result they contradicted the summary
-    // (Claude Haiku 5.5: 10 of 39 gated finishes routed to the user with them as they were, 6 labelled).
-    ...(s.notes?.trim()
+  const state = gateState(s, facts, observation, clauses);
+  fitGateState(state);
+  const questions: Questions = {
+    ...gateQuestions,
+    ...(facts.requirements.length
       ? {
-          workingNotes: {
-            about:
-              'Notes the worker kept while it worked; they may be out of date. The summary, the verification and the observation describe the result as it is now.',
-            text: clip(s.notes, 1500),
+          implementation_matches_request: {
+            ...gateQuestions.implementation_matches_request!,
+            instructions: (
+              gateQuestions.implementation_matches_request as { instructions: string }
+            ).instructions.replace('what `objective` asks for', 'what `objective` and `requirements` ask for'),
           },
         }
       : {}),
-    ...facts,
-    summary: told.summary,
-    ...(told.notes ? { workerNotes: told.notes } : {}),
-    observation,
-    sources: { ...(facts.sources as Record<string, string>) } as Record<string, string>,
-  } as Record<string, any>;
-  fitGateState(state);
-  const weighNotes = (q: Questions[string], sentence: string) =>
-    told.notes ? { ...q, instructions: `${(q as { instructions: string }).instructions} ${sentence}` } : q;
-  const questions: Questions = {
-    ...gateQuestions,
-    implementation_matches_request: weighNotes(
-      gateQuestions.implementation_matches_request!,
-      'workerNotes lists what the worker chose to mention as not done or not tested; weigh an item there only when the objective asks for that thing.',
-    ),
-    requirement_unaddressed: weighNotes(
-      gateQuestions.requirement_unaddressed!,
-      'An item in workerNotes is a requirement only when the objective asks for it.',
-    ),
     ...Object.fromEntries(
       clauses.map((_, i) => [
         `clause_${i}`,
         {
           type: 'noul',
-          instructions: `Is clause_${i} of the objective addressed by the change and the verification shown?`,
+          instructions: `Is clause_${i} of the objective addressed by \`result\` (its files, its check and its observation)?`,
         },
       ]),
     ),

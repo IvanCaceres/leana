@@ -17,6 +17,7 @@
     "test:live": "npm run build && node dist/src/live-test.js",
     "bench:refactor": "npm run build && node dist/src/benchmark.js",
     "bench:harnesses": "npm run build && node bench/harnesses.mjs",
+    "bench:gate-replay": "npm run build && node bench/gate-replay.mjs",
     "start": "node dist/src/cli.js",
     "format": "prettier --write src test",
     "format:check": "prettier --check src test"

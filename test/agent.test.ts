@@ -316,7 +316,10 @@ test('The loop: orient, reason then act, verify what the worker declared as its 
   assert.match(await readFile(join(root, 'src', 'greet.ts'), 'utf8'), /export const VERSION = 1;/);
   assert.equal(result.notes!.split('\n').length, 3);
   const gate = jev.calls.find(c => c.phase === 'evidence-gate')!;
-  assert(gate.state.diffStat && gate.state.verification.afterLastWrite === true, 'the gate sees the facts');
+  assert(
+    gate.state.result.files.diffStat && gate.state.result.check.ranAfterLastEdit === true,
+    'the gate sees the facts, under result',
+  );
   assert.equal(
     jev.calls.filter(c => c.phase === 'watchdog').length,
     6,
@@ -2435,7 +2438,12 @@ test("A completion about to pass while Jev names the observation as its weakest 
             observerFor('page')!.question,
             "the page observer's own question",
           );
-        } else assert.equal(st.observation.question, undefined, 'the main reading is not handed the focused question');
+        } else
+          assert.equal(
+            st.result.observation.question,
+            undefined,
+            'the main reading is not handed the focused question',
+          );
         return j.decide(st, q, c);
       },
     };
@@ -7338,17 +7346,61 @@ test("The completion gate shows Jev the worker's own list of what it did not do 
   await evidenceGate(spy as any, s, facts('Built the page.\n\nLimitations:\n- no backend is wired up'));
   await evidenceGate(spy as any, s, facts('Built the page.'));
   const [withNotes, without] = seen;
-  assert.equal(withNotes!.state.summary, 'Built the page.');
-  assert.equal(withNotes!.state.workerNotes, '- no backend is wired up');
+  assert.equal(withNotes!.state.workerReport.summary, 'Built the page.');
+  assert.equal(withNotes!.state.workerReport.notDoneOrUntested, '- no backend is wired up');
   assert.match(
     withNotes!.questions.implementation_matches_request.instructions,
-    /weigh an item there only when the objective asks for that thing\.$/,
+    /Items in `workerReport\.notDoneOrUntested` count only when the objective asks for that thing\.$/,
   );
   assert.match(withNotes!.questions.requirement_unaddressed.instructions, /only when the objective asks for it\.$/);
-  assert.equal(without!.state.workerNotes, undefined);
-  assert.equal(
-    without!.questions.implementation_matches_request.instructions,
-    (gateQuestions.implementation_matches_request as any).instructions,
-    'a summary without notes is asked about as before',
+  assert.equal(without!.state.workerReport.notDoneOrUntested, undefined, 'a summary without notes has none');
+  assert.deepEqual(
+    without!.questions.implementation_matches_request,
+    gateQuestions.implementation_matches_request,
+    'the questions are the same with or without notes',
   );
+});
+
+test('A finish whose last observation was made before the last write is judged on that observation made again by the harness, as it was made, not on the stale one', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  await writeFile(join(root, 'cli.mjs'), 'console.log("3 tasks");\n');
+  const bonsai = bonsaiOf({
+    steps: [
+      {
+        thought: 'check and run it',
+        action: 'plan',
+        batch: [
+          { action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+          { action: 'observe', args: { kind: 'program', start: '', target: 'node cli.mjs' } },
+        ],
+      },
+      { thought: 'one more file', action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } },
+      { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+      { thought: 'done', action: 'finish', args: { summary: 'a task CLI' } },
+    ],
+    files: { 'src/a.ts': 'export const a = 1;\n' },
+  });
+  const jev = jevOf({});
+  const result = await new Agent(
+    { ...config, maxSteps: 8 },
+    store,
+    jev as any,
+    bonsai,
+    root,
+    () => {},
+    () => {},
+  ).run(await newSession(root, 'A task CLI that lists tasks'));
+  assert.equal(result.status, 'complete', result.stopReason);
+  const observed = (await events(store)).filter(e => e.type === 'observe');
+  assert.deepEqual(
+    observed.map(e => [e.data.target, e.data.by ?? 'worker']),
+    [
+      ['node cli.mjs', 'worker'],
+      ['node cli.mjs', 'harness'],
+    ],
+  );
+  const gate = jev.calls.find(c => c.phase === 'evidence-gate')!;
+  assert.equal(gate.state.result.observation.state, 'current', 'judged on the observation made again');
+  assert.equal(gate.state.result.observation.afterLastWrite, true);
 });

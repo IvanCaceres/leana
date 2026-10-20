@@ -171,7 +171,7 @@ Everything goes under `work/bench/harnesses/<timestamp>/` (git-ignored):
 | `<harness>-<n>/leana-config.json`, `opencode-config.json`, `hermes-config.yaml`, `hermes-plugin.py` | What the trial was configured with (no key)                                                                                                                                                                                                            |
 | `<harness>-<n>/agent-stdout.txt`, `agent-stderr.txt`                                                | The harness's output                                                                                                                                                                                                                                   |
 | `<harness>-<n>/trial.json`                                                                          | Every measurement of the trial, the reference, and the settings check (`settings`)                                                                                                                                                                     |
-| `<harness>-<n>/verify-*.txt`, `page.png`                                                            | Install, build and page-check output, and a screenshot of the page                                                                                                                                                                                     |
+| `<harness>-<n>/verify-*.txt`, `page.png`, `page-full.png`                                           | Install, build and page-check output, and screenshots of the page: the top as it opens (`page.png`) and the whole page (`page-full.png`, scrolled through first so sections that appear on scroll are drawn, up to 12,000 px)                          |
 | `summary.json`, `SUMMARY.md`                                                                        | All trials, the comparison table, and the settings each harness sent                                                                                                                                                                                   |
 
 ## How each harness is run
@@ -242,13 +242,14 @@ Verification runs after the harness exits:
 3. Serve it on a free port with its own scripts: `preview` after a passing build, else `dev`, else `start`. A Next.js project is served with `start` after a passing build, else `dev`, using Next's own flags (`-p`, `-H`).
 4. Load the page with Leana's page observer: exceptions, failed requests, text length, and a screenshot.
 
-**"Passed" isn't a quality score.** A page can load and still look wrong. For example, a hero held invisible by a scroll animation still counts as loaded text, because the check reads text, not visibility. Look at each trial's `page.png`.
+**"Passed" isn't a quality score.** A page can load and still look wrong. For example, a hero held invisible by a scroll animation still counts as loaded text, because the check reads text, not visibility. Look at each trial's screenshots: the summary's **Trials** grid shows them.
 
 ## Reading the results
 
-- **Several trials per harness.** Runs of the same harness on the same task vary a lot: Leana's own runs of this task ranged from 7 to 28 requests. The summary leads with three views:
+- **Several trials per harness.** Runs of the same harness on the same task vary a lot: Leana's own runs of this task ranged from 7 to 28 requests. The summary has four views:
   - **Mean cost per run, dearest run and total billed, and mean and slowest wall time.** The mean is what many runs cost, and the worst run shows the stuck repair loops the median hides.
   - **Each harness against Leana, round by round.** A round gives every harness the same task and settings, so comparing within it removes what the round shares. It gives how many rounds Leana was cheaper and faster, and the average difference with a 95% range from resampling the rounds. A range that crosses 0 means the gap may be chance at that many rounds; 4 rounds is often too few.
+  - **Trials:** a grid with a round per row and a harness per column. Each cell holds the trial's screenshot (click it for the whole page), its cost with Jev, wall time, the amount of text on its page, and whether it passed. A row compares the harnesses on the same task and settings; a column shows how one harness varies.
   - **Medians,** with the request and token counts.
 - **Note what else used the key.** Background jobs or another session spending from the same key inflate the billed figure. Use a dedicated key.
 - **Same settings, different work.** With the settings equal, the differences left are each harness's own: its prompts, its tools, and how many requests and tokens it spends on the task. OpenRouter can still fall back to an endpoint lower in the order (or outside it) when one is busy; the _Settings sent_ section shows which endpoints actually served Leana, Cline and OpenCode.

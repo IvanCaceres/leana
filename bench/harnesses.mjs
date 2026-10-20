@@ -829,9 +829,15 @@ async function verify(trialRepo, trial) {
           : null;
   out.served = serve;
   if (!serve) return dropDeps(repo, out);
-  const r = await renderFacts(repo, `http://127.0.0.1:${port}/`, serve, join(trial, 'page.png'), 90_000, [
-    { do: 'wait', what: '', ms: 3000 },
-  ]);
+  const r = await renderFacts(
+    repo,
+    `http://127.0.0.1:${port}/`,
+    serve,
+    join(trial, 'page.png'),
+    90_000,
+    [{ do: 'wait', what: '', ms: 3000 }],
+    join(trial, 'page-full.png'),
+  );
   writeFileSync(join(trial, 'verify-page.txt'), r.text);
   out.page = {
     ok: r.ok,
@@ -1227,6 +1233,34 @@ const againstLeana = chosen.includes('leana')
         return `| ${name} | ${cell(c, '$')} | ${cell(w, 's')} |`;
       })
   : [];
+// Every trial as a person would judge it: what it built (its screenshot, the whole page a click away) beside what it
+// cost and how long it took. A round per row, a harness per column: a row compares the harnesses on the same task
+// and settings, a column shows how one varies. Paths are relative to SUMMARY.md, in the suite's directory.
+const trialCell = r => {
+  if (!r) return '—';
+  const dir = `${r.harness}-${r.trial}`;
+  const shot = existsSync(join(suite, dir, 'page.png'))
+    ? `[<img src="${dir}/page.png" width="240" alt="${r.harness} round ${r.trial}">](${dir}/${existsSync(join(suite, dir, 'page-full.png')) ? 'page-full.png' : 'page.png'})<br>`
+    : 'no screenshot<br>';
+  const chars = r.verification?.page?.textChars;
+  const why = passed(r)
+    ? 'passed'
+    : r.exitCode !== 0
+      ? `failed: exit ${r.exitCode}`
+      : r.verification?.build === false
+        ? 'failed: build'
+        : 'failed: page';
+  return `${shot}${usd(totalUsd(r))} · ${fmt(r.wallSeconds)} s${chars ? ` · ${chars.toLocaleString('en-US')} chars` : ''} · ${why}`;
+};
+const trialGrid = [
+  `| Round | ${chosen.join(' | ')} |`,
+  `| --- | ${chosen.map(() => '---').join(' | ')} |`,
+  ...Array.from(
+    { length: runs },
+    (_, k) =>
+      `| ${k + 1} | ${chosen.map(name => trialCell(results.find(r => r.harness === name && r.trial === k + 1))).join(' | ')} |`,
+  ),
+];
 const describe = ref =>
   ref
     ? `effort ${ref.effort ?? 'none'}, temperature ${ref.temperature ?? 'none'}, top_p ${ref.top_p ?? 'none'}, top_k ${ref.top_k ?? 'none'}, output cap ${ref.maxTokens ?? 'none'}, endpoints ${ref.provider?.order?.join(' > ') ?? "OpenRouter's choice"}${ref.provider?.allow_fallbacks ? ' (then any other)' : ''}`
@@ -1289,6 +1323,12 @@ const summary = [
         '',
       ]
     : []),
+  '## Trials',
+  '',
+  'Each cell: the top of the page as built (click for the whole page), then the cost (OpenRouter and Jev), wall time, the text on the page, and whether the trial passed.',
+  '',
+  ...trialGrid,
+  '',
   '## Medians',
   '',
   "| Harness | Effort sent | Leana's settings | Passed | Wall time (median) | Working time (median) | Billed by OpenRouter (median, range) | Jev (median) | Requests (median) | Prompt tokens (median) | Output tokens (median) |",

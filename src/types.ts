@@ -302,7 +302,16 @@ export interface Session {
   reproduced?: Record<string, { step: number; sha: string; request: string; ms?: number; tokens?: number }>;
   // The last observation of the result as its user meets it (a page, a service, a program run), as facts.
   // start: the command the observation started it with, if any.
-  lastObservation?: { step: number; kind: string; ok: boolean; target: string; text: string; start?: string };
+  lastObservation?: {
+    step: number;
+    kind: string;
+    ok: boolean;
+    target: string;
+    text: string;
+    start?: string;
+    // The page inputs it played, so the harness can make it again as it was (see Agent.refreshObservation).
+    inputs?: { do: string; what: string; ms: number }[];
+  };
   // Calls of the last turn past its limit, not run: said in the next request, then cleared.
   droppedCalls?: string[];
   // The screenshot of the last page observation, until the next step's prompt has shown it to the model.

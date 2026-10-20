@@ -299,7 +299,9 @@ export function fitGateState(state: Record<string, any>, limit = 21000): void {
   for (const n of [800, 400, 200]) {
     if (size() <= limit) break;
     state.summary = clip(String(state.summary ?? ''), n);
-    state.notes = clip(String(state.notes ?? ''), n);
+    if ('notes' in state) state.notes = clip(String(state.notes ?? ''), n);
+    if (state.workingNotes)
+      state.workingNotes = { ...state.workingNotes, text: clip(String(state.workingNotes.text), n) };
     state.diffStat = clip(String(state.diffStat ?? ''), n);
     if (state.observation && typeof state.observation === 'object')
       state.observation = { ...state.observation, facts: clip(String(state.observation.facts ?? ''), n) };
@@ -334,7 +336,18 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
   const state = {
     objective: s.objective,
     clauses: Object.fromEntries(clauses.map((c, i) => [`clause_${i}`, c])),
-    notes: clip(s.notes ?? '', 1500),
+    // The worker's notes as it kept them while it worked, said to be that: they may be out of date ("Not done: lint
+    // run" after the lint had run), and read as the worker's account of its result they contradicted the summary
+    // (Claude Haiku 5.5: 10 of 39 gated finishes routed to the user with them as they were, 6 labelled).
+    ...(s.notes?.trim()
+      ? {
+          workingNotes: {
+            about:
+              'Notes the worker kept while it worked; they may be out of date. The summary, the verification and the observation describe the result as it is now.',
+            text: clip(s.notes, 1500),
+          },
+        }
+      : {}),
     ...facts,
     summary: told.summary,
     ...(told.notes ? { workerNotes: told.notes } : {}),

@@ -183,6 +183,8 @@ export interface GateVerdict {
   supported: number;
   route: string;
   reason: string;
+  // Jev's reading of each clause of the objective, least addressed first (the gate of a change).
+  clauses?: { clause: string; p: number }[];
 }
 // A finish with nothing written, checked or observed is an answer, not a change: there is no result
 // to verify or to observe, and the files it rests on are the ones the worker read, not ones it wrote. It is
@@ -331,7 +333,8 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     ),
   };
   const a = await jev.decide(state, questions, { step: s.step, phase: 'evidence-gate' });
-  const weak = clauses.map((c, i) => ({ c, p: noul(a[`clause_${i}`]) })).filter(x => x.p < 0.4);
+  const readings = clauses.map((c, i) => ({ clause: c, p: noul(a[`clause_${i}`]) })).sort((x, y) => x.p - y.p);
+  const weak = readings.filter(x => x.p < 0.4).map(x => ({ c: x.clause, p: x.p }));
   const matches = noul(a.implementation_matches_request);
   const unaddressed = noul(a.requirement_unaddressed);
   const supported = noul(a.claim_supported);
@@ -359,6 +362,9 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     !weak.length &&
     (route === 'deterministic_only' ? matches >= 0.6 : matches >= 0.75 && supported >= 0.6);
   // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
+  // requirement_unaddressed decides nothing here: sending a finish back at 0.6 or more (at most twice) made Claude
+  // Haiku 5.5 runs 3 to 5 times dearer and slower, every run sent back twice, for pages 10 to 30% longer, and the reading
+  // stayed above 0.6 after the rebuilds.
   const humanReview =
     route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && matches >= 0.6;
   const reason = !facts_ok
@@ -411,6 +417,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
         supported,
         route: 'rejected',
         reason: `Jev's focused reading of the ${weakest} alone is that it does not show the work done (${focus.toFixed(2)}): ${weakestFact(weakest, facts)}`,
+        clauses: readings,
       };
   }
   return {
@@ -420,6 +427,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     supported,
     route: humanReview ? 'human' : accepted ? route : 'rejected',
     reason: reason + pointer,
+    clauses: readings,
   };
 }
 // The focused question per kind of evidence: judged by that evidence alone.

@@ -30,6 +30,8 @@ export const defaults: Config = {
   // What TypeSafe charges per million input tokens to Jev (docs.typesafe.ai/models: $42 per billion; output tokens are
   // free). Jev's reply reports its tokens, not a cost; each is priced at this.
   jevUsdPerMillionInput: 0.042,
+  // No one will review a finish: one Jev would route to the user goes back to the worker with Jev's readings.
+  unattended: false,
   routeProbability: 0.55,
   routeMargin: 0.12,
   compactProbability: 0.75,

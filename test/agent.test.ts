@@ -7254,3 +7254,45 @@ test('A text is clipped on whole characters, and Jev is sent only well-formed te
     c: null,
   });
 });
+
+test('Unattended, a finish Jev would route to the user goes back to the worker with the parts of the objective Jev is least sure of, and after two the run completes as unreviewed; attended, it pauses for the user as before (saas-landing-haiku-5.5 trials 4 and 6)', async t => {
+  const finish = { thought: 'done', action: 'finish', args: { summary: 'src/a.ts exports a; the check passes.' } };
+  const steps = [
+    { thought: 'write', action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } },
+    { thought: 'check', action: 'bash', args: { command: 'node -e "process.exit(0)"', purpose: 'check', check: true } },
+    finish,
+    finish,
+    finish,
+    finish,
+  ];
+  const run = async (unattended: boolean) => {
+    const { root, store } = await repo(t);
+    const jev = jevOf({
+      gate: { verification_needed: 'human', requirement_unaddressed: 0.5 },
+      clauses: c => (/landing/.test(c) ? 0.5 : 0.9),
+    });
+    const result = await new Agent(
+      { ...config, maxSteps: 12, unattended },
+      store,
+      jev as any,
+      bonsaiOf({ steps, files: { 'src/a.ts': 'export const a = 1;\n' } }),
+      root,
+      () => {},
+      () => {},
+    ).run(await newSession(root, '- Build a landing page\n- Export a from src/a.ts'));
+    return { result, gates: jev.calls.filter(c => c.phase === 'evidence-gate').length };
+  };
+  const attended = await run(false);
+  assert.equal(attended.result.status, 'paused');
+  assert.match(attended.result.stopReason, /Jev routes it to the user for review/);
+  const alone = await run(true);
+  assert.equal(alone.result.status, 'complete', alone.result.stopReason);
+  assert.match(
+    alone.result.stopReason,
+    /^Complete, unreviewed: Jev would have routed this to the user for review 3 times/,
+  );
+  assert.equal(alone.gates, 3);
+  const back = alone.result.entries.filter(e => /would ask the user to review it, and no one will/.test(e.text));
+  assert.equal(back.length, 2, 'sent back twice');
+  assert.match(back[0]!.text, /starting with the parts Jev is least sure of: "Build a landing page" \(0\.50\)/);
+});

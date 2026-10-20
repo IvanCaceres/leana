@@ -7296,38 +7296,3 @@ test('Unattended, a finish Jev would route to the user goes back to the worker w
   assert.equal(back.length, 2, 'sent back twice');
   assert.match(back[0]!.text, /starting with the parts Jev is least sure of: "Build a landing page" \(0\.50\)/);
 });
-
-test('A finish Jev reads as leaving a requirement probably unaddressed (0.6 or more) goes back to be built out, twice at most in a session, then the other readings decide (saas-landing-haiku-5.5: finishes accepted at 0.64 to 0.72, pages about half the text of the other harnesses)', async t => {
-  const finish = { thought: 'done', action: 'finish', args: { summary: 'src/a.ts exports a; the check passes.' } };
-  const steps = [
-    { thought: 'write', action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } },
-    { thought: 'check', action: 'bash', args: { command: 'node -e "process.exit(0)"', purpose: 'check', check: true } },
-    finish,
-    finish,
-    finish,
-    finish,
-  ];
-  const run = async (unaddressed: number) => {
-    const { root, store } = await repo(t);
-    const jev = jevOf({ gate: { requirement_unaddressed: unaddressed } });
-    const result = await new Agent(
-      { ...config, maxSteps: 12 },
-      store,
-      jev as any,
-      bonsaiOf({ steps, files: { 'src/a.ts': 'export const a = 1;\n' } }),
-      root,
-      () => {},
-      () => {},
-    ).run(await newSession(root, 'Build an advanced landing page'));
-    return { result, gates: jev.calls.filter(c => c.phase === 'evidence-gate').length };
-  };
-  const thin = await run(0.7);
-  assert.equal(thin.result.status, 'complete', thin.result.stopReason);
-  assert.equal(thin.gates, 3, 'sent back twice, accepted the third time');
-  const back = thin.result.entries.filter(e => /probably not done yet \(0\.70\)/.test(e.text));
-  assert.equal(back.length, 2);
-  assert.match(back[0]!.text, /That is missing work, not missing verification: more checks will not answer it/);
-  const full = await run(0.5);
-  assert.equal(full.result.status, 'complete', full.result.stopReason);
-  assert.equal(full.gates, 1, 'below 0.6: accepted at once');
-});

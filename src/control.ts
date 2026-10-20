@@ -305,10 +305,6 @@ export function fitGateState(state: Record<string, any>, limit = 21000): void {
       state.observation = { ...state.observation, facts: clip(String(state.observation.facts ?? ''), n) };
   }
 }
-// The reading of requirement_unaddressed at which a finish is sent back to be built out, and how many times a session
-// is sent back for it.
-const thinAt = 0.6;
-const scopeReviews = 2;
 export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Promise<GateVerdict> {
   const clauses = objectiveClauses(s.objective);
   const observation =
@@ -358,45 +354,34 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     weakest === 'observation' &&
     weakestP >= 0.5 &&
     (facts.observationState === 'never' || facts.observationState === 'stale');
-  // A requirement Jev reads as probably unaddressed sends the finish back to be built out, at most scopeReviews times
-  // in a session, after which the readings above decide. Accepted finishes on Claude Haiku 5.5 read 0.64 to 0.72 here,
-  // their pages about half the text of the other harnesses'; on GLM-5.3, with full pages, 0.29 to 0.55.
-  const thin = unaddressed >= thinAt && (s.scopeRejections ?? 0) < scopeReviews;
   const accepted =
     facts_ok &&
     !observationBroken &&
     !observationMissing &&
-    !thin &&
     route !== 'human' &&
     !weak.length &&
     (route === 'deterministic_only' ? matches >= 0.6 : matches >= 0.75 && supported >= 0.6);
   // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
+  // requirement_unaddressed decides nothing here: sending a finish back at 0.6 or more (at most twice) made Claude
+  // Haiku 5.5 runs 3 to 5 times dearer and slower, every run sent back twice, for pages 10 to 30% longer, and the reading
+  // stayed above 0.6 after the rebuilds.
   const humanReview =
-    route === 'human' &&
-    facts_ok &&
-    !observationBroken &&
-    !observationMissing &&
-    !thin &&
-    !weak.length &&
-    matches >= 0.6;
-  if (thin && facts_ok && !observationBroken && !observationMissing) s.scopeRejections = (s.scopeRejections ?? 0) + 1;
+    route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && matches >= 0.6;
   const reason = !facts_ok
     ? 'the verification did not pass after the last edit'
     : observationMissing
       ? `Jev reads the observation as the weakest evidence (${weakestP.toFixed(2)}) and the result ${facts.observationState === 'never' ? 'has never been observed' : 'has not been observed since the last write'}: observe it as its user meets it and act on what that shows before finishing`
       : observationBroken
         ? `the last observation (${obs!.kind} ${obs!.target ?? ''}) failed: ${clip(String(obs!.facts ?? ''), 300)}`
-        : thin
-          ? `Jev reads part of what the objective asks as probably not done yet (${unaddressed.toFixed(2)})${weak.length ? `, these parts most: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}` : ''}. That is missing work, not missing verification: more checks will not answer it. Reread the objective word by word, and for each thing it asks for or implies (every feature, section, quality or practice it names, and what "advanced", "complete" or "best practices" would mean to its user), find where the result delivers it. Build what is absent or thin, then verify and observe it, and finish again`
-          : humanReview
-            ? 'Jev routes this completion to the user'
-            : accepted
-              ? "the facts and Jev's reading agree"
-              : weak.length
-                ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}`
-                : `Jev reads the change as ${matches < 0.75 ? 'not implementing the request' : ''}${supported < 0.6 ? ' not supported by the facts' : ''}`
-                    .replace(/\s+/g, ' ')
-                    .trim();
+        : humanReview
+          ? 'Jev routes this completion to the user'
+          : accepted
+            ? "the facts and Jev's reading agree"
+            : weak.length
+              ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}`
+              : `Jev reads the change as ${matches < 0.75 ? 'not implementing the request' : ''}${supported < 0.6 ? ' not supported by the facts' : ''}`
+                  .replace(/\s+/g, ' ')
+                  .trim();
   // A rejection says where Jev reads the gap, with the fact itself, so the worker acts on it rather than guessing.
   const pointer =
     accepted || humanReview || !facts_ok || observationBroken || observationMissing || !weakest

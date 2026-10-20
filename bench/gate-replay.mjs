@@ -6,7 +6,7 @@
 //
 // Good finishes: every gate request in the suites' Leana trials whose check passed and whose result was observed
 // working. Flawed finishes: copies of some of them with a real flaw (the objective names a feature none of them has;
-// the summary claims a feature that is not there; the source is a stub). Jev answers a state the same way each time
+// the summary claims a feature that is not there; the source is a stub; the objective asks for something else). Jev answers a state the same way each time
 // (within about 0.01), so a difference between two builds is the presentation's. A stale observation is taken as
 // made again, as the gate now does. Needs TYPESAFE_API_KEY; about two Jev calls per request, a few cents per run.
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -108,18 +108,25 @@ const flawed = [];
 const plain = good.filter(
   c => !/roi|calculator|stripe|checkout/i.test(JSON.stringify(c.facts.sources) + c.facts.summary),
 );
-const every = Math.max(1, Math.floor(plain.length / 24));
+const every = Math.max(1, Math.floor(plain.length / 32));
 plain
   .filter((_, i) => i % every === 0)
-  .slice(0, 24)
+  .slice(0, 32)
   .forEach((c, k) => {
-    if (k % 3 === 0)
+    if (k % 4 === 3)
+      flawed.push({
+        ...c,
+        kind: 'wrong thing',
+        objective:
+          'build a REST API in Go for inventory management, with endpoints to add, list and remove stock items',
+      });
+    if (k % 4 === 0)
       flawed.push({
         ...c,
         kind: 'missing feature',
         objective: `${c.objective}, including an interactive ROI calculator`,
       });
-    if (k % 3 === 1)
+    if (k % 4 === 1)
       flawed.push({
         ...c,
         kind: 'unsupported claim',
@@ -128,7 +135,7 @@ plain
           summary: `${c.facts.summary}\n\nIt also includes a working Stripe checkout and an interactive ROI calculator, both tested.`,
         },
       });
-    if (k % 3 === 2)
+    if (k % 4 === 2)
       flawed.push({
         ...c,
         kind: 'stub',
@@ -152,10 +159,10 @@ function verdict(a, observationState) {
   const weakest = a.weakest_evidence?.choice;
   const wp = a.weakest_evidence?.probabilities?.[weakest] ?? 0;
   if (weakest === 'observation' && wp >= 0.5 && ['stale', 'never'].includes(observationState)) return 'reject';
-  const m = a.implementation_matches_request.noul;
-  const route = a.verification_needed.choice;
-  if (route === 'human') return m >= 0.6 ? 'person' : 'reject';
-  return (route === 'deterministic_only' ? m >= 0.6 : m >= 0.75 && a.claim_supported.noul >= 0.6) ? 'accept' : 'reject';
+  // The named thing delivered and the summary supported; a reading that passes and that Jev routes to the user goes
+  // to the user. How advanced it is (quality) decides nothing.
+  if (a.implementation_matches_request.noul < 0.5 || a.claim_supported.noul < 0.6) return 'reject';
+  return a.verification_needed.choice === 'human' ? 'person' : 'accept';
 }
 async function judge(c) {
   const observation =

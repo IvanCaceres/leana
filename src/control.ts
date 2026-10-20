@@ -139,15 +139,25 @@ export interface GateFacts {
   requirements: string[];
   sources: unknown;
 }
-// The wording is measured, not chosen: on 90 replayed finishes "what `objective` and its requirements ask for" (with no
-// requirements in the state) accepted 63, "what `objective` asks for" 75; "its observation as its user meets it, or
-// the absence of one" 58 against "its observation" 75. Neither let any of 24 flawed copies through. Requirements the
-// repository states are named only when there are some (evidenceGate).
+// The wording is measured, not chosen (bench/gate-replay.mjs): "and its requirements" with none in the state, or "its
+// observation ..., or the absence of one", each cost 12 to 17 of 90 good finishes; requirements the repository states
+// are named only when there are some (evidenceGate). implementation_matches_request asks what can be settled, whether
+// the named thing was delivered; how advanced or polished it is goes to quality, a score that decides nothing.
 export const gateQuestions: Questions = {
   implementation_matches_request: {
     type: 'noul',
     instructions:
-      'Does `result` (its files, its check and its observation) implement what `objective` asks for, as opposed to something adjacent, partial, broken or invented? Items in `workerReport.notDoneOrUntested` count only when the objective asks for that thing.',
+      '`result` (its files, its check and its observation) delivers what `objective` names: the kind of thing to build, what it is for, and every feature or technology the objective names. Judge only what is named; leave words of quality such as advanced, modern or best practices aside. Items in `workerReport.notDoneOrUntested` count only when the objective names that thing.',
+  },
+  quality: {
+    type: 'score',
+    instructions:
+      'How fully does `result` show the qualities `objective` asks for in words such as advanced, modern, polished or best practices? Judge only those qualities, not whether named things exist.',
+    criteria: [
+      'A starter or template-level result: the minimum that works, defaults throughout, nothing beyond what is required.',
+      'A complete, coherent result: everything expected of its kind is there and consistent, built with current tools on a sound structure.',
+      'A showcase result: well beyond the minimum in craft and care (thoughtful details, robustness, accessibility or performance where they apply), with well organised code and current libraries used well.',
+    ],
   },
   requirement_unaddressed: {
     type: 'noul',
@@ -191,6 +201,9 @@ export interface GateVerdict {
   reason: string;
   // Jev's reading of each clause of the objective, least addressed first (the gate of a change).
   clauses?: { clause: string; p: number }[];
+  // How fully the result shows the qualities the objective asks for (advanced, best practices), 0 to 2: reported,
+  // never a reason to reject (the gate of a change).
+  quality?: number;
 }
 // A finish with nothing written, checked or observed is an answer, not a change: there is no result
 // to verify or to observe, and the files it rests on are the ones the worker read, not ones it wrote. It is
@@ -400,7 +413,10 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
             ...gateQuestions.implementation_matches_request!,
             instructions: (
               gateQuestions.implementation_matches_request as { instructions: string }
-            ).instructions.replace('what `objective` asks for', 'what `objective` and `requirements` ask for'),
+            ).instructions.replace(
+              'delivers what `objective` names',
+              'delivers what `objective` and `requirements` name',
+            ),
           },
         }
       : {}),
@@ -436,19 +452,24 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     weakest === 'observation' &&
     weakestP >= 0.5 &&
     (facts.observationState === 'never' || facts.observationState === 'stale');
-  const accepted =
-    facts_ok &&
-    !observationBroken &&
-    !observationMissing &&
-    route !== 'human' &&
-    !weak.length &&
-    (route === 'deterministic_only' ? matches >= 0.6 : matches >= 0.75 && supported >= 0.6);
-  // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
+  // A finish passes on what can be settled: the result delivers what the objective names (matches, now asked of
+  // that alone), and the worker's summary is supported by it. How advanced or polished it is (quality, a score) is a
+  // matter of taste, read and reported but never a reason to send the worker back: asked as one question with the
+  // rest, it held working results near 0.7 against a bar of 0.75, and the worker went back, added checks, and was
+  // read near 0.7 again (Claude Haiku 5.5: two of six runs 2 to 3 minutes longer for it). Replayed, the named-delivery
+  // reading is 0.72 on good finishes (none under 0.57) and 0.01 to 0.11 on a missing feature, a stub or the wrong
+  // thing built; at 0.5, 78 of 90 good finishes passed against 75, none of 32 flawed ones. The user's review stays
+  // for a reading that would otherwise pass: without it one unsupported claim passed.
   // requirement_unaddressed decides nothing here: sending a finish back at 0.6 or more (at most twice) made Claude
   // Haiku 5.5 runs 3 to 5 times dearer and slower, every run sent back twice, for pages 10 to 30% longer, and the reading
   // stayed above 0.6 after the rebuilds.
+  const delivered = matches >= 0.5 && supported >= 0.6;
+  const accepted =
+    facts_ok && !observationBroken && !observationMissing && route !== 'human' && !weak.length && delivered;
+  // A clear rejection is the worker's to act on; only a reading that would otherwise pass is sent to the user.
   const humanReview =
-    route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && matches >= 0.6;
+    route === 'human' && facts_ok && !observationBroken && !observationMissing && !weak.length && delivered;
+  const quality = a.quality?.type === 'score' ? a.quality.score : undefined;
   const reason = !facts_ok
     ? 'the verification did not pass after the last edit'
     : observationMissing
@@ -461,9 +482,16 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
             ? "the facts and Jev's reading agree"
             : weak.length
               ? `Jev reads these parts of the objective as not addressed: ${weak.map(x => `"${x.c}" (${x.p.toFixed(2)})`).join('; ')}`
-              : `Jev reads the change as ${matches < 0.75 ? 'not implementing the request' : ''}${supported < 0.6 ? ' not supported by the facts' : ''}`
-                  .replace(/\s+/g, ' ')
-                  .trim();
+              : [
+                  matches < 0.5
+                    ? `Jev reads the result as not delivering what the objective names (${matches.toFixed(2)})`
+                    : '',
+                  supported < 0.6
+                    ? `Jev reads the summary as claiming more than the result shows (${supported.toFixed(2)})`
+                    : '',
+                ]
+                  .filter(Boolean)
+                  .join('; ');
   // A rejection says where Jev reads the gap, with the fact itself, so the worker acts on it rather than guessing.
   const pointer =
     accepted || humanReview || !facts_ok || observationBroken || observationMissing || !weakest
@@ -500,6 +528,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
         route: 'rejected',
         reason: `Jev's focused reading of the ${weakest} alone is that it does not show the work done (${focus.toFixed(2)}): ${weakestFact(weakest, facts)}`,
         clauses: readings,
+        ...(quality !== undefined ? { quality } : {}),
       };
   }
   return {
@@ -510,6 +539,7 @@ export async function evidenceGate(jev: Jev, s: Session, facts: GateFacts): Prom
     route: humanReview ? 'human' : accepted ? route : 'rejected',
     reason: reason + pointer,
     clauses: readings,
+    ...(quality !== undefined ? { quality } : {}),
   };
 }
 // The focused question per kind of evidence: judged by that evidence alone.

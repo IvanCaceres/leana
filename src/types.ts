@@ -71,11 +71,15 @@ export interface Deliverable {
   placement?: string;
 }
 export type Phase = 'inspect' | 'implement' | 'verify';
+// A score's criteria are its levels, low to high; its answer is the probability-weighted level, 0 to the top level.
 export type Question =
-  { type: 'noul'; instructions: string } | { type: 'choice'; instructions: string; criteria: Record<string, string> };
+  | { type: 'noul'; instructions: string }
+  | { type: 'choice'; instructions: string; criteria: Record<string, string> }
+  | { type: 'score'; instructions: string; criteria: string[] };
 export type Answer =
   | { type: 'noul'; noul: number }
-  | { type: 'choice'; choice: string; probabilities: Record<string, number>; confidence: number };
+  | { type: 'choice'; choice: string; probabilities: Record<string, number>; confidence: number }
+  | { type: 'score'; score: number; probabilities: Record<string, number>; confidence: number };
 export type Questions = Record<string, Question>;
 export type Answers = Record<string, Answer>;
 export interface Task {

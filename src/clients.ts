@@ -193,7 +193,7 @@ export function validateAnswers(questions: Questions, raw: unknown): Answers {
     if (!a || a.type !== q.type) throw new Error(`Jev: mismatched answer ${id}`);
     if (a.type === 'noul') {
       if (!probability(a.noul)) throw new Error(`Jev: invalid Noul ${id}`);
-    } else if (q.type === 'choice') {
+    } else if (q.type === 'choice' && a.type === 'choice') {
       if (
         !Object.hasOwn(q.criteria, a.choice) ||
         !probability(a.confidence) ||
@@ -210,6 +210,14 @@ export function validateAnswers(questions: Questions, raw: unknown): Answers {
       // is reconciled to the argmax rather than failing the whole step.
       const top = Object.entries(a.probabilities).sort((x, y) => y[1] - x[1])[0]![0];
       if (a.probabilities[top]! > a.probabilities[a.choice]! + 1e-6) a.choice = top;
+    } else if (q.type === 'score' && a.type === 'score') {
+      // Levels by number, 0 to the top one; the score is their probability-weighted mean.
+      const top = q.criteria.length - 1;
+      if (typeof a.score !== 'number' || !(a.score >= 0 && a.score <= top + 1e-6) || !probability(a.confidence))
+        throw new Error(`Jev: invalid Score ${id}`);
+      const levels = q.criteria.map((_, i) => String(i));
+      if (!a.probabilities || levels.some(k => !probability(a.probabilities[k])))
+        throw new Error(`Jev: invalid distribution ${id}`);
     }
   }
   return answers;

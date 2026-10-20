@@ -7350,7 +7350,7 @@ test("The completion gate shows Jev the worker's own list of what it did not do 
   assert.equal(withNotes!.state.workerReport.notDoneOrUntested, '- no backend is wired up');
   assert.match(
     withNotes!.questions.implementation_matches_request.instructions,
-    /Items in `workerReport\.notDoneOrUntested` count only when the objective asks for that thing\.$/,
+    /Items in `workerReport\.notDoneOrUntested` count only when the objective names that thing\.$/,
   );
   assert.match(withNotes!.questions.requirement_unaddressed.instructions, /only when the objective asks for it\.$/);
   assert.equal(without!.state.workerReport.notDoneOrUntested, undefined, 'a summary without notes has none');
@@ -7403,4 +7403,46 @@ test('A finish whose last observation was made before the last write is judged o
   const gate = jev.calls.find(c => c.phase === 'evidence-gate')!;
   assert.equal(gate.state.result.observation.state, 'current', 'judged on the observation made again');
   assert.equal(gate.state.result.observation.afterLastWrite, true);
+});
+
+test('The gate passes a finish on what can be settled, the named thing delivered and the summary supported, and reports how advanced it is without rejecting on it; a clear miss is rejected with its reason (Claude Haiku 5.5: working results read near 0.7 on one question that mixed both, against a bar of 0.75)', async () => {
+  const { evidenceGate } = await import('../src/control.js');
+  const s = await newSession(await mkdtemp(join(tmpdir(), 'leana-gate-')), 'Build an advanced landing page');
+  const facts = {
+    summary: 'Built the page.',
+    changedFiles: ['src/App.tsx'],
+    diffStat: '',
+    observation: { kind: 'program', step: 3, afterLastWrite: true, ok: true, target: 'node app.mjs', facts: 'ran' },
+    observationState: 'current' as const,
+    verification: { command: 'npm run build', ok: true, afterLastWrite: true, exitCode: 0, text: 'built' },
+    requirements: [],
+    sources: {},
+  };
+  const judged = (delivered: number, supported: number) => {
+    const j = jevOf({
+      gate: {
+        implementation_matches_request: delivered,
+        claim_supported: supported,
+        verification_needed: 'semantic_review',
+        weakest_evidence: 'summary',
+      } as any,
+    });
+    return {
+      decide: async (st: any, q: any, c: any) => {
+        const a = await j.decide(st, q, c);
+        return c.phase === 'evidence-gate'
+          ? { ...a, quality: { type: 'score', score: 1.4, confidence: 0.6, probabilities: { 0: 0.1, 1: 0.4, 2: 0.5 } } }
+          : a;
+      },
+    };
+  };
+  const probably = await evidenceGate(judged(0.65, 0.8) as any, s, facts);
+  assert.equal(probably.accepted, true, 'a working result read as probably delivered passes');
+  assert.equal(probably.quality, 1.4, 'and how advanced it is, reported');
+  const missed = await evidenceGate(judged(0.3, 0.8) as any, s, facts);
+  assert.equal(missed.accepted, false);
+  assert.match(missed.reason, /^Jev reads the result as not delivering what the objective names \(0\.30\)/);
+  const claimed = await evidenceGate(judged(0.8, 0.4) as any, s, facts);
+  assert.equal(claimed.accepted, false);
+  assert.match(claimed.reason, /^Jev reads the summary as claiming more than the result shows \(0\.40\)/);
 });

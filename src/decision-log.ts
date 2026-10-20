@@ -27,7 +27,11 @@ export function decisionLog(type: string, data: any, at: string): string {
     for (const [id, a] of Object.entries(data.answers as Answers)) {
       if (a.type === 'noul') lines.push(`- ${id}: P(yes) = ${a.noul}`);
       else {
-        lines.push(`- ${id}: selected ${a.choice}; confidence = ${a.confidence}`);
+        lines.push(
+          a.type === 'score'
+            ? `- ${id}: score ${a.score}; confidence = ${a.confidence}`
+            : `- ${id}: selected ${a.choice}; confidence = ${a.confidence}`,
+        );
         for (const [option, p] of Object.entries(a.probabilities).sort((a, b) => b[1] - a[1]))
           lines.push(`  - ${option}: ${p}`);
       }

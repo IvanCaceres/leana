@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { readFile, realpath, stat } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { loadConfig, loadSettings } from './config.js';
@@ -22,6 +24,7 @@ const usage = `Leana — a coding agent: the model reasons and acts, Jev guards 
   leana model [--model id]                what the model is and the options it takes
   leana report session-directory [--follow]
   leana doctor
+  leana --version
 
 Model:   --provider llama|openrouter, --model ID, --reasoning on|off, --file-reasoning on|off,
          --effort LEVEL, --reasoning-budget N  (only what the model takes is accepted; see leana model)
@@ -56,6 +59,7 @@ async function main(): Promise<void> {
       'max-steps': { type: 'string' },
       message: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
+      version: { type: 'boolean' },
       'allow-dirty': { type: 'boolean' },
       unattended: { type: 'boolean' },
       verbose: { type: 'boolean', short: 'v' },
@@ -71,6 +75,11 @@ async function main(): Promise<void> {
     },
   });
   const [command, ...rest] = positionals;
+  if (v.version) {
+    // package.json sits two levels up from dist/src, in the repository and in the installed package alike.
+    console.log(JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8')).version);
+    return;
+  }
   if (v.help || (!command && !process.stdin.isTTY)) {
     console.log(usage);
     return;
@@ -283,7 +292,17 @@ async function main(): Promise<void> {
   );
   if (r.status !== 'complete') process.exitCode = 2;
 }
-if (process.argv[1] && import.meta.url === new URL(`file://${resolve(process.argv[1])}`).href)
+// Run only when started as the program, not when imported. A global npm install starts it through a link (a
+// symlink in the bin directory on macOS and Linux), so the path it was started by is resolved as Node resolves
+// the module's own.
+const startedAs = (() => {
+  try {
+    return process.argv[1] ? pathToFileURL(realpathSync(process.argv[1])).href : null;
+  } catch {
+    return null;
+  }
+})();
+if (import.meta.url === startedAs)
   main().catch(e => {
     console.error(`Leana: ${(e as Error).message}`);
     process.exitCode = 1;

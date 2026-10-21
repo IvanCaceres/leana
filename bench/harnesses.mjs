@@ -71,6 +71,11 @@ const { values: args } = parseArgs({
 const scenario = args.resume
   ? JSON.parse(readFileSync(join(resolve(args.resume), 'suite.json'), 'utf8')).scenario
   : JSON.parse(readFileSync(args.scenario, 'utf8'));
+// The one OpenRouter endpoint every harness's requests go to (the scenario's endpoint), fallbacks off: wall time then
+// measures the harness, not where OpenRouter routed it. With an order and fallbacks on, one GLM-5.3 trial of Leana's
+// went to an endpoint generating 34 tokens a second while the other harnesses' trials in its round got one at 205.
+// A request the endpoint cannot serve fails, and the harness sees it, rather than going quietly to another.
+const pinned = scenario.endpoint ? { order: [scenario.endpoint], allow_fallbacks: false } : null;
 const key = process.env.OPENROUTER_API_KEY;
 if (!key) throw new Error('Set OPENROUTER_API_KEY: every harness is pointed at OpenRouter with this key.');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -327,7 +332,9 @@ function referenceOf(rs) {
     }
     return JSON.parse([...n].sort((a, b) => b[1] - a[1])[0][0]);
   };
-  return Object.fromEntries(Object.entries(compared).map(([k, f]) => [k, mode(f)]));
+  const ref = Object.fromEntries(Object.entries(compared).map(([k, f]) => [k, mode(f)]));
+  if (pinned) ref.provider = pinned;
+  return ref;
 }
 // What a trial's requests carried, how many the proxy changed and what the harness had asked for there, the endpoints
 // that served them, and every way they differ from the reference.
@@ -399,6 +406,12 @@ const asLeana = (ref, session) => body => {
   if (body.session_id === undefined) set('session_id', session);
   return changed;
 };
+// Leana's own requests set to the pinned endpoint: they are the reference the other harnesses are set to.
+const pinTo = provider => body => {
+  if (JSON.stringify(body.provider) === JSON.stringify(provider)) return [];
+  body.provider = provider;
+  return ['provider'];
+};
 // A recording proxy for a trial, its rewrite to the reference when one is given.
 const proxyFor = (trial, rewrite) => startProxy(join(trial, 'requests.jsonl'), rewrite);
 
@@ -408,9 +421,10 @@ const harnesses = {
   leana: {
     version: () =>
       JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version + ` (${git('rev-parse --short HEAD')})`,
-    // Through the proxy too, unchanged: what it sends is recorded the same way, and becomes the round's reference.
+    // Through the proxy too, unchanged but for the pinned endpoint: what it sends is recorded the same way, and becomes
+    // the round's reference.
     async prepare(s, repo, trial) {
-      const proxy = await proxyFor(trial, null);
+      const proxy = await proxyFor(trial, pinned ? pinTo(pinned) : null);
       const config = join(trial, 'leana-config.json');
       writeFileSync(config, JSON.stringify({ openrouterUrl: proxy.url }, null, 2));
       return { proxy, config };
@@ -1263,7 +1277,7 @@ const trialGrid = [
 ];
 const describe = ref =>
   ref
-    ? `effort ${ref.effort ?? 'none'}, temperature ${ref.temperature ?? 'none'}, top_p ${ref.top_p ?? 'none'}, top_k ${ref.top_k ?? 'none'}, output cap ${ref.maxTokens ?? 'none'}, endpoints ${ref.provider?.order?.join(' > ') ?? "OpenRouter's choice"}${ref.provider?.allow_fallbacks ? ' (then any other)' : ''}`
+    ? `effort ${ref.effort ?? 'none'}, temperature ${ref.temperature ?? 'none'}, top_p ${ref.top_p ?? 'none'}, top_k ${ref.top_k ?? 'none'}, output cap ${ref.maxTokens ?? 'none'}, endpoints ${ref.provider?.order?.join(' > ') ?? "OpenRouter's choice"}${ref.provider?.allow_fallbacks ? ' (then any other)' : ref.provider?.order ? ' (that endpoint only, fallbacks off)' : ''}`
     : 'none recorded';
 const references = distinct(results.map(r => r.reference).filter(Boolean));
 const settingLines = chosen.map(name => {

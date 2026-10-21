@@ -215,6 +215,8 @@ Several other settings also decide what a request does, where it runs and what i
 
 The endpoint order changes as prices and availability change. One run put `relace` first, another `wafer/us`. That's why the reference is taken again in every round.
 
+**One endpoint for every harness.** When the scenario names an `endpoint`, every request every harness sends goes to that endpoint alone, with fallbacks off (`provider: { order: [endpoint], allow_fallbacks: false }`). That includes Leana's own requests, which the proxy sets to it. Otherwise, OpenRouter can route each run to a different provider of the same model, and wall time measures the endpoint as much as the harness: in one GLM-5.3 round, Leana's requests went to an endpoint generating 34 tokens a second while the other harnesses' went to one generating 205. A request the pinned endpoint can't serve fails, and the harness sees the failure instead of being moved to another provider. `bench/scenario.json` pins `wafer/us` for GLM-5.3, and `bench/scenario-haiku.json` pins `google-vertex/global` for Claude Haiku 5.5.
+
 How each harness is given these settings:
 
 - **Leana** goes through the recording proxy (`bench/proxy.mjs`) unchanged, so its requests are recorded the same way as the others'.

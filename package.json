@@ -30,6 +30,7 @@
   },
   "files": [
     "dist/src",
+    "!dist/src/**/*.map",
     "LICENSE",
     "README.md"
   ],
@@ -38,6 +39,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
     "test:live": "npm run build && node dist/src/live-test.js",
@@ -45,7 +47,7 @@
     "bench:harnesses": "npm run build && node bench/harnesses.mjs",
     "bench:gate-replay": "npm run build && node bench/gate-replay.mjs",
     "start": "node dist/src/cli.js",
-    "prepublishOnly": "npm test",
+    "prepublishOnly": "npm run clean && npm test",
     "format": "prettier --write src test",
     "format:check": "prettier --check src test"
   },

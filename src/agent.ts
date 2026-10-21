@@ -172,6 +172,14 @@ const readIfPresent = (root: string, path: string): Promise<string | null> =>
     .then(f => readFile(f, 'utf8'))
     .catch(() => null);
 
+// The user's words join the objective, during a run or as a resume's message. The check that passed before them
+// cannot speak for what they ask, so the harness proposes no finish on it: the worker finishes, with its answer
+// or with the new work checked. (A question asked after a run that had completed was otherwise closed at once by
+// the harness, on the old check, with the worker's old notes as the outcome and no answer.)
+export function joinObjective(s: Session, text: string): void {
+  s.objective += `\nUser update: ${text}`;
+  if (s.lastCheck) s.finishTriedAtCheck = s.lastCheck.step;
+}
 export async function newSession(root: string, objective: string): Promise<Session> {
   if (!objective.trim() || Buffer.byteLength(objective) > 6000)
     throw new Error('Objective must be 1..6000 UTF-8 bytes');
@@ -1629,7 +1637,7 @@ export class Agent {
   private async takeGuidance(s: Session): Promise<string[]> {
     const given = this.guidance.splice(0);
     for (const text of given) {
-      s.objective += `\nUser update: ${text}`;
+      joinObjective(s, text);
       await this.store.log('guidance', { step: s.step, text });
       this.observe({ kind: 'guidance', step: s.step, text });
     }

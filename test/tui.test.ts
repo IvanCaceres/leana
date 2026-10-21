@@ -168,6 +168,30 @@ test('A frame rewrites only the rows that changed, in one write, and the termina
   assert(writes.at(-1)!.includes('\x1b[?1049l'), 'the shell screen is back');
 });
 
+test('A long first line kept whole in the body is not repeated there when the title shows all of it', () => {
+  const block = (title: string) => ({
+    id: 1,
+    tone: 'info' as const,
+    title,
+    body: [title],
+    collapsed: false,
+    preview: 8,
+    version: 0,
+  });
+  const fits = 'Session: C:\\Users\\someone\\.local\\state\\leana\\repo-1234\\runs\\2026-10-21T16-13-29-733Z-ce815d4b';
+  assert.equal(
+    renderBlock(block(fits), 140, false, plain).filter(r => r.includes('ce815d4b')).length,
+    1,
+    'shown once, as the title',
+  );
+  const long = `COMPLETE: ${'word '.repeat(40).trim()}`;
+  const rows = renderBlock(block(long), 80, false, plain);
+  assert(
+    rows.length > 2 && rows.slice(1).join(' ').includes('word word'),
+    'a title cut at the width keeps the whole line below',
+  );
+});
+
 test('The mouse is left to the terminal, so text on the screen can be selected and copied; with the mouse on, the wheel scrolls', () => {
   const { term, writes } = fakeTerminal();
   term.enter(

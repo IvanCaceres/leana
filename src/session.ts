@@ -9,7 +9,7 @@ import type { Config, Log, Session } from './types.js';
 import { Bonsai, Jev } from './clients.js';
 import { OpenRouter } from './openrouter.js';
 import { describeModel, effortsOf, fitToModel, nearestEffort, unsupportedSettings, type ModelInfo } from './models.js';
-import { Agent, newSession } from './agent.js';
+import { Agent, joinObjective, newSession } from './agent.js';
 import { Store, runsDir, stateDir } from './store.js';
 import { runCommand } from './commands.js';
 import { Display, type RunView, type RunViewOptions, type Usage } from './display.js';
@@ -158,7 +158,7 @@ export async function runSession(req: RunRequest): Promise<RunOutcome> {
     const note = `\nRecovery note: ${session.stopReason}`;
     if (session.stopReason && !session.instructions.endsWith(note)) session.instructions += note;
     const update = `\nUser update: ${req.message}`;
-    if (req.message && !session.objective.includes(update)) session.objective += update;
+    if (req.message && !session.objective.includes(update)) joinObjective(session, req.message);
     if (Buffer.byteLength(session.objective) > 6000 || Buffer.byteLength(session.instructions) > 12000)
       throw new Error('Resumed pinned context exceeds budget');
   } else {
@@ -243,6 +243,10 @@ export async function runSession(req: RunRequest): Promise<RunOutcome> {
     await unlink(lockPath);
   }
 }
+// How a session ended, as one line: its status, then what it ended with, the status not said twice.
+export const endingLine = (s: Session): string =>
+  `${s.status.toUpperCase()}: ${(s.outcome ?? s.stopReason).replace(new RegExp(`^${s.status}:\\s*`, 'i'), '')}`;
+export const stepsOf = (n: number): string => `${n} step${n === 1 ? '' : 's'}`;
 export const elapsed = (ms: number): string => {
   const sec = Math.round(ms / 1000);
   return sec >= 60 ? `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s` : `${sec}s`;

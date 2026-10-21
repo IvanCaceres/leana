@@ -1206,6 +1206,8 @@ test('In the app, what is typed after a run continues that session; /new starts 
         const { objective, sessionDir, message, allowDirty } = req;
         calls.push({ objective, sessionDir, message, allowDirty });
         const path = sessionDir ?? join(runsDir(repo), `s${++made}`);
+        req.out?.(`Session: ${path}`);
+        req.out?.('Model: openrouter m');
         await mkdir(path, { recursive: true });
         await writeFile(join(repo, 'page.html'), `<p>${calls.length}</p>`);
         await writeFile(
@@ -1228,8 +1230,16 @@ test('In the app, what is typed after a run continues that session; /new starts 
     return said.join('\n');
   };
   const s1 = join(runsDir(repo), 's1');
-  assert.match(await say(first, 'build a page'), /COMPLETE: Done[\s\S]*What you type next continues this session/);
-  assert.match(await say(first, 'add a footer'), /COMPLETE: Done/, 'a follow-up runs, over the changes the run left');
+  assert.match(
+    await say(first, 'build a page'),
+    /Session: [\s\S]*Model: openrouter m[\s\S]*COMPLETE: Done[\s\S]*What you type next continues this session/,
+  );
+  const followed = await say(first, 'add a footer');
+  assert.match(followed, /COMPLETE: Done/, 'a follow-up runs, over the changes the run left');
+  assert(
+    !said.includes(`Session: ${s1}`) && !said.includes('Model: openrouter m'),
+    `the session and model, unchanged, are not announced again: ${said.join(' | ')}`,
+  );
   assert.deepEqual(calls[1], { objective: undefined, sessionDir: s1, message: 'add a footer', allowDirty: undefined });
   assert.match(await say(first, '/status'), new RegExp(`session +${s1.replace(/\\/g, '\\\\')}`));
 

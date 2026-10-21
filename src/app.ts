@@ -16,7 +16,16 @@ import {
   type ModelInfo,
   type Provider,
 } from './models.js';
-import { dirtySessionConflict, elapsed, forModel, providerKey, runSession, sessionsOf } from './session.js';
+import {
+  dirtySessionConflict,
+  elapsed,
+  endingLine,
+  forModel,
+  providerKey,
+  runSession,
+  sessionsOf,
+  stepsOf,
+} from './session.js';
 import type { Agent } from './agent.js';
 import { usageLine } from './display.js';
 import type { RunView, RunViewOptions } from './display.js';
@@ -51,6 +60,8 @@ export class App {
   session: string | null = null;
   // Set by /new: the next objective starts a new session even over changes earlier sessions left uncommitted.
   private fresh = false;
+  // The lines the session's last run started with (its session, model, notes): a follow-up shows only what changed.
+  private header = new Set<string>();
   private readonly write: (text: string) => void;
   constructor(private opts: AppOptions) {
     this.settings = {
@@ -429,6 +440,8 @@ export class App {
     allowDirty?: boolean;
   }): Promise<void> {
     if (!this.opts.jevKey) throw new Error('Jev needs its key: start Leana with --key-file or TYPESAFE_API_KEY');
+    const following = what.sessionDir !== undefined && what.sessionDir === this.session;
+    if (!following) this.header.clear();
     this.running = true;
     try {
       const outcome = await (this.opts.runSession ?? runSession)({
@@ -438,13 +451,17 @@ export class App {
         started: a => {
           this.agent = a;
         },
-        out: l => this.write(l),
+        out: l => {
+          if (following && this.header.has(l)) return;
+          this.header.add(l);
+          this.write(l);
+        },
         ...(this.opts.view ? { view: this.opts.view } : {}),
       });
       const s = outcome.session;
       this.session = outcome.store.path;
       this.write(
-        `\n${s.status.toUpperCase()}: ${s.outcome ?? s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}\nSession: ${outcome.store.path}`,
+        `\n${endingLine(s)}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${stepsOf(outcome.steps)}${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}\nSession: ${outcome.store.path}`,
       );
       this.write('What you type next continues this session; /new starts another.');
     } finally {

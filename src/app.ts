@@ -277,12 +277,21 @@ export class App {
     await this.remember({ provider: name as Provider, ...(model ? { model } : {}) });
     this.info = null;
     this.write(
-      `provider: ${name}${name === 'openrouter' && !model ? '; choose a model with /models <words> and /model <id>' : ''}`,
+      `provider: ${name}${name === 'openrouter' && !model ? `; model ${(await this.config()).model} (/models <words> and /model <id> change it)` : ''}`,
     );
-    if (name === 'openrouter' && !(await this.key()))
-      this.write(
+    for (const m of await this.missingKeys()) this.write(m);
+  }
+  // The keys a run needs that are not there, each as what to do about it.
+  async missingKeys(): Promise<string[]> {
+    const out: string[] = [];
+    if (!this.opts.jevKey)
+      out.push('Jev needs a TypeSafe API key: set TYPESAFE_API_KEY, or start Leana with --key-file.');
+    const c = await this.config();
+    if (c.provider === 'openrouter' && !(await this.key(c)))
+      out.push(
         'OpenRouter needs an API key: set OPENROUTER_API_KEY, or providerKeyFile in the config to a file that holds it.',
       );
+    return out;
   }
   private async models(words: string[]): Promise<void> {
     const c = await this.config();
@@ -483,6 +492,7 @@ export async function startApp(opts: AppOptions): Promise<void> {
   });
   const c = await app.config();
   process.stdout.write(`Leana — ${c.provider}:${c.model} in ${app.repo}. Type an objective, or /help.\n`);
+  for (const m of await app.missingKeys()) process.stdout.write(`${m}\n`);
   try {
     await app.model();
   } catch (e) {
@@ -583,6 +593,10 @@ export async function startTui(opts: AppOptions): Promise<void> {
     });
     ui.start();
     ui.message(`Leana: ${c.provider}:${c.model} in ${app.repo}. Type an objective, or /help.`);
+    app
+      .missingKeys()
+      .then(missing => missing.forEach(m => ui!.message(m, 'warn')))
+      .catch(() => {});
     app.model().catch(e => ui!.message(`(model facts unavailable: ${(e as Error).message})`, 'warn'));
   });
 }

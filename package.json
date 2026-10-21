@@ -9,7 +9,6 @@
     "llm",
     "cli",
     "openrouter",
-    "llama-cpp",
     "jev",
     "typesafe"
   ],

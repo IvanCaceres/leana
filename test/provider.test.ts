@@ -1142,7 +1142,11 @@ test('The app offers and sets only what the active provider and model take, swit
     await app.handle(line);
     return said.join('\n');
   };
-  assert.match(await run('/provider openrouter'), /provider: openrouter; choose a model/);
+  assert.match(
+    await run('/provider openrouter'),
+    /provider: openrouter; model anthropic\/claude-haiku-5\.5 \(\/models <words> and \/model <id> change it\)/,
+    'OpenRouter, with its default model',
+  );
   assert.match(await run('/models gpt'), /openai\/gpt-5\.6-luna-pro/);
   assert.match(await run('/model inclusionai/ling-3.1-flash'), /model: inclusionai\/ling-3\.1-flash/);
   const opts = await run('/options');
@@ -1174,6 +1178,23 @@ test('The app offers and sets only what the active provider and model take, swit
   assert.match(await run('/allow bash on'), /bash: on \(commands run unsandboxed/);
   assert.match(await run('/nonsense'), /No command \/nonsense/);
   assert.equal(await app.handle('/quit'), 'quit');
+  // Started without keys: the app says which are missing and how to give them, before any run.
+  const orKey = process.env.OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  t.after(() => {
+    if (orKey !== undefined) process.env.OPENROUTER_API_KEY = orKey;
+  });
+  const keyless = new App({
+    base: await loadConfig(undefined, {}),
+    settings: { config: {} },
+    jevKey: '',
+    repo: join(dir, 'repo'),
+    settingsPath: join(dir, 'keyless.json'),
+  });
+  const missing = await keyless.missingKeys();
+  assert.equal(missing.length, 2);
+  assert.match(missing[0]!, /TYPESAFE_API_KEY/);
+  assert.match(missing[1]!, /OPENROUTER_API_KEY/, 'OpenRouter is the default provider');
   await writeFile(join(dir, 'x'), '');
 });
 

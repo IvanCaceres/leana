@@ -2,7 +2,7 @@
 
 **Fewer tokens. Lower cost. Faster work.**
 
-Leana is an open-source coding agent. It pairs a worker model, any model on OpenRouter or a local one through llama-server, with **Jev**, a judgment model from [TypeSafe](https://typesafe.ai). The worker writes the code; Jev watches every step and decides when the work is really done, so the worker doesn't keep going after it's finished. On the same task, with the same model and settings, Leana used the fewest tokens, cost the least and finished the fastest against Cline, OpenCode and Hermes, on both models we tested.
+Leana is an open-source coding agent. It pairs a worker model, any model on OpenRouter, with **Jev**, a judgment model from [TypeSafe](https://typesafe.ai). The worker writes the code; Jev watches every step and decides when the work is really done, so the worker doesn't keep going after it's finished. On the same task, with the same model and settings, Leana used the fewest tokens, cost the least and finished the fastest against Cline, OpenCode and Hermes, on both models we tested.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark/haiku-5.5-dark.svg">
@@ -89,7 +89,7 @@ Leana needs Node 22+ and [ripgrep](https://github.com/BurntSushi/ripgrep). On Wi
 It needs two API keys:
 
 - **TypeSafe, for Jev**, from [typesafe.ai](https://typesafe.ai). Jev's calls are 3 to 5% of a run's cost.
-- **OpenRouter, for the worker model**, from [openrouter.ai](https://openrouter.ai). Or run a local model through llama-server instead.
+- **OpenRouter, for the worker model**, from [openrouter.ai](https://openrouter.ai).
 
 Install it. The package is `leana-cli`; the command it installs is `leana`.
 
@@ -112,14 +112,7 @@ cd /path/to/repository
 leana
 ```
 
-The first time, pick OpenRouter and a model inside the app. Leana keeps the choice for next time, in `~/.config/leana/settings.json`.
-
-```text
-/provider openrouter
-/model anthropic/claude-haiku-5.5
-```
-
-Then type what you want done and press Enter. `leana doctor` checks both keys and the model.
+Type what you want done and press Enter. Leana uses Claude Haiku 5.5 through OpenRouter unless you choose another model: `/models <words>` searches them, and `/model <id>` switches. The choice is kept for next time, in `~/.config/leana/settings.json`. `leana doctor` checks both keys and the model.
 
 The worker writes files and runs shell commands with your user's privileges, unsandboxed. `/allow bash off` (or `--no-bash`) turns the shell off, and `--read-only` turns off writes too. Run it on a repository you can afford to have changed, or in a container.
 
@@ -128,7 +121,7 @@ The worker writes files and runs shell commands with your user's privileges, uns
 - **During a run,** the conversation shows each step, its results and each edit as a diff, and the status bar shows the model, steps, context, tokens and cost. Type to guide the run: your words join the objective at its next step. Ctrl-C stops it after the current step.
 - **After a run,** what you type continues the same session: ask about the work, or ask for more. `/new` starts a fresh session on top of the changes so far. `/sessions` lists the repository's sessions, and `/resume` picks one up.
 - **To copy,** drag to select text and copy it as your terminal does. PgUp and PgDn scroll, Esc returns to the end, and Tab browses the steps and folds them. `/mouse on` makes the wheel scroll instead; most terminals then select with Shift held.
-- **To change the model,** use `/models <words>` to search OpenRouter's models and `/model <id>` to switch. `/options` shows what the model takes, such as reasoning and effort, and `/set` changes it.
+- **To change the model,** use `/models <words>` to search OpenRouter's models and `/model <id>` to switch, for example `/model z-ai/glm-5.3`. `/options` shows what the model takes, such as reasoning and effort, and `/set` changes it.
 - **Other settings:** `/check <command>` sets the command that verifies the work, `/allow write|bash on|off` sets what runs may do, and `/repo <path>` switches the repository, which is kept for next time.
 - **`/help`** lists every command. Ctrl-C twice leaves.
 
@@ -144,7 +137,7 @@ leana models haiku                   # search the provider's models
 leana doctor                         # check the keys and the model
 ```
 
-Every run is a session, saved under `~/.local/state/leana` with its event log and checkpoint, so it can be resumed or reported on. `leana --help` lists every flag. For a local model, start llama-server and use `--provider llama` (or `/provider llama`).
+Every run is a session, saved under `~/.local/state/leana` with its event log and checkpoint, so it can be resumed or reported on. `leana --help` lists every flag.
 
 From source instead: `npm ci && npm run build`, then `node dist/src/cli.js` in place of `leana`, or `npm link` to put `leana` on your path.
 

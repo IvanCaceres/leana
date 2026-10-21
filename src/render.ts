@@ -11,6 +11,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { runCommand } from './commands.js';
 import { announcedElsewhere, notAnswering, startServer, type Started } from './serve.js';
 export { announcedElsewhere };
@@ -25,11 +26,18 @@ const windowsBrowsers = () =>
       join(d, 'Chromium', 'Application', 'chrome.exe'),
       join(d, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     ]);
+// On macOS they are app bundles, in /Applications or the user's own, and not on the PATH either.
+const macBrowsers = () =>
+  ['/Applications', join(homedir(), 'Applications')].flatMap(d => [
+    join(d, 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'),
+    join(d, 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
+    join(d, 'Microsoft Edge.app', 'Contents', 'MacOS', 'Microsoft Edge'),
+  ]);
 export async function findBrowser(): Promise<string | null> {
-  if (process.platform === 'win32') {
-    const at = windowsBrowsers().find(p => existsSync(p));
-    if (at) return at;
-  }
+  const installed =
+    process.platform === 'win32' ? windowsBrowsers() : process.platform === 'darwin' ? macBrowsers() : [];
+  const at = installed.find(p => existsSync(p));
+  if (at) return at;
   const r = await runCommand(
     'bash',
     [
@@ -341,7 +349,7 @@ export async function renderFacts(
   if (!browser)
     return {
       ok: false,
-      text: 'No browser is installed on this machine (chromium or google-chrome); the page cannot be rendered.',
+      text: 'No browser is installed on this machine (Chrome, Chromium or Edge); the page cannot be rendered.',
     };
   let server: Started | null = null;
   try {

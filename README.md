@@ -4,6 +4,44 @@
 
 Leana is an open-source coding agent. It pairs a worker model, any model on OpenRouter, with **Jev**, a judgment model from [TypeSafe](https://typesafe.ai). The worker writes the code; Jev watches every step and decides when the work is really done, so the worker doesn't keep going after it's finished. On the same task, with the same model and settings, Leana used the fewest tokens, cost the least and finished the fastest against Cline, OpenCode and Hermes, on both models we tested.
 
+## Quick start
+
+Leana needs Node 22+ and [ripgrep](https://github.com/BurntSushi/ripgrep). On Windows it also needs [Git for Windows](https://git-scm.com/download/win), whose bash it runs commands with.
+
+It needs two API keys:
+
+- **TypeSafe, for Jev**, from [typesafe.ai](https://typesafe.ai). Jev's calls are 3 to 5% of a run's cost.
+- **OpenRouter, for the worker model**, from [openrouter.ai](https://openrouter.ai).
+
+Install it. The package is `leana-cli`; the command it installs is `leana`.
+
+```bash
+npm install -g leana-cli
+leana --version
+```
+
+Set the keys. In PowerShell, use `$env:TYPESAFE_API_KEY = "..."` instead.
+
+```bash
+export TYPESAFE_API_KEY=...
+export OPENROUTER_API_KEY=...
+```
+
+Start the app in the repository you want to work on:
+
+```bash
+cd /path/to/repository
+leana
+```
+
+Type what you want done and press Enter. Leana uses Claude Haiku 5.5 through OpenRouter unless you choose another model: `/models <words>` searches them, and `/model <id>` switches. The choice is kept for next time, in `~/.config/leana/settings.json`. `leana doctor` checks both keys and the model.
+
+The worker writes files and runs shell commands with your user's privileges, unsandboxed. `/allow bash off` (or `--no-bash`) turns the shell off, and `--read-only` turns off writes too. Run it on a repository you can afford to have changed, or in a container.
+
+[Using the app](#using-the-app) covers follow-ups, copying and the commands; [From the command line](#from-the-command-line) covers one-off runs.
+
+## The benchmark at a glance
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark/haiku-5.5-dark.svg">
   <img alt="Claude Haiku 5.5: mean cost and wall time per run for Leana, Cline, OpenCode and Hermes" src="docs/benchmark/haiku-5.5-light.svg" width="760">
@@ -13,8 +51,6 @@ Leana is an open-source coding agent. It pairs a worker model, any model on Open
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark/glm-5.3-dark.svg">
   <img alt="GLM-5.3: mean cost and wall time per run for Leana, Cline, OpenCode and Hermes" src="docs/benchmark/glm-5.3-light.svg" width="760">
 </picture>
-
-## The benchmark at a glance
 
 Every harness built the same thing: _"build an advanced react demo landing page app for a saas startup using the latest and greatest best practices"_, from an empty folder. Each round ran every harness once, back to back, on the same model. Every request each harness sent carried the same reasoning effort, sampling, output cap and provider endpoint, and was checked for it. Cost is the OpenRouter key's usage over each trial. A trial passed if the project built, served and loaded in a headless browser with no errors.
 
@@ -81,40 +117,6 @@ It needs Cline, OpenCode and Hermes installed, and a dedicated OpenRouter key, s
 - **The prompt is laid out for caching.** It's ordered by how often each part changes, so most of every request is read from the provider's cache.
 
 The [architecture guide](docs/ARCHITECTURE.md) covers the loop, the tools, the prompt and Jev's questions in detail.
-
-## Quick start
-
-Leana needs Node 22+ and [ripgrep](https://github.com/BurntSushi/ripgrep). On Windows it also needs [Git for Windows](https://git-scm.com/download/win), whose bash it runs commands with.
-
-It needs two API keys:
-
-- **TypeSafe, for Jev**, from [typesafe.ai](https://typesafe.ai). Jev's calls are 3 to 5% of a run's cost.
-- **OpenRouter, for the worker model**, from [openrouter.ai](https://openrouter.ai).
-
-Install it. The package is `leana-cli`; the command it installs is `leana`.
-
-```bash
-npm install -g leana-cli
-leana --version
-```
-
-Set the keys. In PowerShell, use `$env:TYPESAFE_API_KEY = "..."` instead.
-
-```bash
-export TYPESAFE_API_KEY=...
-export OPENROUTER_API_KEY=...
-```
-
-Start the app in the repository you want to work on:
-
-```bash
-cd /path/to/repository
-leana
-```
-
-Type what you want done and press Enter. Leana uses Claude Haiku 5.5 through OpenRouter unless you choose another model: `/models <words>` searches them, and `/model <id>` switches. The choice is kept for next time, in `~/.config/leana/settings.json`. `leana doctor` checks both keys and the model.
-
-The worker writes files and runs shell commands with your user's privileges, unsandboxed. `/allow bash off` (or `--no-bash`) turns the shell off, and `--read-only` turns off writes too. Run it on a repository you can afford to have changed, or in a container.
 
 ## Using the app
 

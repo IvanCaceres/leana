@@ -3,11 +3,11 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Config } from './types.js';
 export const defaults: Config = {
-  provider: 'llama',
+  provider: 'openrouter',
   openrouterUrl: 'https://openrouter.ai/api/v1',
   providerKeyFile: '',
   baseUrl: 'http://127.0.0.1:8080/v1',
-  model: 'bonsai-27b',
+  model: 'anthropic/claude-haiku-5.5',
   contextWindow: 48000,
   maxTokens: 8192,
   workingTokens: 12000,

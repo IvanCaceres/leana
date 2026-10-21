@@ -1,0 +1,391 @@
+{
+  "scenario": {
+    "id": "saas-landing-haiku-5.5",
+    "prompt": "build an advanced react demo landing page app for a saas startup using the latest and greatest best practices",
+    "provider": "openrouter",
+    "model": "anthropic/claude-haiku-5.5",
+    "endpoint": "google-vertex/global",
+    "endpointNote": "Every harness's requests go to this one endpoint, fallbacks off, so wall time measures the harness and not OpenRouter's routing. Google Vertex served every request of the earlier Claude Haiku 5.5 suites.",
+    "effort": "low",
+    "effortNote": "The same task as saas-landing-glm-5.3, on Claude Haiku 5.5 at reasoning effort low. Haiku takes no top_k, so none is sent. Its cached input costs a tenth of its input, so how each harness marks its prompt for caching shows in its cost (see BENCHMARK.md, Same settings as Leana).",
+    "timeoutMinutes": 20,
+    "idleMinutes": 4
+  },
+  "runs": 6,
+  "started": "2026-10-21T02:52:46.139Z",
+  "screenshotsFromRound": 1,
+  "harnesses": {
+    "leana": {
+      "version": "0.1.0 (35aaf07)",
+      "runs": 6,
+      "passed": 6,
+      "cost": {
+        "mean": 0.011887,
+        "median": 0.010759999999999999,
+        "min": 0.009278,
+        "max": 0.017383000000000003
+      },
+      "wallSeconds": {
+        "mean": 66.09883333333335,
+        "median": 61.0465,
+        "min": 57.886,
+        "max": 85.276
+      },
+      "promptTokens": {
+        "mean": 54400.666666666664,
+        "median": 44332
+      },
+      "outputTokens": {
+        "mean": 11804.666666666666,
+        "median": 11642.5
+      },
+      "tokensFrom": "OpenRouter, through the proxy",
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.01028,
+          "wallSeconds": 62,
+          "promptTokens": 41026,
+          "outputTokens": 11347,
+          "passed": true,
+          "quality": 1.94,
+          "delivered": 0.65
+        },
+        {
+          "round": 2,
+          "cost": 0.00991,
+          "wallSeconds": 60,
+          "promptTokens": 31694,
+          "outputTokens": 11938,
+          "passed": true,
+          "quality": 1.9,
+          "delivered": 0.65
+        },
+        {
+          "round": 3,
+          "cost": 0.00928,
+          "wallSeconds": 58,
+          "promptTokens": 47638,
+          "outputTokens": 9369,
+          "passed": true,
+          "quality": 1.72,
+          "delivered": 0.63
+        },
+        {
+          "round": 4,
+          "cost": 0.01738,
+          "wallSeconds": 85,
+          "promptTokens": 100333,
+          "outputTokens": 18251,
+          "passed": true,
+          "quality": 1.94,
+          "delivered": 0.66
+        },
+        {
+          "round": 5,
+          "cost": 0.01124,
+          "wallSeconds": 58,
+          "promptTokens": 35490,
+          "outputTokens": 7953,
+          "passed": true,
+          "quality": 1.69,
+          "delivered": 0.68
+        },
+        {
+          "round": 6,
+          "cost": 0.01324,
+          "wallSeconds": 73,
+          "promptTokens": 70223,
+          "outputTokens": 11970,
+          "passed": true,
+          "quality": 1.98,
+          "delivered": 0.75
+        }
+      ],
+      "quality": {
+        "mean": 1.8616666666666666,
+        "min": 1.69,
+        "max": 1.98
+      }
+    },
+    "cline": {
+      "version": "3.0.73",
+      "runs": 6,
+      "passed": 6,
+      "cost": {
+        "mean": 0.018512999999999998,
+        "median": 0.0170615,
+        "min": 0.015016,
+        "max": 0.026992
+      },
+      "wallSeconds": {
+        "mean": 106.71300000000001,
+        "median": 97.084,
+        "min": 79.788,
+        "max": 157.525
+      },
+      "promptTokens": {
+        "mean": 364244.8333333333,
+        "median": 313974.5
+      },
+      "outputTokens": {
+        "mean": 19886.5,
+        "median": 18266
+      },
+      "tokensFrom": "OpenRouter, through the proxy",
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.0153,
+          "wallSeconds": 93,
+          "promptTokens": 266289,
+          "outputTokens": 15830,
+          "passed": true,
+          "quality": 1.77,
+          "delivered": 0.65
+        },
+        {
+          "round": 2,
+          "cost": 0.01743,
+          "wallSeconds": 100,
+          "promptTokens": 229696,
+          "outputTokens": 21983,
+          "passed": true,
+          "quality": 1.84,
+          "delivered": 0.66
+        },
+        {
+          "round": 3,
+          "cost": 0.01669,
+          "wallSeconds": 94,
+          "promptTokens": 361660,
+          "outputTokens": 15518,
+          "passed": true,
+          "quality": 1.92,
+          "delivered": 0.71
+        },
+        {
+          "round": 4,
+          "cost": 0.01502,
+          "wallSeconds": 80,
+          "promptTokens": 134127,
+          "outputTokens": 18155,
+          "passed": true,
+          "quality": 1.84,
+          "delivered": 0.66
+        },
+        {
+          "round": 5,
+          "cost": 0.01964,
+          "wallSeconds": 115,
+          "promptTokens": 455828,
+          "outputTokens": 18377,
+          "passed": true,
+          "quality": 1.79,
+          "delivered": 0.63
+        },
+        {
+          "round": 6,
+          "cost": 0.02699,
+          "wallSeconds": 158,
+          "promptTokens": 737869,
+          "outputTokens": 29456,
+          "passed": true,
+          "quality": 1.89,
+          "delivered": 0.66
+        }
+      ],
+      "quality": {
+        "mean": 1.8416666666666668,
+        "min": 1.77,
+        "max": 1.92
+      }
+    },
+    "opencode": {
+      "version": "opencode v2.0.32",
+      "runs": 6,
+      "passed": 6,
+      "cost": {
+        "mean": 0.021605833333333335,
+        "median": 0.024156,
+        "min": 0.012186,
+        "max": 0.030475
+      },
+      "wallSeconds": {
+        "mean": 143.289,
+        "median": 129.65949999999998,
+        "min": 89.144,
+        "max": 207.125
+      },
+      "promptTokens": {
+        "mean": 431400.5,
+        "median": 508149
+      },
+      "outputTokens": {
+        "mean": 25875.333333333332,
+        "median": 24571
+      },
+      "tokensFrom": "OpenRouter, through the proxy",
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.02536,
+          "wallSeconds": 141,
+          "promptTokens": 649409,
+          "outputTokens": 23951,
+          "passed": true,
+          "quality": 1.9,
+          "delivered": 0.65
+        },
+        {
+          "round": 2,
+          "cost": 0.0133,
+          "wallSeconds": 99,
+          "promptTokens": 118995,
+          "outputTokens": 17894,
+          "passed": true,
+          "quality": 1.94,
+          "delivered": 0.69
+        },
+        {
+          "round": 3,
+          "cost": 0.01219,
+          "wallSeconds": 89,
+          "promptTokens": 147201,
+          "outputTokens": 17859,
+          "passed": true,
+          "quality": 1.93,
+          "delivered": 0.65
+        },
+        {
+          "round": 4,
+          "cost": 0.02425,
+          "wallSeconds": 207,
+          "promptTokens": 530878,
+          "outputTokens": 33673,
+          "passed": true,
+          "quality": 1.98,
+          "delivered": 0.73
+        },
+        {
+          "round": 5,
+          "cost": 0.02407,
+          "wallSeconds": 118,
+          "promptTokens": 485420,
+          "outputTokens": 25191,
+          "passed": true,
+          "quality": 1.96,
+          "delivered": 0.73
+        },
+        {
+          "round": 6,
+          "cost": 0.03047,
+          "wallSeconds": 205,
+          "promptTokens": 656500,
+          "outputTokens": 36684,
+          "passed": true,
+          "quality": 1.96,
+          "delivered": 0.68
+        }
+      ],
+      "quality": {
+        "mean": 1.9450000000000003,
+        "min": 1.9,
+        "max": 1.98
+      }
+    },
+    "hermes": {
+      "version": "Hermes Agent v0.21.3 (2026.9.14) · upstream dfc28b61\r",
+      "runs": 6,
+      "passed": 6,
+      "cost": {
+        "mean": 0.023453166666666667,
+        "median": 0.022486,
+        "min": 0.015662,
+        "max": 0.03139
+      },
+      "wallSeconds": {
+        "mean": 286.73266666666666,
+        "median": 313.84400000000005,
+        "min": 96.486,
+        "max": 452.62
+      },
+      "promptTokens": {
+        "mean": 511819.5,
+        "median": 543215.5
+      },
+      "outputTokens": {
+        "mean": 19803.666666666668,
+        "median": 20114.5
+      },
+      "tokensFrom": "the harness's own report",
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.01566,
+          "wallSeconds": 96,
+          "promptTokens": 216698,
+          "outputTokens": 13141,
+          "passed": true,
+          "quality": 1.95,
+          "delivered": 0.68
+        },
+        {
+          "round": 2,
+          "cost": 0.01851,
+          "wallSeconds": 111,
+          "promptTokens": 361168,
+          "outputTokens": 19675,
+          "passed": true,
+          "quality": 1.92,
+          "delivered": 0.73
+        },
+        {
+          "round": 3,
+          "cost": 0.02365,
+          "wallSeconds": 262,
+          "promptTokens": 736466,
+          "outputTokens": 20025,
+          "passed": true,
+          "quality": 1.95,
+          "delivered": 0.69
+        },
+        {
+          "round": 4,
+          "cost": 0.03019,
+          "wallSeconds": 453,
+          "promptTokens": 670154,
+          "outputTokens": 22950,
+          "passed": true,
+          "quality": 1.94,
+          "delivered": 0.7
+        },
+        {
+          "round": 5,
+          "cost": 0.03139,
+          "wallSeconds": 433,
+          "promptTokens": 560958,
+          "outputTokens": 22827,
+          "passed": true,
+          "quality": 1.92,
+          "delivered": 0.67
+        },
+        {
+          "round": 6,
+          "cost": 0.02132,
+          "wallSeconds": 366,
+          "promptTokens": 525473,
+          "outputTokens": 20204,
+          "passed": true,
+          "quality": 1.92,
+          "delivered": 0.67
+        }
+      ],
+      "quality": {
+        "mean": 1.9333333333333333,
+        "min": 1.92,
+        "max": 1.95
+      }
+    }
+  }
+}

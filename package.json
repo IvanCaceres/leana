@@ -1,14 +1,40 @@
 {
-  "name": "leana",
+  "name": "@grandeurintelligence/leana",
   "version": "0.1.0",
-  "private": true,
-  "description": "Jev-directed coding harness for local Bonsai inference",
+  "description": "A coding agent that knows when the work is done: a worker model guarded by Jev, a judgment model",
+  "license": "Apache-2.0",
+  "keywords": [
+    "coding-agent",
+    "ai-agent",
+    "llm",
+    "cli",
+    "openrouter",
+    "llama-cpp",
+    "jev",
+    "typesafe"
+  ],
+  "homepage": "https://github.com/IvanCaceres/leana#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IvanCaceres/leana.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IvanCaceres/leana/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "bin": {
     "leana": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -19,6 +45,7 @@
     "bench:harnesses": "npm run build && node bench/harnesses.mjs",
     "bench:gate-replay": "npm run build && node bench/gate-replay.mjs",
     "start": "node dist/src/cli.js",
+    "prepublishOnly": "npm test",
     "format": "prettier --write src test",
     "format:check": "prettier --check src test"
   },

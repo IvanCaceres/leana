@@ -225,7 +225,7 @@ export async function observeResult(
   if (!(await o.available()))
     return {
       ok: false,
-      text: `The ${kind} observer cannot run on this machine${kind === 'page' ? ' (no chromium or google-chrome is installed)' : ''}.`,
+      text: `The ${kind} observer cannot run on this machine${kind === 'page' ? ' (no Chrome, Chromium or Edge is installed)' : ''}.`,
     };
   // Nothing to start and nothing accepting connections at the address: that is the whole observation.
   if (!start.trim() && (await connectionRefused(target)))

@@ -27,6 +27,7 @@ import {
   stepsOf,
 } from './session.js';
 import type { Agent } from './agent.js';
+import { runCommand } from './commands.js';
 import { usageLine } from './display.js';
 import type { RunView, RunViewOptions } from './display.js';
 import { TerminalUI } from './tui/view.js';
@@ -293,6 +294,16 @@ export class App {
       );
     return out;
   }
+  // The programs a run needs that are not on the PATH. Without ripgrep the worker's first search_codebase fails,
+  // and the run goes on reading files blind.
+  async missingTools(rg = 'rg'): Promise<string[]> {
+    const r = await runCommand(rg, ['--version'], process.cwd(), 5000).catch(() => null);
+    return r?.code === 0
+      ? []
+      : [
+          'Leana needs ripgrep (rg) to search code, and it is not on the PATH: install it (https://github.com/BurntSushi/ripgrep#installation), confirm rg --version works in this terminal, then restart Leana.',
+        ];
+  }
   private async models(words: string[]): Promise<void> {
     const c = await this.config();
     const list = await listModels(c, await this.key(c), words.join(' '));
@@ -492,7 +503,7 @@ export async function startApp(opts: AppOptions): Promise<void> {
   });
   const c = await app.config();
   process.stdout.write(`Leana — ${c.provider}:${c.model} in ${app.repo}. Type an objective, or /help.\n`);
-  for (const m of await app.missingKeys()) process.stdout.write(`${m}\n`);
+  for (const m of [...(await app.missingKeys()), ...(await app.missingTools())]) process.stdout.write(`${m}\n`);
   try {
     await app.model();
   } catch (e) {
@@ -593,9 +604,8 @@ export async function startTui(opts: AppOptions): Promise<void> {
     });
     ui.start();
     ui.message(`Leana: ${c.provider}:${c.model} in ${app.repo}. Type an objective, or /help.`);
-    app
-      .missingKeys()
-      .then(missing => missing.forEach(m => ui!.message(m, 'warn')))
+    Promise.all([app.missingKeys(), app.missingTools()])
+      .then(missing => missing.flat().forEach(m => ui!.message(m, 'warn')))
       .catch(() => {});
     app.model().catch(e => ui!.message(`(model facts unavailable: ${(e as Error).message})`, 'warn'));
   });

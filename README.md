@@ -1,8 +1,8 @@
 # Leana
 
-**A coding agent that knows when the work is done.**
+**Fewer tokens. Lower cost. Faster work.**
 
-Leana pairs a worker model, any model on OpenRouter or a local one through llama-server, with **Jev**, a judgment model from [TypeSafe](https://typesafe.ai). Jev watches every step and decides whether a finish is really finished, while the worker writes the code. On the same task, with the same model and settings, Leana finished at the lowest cost against Cline, OpenCode and Hermes on both models we tested, and the fastest on one of them.
+Leana is an open-source coding agent. It pairs a worker model, any model on OpenRouter or a local one through llama-server, with **Jev**, a judgment model from [TypeSafe](https://typesafe.ai). The worker writes the code; Jev watches every step and decides when the work is really done, so the worker doesn't keep going after it's finished. On the same task, with the same model and settings, Leana used the fewest tokens, cost the least and finished the fastest against Cline, OpenCode and Hermes, on both models we tested.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark/haiku-5.5-dark.svg">
@@ -16,52 +16,51 @@ Leana pairs a worker model, any model on OpenRouter or a local one through llama
 
 ## The benchmark at a glance
 
-Every harness built the same thing: *"build an advanced react demo landing page app for a saas startup using the latest and greatest best practices"*, from an empty folder. Each round ran every harness once, back to back, on the same model. Every request each harness sent carried the same reasoning effort, sampling, output cap and provider order, and was checked for it. Cost is the OpenRouter key's usage over each trial. A trial passed if the project built, served and loaded in a headless browser with no errors.
+Every harness built the same thing: _"build an advanced react demo landing page app for a saas startup using the latest and greatest best practices"_, from an empty folder. Each round ran every harness once, back to back, on the same model. Every request each harness sent carried the same reasoning effort, sampling, output cap and provider routing, and was checked for it. Cost is the OpenRouter key's usage over each trial. A trial passed if the project built, served and loaded in a headless browser with no errors.
 
 **Claude Haiku 5.5**: 6 rounds, all 24 trials passed
 
-| Harness | Cost per run | Wall time | Dearest / slowest run | Quality (0–2) |
-| --- | --- | --- | --- | --- |
-| **Leana** | **$0.011** | **66 s** | $0.013 / 81 s | 1.77 |
-| Cline | $0.015 | 96 s | $0.019 / 130 s | 1.80 |
-| OpenCode | $0.019 | 109 s | $0.028 / 131 s | 1.92 |
-| Hermes | $0.027 | 288 s | $0.036 / 604 s | 1.93 |
+| Harness   | Tokens in / out | Cost per run | Wall time | Dearest / slowest run | Quality (0–2) |
+| --------- | --------------- | ------------ | --------- | --------------------- | ------------- |
+| **Leana** | **68k / 10k**   | **$0.011**   | **66 s**  | $0.013 / 81 s         | 1.77          |
+| Cline     | 258k / 16k      | $0.015       | 96 s      | $0.019 / 130 s        | 1.80          |
+| OpenCode  | 348k / 20k      | $0.019       | 109 s     | $0.028 / 131 s        | 1.92          |
+| Hermes    | 751k / 24k      | $0.027       | 288 s     | $0.036 / 604 s        | 1.93          |
 
-**GLM-5.3**: 6 rounds, 23 of 24 trials passed
+**GLM-5.3**: 6 rounds, all 24 trials passed
 
-| Harness | Cost per run | Wall time | Dearest / slowest run | Quality (0–2) |
-| --- | --- | --- | --- | --- |
-| **Leana** | **$0.025** | 140 s | $0.034 / 261 s | 1.80 |
-| Cline | $0.039 | **104 s** | $0.061 / 164 s | 1.80 |
-| OpenCode | $0.055 | 182 s | $0.112 / 342 s | 1.93 |
-| Hermes | $0.078 | 153 s | $0.130 / 209 s | 1.90 |
+| Harness   | Tokens in / out | Cost per run | Wall time | Dearest / slowest run | Quality (0–2) |
+| --------- | --------------- | ------------ | --------- | --------------------- | ------------- |
+| **Leana** | **88k / 10k**   | **$0.022**   | **88 s**  | $0.027 / 121 s        | 1.78          |
+| Cline     | 373k / 17k      | $0.053       | 124 s     | $0.083 / 178 s        | 1.78          |
+| OpenCode  | 321k / 25k      | $0.060       | 199 s     | $0.072 / 257 s        | 1.94          |
+| Hermes    | 770k / 18k      | $0.084       | 168 s     | $0.113 / 203 s        | 1.93          |
 
-Cline's one failure on GLM-5.3 exited with code 126: on Windows, its own cleanup of the processes it started ended its launcher. Its page built and loaded.
-
-Cost is what OpenRouter billed, plus for Leana its Jev calls, which TypeSafe bills: 3 to 5% of Leana's cost. Times are means. Quality is Jev's reading of how fully each result shows what "advanced … best practices" asks for, from 0 (template-level) through 1 (complete) to 2 (showcase), given every harness's source and page check alike.
+Cost is what OpenRouter billed, plus for Leana its Jev calls, which TypeSafe bills: 3 to 5% of Leana's cost. Tokens, cost and times are means; tokens are as OpenRouter reported them, except Hermes's, which are its own report. Quality is Jev's reading of how fully each result shows what "advanced … best practices" asks for, from 0 (template-level) through 1 (complete) to 2 (showcase), given every harness's source and page check alike.
 
 ### What the results show
 
-- **The cheapest on both models, round by round.** Leana was cheaper than OpenCode and Hermes in every round on both models, and than Cline in 5 of 6 rounds on Claude Haiku 5.5 and 4 of 6 on GLM-5.3. It saved $0.004 to $0.016 a run on Haiku and $0.014 to $0.052 on GLM. Each of those gaps holds at 95% confidence.
-- **The fastest on Claude Haiku 5.5, level on GLM-5.3.** On Haiku, Leana was faster than each of the others in at least 5 of 6 rounds, by 30 to 222 seconds a run, again at 95% confidence. On GLM, Cline was faster on average, but no time gap there was clear of noise.
+- **The fewest tokens.** On both models Leana read about a quarter of the input tokens of the next-leanest harness, and wrote the fewest output tokens.
+- **The cheapest on both models, round by round.** Leana was cheaper than every other harness in every round on GLM-5.3, and on Claude Haiku 5.5 than OpenCode and Hermes in every round and Cline in 5 of 6. It saved $0.004 to $0.016 a run on Haiku and $0.030 to $0.062 on GLM. Each of those gaps holds at 95% confidence.
+- **The fastest on both models.** Leana was faster than each of the others in at least 5 of 6 rounds on both models, by 30 to 222 seconds a run on Haiku and 36 to 111 seconds on GLM, again at 95% confidence.
 - **Its costs are the most predictable.** On both models, Leana's dearest run cost less than the average run of every other harness.
-- **Its lead is cost, not polish.** On quality, Leana is level with Cline on GLM-5.3 and just behind it on Haiku, and slightly behind OpenCode and Hermes on both, which spend more. All four land between complete and showcase; none built a template-level page.
+- **Its lead is efficiency, not polish.** On quality, Leana is level with Cline on GLM-5.3 and just behind it on Haiku, and slightly behind OpenCode and Hermes on both, which spend more. All four land between complete and showcase; none built a template-level page.
 
 ### What they don't show
 
 - **One task, two models, six rounds each.** A landing page is one kind of work. Long refactors, backend services and existing codebases aren't measured here.
 - **Quality is read by Jev, which is also Leana's own judge.** An independent judge would be stronger evidence. So you can judge for yourself, every trial's page is in the galleries below.
-- **Wall time depends on which endpoint serves a run.** OpenRouter can route each run to a different provider of the same model. In one GLM-5.3 round, Leana's requests went to an endpoint generating 34 tokens a second while Cline and OpenCode got one generating about 205, and that run took 261 seconds.
+- **One endpoint per model.** Every recorded request for a model went to one OpenRouter endpoint: Wafer for GLM-5.3, pinned for every harness with fallbacks off, and Google for Claude Haiku 5.5. Other endpoints run at other speeds and prices, so absolute times and costs elsewhere will differ.
 - **Each harness ran with its own defaults otherwise.** Versions: Cline 3.0.73, OpenCode 2.0.32, Hermes Agent 0.21.3.
 
 ### What each harness built
 
 One round on Claude Haiku 5.5, the round where Leana's cost was its median, not its best:
 
-| Leana | Cline | OpenCode | Hermes |
-| --- | --- | --- | --- |
+| Leana                                                                           | Cline                                                                           | OpenCode                                                                              | Hermes                                                                            |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | <img src="docs/benchmark/haiku-5.5/leana-3.png" width="200" alt="Leana's page"> | <img src="docs/benchmark/haiku-5.5/cline-3.png" width="200" alt="Cline's page"> | <img src="docs/benchmark/haiku-5.5/opencode-3.png" width="200" alt="OpenCode's page"> | <img src="docs/benchmark/haiku-5.5/hermes-3.png" width="200" alt="Hermes's page"> |
-| $0.010 · 56 s | $0.014 · 87 s | $0.025 · 127 s | $0.030 · 178 s |
+| $0.010 · 56 s                                                                   | $0.014 · 87 s                                                                   | $0.025 · 127 s                                                                        | $0.030 · 178 s                                                                    |
 
 Every trial, with its cost, time and quality: the [Claude Haiku 5.5 gallery](docs/benchmark/haiku-5.5-gallery.md) and the [GLM-5.3 gallery](docs/benchmark/glm-5.3-gallery.md).
 

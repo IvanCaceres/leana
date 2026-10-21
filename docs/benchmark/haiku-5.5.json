@@ -29,11 +29,22 @@
         "min": 55.924,
         "max": 81.15
       },
+      "promptTokens": {
+        "mean": 68124.16666666667,
+        "median": 64649
+      },
+      "outputTokens": {
+        "mean": 10230.833333333334,
+        "median": 10024.5
+      },
+      "tokensFrom": "OpenRouter, through the proxy",
       "trials": [
         {
           "round": 1,
           "cost": 0.00915,
           "wallSeconds": 64,
+          "promptTokens": 49450,
+          "outputTokens": 10449,
           "passed": true,
           "quality": 1.84,
           "delivered": 0.62
@@ -42,6 +53,8 @@
           "round": 2,
           "cost": 0.00815,
           "wallSeconds": 65,
+          "promptTokens": 54486,
+          "outputTokens": 7949,
           "passed": true,
           "quality": 1.6,
           "delivered": 0.61
@@ -50,6 +63,8 @@
           "round": 3,
           "cost": 0.01015,
           "wallSeconds": 56,
+          "promptTokens": 50817,
+          "outputTokens": 9600,
           "passed": true,
           "quality": 1.88,
           "delivered": 0.64
@@ -58,6 +73,8 @@
           "round": 4,
           "cost": 0.01265,
           "wallSeconds": 81,
+          "promptTokens": 88165,
+          "outputTokens": 11995,
           "passed": true,
           "quality": 1.86,
           "delivered": 0.67
@@ -66,6 +83,8 @@
           "round": 5,
           "cost": 0.01169,
           "wallSeconds": 58,
+          "promptTokens": 74812,
+          "outputTokens": 9190,
           "passed": true,
           "quality": 1.7,
           "delivered": 0.66
@@ -74,6 +93,8 @@
           "round": 6,
           "cost": 0.01286,
           "wallSeconds": 72,
+          "promptTokens": 91015,
+          "outputTokens": 12202,
           "passed": true,
           "quality": 1.75,
           "delivered": 0.57
@@ -101,11 +122,22 @@
         "min": 50.207,
         "max": 129.778
       },
+      "promptTokens": {
+        "mean": 257704.5,
+        "median": 245972
+      },
+      "outputTokens": {
+        "mean": 15974.833333333334,
+        "median": 15563
+      },
+      "tokensFrom": "OpenRouter, through the proxy",
       "trials": [
         {
           "round": 1,
           "cost": 0.01452,
           "wallSeconds": 107,
+          "promptTokens": 321451,
+          "outputTokens": 13095,
           "passed": true,
           "quality": 1.75,
           "delivered": 0.69
@@ -114,6 +146,8 @@
           "round": 2,
           "cost": 0.01499,
           "wallSeconds": 116,
+          "promptTokens": 227853,
+          "outputTokens": 22894,
           "passed": true,
           "quality": 1.74,
           "delivered": 0.67
@@ -122,6 +156,8 @@
           "round": 3,
           "cost": 0.01417,
           "wallSeconds": 87,
+          "promptTokens": 180568,
+          "outputTokens": 13483,
           "passed": true,
           "quality": 1.8,
           "delivered": 0.66
@@ -130,6 +166,8 @@
           "round": 4,
           "cost": 0.00909,
           "wallSeconds": 50,
+          "promptTokens": 38704,
+          "outputTokens": 10878,
           "passed": true,
           "quality": 1.9,
           "delivered": 0.72
@@ -138,6 +176,8 @@
           "round": 5,
           "cost": 0.01913,
           "wallSeconds": 130,
+          "promptTokens": 513560,
+          "outputTokens": 17856,
           "passed": true,
           "quality": 1.81,
           "delivered": 0.69
@@ -146,6 +186,8 @@
           "round": 6,
           "cost": 0.01583,
           "wallSeconds": 86,
+          "promptTokens": 264091,
+          "outputTokens": 17643,
           "passed": true,
           "quality": 1.79,
           "delivered": 0.73
@@ -173,11 +215,22 @@
         "min": 63.862,
         "max": 130.799
       },
+      "promptTokens": {
+        "mean": 347834.6666666667,
+        "median": 386632.5
+      },
+      "outputTokens": {
+        "mean": 19569.166666666668,
+        "median": 20275.5
+      },
+      "tokensFrom": "OpenRouter, through the proxy",
       "trials": [
         {
           "round": 1,
           "cost": 0.01004,
           "wallSeconds": 64,
+          "promptTokens": 99890,
+          "outputTokens": 12937,
           "passed": true,
           "quality": 1.82,
           "delivered": 0.64
@@ -186,6 +239,8 @@
           "round": 2,
           "cost": 0.0276,
           "wallSeconds": 128,
+          "promptTokens": 366846,
+          "outputTokens": 20348,
           "passed": true,
           "quality": 1.93,
           "delivered": 0.69
@@ -194,6 +249,8 @@
           "round": 3,
           "cost": 0.02448,
           "wallSeconds": 127,
+          "promptTokens": 617680,
+          "outputTokens": 22343,
           "passed": true,
           "quality": 1.98,
           "delivered": 0.71
@@ -202,6 +259,8 @@
           "round": 4,
           "cost": 0.01376,
           "wallSeconds": 91,
+          "promptTokens": 165543,
+          "outputTokens": 19044,
           "passed": true,
           "quality": 1.95,
           "delivered": 0.72
@@ -210,6 +269,8 @@
           "round": 5,
           "cost": 0.01764,
           "wallSeconds": 116,
+          "promptTokens": 406419,
+          "outputTokens": 20203,
           "passed": true,
           "quality": 1.92,
           "delivered": 0.67
@@ -218,6 +279,8 @@
           "round": 6,
           "cost": 0.02048,
           "wallSeconds": 131,
+          "promptTokens": 430630,
+          "outputTokens": 22540,
           "passed": true,
           "quality": 1.93,
           "delivered": 0.7
@@ -245,11 +308,22 @@
         "min": 112.351,
         "max": 603.64
       },
+      "promptTokens": {
+        "mean": 751303.5,
+        "median": 669350.5
+      },
+      "outputTokens": {
+        "mean": 23701.833333333332,
+        "median": 21719
+      },
+      "tokensFrom": "the harness's own report",
       "trials": [
         {
           "round": 1,
           "cost": 0.02929,
           "wallSeconds": 604,
+          "promptTokens": 477815,
+          "outputTokens": 21702,
           "passed": true,
           "quality": 1.94,
           "delivered": 0.69
@@ -258,6 +332,8 @@
           "round": 2,
           "cost": 0.01538,
           "wallSeconds": 112,
+          "promptTokens": 414398,
+          "outputTokens": 18383,
           "passed": true,
           "quality": 1.94,
           "delivered": 0.73
@@ -266,6 +342,8 @@
           "round": 3,
           "cost": 0.03029,
           "wallSeconds": 178,
+          "promptTokens": 847869,
+          "outputTokens": 30104,
           "passed": true,
           "quality": 1.96,
           "delivered": 0.72
@@ -274,6 +352,8 @@
           "round": 4,
           "cost": 0.02644,
           "wallSeconds": 204,
+          "promptTokens": 896951,
+          "outputTokens": 21509,
           "passed": true,
           "quality": 1.88,
           "delivered": 0.7
@@ -282,6 +362,8 @@
           "round": 5,
           "cost": 0.03616,
           "wallSeconds": 500,
+          "promptTokens": 1379956,
+          "outputTokens": 28777,
           "passed": true,
           "quality": 1.94,
           "delivered": 0.73
@@ -290,6 +372,8 @@
           "round": 6,
           "cost": 0.02188,
           "wallSeconds": 130,
+          "promptTokens": 490832,
+          "outputTokens": 21736,
           "passed": true,
           "quality": 1.94,
           "delivered": 0.69

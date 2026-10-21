@@ -38,11 +38,16 @@ const median = xs => {
   const s = [...xs].sort((a, b) => a - b);
   return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
 };
+// A run's tokens as OpenRouter reported them through the proxy, or the harness's own report where it is not behind
+// the proxy (Hermes). Leana's exclude its Jev calls, which are priced in its cost.
+const tokensOf = t => t.metered ?? t.usage ?? {};
 const stats = Object.fromEntries(
   harnesses.map(h => {
     const ts = trials[h];
     const cost = ts.map(costOf);
     const wall = ts.map(t => t.wallSeconds);
+    const promptTokens = ts.map(t => tokensOf(t).promptTokens ?? 0);
+    const outputTokens = ts.map(t => tokensOf(t).outputTokens ?? 0);
     return [
       h,
       {
@@ -51,10 +56,15 @@ const stats = Object.fromEntries(
         passed: ts.filter(passed).length,
         cost: { mean: mean(cost), median: median(cost), min: Math.min(...cost), max: Math.max(...cost) },
         wallSeconds: { mean: mean(wall), median: median(wall), min: Math.min(...wall), max: Math.max(...wall) },
+        promptTokens: { mean: mean(promptTokens), median: median(promptTokens) },
+        outputTokens: { mean: mean(outputTokens), median: median(outputTokens) },
+        tokensFrom: ts.some(t => t.metered) ? 'OpenRouter, through the proxy' : "the harness's own report",
         trials: ts.map(t => ({
           round: t.trial,
           cost: +costOf(t).toFixed(5),
           wallSeconds: Math.round(t.wallSeconds),
+          promptTokens: tokensOf(t).promptTokens ?? null,
+          outputTokens: tokensOf(t).outputTokens ?? null,
           passed: passed(t),
         })),
       },
@@ -112,9 +122,21 @@ if (key) {
     }
     throw new Error('Jev did not answer');
   };
+  // A trial already read for this suite keeps its reading: Jev's readings move by about 0.01 between requests, and
+  // figures made again from the same suite should not change under a README that quotes them.
+  const before = existsSync(join(out, `${name}.json`))
+    ? JSON.parse(readFileSync(join(out, `${name}.json`), 'utf8'))
+    : null;
+  const kept = before?.started === meta.started ? before.harnesses : {};
   for (const h of harnesses)
     await Promise.all(
       stats[h].trials.map(async t => {
+        const was = kept[h]?.trials?.find(x => x.round === t.round);
+        if (was?.quality !== undefined) {
+          t.quality = was.quality;
+          t.delivered = was.delivered;
+          return;
+        }
         const dir = join(suite, `${h}-${t.round}`);
         const check = existsSync(join(dir, 'verify-page.txt'))
           ? readFileSync(join(dir, 'verify-page.txt'), 'utf8')

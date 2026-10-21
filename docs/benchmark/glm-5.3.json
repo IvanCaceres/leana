@@ -1,0 +1,305 @@
+{
+  "scenario": {
+    "id": "saas-landing-glm-5.3",
+    "prompt": "build an advanced react demo landing page app for a saas startup using the latest and greatest best practices",
+    "provider": "openrouter",
+    "model": "z-ai/glm-5.3",
+    "effort": "low",
+    "effortNote": "GLM-5.3 offers reasoning efforts low, high and max, and every harness takes low as given. Each harness is asked for it with its own option, and every request each one sends is checked for it (see BENCHMARK.md, Same settings as Leana).",
+    "timeoutMinutes": 20,
+    "idleMinutes": 4
+  },
+  "runs": 6,
+  "started": "2026-10-20T23:34:19.856Z",
+  "screenshotsFromRound": 3,
+  "harnesses": {
+    "leana": {
+      "version": "0.1.0 (00bb82b)",
+      "runs": 6,
+      "passed": 6,
+      "cost": {
+        "mean": 0.025496500000000002,
+        "median": 0.023389,
+        "min": 0.018077,
+        "max": 0.033978
+      },
+      "wallSeconds": {
+        "mean": 140.203,
+        "median": 98.743,
+        "min": 61.458,
+        "max": 260.805
+      },
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.01808,
+          "wallSeconds": 61,
+          "passed": true,
+          "quality": 1.81,
+          "delivered": 0.65
+        },
+        {
+          "round": 2,
+          "cost": 0.03167,
+          "wallSeconds": 110,
+          "passed": true,
+          "quality": 1.85,
+          "delivered": 0.68
+        },
+        {
+          "round": 3,
+          "cost": 0.02311,
+          "wallSeconds": 87,
+          "passed": true,
+          "quality": 1.88,
+          "delivered": 0.69
+        },
+        {
+          "round": 4,
+          "cost": 0.03398,
+          "wallSeconds": 261,
+          "passed": true,
+          "quality": 1.79,
+          "delivered": 0.63
+        },
+        {
+          "round": 5,
+          "cost": 0.02367,
+          "wallSeconds": 253,
+          "passed": true,
+          "quality": 1.88,
+          "delivered": 0.66
+        },
+        {
+          "round": 6,
+          "cost": 0.02247,
+          "wallSeconds": 69,
+          "passed": true,
+          "quality": 1.59,
+          "delivered": 0.68
+        }
+      ],
+      "quality": {
+        "mean": 1.8,
+        "min": 1.59,
+        "max": 1.88
+      }
+    },
+    "cline": {
+      "version": "3.0.73",
+      "runs": 6,
+      "passed": 5,
+      "cost": {
+        "mean": 0.03939183333333334,
+        "median": 0.042091500000000004,
+        "min": 0.013279,
+        "max": 0.060546
+      },
+      "wallSeconds": {
+        "mean": 103.70100000000001,
+        "median": 107.33500000000001,
+        "min": 38.566,
+        "max": 164.091
+      },
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.01328,
+          "wallSeconds": 39,
+          "passed": true,
+          "quality": 1.7,
+          "delivered": 0.62
+        },
+        {
+          "round": 2,
+          "cost": 0.05416,
+          "wallSeconds": 128,
+          "passed": true,
+          "quality": 1.83,
+          "delivered": 0.64
+        },
+        {
+          "round": 3,
+          "cost": 0.04709,
+          "wallSeconds": 87,
+          "passed": true,
+          "quality": 1.8,
+          "delivered": 0.63
+        },
+        {
+          "round": 4,
+          "cost": 0.02418,
+          "wallSeconds": 63,
+          "passed": true,
+          "quality": 1.67,
+          "delivered": 0.67
+        },
+        {
+          "round": 5,
+          "cost": 0.06055,
+          "wallSeconds": 164,
+          "passed": true,
+          "quality": 1.89,
+          "delivered": 0.68
+        },
+        {
+          "round": 6,
+          "cost": 0.03709,
+          "wallSeconds": 142,
+          "passed": false,
+          "quality": 1.89,
+          "delivered": 0.71
+        }
+      ],
+      "quality": {
+        "mean": 1.7966666666666669,
+        "min": 1.67,
+        "max": 1.89
+      }
+    },
+    "opencode": {
+      "version": "opencode v2.0.32",
+      "runs": 6,
+      "passed": 6,
+      "cost": {
+        "mean": 0.05453683333333333,
+        "median": 0.0442535,
+        "min": 0.036859,
+        "max": 0.112398
+      },
+      "wallSeconds": {
+        "mean": 182.32083333333333,
+        "median": 190.5925,
+        "min": 82.596,
+        "max": 342.39
+      },
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.03709,
+          "wallSeconds": 86,
+          "passed": true,
+          "quality": 1.96,
+          "delivered": 0.71
+        },
+        {
+          "round": 2,
+          "cost": 0.1124,
+          "wallSeconds": 342,
+          "passed": true,
+          "quality": 1.94,
+          "delivered": 0.72
+        },
+        {
+          "round": 3,
+          "cost": 0.05237,
+          "wallSeconds": 200,
+          "passed": true,
+          "quality": 1.81,
+          "delivered": 0.65
+        },
+        {
+          "round": 4,
+          "cost": 0.03686,
+          "wallSeconds": 83,
+          "passed": true,
+          "quality": 1.96,
+          "delivered": 0.72
+        },
+        {
+          "round": 5,
+          "cost": 0.03904,
+          "wallSeconds": 181,
+          "passed": true,
+          "quality": 1.95,
+          "delivered": 0.7
+        },
+        {
+          "round": 6,
+          "cost": 0.04947,
+          "wallSeconds": 202,
+          "passed": true,
+          "quality": 1.97,
+          "delivered": 0.7
+        }
+      ],
+      "quality": {
+        "mean": 1.9316666666666666,
+        "min": 1.81,
+        "max": 1.97
+      }
+    },
+    "hermes": {
+      "version": "Hermes Agent v0.21.3 (2026.9.14) · upstream dfc28b61\r",
+      "runs": 6,
+      "passed": 6,
+      "cost": {
+        "mean": 0.077511,
+        "median": 0.083219,
+        "min": 0.02523,
+        "max": 0.129978
+      },
+      "wallSeconds": {
+        "mean": 153.03383333333332,
+        "median": 156.7115,
+        "min": 85.577,
+        "max": 209.42
+      },
+      "trials": [
+        {
+          "round": 1,
+          "cost": 0.12998,
+          "wallSeconds": 209,
+          "passed": true,
+          "quality": 1.94,
+          "delivered": 0.72
+        },
+        {
+          "round": 2,
+          "cost": 0.03814,
+          "wallSeconds": 86,
+          "passed": true,
+          "quality": 1.86,
+          "delivered": 0.73
+        },
+        {
+          "round": 3,
+          "cost": 0.02523,
+          "wallSeconds": 117,
+          "passed": true,
+          "quality": 1.85,
+          "delivered": 0.7
+        },
+        {
+          "round": 4,
+          "cost": 0.1002,
+          "wallSeconds": 193,
+          "passed": true,
+          "quality": 1.94,
+          "delivered": 0.68
+        },
+        {
+          "round": 5,
+          "cost": 0.06623,
+          "wallSeconds": 130,
+          "passed": true,
+          "quality": 1.88,
+          "delivered": 0.62
+        },
+        {
+          "round": 6,
+          "cost": 0.10528,
+          "wallSeconds": 183,
+          "passed": true,
+          "quality": 1.95,
+          "delivered": 0.73
+        }
+      ],
+      "quality": {
+        "mean": 1.903333333333333,
+        "min": 1.85,
+        "max": 1.95
+      }
+    }
+  }
+}

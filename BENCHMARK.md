@@ -244,6 +244,16 @@ Verification runs after the harness exits:
 
 **"Passed" isn't a quality score.** A page can load and still look wrong. For example, a hero held invisible by a scroll animation still counts as loaded text, because the check reads text, not visibility. Look at each trial's screenshots: the summary's **Trials** grid shows them.
 
+## The README's figures
+
+The charts, tables and galleries in the README come from a suite's own results:
+
+```bash
+TYPESAFE_API_KEY=... node bench/readme-assets.mjs work/bench/harnesses/<suite> <name>
+```
+
+It writes into `docs/benchmark/`: a light and a dark chart of cost and wall time per run (`<name>-light.svg`, `<name>-dark.svg`), every trial's page with a gallery of them (`<name>/`, `<name>-gallery.md`), and the figures as `<name>.json`. With `TYPESAFE_API_KEY` set, it also reads each trial's quality with the completion gate's quality score (0 template-level, 1 complete, 2 showcase). Every harness gets the same evidence, the project's source and the benchmark's check of its page, and quality varies by about 0.01 between readings. The README's screenshot strip is the round where Leana's cost was its median.
+
 ## Replaying the completion gate
 
 Leana's completion gate asks Jev whether a finish is done, and what Jev is shown decides the answer. Jev answers the same state the same way each time (within about 0.01), so a change to how a finish is presented can be measured on the gate requests already logged, before any benchmark run:

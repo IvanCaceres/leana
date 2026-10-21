@@ -36,12 +36,14 @@ node dist/src/cli.js resume /path/to/repository/.leana/runs/SESSION \
 
 | Key | Between runs | During a run |
 | --- | --- | --- |
-| Enter | Run the objective typed, or a `/command` | Guide the run: the text joins the objective and the next step is told of it |
+| Enter | Run the objective typed, or a `/command`; after a run, follow up in that session | Guide the run: the text joins the objective and the next step is told of it |
 | Tab | Complete a `/command`; otherwise browse the conversation's blocks | Browse the blocks |
 | Up / Down | Recall earlier input (while browsing: select a block) | The same |
 | Enter / Space, `a` (browsing) | Fold or unfold the selected block; fold or unfold all | The same |
-| PgUp / PgDn, mouse wheel | Scroll back through the conversation; Esc returns to its end | The same |
+| PgUp / PgDn | Scroll back through the conversation; Esc returns to its end (`/mouse on`: the wheel too) | The same |
 | Ctrl-C | Twice to leave | Stop after the current step; twice to leave at once |
+
+After a run, completed or paused, what you type continues that session: it joins the objective as a `resume --message` does, over the changes the run left. `/new` starts another session on top of them, `/resume` picks an earlier one, and `/sessions` lists them. The mouse is left to the terminal, so dragging selects text to copy; `/mouse on` makes the wheel scroll the conversation instead (most terminals still select with Shift held).
 
 `--plain` (or output that is not a terminal) keeps the line prompt and the status panel; `NO_COLOR` turns colour off. `leana run` and `leana resume` print to the terminal as before.
 

@@ -141,6 +141,9 @@ export class TerminalUI {
     this.pending = this.ticker = null;
     this.term.leave();
   }
+  setMouse(on: boolean): void {
+    this.term.setMouse(on);
+  }
   setModel(model: string): void {
     this.status.model = model;
     this.schedule();

@@ -87,12 +87,12 @@ The [architecture guide](docs/ARCHITECTURE.md) covers the loop, the tools, the p
 Leana needs Node 22+ and [ripgrep](https://github.com/BurntSushi/ripgrep). On Windows it also needs [Git for Windows](https://git-scm.com/download/win), whose bash it runs commands with.
 
 ```bash
-npm install -g leana
+npm install -g leana-cli
 
 export TYPESAFE_API_KEY=...     # Jev
 export OPENROUTER_API_KEY=...   # the worker model
 
-# The app: type an objective, pick a provider and model in place
+# The app: type an objective, then follow-ups; pick a provider and model in place
 leana
 
 # Or one run from the command line

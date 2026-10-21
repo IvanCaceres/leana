@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { createServer, type ServerResponse } from 'node:http';
+import { execFileSync } from 'node:child_process';
 import { defaults, loadConfig, loadSettings } from '../src/config.js';
 import {
   effortsOf,
@@ -18,7 +19,7 @@ import { OpenRouter, parseJson } from '../src/openrouter.js';
 import { forModel } from '../src/session.js';
 import { App } from '../src/app.js';
 import { Agent, argsProblem, fileBeingWritten, newSession } from '../src/agent.js';
-import { Store } from '../src/store.js';
+import { runsDir, Store } from '../src/store.js';
 import { schemas, stepSchema, toolSchema, withDefaults } from '../src/schema.js';
 import { AGENT_SYSTEM, actionTool, agentSystem, stepMessages } from '../src/context.js';
 import type { Answers, Config, Message, Questions } from '../src/types.js';
@@ -1174,6 +1175,98 @@ test('The app offers and sets only what the active provider and model take, swit
   assert.match(await run('/nonsense'), /No command \/nonsense/);
   assert.equal(await app.handle('/quit'), 'quit');
   await writeFile(join(dir, 'x'), '');
+});
+
+test('In the app, what is typed after a run continues that session; /new starts another, also over the changes a session left; /resume picks a complete session to continue', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'leana-follow-'));
+  const state = process.env.LEANA_STATE_DIR;
+  process.env.LEANA_STATE_DIR = join(dir, 'state');
+  t.after(async () => {
+    if (state === undefined) delete process.env.LEANA_STATE_DIR;
+    else process.env.LEANA_STATE_DIR = state;
+    await rm(dir, { recursive: true, force: true });
+  });
+  const repo = join(dir, 'repo');
+  await mkdir(repo);
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  const calls: { objective?: string; sessionDir?: string; message?: string; allowDirty?: boolean }[] = [];
+  let made = 0;
+  const said: string[] = [];
+  const base = await loadConfig(undefined, {});
+  const app = () =>
+    new App({
+      base,
+      settings: { config: {} },
+      jevKey: 'j',
+      repo,
+      settingsPath: join(dir, 'settings.json'),
+      write: l => said.push(l),
+      // A run that writes page.html and completes, leaving its session as a real one does.
+      runSession: async req => {
+        const { objective, sessionDir, message, allowDirty } = req;
+        calls.push({ objective, sessionDir, message, allowDirty });
+        const path = sessionDir ?? join(runsDir(repo), `s${++made}`);
+        req.out?.(`Session: ${path}`);
+        req.out?.('Model: openrouter m');
+        await mkdir(path, { recursive: true });
+        await writeFile(join(repo, 'page.html'), `<p>${calls.length}</p>`);
+        await writeFile(
+          join(path, 'checkpoint.json'),
+          JSON.stringify({ status: 'complete', step: 3, objective: objective ?? 'x', writes: ['page.html'] }),
+        );
+        return {
+          session: { status: 'complete', outcome: 'Done' },
+          store: { path },
+          elapsedMs: 1000,
+          steps: 3,
+          usage: { requests: 0 },
+        } as any;
+      },
+    });
+  const first = app();
+  const say = async (a: App, line: string) => {
+    said.length = 0;
+    await a.handle(line);
+    return said.join('\n');
+  };
+  const s1 = join(runsDir(repo), 's1');
+  assert.match(
+    await say(first, 'build a page'),
+    /Session: [\s\S]*Model: openrouter m[\s\S]*COMPLETE: Done[\s\S]*What you type next continues this session/,
+  );
+  const followed = await say(first, 'add a footer');
+  assert.match(followed, /COMPLETE: Done/, 'a follow-up runs, over the changes the run left');
+  assert(
+    !said.includes(`Session: ${s1}`) && !said.includes('Model: openrouter m'),
+    `the session and model, unchanged, are not announced again: ${said.join(' | ')}`,
+  );
+  assert.deepEqual(calls[1], { objective: undefined, sessionDir: s1, message: 'add a footer', allowDirty: undefined });
+  assert.match(await say(first, '/status'), new RegExp(`session +${s1.replace(/\\/g, '\\\\')}`));
+
+  // Leana started again: an objective over the changes s1 left is not run, and the ways on are named.
+  const second = app();
+  assert.match(
+    await say(second, 'a pricing page'),
+    /uncommitted changes to page\.html made by session .*s1.* \/resume continues that session; \/new <objective> starts a new one on top of its changes\.$/,
+  );
+  assert.equal(calls.length, 2, 'not run');
+  assert.match(await say(second, '/resume'), /s1 is complete; what you type next continues it/);
+  assert.equal(calls.length, 2, 'choosing a complete session runs nothing');
+  await say(second, 'make it blue');
+  assert.deepEqual(calls[2], { objective: undefined, sessionDir: s1, message: 'make it blue', allowDirty: undefined });
+  await say(second, '/new a pricing page');
+  assert.deepEqual(calls[3], {
+    objective: 'a pricing page',
+    sessionDir: undefined,
+    message: undefined,
+    allowDirty: true,
+  });
+  await say(second, 'add a toggle');
+  assert.deepEqual(calls[4]!.sessionDir, join(runsDir(repo), 's2'), 'the new session is the one followed up');
+  assert.match(await say(second, '/new'), /The next objective starts a new session/);
+  await say(second, 'a blog');
+  assert.deepEqual([calls[5]!.objective, calls[5]!.allowDirty], ['a blog', true]);
+  assert.match(await say(second, '/mouse on'), /\/mouse is for the full-screen app/);
 });
 
 // The catalogue entry of the model of run react-demo-90 (2026-10-04): it always reasons, takes tools and

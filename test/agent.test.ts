@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { venvBin, windowsExe } from '../src/shell.js';
 import { join } from 'node:path';
 import { defaults } from '../src/config.js';
-import { Agent, newSession } from '../src/agent.js';
+import { Agent, joinObjective, newSession } from '../src/agent.js';
 import { evidenceTokens } from '../src/context.js';
 import { hash } from '../src/files.js';
 import { Store } from '../src/store.js';
@@ -1081,6 +1081,43 @@ test('Jev reads scope: three steps of work the objective did not ask for are nam
     notes[4] && /did not ask for/.test(notes[4]),
     `after three out-of-scope steps the worker is told: ${notes[4]}`,
   );
+});
+
+test('A question asked after a completed run is answered by the worker: the harness proposes no finish on the check that passed before it', async t => {
+  const { root, store } = await repo(t);
+  await writeFile(join(root, 'check.mjs'), 'process.exit(0);\n');
+  let satisfied = 0.2;
+  const jev = jevOf({ watch: () => ({ objective_satisfied: satisfied }) });
+  const agent = (steps: any[], files = {}) =>
+    new Agent(
+      { ...config, maxSteps: 4 },
+      store,
+      jev,
+      bonsaiOf({ steps, files }),
+      root,
+      () => {},
+      () => {},
+    );
+  const done = await agent(
+    [
+      { thought: 'write', action: 'create_file', args: { path: 'src/a.ts', purpose: 'a' } },
+      { thought: 'check', action: 'bash', args: { command: 'node check.mjs', purpose: 'check', check: true } },
+      { thought: 'done', action: 'finish', args: { summary: 'src/a.ts exports a; node check.mjs passes.' } },
+    ],
+    { 'src/a.ts': 'export const a = 1;\n' },
+  ).run(await newSession(root, 'Add src/a.ts exporting a'));
+  assert.equal(done.status, 'complete', done.stopReason);
+  // The user asks about the work; Jev still reads the objective as met and the old check still stands.
+  joinObjective(done, 'what does a export?');
+  satisfied = 0.9;
+  const answered = await agent([
+    { thought: 'read it', action: 'read_files', args: { files: [{ path: 'src/a.ts', start: 1, end: 5 }] } },
+    { thought: 'answer', action: 'finish', args: { summary: 'a is the number 1.' } },
+  ]).run(done);
+  assert.equal(answered.status, 'complete', answered.stopReason);
+  assert.doesNotMatch(answered.stopReason, /met by the facts/, 'not closed by the harness on the old check');
+  assert.match(answered.outcome ?? '', /a is the number 1/, "the worker's answer is the outcome");
+  assert(!(await events(store)).some(e => e.type === 'auto-finish'));
 });
 
 test('The harness proposes completion itself: Jev reads the objective as satisfied, the check passed after the last edit, the gate accepts, and the run completes without a worker claim', async t => {

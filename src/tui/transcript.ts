@@ -131,6 +131,11 @@ export function renderBlock(b: Block, width: number, selected: boolean, s: Style
   const w = Math.max(10, width);
   const out: string[] = [];
   if (b.tone === 'user' || b.tone === 'thought' || b.tone === 'outcome') out.push('');
+  // A long first line is kept whole in the body as well (an outcome's summary); where the title shows all of it,
+  // the body does not repeat it.
+  const repeat = b.body[0] === b.title && cells(`- ${icons[b.tone]} ${row(b.title)}`) <= w;
+  const body = repeat ? b.body.slice(1) : b.body;
+  b = body === b.body ? b : { ...b, body };
   const foldable = b.body.length > b.preview;
   const mark = !b.body.length ? ' ' : b.collapsed && foldable ? '+' : '-';
   const head = fitTo(`${mark} ${icons[b.tone]} ${row(b.title)}`, w);

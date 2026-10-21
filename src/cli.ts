@@ -10,7 +10,7 @@ import { Jev, postJson } from './clients.js';
 import { runCommand } from './commands.js';
 import { renderReport } from './report.js';
 import { describeModel, effortsOf, listModels, modelOptions } from './models.js';
-import { elapsed, forModel, modelClient, providerKey, readKey, runSession } from './session.js';
+import { elapsed, endingLine, forModel, modelClient, providerKey, readKey, runSession, stepsOf } from './session.js';
 import { startApp, startTui } from './app.js';
 import { usageLine } from './display.js';
 export { readKey, dirtySessionConflict } from './session.js';
@@ -288,7 +288,7 @@ async function main(): Promise<void> {
   }
   const r = outcome.session;
   console.log(
-    `\n${r.status.toUpperCase()}: ${r.outcome ?? r.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps (${r.step} in total)${since}${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}${jevLine}\nSession: ${outcome.store.path}`,
+    `\n${endingLine(r)}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${stepsOf(outcome.steps)} (${r.step} in total)${since}${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}${jevLine}\nSession: ${outcome.store.path}`,
   );
   if (r.status !== 'complete') process.exitCode = 2;
 }

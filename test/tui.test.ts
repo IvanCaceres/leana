@@ -168,6 +168,53 @@ test('A frame rewrites only the rows that changed, in one write, and the termina
   assert(writes.at(-1)!.includes('\x1b[?1049l'), 'the shell screen is back');
 });
 
+test('A long first line kept whole in the body is not repeated there when the title shows all of it', () => {
+  const block = (title: string) => ({
+    id: 1,
+    tone: 'info' as const,
+    title,
+    body: [title],
+    collapsed: false,
+    preview: 8,
+    version: 0,
+  });
+  const fits = 'Session: C:\\Users\\someone\\.local\\state\\leana\\repo-1234\\runs\\2026-10-21T16-13-29-733Z-ce815d4b';
+  assert.equal(
+    renderBlock(block(fits), 140, false, plain).filter(r => r.includes('ce815d4b')).length,
+    1,
+    'shown once, as the title',
+  );
+  const long = `COMPLETE: ${'word '.repeat(40).trim()}`;
+  const rows = renderBlock(block(long), 80, false, plain);
+  assert(
+    rows.length > 2 && rows.slice(1).join(' ').includes('word word'),
+    'a title cut at the width keeps the whole line below',
+  );
+});
+
+test('The mouse is left to the terminal, so text on the screen can be selected and copied; with the mouse on, the wheel scrolls', () => {
+  const { term, writes } = fakeTerminal();
+  term.enter(
+    () => {},
+    () => {},
+  );
+  assert(!writes.join('').includes('\x1b[?1000h'), 'no mouse reports: a drag selects text');
+  assert(writes.join('').includes('\x1b[?1007l'), 'the wheel is not turned into Up and Down, which recall history');
+  term.setMouse(true);
+  assert.equal(writes.at(-1), '\x1b[?1000h\x1b[?1006h');
+  term.leave();
+  assert(writes.at(-1)!.includes('\x1b[?1000l') && writes.at(-1)!.includes('\x1b[?1007h'), 'both as they were');
+  writes.length = 0;
+  term.enter(
+    () => {},
+    () => {},
+  );
+  assert(writes.join('').includes('\x1b[?1000h'), 'kept when the screen is entered again');
+  term.setMouse(false);
+  assert.equal(writes.at(-1), '\x1b[?1006l\x1b[?1000l');
+  term.leave();
+});
+
 test('The app as a terminal UI: a status bar, the conversation as blocks, an input box; Enter submits, Up recalls; during a run the input is guidance and the run shows its steps, results, diffs and usage', async () => {
   const f = fakeTerminal(110, 30);
   const submitted: string[] = [];

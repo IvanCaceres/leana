@@ -16,7 +16,7 @@ import {
   type ModelInfo,
   type Provider,
 } from './models.js';
-import { elapsed, forModel, providerKey, runSession, sessionsOf } from './session.js';
+import { dirtySessionConflict, elapsed, forModel, providerKey, runSession, sessionsOf } from './session.js';
 import type { Agent } from './agent.js';
 import { usageLine } from './display.js';
 import type { RunView, RunViewOptions } from './display.js';
@@ -33,6 +33,10 @@ export interface AppOptions {
   write?: (text: string) => void;
   // What shows a run (the terminal UI); the status panel on stderr by default.
   view?: (o: RunViewOptions) => RunView;
+  // Turns the wheel's scrolling on or off in the full-screen app; without it, /mouse does not apply.
+  mouse?: (on: boolean) => void;
+  // What runs a session: runSession, or a stand-in in a test.
+  runSession?: typeof runSession;
 }
 export class App {
   settings: Settings;
@@ -43,6 +47,10 @@ export class App {
   private info: ModelInfo | null = null;
   private agent: Agent | null = null;
   running = false;
+  // The session the last run worked in: what is typed next continues it, until /new or /repo.
+  session: string | null = null;
+  // Set by /new: the next objective starts a new session even over changes earlier sessions left uncommitted.
+  private fresh = false;
   private readonly write: (text: string) => void;
   constructor(private opts: AppOptions) {
     this.settings = {
@@ -161,18 +169,28 @@ export class App {
         this.write(`${or ? 'turns' : 'steps'}: ${a[0]}`);
       },
     },
+    new: {
+      args: '[objective]',
+      help: 'start a new session, on top of the changes so far, with this objective or the next one typed',
+      run: async a => this.startNew(a.join(' ')),
+    },
     sessions: { args: '', help: "the repository's sessions, newest first", run: async () => this.sessions() },
     resume: {
       args: '[n|path] [message]',
       help: 'resume a session (1 = newest), optionally with new guidance',
       run: async a => this.resume(a),
     },
+    mouse: {
+      args: 'on|off',
+      help: 'the mouse wheel scrolls (on), or the mouse selects text to copy (off, the default)',
+      run: async a => this.mouse(a[0]),
+    },
     quit: { args: '', help: 'leave', run: async () => {} },
   };
   async handle(line: string): Promise<'quit' | void> {
     const t = line.trim();
     if (!t) return;
-    if (!t.startsWith('/')) return void (await this.run(t));
+    if (!t.startsWith('/')) return void (await (this.session ? this.followUp(t) : this.run(t)));
     const [name, ...args] = t.slice(1).split(/\s+/);
     const c = this.commands[name!.toLowerCase()] ?? (name === 'exit' ? this.commands.quit : undefined);
     if (!c) return void this.write(`No command /${name}; /help lists them.`);
@@ -212,7 +230,9 @@ export class App {
     return [pool.filter(p => p.startsWith(word)), word];
   }
   private help(): void {
-    this.write('Type an objective to run it in the repository, or a command:');
+    this.write(
+      'Type an objective to run it in the repository. After a run, what you type continues that session; /new starts another. Commands:',
+    );
     for (const [n, c] of Object.entries(this.commands))
       this.write(`  /${n}${c.args ? ` ${c.args}` : ''}`.padEnd(38) + c.help);
   }
@@ -221,6 +241,7 @@ export class App {
     this.write(`provider   ${c.provider}${c.provider === 'openrouter' ? ` (${c.openrouterUrl})` : ` (${c.baseUrl})`}`);
     this.write(`model      ${c.model}`);
     this.write(`repository ${this.repo}`);
+    this.write(`session    ${this.session ?? 'none yet; the next objective starts one'}`);
     this.write(
       `permissions write ${this.allowWrite ? 'on' : 'off'}, shell ${this.allowBash ? 'on' : 'off'}${this.checkCommand ? `; check: ${this.checkCommand}` : ''}; up to ${c.provider === 'openrouter' ? `${c.openrouterMaxTurns} turns` : `${c.maxSteps} steps`}`,
     );
@@ -317,6 +338,7 @@ export class App {
   private async setRepo(path?: string): Promise<void> {
     if (!path) return void this.write(`repository: ${this.repo}`);
     this.repo = await realpath(resolve(path.replace(/^~(?=\/|$)/, process.env.HOME ?? '~')));
+    this.session = null;
     this.settings.repo = this.repo;
     await saveSettings(this.settings, this.opts.settingsPath);
     this.write(`repository: ${this.repo}`);
@@ -345,18 +367,71 @@ export class App {
     const target = /^\d+$/.test(which) ? list[Number(which) - 1]?.path : which;
     if (!target) throw new Error('no such session; /sessions lists them');
     const message = a.slice(1).join(' ');
+    // A complete session has nothing left to resume until there is more to do: it becomes the one what is typed
+    // next continues.
+    if (!message && list.find(s => s.path === target)?.status === 'complete') {
+      this.session = target;
+      return void this.write(`Session ${target} is complete; what you type next continues it.`);
+    }
     await this.go({ sessionDir: target, ...(message ? { message } : {}) });
   }
   private async run(objective: string): Promise<void> {
     if (!this.allowWrite)
       this.write('Note: write is off, so this run can read but not change files (/allow write on).');
-    await this.go({ objective, repo: this.repo });
+    const over = this.fresh;
+    this.fresh = false;
+    if (!over) {
+      const conflict = await dirtySessionConflict(this.repo);
+      if (conflict)
+        return void this.write(
+          conflict.replace(
+            / Resume that session, revert the files, or pass --allow-dirty to start over on top of them\.$/,
+            ' /resume continues that session; /new <objective> starts a new one on top of its changes.',
+          ),
+        );
+    }
+    await this.go({ objective, repo: this.repo, allowDirty: true });
   }
-  private async go(what: { objective?: string; repo?: string; sessionDir?: string; message?: string }): Promise<void> {
+  // What is typed after a run joins that session's objective, as a resume's message does, and the session goes on.
+  private async followUp(message: string): Promise<void> {
+    try {
+      await this.go({ sessionDir: this.session!, message });
+    } catch (e) {
+      if (/pinned context exceeds budget/.test((e as Error).message))
+        throw new Error(
+          'This session holds all the follow-ups it can; /new starts a new session on top of its changes.',
+        );
+      throw e;
+    }
+  }
+  private async startNew(objective: string): Promise<void> {
+    this.session = null;
+    this.fresh = true;
+    if (objective) return this.run(objective);
+    this.write('The next objective starts a new session, on top of the changes so far.');
+  }
+  private async mouse(value?: string): Promise<void> {
+    if (!value || !/^(on|off)$/.test(value)) throw new Error('/mouse on|off');
+    if (!this.opts.mouse)
+      return void this.write('/mouse is for the full-screen app; here the terminal selects text as usual.');
+    this.opts.mouse(value === 'on');
+    this.write(
+      value === 'on'
+        ? 'mouse: the wheel scrolls; most terminals still select text while Shift is held'
+        : 'mouse: drag to select text and copy it; PgUp/PgDn scroll',
+    );
+  }
+  private async go(what: {
+    objective?: string;
+    repo?: string;
+    sessionDir?: string;
+    message?: string;
+    allowDirty?: boolean;
+  }): Promise<void> {
     if (!this.opts.jevKey) throw new Error('Jev needs its key: start Leana with --key-file or TYPESAFE_API_KEY');
     this.running = true;
     try {
-      const outcome = await runSession({
+      const outcome = await (this.opts.runSession ?? runSession)({
         config: await this.config(),
         jevKey: this.opts.jevKey,
         ...what,
@@ -367,9 +442,11 @@ export class App {
         ...(this.opts.view ? { view: this.opts.view } : {}),
       });
       const s = outcome.session;
+      this.session = outcome.store.path;
       this.write(
         `\n${s.status.toUpperCase()}: ${s.outcome ?? s.stopReason}\nElapsed: ${elapsed(outcome.elapsedMs)} for ${outcome.steps} steps${outcome.usage.requests ? `\nUsage: ${usageLine(outcome.usage)}` : ''}\nSession: ${outcome.store.path}`,
       );
+      this.write('What you type next continues this session; /new starts another.');
     } finally {
       this.agent = null;
       this.running = false;
@@ -431,6 +508,7 @@ export async function startTui(opts: AppOptions): Promise<void> {
     ...opts,
     write: t => ui?.message(t, /^\n*(COMPLETE|PAUSED):/.test(t) ? 'outcome' : 'info'),
     view: o => ui!.run(o),
+    mouse: on => ui?.setMouse(on),
   });
   const c = await app.config();
   return new Promise<void>(resolve => {

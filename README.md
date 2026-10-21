@@ -92,7 +92,7 @@ npm install -g leana
 export TYPESAFE_API_KEY=...     # Jev
 export OPENROUTER_API_KEY=...   # the worker model
 
-# The app: type an objective, pick a provider and model in place
+# The app: type an objective, then follow-ups; pick a provider and model in place
 leana
 
 # Or one run from the command line

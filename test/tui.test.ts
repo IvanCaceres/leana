@@ -168,6 +168,29 @@ test('A frame rewrites only the rows that changed, in one write, and the termina
   assert(writes.at(-1)!.includes('\x1b[?1049l'), 'the shell screen is back');
 });
 
+test('The mouse is left to the terminal, so text on the screen can be selected and copied; with the mouse on, the wheel scrolls', () => {
+  const { term, writes } = fakeTerminal();
+  term.enter(
+    () => {},
+    () => {},
+  );
+  assert(!writes.join('').includes('\x1b[?1000h'), 'no mouse reports: a drag selects text');
+  assert(writes.join('').includes('\x1b[?1007l'), 'the wheel is not turned into Up and Down, which recall history');
+  term.setMouse(true);
+  assert.equal(writes.at(-1), '\x1b[?1000h\x1b[?1006h');
+  term.leave();
+  assert(writes.at(-1)!.includes('\x1b[?1000l') && writes.at(-1)!.includes('\x1b[?1007h'), 'both as they were');
+  writes.length = 0;
+  term.enter(
+    () => {},
+    () => {},
+  );
+  assert(writes.join('').includes('\x1b[?1000h'), 'kept when the screen is entered again');
+  term.setMouse(false);
+  assert.equal(writes.at(-1), '\x1b[?1006l\x1b[?1000l');
+  term.leave();
+});
+
 test('The app as a terminal UI: a status bar, the conversation as blocks, an input box; Enter submits, Up recalls; during a run the input is guidance and the run shows its steps, results, diffs and usage', async () => {
   const f = fakeTerminal(110, 30);
   const submitted: string[] = [];

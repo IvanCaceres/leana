@@ -1,5 +1,5 @@
 // The terminal as a full screen: the alternate screen (the shell's own screen comes back on leaving), raw
-// input with bracketed paste and mouse-wheel reports, and drawing by rows. A frame is drawn by rewriting only
+// input with bracketed paste, mouse-wheel reports when asked for, and drawing by rows. A frame is drawn by rewriting only
 // the rows that differ from the last one, in one write, so streaming at ten updates a second costs a few rows.
 // Leaving restores everything, also when the process exits, crashes or is signalled.
 import { KeyReader, type Key } from './keys.js';
@@ -25,12 +25,19 @@ export interface Cursor {
   col: number;
 }
 
-const enterSeq = '\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?25l\x1b[2J';
-const leaveSeq = '\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l';
+// Mouse reports are off unless asked for: while they are on, the terminal sends a click or drag to the app
+// instead of selecting text, so nothing on the screen can be copied. With them off, a terminal that turns the
+// wheel into Up and Down in the alternate screen (alternate scroll) is told not to, as Up recalls history
+// here; leaving turns it back on for the programs that rely on it.
+const enterSeq = '\x1b[?1049h\x1b[?1007l\x1b[?2004h\x1b[?25l\x1b[2J';
+const mouseOn = '\x1b[?1000h\x1b[?1006h';
+const mouseOff = '\x1b[?1006l\x1b[?1000l';
+const leaveSeq = `\x1b[?2004l${mouseOff}\x1b[?1007h\x1b[0m\x1b[?25h\x1b[?1049l`;
 
 export class Terminal {
   private frame: string[] = [];
   private active = false;
+  private wheel = false;
   private readonly reader = new KeyReader();
   private onData: ((chunk: Buffer | string) => void) | null = null;
   private onResize: (() => void) | null = null;
@@ -48,7 +55,7 @@ export class Terminal {
   enter(keys: (keys: Key[]) => void, resized: () => void): void {
     if (this.active) return;
     this.active = true;
-    this.output.write(enterSeq);
+    this.output.write(enterSeq + (this.wheel ? mouseOn : ''));
     this.input.setRawMode?.(true);
     this.onData = chunk => keys(this.reader.feed(typeof chunk === 'string' ? chunk : chunk.toString('utf8')));
     this.input.on('data', this.onData);
@@ -70,6 +77,14 @@ export class Terminal {
     this.output.write(leaveSeq);
     this.frame = [];
     process.off('exit', this.restore);
+  }
+  // The wheel scrolls the app (mouse reports on), or the mouse selects text as the terminal's own does (off).
+  setMouse(on: boolean): void {
+    if (this.active && on !== this.wheel) this.output.write(on ? mouseOn : mouseOff);
+    this.wheel = on;
+  }
+  get mouse(): boolean {
+    return this.wheel;
   }
   get isActive(): boolean {
     return this.active;

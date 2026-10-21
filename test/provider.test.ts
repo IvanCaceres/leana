@@ -1195,6 +1195,8 @@ test('The app offers and sets only what the active provider and model take, swit
   assert.equal(missing.length, 2);
   assert.match(missing[0]!, /TYPESAFE_API_KEY/);
   assert.match(missing[1]!, /OPENROUTER_API_KEY/, 'OpenRouter is the default provider');
+  // Started without ripgrep: the app says so before the worker's first search fails.
+  assert.match((await keyless.missingTools('leana-no-such-rg'))[0]!, /ripgrep \(rg\)/);
   await writeFile(join(dir, 'x'), '');
 });
 

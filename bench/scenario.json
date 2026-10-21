@@ -3,6 +3,8 @@
   "prompt": "build an advanced react demo landing page app for a saas startup using the latest and greatest best practices",
   "provider": "openrouter",
   "model": "z-ai/glm-5.3",
+  "endpoint": "wafer/us",
+  "endpointNote": "Every harness's requests go to this one endpoint, fallbacks off, so wall time measures the harness and not OpenRouter's routing. Wafer served every request of the earlier GLM-5.3 suites, at about 200 tokens a second.",
   "effort": "low",
   "effortNote": "GLM-5.3 offers reasoning efforts low, high and max, and every harness takes low as given. Each harness is asked for it with its own option, and every request each one sends is checked for it (see BENCHMARK.md, Same settings as Leana).",
   "timeoutMinutes": 20,

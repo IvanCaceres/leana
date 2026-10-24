@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../src/config.js';
 import { App } from '../src/app.js';
 
@@ -28,10 +29,20 @@ test('/endpoints lists the model providers, chooses one for the runs, and clears
       uptime_last_30m: 99,
     },
   ];
+  // The catalogue lists both test models, cloned from a fixture entry, so a switch to either succeeds.
+  const sample = JSON.parse(
+    await readFile(fileURLToPath(new URL('../../test/fixtures/openrouter/models.json', import.meta.url)), 'utf8'),
+  ).data[0];
+  const catalogue = {
+    data: ['vendor/model-x', 'vendor/other-model'].map(id => ({ ...sample, id, canonical_slug: id })),
+  };
   const server = createServer((req, res) => {
     if (req.url?.endsWith('/endpoints')) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ data: { endpoints } }));
+    } else if (req.url?.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(catalogue));
     } else {
       res.writeHead(404);
       res.end('{}');
@@ -73,4 +84,11 @@ test('/endpoints lists the model providers, chooses one for the runs, and clears
 
   assert.match(await run('/endpoints auto'), /provider: automatic/);
   assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).config.openrouterProvider, '');
+
+  // Choose again, switch to another model, then back: the choice for vendor/model-x comes back.
+  assert.match(await run('/endpoints wafer/fp4'), /provider: wafer\/fp4/);
+  await run('/model vendor/other-model');
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).config.openrouterProvider, '');
+  await run('/model vendor/model-x');
+  assert.equal(JSON.parse(await readFile(settingsPath, 'utf8')).config.openrouterProvider, 'wafer/fp4');
 });

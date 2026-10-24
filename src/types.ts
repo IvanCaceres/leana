@@ -352,6 +352,8 @@ export interface Config {
   // Which of a model's OpenRouter endpoints a run asks for first: cost ranks them by what Leana's requests cost there
   // (mostly cached prompt, some output; see endpointOrder), default leaves the choice to OpenRouter.
   openrouterRouting: 'cost' | 'default';
+  // The OpenRouter endpoint (provider tag, as /endpoints lists them) a run asks for first; empty leaves it to routing.
+  openrouterProvider: string;
   baseUrl: string;
   model: string;
   contextWindow: number;

@@ -11,6 +11,7 @@ import {
   describeModel,
   effortsOf,
   listModels,
+  modelEndpoints,
   modelOptions,
   providers,
   type ModelInfo,
@@ -121,6 +122,11 @@ export class App {
       args: '[llama|openrouter]',
       help: 'show or switch the model provider',
       run: async a => this.provider(a[0]),
+    },
+    endpoints: {
+      args: '[provider|auto]',
+      help: "list the model's OpenRouter providers, or choose one (auto: routing picks)",
+      run: async a => this.endpoints(a),
     },
     models: {
       args: '[words]',
@@ -304,6 +310,28 @@ export class App {
           'Leana needs ripgrep (rg) to search code, and it is not on the PATH: install it (https://github.com/BurntSushi/ripgrep#installation), confirm rg --version works in this terminal, then restart Leana.',
         ];
   }
+  // The model's OpenRouter providers (endpoints): listed with their prices, or one chosen for the runs (auto: routing picks).
+  private async endpoints(a: string[]): Promise<void> {
+    const c = await this.config();
+    if (c.provider !== 'openrouter') throw new Error('endpoints are OpenRouter providers: /provider openrouter first');
+    const list = await modelEndpoints(c, await this.key(c));
+    if (a[0] === 'auto') {
+      await this.remember({ openrouterProvider: '' });
+      return void this.write('provider: automatic (routing picks)');
+    }
+    if (a[0]) {
+      if (!list.some(e => e.tag === a[0]))
+        throw new Error(`${a[0]} is not a provider of ${c.model}; /endpoints lists them`);
+      await this.remember({ openrouterProvider: a[0] });
+      return void this.write(`provider: ${a[0]}`);
+    }
+    if (!list.length) return void this.write(`No providers listed for ${c.model}.`);
+    this.write(`providers of ${c.model} (${c.openrouterProvider ? `chosen: ${c.openrouterProvider}` : 'automatic'}):`);
+    for (const e of list)
+      this.write(
+        `${e.tag === c.openrouterProvider ? '*' : ' '} ${e.tag.padEnd(32)} ${e.up ? 'up  ' : 'down'} ${usd(e.prompt)} in / ${usd(e.completion)} out per 1M`,
+      );
+  }
   private async models(words: string[]): Promise<void> {
     const c = await this.config();
     const list = await listModels(c, await this.key(c), words.join(' '));
@@ -321,7 +349,7 @@ export class App {
     const { notes } = forModel(candidate, m);
     // Neither reasoning nor its effort is kept as fitted to this model: forModel fits them for each run (reasoning
     // off where it cannot reason, the nearest effort it takes), and a switch back finds the choices as they were.
-    await this.remember({ model: m.id });
+    await this.remember({ model: m.id, openrouterProvider: '' });
     this.info = m;
     this.write(`model: ${m.id}`);
     for (const n of notes) this.write(`note: ${n}`);

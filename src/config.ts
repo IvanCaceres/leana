@@ -23,6 +23,8 @@ export const defaults: Config = {
   screenshots: 'auto',
   // OpenRouter endpoints by what Leana's requests cost on them (endpointOrder), or OpenRouter's own choice.
   openrouterRouting: 'cost',
+  // The model's OpenRouter endpoint chosen with /endpoints; empty: routing picks (cost, or OpenRouter's own choice).
+  openrouterProvider: '',
   // How the prompt is written (Session.form): json for Bonsai; fitted to an OpenRouter model, tools when it takes them, else text.
   promptForm: 'json',
   jevUrl: 'https://api.typesafe.ai/v1/systemone',
@@ -141,6 +143,8 @@ export async function loadConfig(path?: string, overrides: Partial<Config> = {})
   if (!['auto', 'off'].includes(c.promptCache)) throw new Error('promptCache must be auto or off');
   if (!['auto', 'off'].includes(c.screenshots)) throw new Error('screenshots must be auto or off');
   if (!['cost', 'default'].includes(c.openrouterRouting)) throw new Error('openrouterRouting must be cost or default');
+  if (typeof c.openrouterProvider !== 'string' || !/^[\w./-]*$/.test(c.openrouterProvider))
+    throw new Error('openrouterProvider must be an endpoint tag such as wafer/fp4, or empty');
   if (
     !Number.isSafeInteger(c.openrouterWorkingTokens) ||
     (c.openrouterWorkingTokens && c.openrouterWorkingTokens < 2000)
@@ -193,6 +197,7 @@ const kept = new Set([
   'promptCache',
   'screenshots',
   'openrouterRouting',
+  'openrouterProvider',
 ]);
 export interface Settings {
   config: Partial<Config>;

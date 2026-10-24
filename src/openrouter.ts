@@ -307,6 +307,7 @@ export class OpenRouter {
   // left to OpenRouter or the endpoints cannot be listed, so a request is never held up by it.
   private order: Promise<string[]> | null = null;
   private providerOrder(m: ModelInfo): Promise<string[]> {
+    if (this.config.openrouterProvider) return Promise.resolve([this.config.openrouterProvider]);
     if (this.config.openrouterRouting !== 'cost') return Promise.resolve([]);
     this.order ??= modelEndpoints(this.config, this.key)
       .then(async endpoints => {

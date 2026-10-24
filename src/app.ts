@@ -69,6 +69,7 @@ export class App {
     this.settings = {
       config: { ...opts.settings.config },
       ...(opts.settings.repo ? { repo: opts.settings.repo } : {}),
+      ...(opts.settings.endpoints ? { endpoints: { ...opts.settings.endpoints } } : {}),
     };
     this.repo = opts.repo;
     this.allowWrite = opts.base.allowWrite;
@@ -99,6 +100,16 @@ export class App {
     this.settings.config = { ...this.settings.config, ...change } as Partial<Config>;
     await loadConfig(this.opts.configPath, { ...this.settings.config }); // refuses an inconsistent combination before it is kept
     await saveSettings(this.settings, this.opts.settingsPath);
+  }
+  // The endpoint kept for a model by its id, so switching models and back asks for the endpoint chosen for that
+  // model again: a choice with the second argument is kept (empty clears it), and it is read without one.
+  private endpointFor(model: string, choice?: string): string {
+    if (choice === undefined) return this.settings.endpoints?.[model] ?? '';
+    const all = { ...this.settings.endpoints };
+    if (choice) all[model] = choice;
+    else delete all[model];
+    this.settings.endpoints = all;
+    return choice;
   }
   // Guidance for the run under way: it reaches the run at its next step.
   guide(text: string): boolean {
@@ -315,13 +326,16 @@ export class App {
     const c = await this.config();
     if (c.provider !== 'openrouter') throw new Error('endpoints are OpenRouter providers: /provider openrouter first');
     const list = await modelEndpoints(c, await this.key(c));
+    // The choice is kept for the model as well as for this run: /model switches it away, and back to this model's.
     if (a[0] === 'auto') {
+      this.endpointFor(c.model, '');
       await this.remember({ openrouterProvider: '' });
       return void this.write('provider: automatic (routing picks)');
     }
     if (a[0]) {
       if (!list.some(e => e.tag === a[0]))
         throw new Error(`${a[0]} is not a provider of ${c.model}; /endpoints lists them`);
+      this.endpointFor(c.model, a[0]);
       await this.remember({ openrouterProvider: a[0] });
       return void this.write(`provider: ${a[0]}`);
     }
@@ -345,13 +359,20 @@ export class App {
   private async switchModel(id: string): Promise<void> {
     const c = await this.config();
     const candidate = { ...c, model: id };
-    const m = await describeModel(candidate, await this.key(candidate));
+    const key = await this.key(candidate);
+    const m = await describeModel(candidate, key);
     const { notes } = forModel(candidate, m);
     // Neither reasoning nor its effort is kept as fitted to this model: forModel fits them for each run (reasoning
     // off where it cannot reason, the nearest effort it takes), and a switch back finds the choices as they were.
-    await this.remember({ model: m.id, openrouterProvider: '' });
+    // The endpoint kept for this model (endpointFor) is asked for again when the model still lists it; when it no
+    // longer does — or its endpoints cannot be listed, so a switch is never held up by them — routing picks.
+    const preferred = candidate.provider === 'openrouter' ? this.endpointFor(m.id) : '';
+    const list = candidate.provider === 'openrouter' ? await modelEndpoints(candidate, key).catch(() => []) : [];
+    const provider = preferred && list.some(e => e.tag === preferred) ? preferred : '';
+    await this.remember({ model: m.id, openrouterProvider: provider });
     this.info = m;
     this.write(`model: ${m.id}`);
+    if (preferred && !provider) this.write(`note: ${preferred} is no longer a provider of ${m.id}: routing picks`);
     for (const n of notes) this.write(`note: ${n}`);
   }
   private async showModel(): Promise<void> {

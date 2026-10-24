@@ -202,6 +202,9 @@ const kept = new Set([
 export interface Settings {
   config: Partial<Config>;
   repo?: string;
+  // The endpoint chosen for each model with /endpoints, by model id: switching models and back asks for the endpoint
+  // chosen for that model again, when it still lists it (routing picks otherwise; app.ts switchModel).
+  endpoints?: Record<string, string>;
 }
 export async function loadSettings(path = settingsPath()): Promise<Settings> {
   let raw: any;
@@ -211,12 +214,25 @@ export async function loadSettings(path = settingsPath()): Promise<Settings> {
     return { config: {} };
   }
   const config = Object.fromEntries(Object.entries(raw?.config ?? {}).filter(([k]) => kept.has(k))) as Partial<Config>;
-  return { config, ...(typeof raw?.repo === 'string' ? { repo: raw.repo } : {}) };
+  // The remembered endpoints, only model ids mapped to endpoint tags as loadConfig accepts them.
+  const listed = raw?.endpoints;
+  const endpoints: Record<string, string> = {};
+  if (listed && typeof listed === 'object' && !Array.isArray(listed))
+    for (const [model, tag] of Object.entries(listed))
+      if (model && typeof tag === 'string' && /^[\w./-]+$/.test(tag)) endpoints[model] = tag;
+  return {
+    config,
+    ...(Object.keys(endpoints).length ? { endpoints } : {}),
+    ...(typeof raw?.repo === 'string' ? { repo: raw.repo } : {}),
+  };
 }
 export async function saveSettings(s: Settings, path = settingsPath()): Promise<void> {
   const config = Object.fromEntries(Object.entries(s.config).filter(([k]) => kept.has(k)));
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify({ config, ...(s.repo ? { repo: s.repo } : {}) }, null, 2)}\n`, {
-    mode: 0o600,
-  });
+  const kept_settings = {
+    config,
+    ...(s.repo ? { repo: s.repo } : {}),
+    ...(s.endpoints && Object.keys(s.endpoints).length ? { endpoints: s.endpoints } : {}),
+  };
+  await writeFile(path, `${JSON.stringify(kept_settings, null, 2)}\n`, { mode: 0o600 });
 }

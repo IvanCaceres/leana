@@ -63,7 +63,8 @@ export function shellEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 // The environment a command gets: a small allowlist, so API keys are not
 // inherited. Windows programs also need where the system, the user's profile
 // and the temporary directory are (npm, node-gyp and Python fail without them).
-const shared = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM'];
+// SSH_AUTH_SOCK and SSH_AGENT_PID let git reach a running ssh-agent (git push over SSH); no key is copied.
+const shared = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID'];
 const windowsOnly = [
   'SystemRoot',
   'SystemDrive',

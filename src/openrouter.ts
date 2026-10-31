@@ -504,6 +504,11 @@ export class OpenRouter {
           ...(less ? { retry: less } : {}),
         });
         if (less) {
+          // The retry's total budget shrinks with its reasoning: the reply's limit plus the smaller budget, not the first request's.
+          body.max_tokens = Math.min(
+            Number(body.max_tokens),
+            maxTokens + Number((less as { max_tokens?: number }).max_tokens ?? 0),
+          );
           body.reasoning = less;
           r = await send();
         }

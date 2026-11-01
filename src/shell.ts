@@ -55,7 +55,9 @@ export function shellEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
       delete env[k];
     }
   const { git } = windowsBash();
-  env.PATH = git ? [join(git, 'mingw64', 'bin'), join(git, 'usr', 'bin'), path].filter(Boolean).join(delimiter) : path;
+  // Windows' own OpenSSH goes ahead of MSYS's /usr/bin/ssh: only it sees the Windows ssh-agent.
+  const winOpenSsh = join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'OpenSSH').replace(/\\/g, '/');
+  env.PATH = git ? [join(git, 'mingw64', 'bin'), winOpenSsh, join(git, 'usr', 'bin'), path].filter(Boolean).join(delimiter) : path;
   if (git && !env.MSYSTEM) env.MSYSTEM = 'MINGW64';
   return env;
 }

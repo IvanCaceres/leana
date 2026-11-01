@@ -64,7 +64,7 @@ export function shellEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 // inherited. Windows programs also need where the system, the user's profile
 // and the temporary directory are (npm, node-gyp and Python fail without them).
 // SSH_AUTH_SOCK and SSH_AGENT_PID let git reach a running ssh-agent (git push over SSH); no key is copied.
-const shared = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID'];
+const shared = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TMPDIR', 'TERM', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'GIT_SSH_COMMAND'];
 const windowsOnly = [
   'SystemRoot',
   'SystemDrive',
@@ -91,6 +91,13 @@ const windowsOnly = [
 export function commandEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of windows ? [...shared, ...windowsOnly] : shared) if (process.env[key]) env[key] = process.env[key];
+  // Git for Windows' ssh cannot reach the Windows ssh-agent (a named pipe), so git
+  // pushes would fail with publickey denied. Use Windows' own OpenSSH unless set.
+  if (windows && !env.GIT_SSH_COMMAND) {
+    // Forward slashes: GIT_SSH_COMMAND runs through a shell, which strips backslashes.
+    const winSsh = join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe').replace(/\\/g, '/');
+    if (existsSync(winSsh)) env.GIT_SSH_COMMAND = winSsh;
+  }
   return shellEnv(env);
 }
 

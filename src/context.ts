@@ -80,6 +80,7 @@ export const routeDescriptions: Record<Route, string> = {
     'For small, local edits only: newText is part of this JSON reply and the whole reply is limited in length, so a large replacement is cut off and lost; use rewrite_file for anything larger. Replace, delete or prefix up to 40 line ranges of an already-read file in one step, addressed by line numbers instead of exact anchors; the way to remove many unused-import lines at once, to export many declarations at once (prepend), or to rewrite a region.',
   move_lines:
     'Cut a contiguous line range from an already-read file and append it, unchanged, to another file (created when it does not exist), without retyping it.',
+  push: 'Push the current branch to a remote for the first time (git push -u). Needs the user if git cannot authenticate: then ask_user, do not retry.',
   bash: 'Run a shell command, including tests, builds or diagnostics, with explicit execution permission.',
   finish: 'Report completion when the objective is met and the supplied evidence supports completion.',
   ask_user: 'Pause because essential user information or a permission is missing; no other action fits.',
@@ -533,6 +534,7 @@ export function evidenceTokens(s: Session): number {
   );
 }
 const details: Record<Route, string> = {
+  push: 'branch is the current branch name; remote defaults to origin. Pushes with git push -u and sets the upstream. If git cannot authenticate, the user must load the SSH key, so ask_user; never retry.',
   rewrite_file:
     'path is an existing file; purpose says what the new content must contain and change. Its current content is put in front of you when the block or the file is generated, so there is no need to read it first to append to it or change it. start and end (optional, 1-based, inclusive, numbered as in the latest read or edit result of the file) limit the regeneration to that block: give them whenever most of the file stays as it is (appending rules, adding a component, replacing one function); omit them only when most of the file changes. Never put file content in the arguments: it is generated next, as code, from the current content, your thought and purpose.',
   observe: `kind is one of ${observerCatalog.map(o => o.kind).join(', ')}: whichever is how the objective's user meets the result. start is the shell command that starts what is observed and keeps running (a server on a fixed port with no browser opening, a service), stopped afterwards; "" when it already runs or nothing needs starting. target is what is observed: a URL, or the command to run with its arguments. inputs plays a page as its user would, in order (page only; [] for none): press a key (what: Enter, Space, Escape, an arrow, a letter), hold one for ms, type text into what has focus, click the element a CSS selector names, or wait; each is followed by ms of watching, and what it did is stated: exceptions thrown, frames drawn, how much of each canvas changed and where, text that came or went. Everything runs in the repository root.`,
@@ -778,6 +780,7 @@ const evidenceMessage = (e: Entry): Message => ({ role: 'user', content: evidenc
 // quarter of a small run's prompt (run react-demo-glm-3). Every rule the harness enforces is kept; the reasons and
 // examples are not. The file actions write their content in the call (toolForms).
 const toolBriefs: Record<Route, string> = {
+  push: 'Push branch to remote for the first time (git push -u). branch and remote; authentication failures need the user.',
   read_files:
     'Read files or line ranges, or a stored output as @artifact/NAME. files: up to three {path, start, end} (1-based, inclusive; no range reads the whole file); more go in further read_files calls of the same turn. Exact repository-relative paths, no globs or directories. A read shows as much of each range as fits its budget and names the last line shown: continue from the next line. To find a declaration in a large file, search_codebase first and read around it. Read a file before editing it.',
   search_codebase:

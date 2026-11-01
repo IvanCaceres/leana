@@ -58,6 +58,8 @@ export const schemas: Record<Route, JsonSchema> = {
     destinationHash: str(16),
   }),
   bash: obj({ command: str(), purpose: str(), check: { type: 'boolean' } }),
+  // Pushes the branch to its remote for the first time (git push -u); the harness checks the names.
+  push: obj({ branch: str(200), remote: str(100) }),
   finish: obj({ summary: str() }),
   ask_user: obj({ question: str() }),
   // The worker's own notes: its plan and what it has learned, replaced whole.
@@ -86,6 +88,7 @@ export const actions = [
   'read_files',
   'search_codebase',
   'bash',
+  'push',
   'create_file',
   'rewrite_file',
   'write',

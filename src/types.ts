@@ -6,6 +6,7 @@ export type Route =
   | 'replace_lines'
   | 'move_lines'
   | 'bash'
+  | 'push'
   | 'plan'
   | 'observe'
   | 'rewrite_file'

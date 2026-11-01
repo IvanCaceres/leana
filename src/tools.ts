@@ -18,6 +18,7 @@ import {
 } from './edit-checks.js';
 import { boundedRead, hash, parentDirectory, readLines, safePath } from './files.js';
 import { commandShell, describeProcesses, plainText, runCommand } from './commands.js';
+import { pushBranch } from './push.js';
 import { LineEditPlan, type LineEdit } from './line-edits.js';
 // Replaces a file's content whole or not at all: written to a temporary file with the original's mode, then
 // renamed over it, only while the file still has the hash the edit was made against. alongside runs in
@@ -116,7 +117,25 @@ export class ToolBox {
     replace_lines: this.replaceLines,
     move_lines: this.moveLines,
     bash: this.bash,
+    push: this.push,
   };
+  private async push(a: Record<string, any>): Promise<ToolResult> {
+    if (!this.config.allowBash) throw new Error('Push disabled; restart with --allow-bash');
+    const r = await pushBranch(this.root, String(a.branch ?? ''), String(a.remote ?? 'origin'));
+    if (!r.ok)
+      return {
+        ok: false,
+        changed: [],
+        hashes: {},
+        text: `push ${r.branch} to ${r.remote} failed${r.needsUser ? ' (needs the user)' : ''}: ${r.reason}\n${r.output}`,
+      };
+    return {
+      ok: true,
+      changed: [],
+      hashes: {},
+      text: `Pushed ${r.branch} to ${r.remote}; upstream is ${r.upstream}.\n${r.output}`,
+    };
+  }
   private async readFiles(a: Record<string, any>): Promise<ToolResult> {
     const results: string[] = [];
     const hashes: Record<string, string> = {};
